@@ -1,0 +1,27 @@
+[package]
+name = "linux-agent"
+description = "A Rust crate for sending HTTP POST requests with JSON payloads, parsing configuration files, and communicating with the Linux kernel using Netlink."
+authors = [ "zebra. <zebra@gmail.com>"]
+#repository = "https://github.com/zebra/linux-agent"
+homepage = "https://stalw.art"
+
+keywords = ["post-request", "json", "configuration", "parsing", "netlink", "kernel-communication"]
+categories = ["network-programming", "data-processing", "system"]
+license = "MIT"
+repository = "https://github.com/yourname/json-netlink-handler"
+version = "0.10.6"
+edition = "2021"
+resolver = "2"
+[[bin]]
+name = "MagicArmor_0"
+path = "src/main.rs"
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hostinfo = { path =  "../hostinfo" }
+online = { path =  "../online" }
+task = { path =  "../task" }
+common = { path = "../common" }
+kernel_event =  { path = "../kernel_event" }
+
+
+

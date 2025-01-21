@@ -1,0 +1,24 @@
+[package]
+name = "task"
+version = "0.10.6"
+edition = "2021"
+resolver = "2"
+
+[dependencies]
+ring = { version = "0.17" }
+tokio = { version = "1.23", features = ["net", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+arc-swap = "1.6.0"
+configparser = "3.1.0"  # 选择适合的版本
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+num-derive = "0.3"
+num-traits = "0.2"
+
+net_client = { path = "../net_client" }
+common = { path =  "../common" }
+hostinfo = { path =  "../hostinfo" }
+
+[features]
+test_mode = []
+

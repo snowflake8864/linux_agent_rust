@@ -1,0 +1,148 @@
+use reqwest::Client;
+use std::time::Duration;
+use serde::{Deserialize};
+
+#[derive(Deserialize)]
+struct ResponseData {
+    code: String,
+    data: Data,
+    msg: String,
+}
+
+#[derive(Deserialize)]
+struct Data {
+    token: String,
+}
+
+pub struct NetClient {
+    client: Client,
+    pub base_url: String,
+    token: Option<String>,  // 用来存储 token
+}
+
+impl NetClient {
+    // 初始化客户端（同步版本）
+    pub fn new(base_url :String, disable_ssl: bool, token: Option<String>) -> Result<Self, String> {
+        let client_builder = Client::builder()
+            .timeout(Duration::from_secs(10)); // 设置请求超时时间
+
+        // 如果禁用 SSL 证书验证，则设置相应的选项
+        let client = if disable_ssl {
+            client_builder
+                .danger_accept_invalid_certs(true) // 禁用 SSL 证书验证
+                .build()
+                .map_err(|e| format!("Failed to create client with SSL disabled: {}", e))?
+        } else {
+            client_builder
+                .build()
+                .map_err(|e| format!("Failed to create client: {}", e))?
+        };
+
+        Ok(NetClient {
+                client,
+                base_url,
+                token, // 初始化时token为空
+                })
+    }
+    // 解析响应中的 token 并更新 token 字段（同步版本）
+    pub fn parse_token(&mut self, response: &str) -> Result<(), String> {
+        match serde_json::from_str::<serde_json::Value>(response) {
+            Ok(json) => {
+                if let Some(token) = json.get("data").and_then(|d| d.get("token")) {
+                    self.token = Some(token.as_str().unwrap_or_default().to_string());
+                    Ok(())
+                } else {
+                    Err("Token not found in response.".to_string())
+                }
+            }
+            Err(_) => Err("Failed to parse response JSON.".to_string()),
+        }
+    }
+
+    // 判断是否有 token（同步版本）
+    pub fn has_token(&self) -> bool {
+        self.token.is_some()
+    }
+
+    // 获取 token（同步版本）
+    pub fn get_token(&self) -> Option<String> {
+        self.token.clone()
+    }
+    // 修复后的异步版本
+    pub async fn post_data_async(
+            &self,
+            url: &str,
+            json_data: &str,
+            timeout: Duration,
+            token: Option<&str>, // 添加 token 参数
+            ) -> Result<String, String> {
+        let mut request = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .timeout(timeout)
+            .body(json_data.to_string());
+
+        println!("response:{:?}",request); 
+        if let Some(token_str) = token {
+            request = request.header("Authorization", format!("{}", token_str));
+        }
+
+        let response = request.send().await;
+        match response {
+            Ok(r) => {
+                let status_code = r.status();
+                let response_text = r.text().await.map_err(|e| format!("Failed to read response text: {}", e))?;
+                if status_code.is_success() {
+                    Ok(response_text)
+                } else {
+                    Err(format!("POST request failed with status: {} - {}", status_code, response_text))
+                }
+            }
+            Err(e) => Err(format!("Failed to send POST request: {}", e)),
+        }
+    }
+
+ pub fn post_data(
+        &self,
+        url: &str,
+        json_data: &str,
+        timeout: Duration,
+        token: Option<&str>, // 添加 token 参数
+    ) -> Result<String, String> {
+        // 创建同步客户端
+        let mut request = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .timeout(timeout)
+            .body(json_data.to_string());
+
+        // 如果提供了 token，则添加 Authorization 头
+        if let Some(token_str) = token {
+            request = request.header("Authorization", format!("{}", token_str));
+        }
+
+        // 发送同步请求并获取响应
+        let response: Result<Response, reqwest::Error> = request.send();
+
+        // 处理响应
+        match response {
+            Ok(r) => {
+                let status_code = r.status();
+                // 获取响应文本
+                let response_text = r.text().map_err(|e| format!("Failed to read response text: {}", e))?;
+                if status_code.is_success() {
+                    Ok(response_text)
+                } else {
+                    Err(format!("POST request failed with status: {} - {}", status_code, response_text))
+                }
+            }
+            Err(e) => Err(format!("Failed to send POST request: {}", e)),
+        }
+    }
+
+}
+

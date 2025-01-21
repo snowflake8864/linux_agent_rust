@@ -1,0 +1,122 @@
+//crates/common/src/manager/boot.rs
+use std::{sync::Arc};
+use arc_swap::ArcSwap;
+use configparser::ini::Ini;
+use crate::{Core, Inner};
+use config::net_info::NetInfoConfig; // 导入 NetInfoConfig
+use crate::NetClient;  // Import NetClient from the common module
+//use tokio::sync::mpsc;
+
+#[derive(Clone)]
+pub struct BootManager {
+    pub inner: Arc<Inner>,
+}
+
+const HELP: &str = concat!(
+    "Stalwart Mail Server v",
+    env!("CARGO_PKG_VERSION"),
+    r#"
+
+Usage: stalwart-mail [OPTIONS]
+
+Options:
+  -c, --config <PATH>              Start server with the specified configuration file
+  -I, --init <PATH>                Initialize a new server at a specific path
+  -h, --help                       Print help
+  -V, --version                    Print version
+"#
+);
+
+impl BootManager {
+    pub async fn init() -> Self {
+        let mut config_path = std::env::var("CONFIG_PATH").ok();
+
+        if config_path.is_none() {
+            let mut args = std::env::args().skip(1);
+
+            while let Some(arg) = args.next().and_then(|arg| {
+                arg.strip_prefix("--")
+                    .or_else(|| arg.strip_prefix('-'))
+                    .map(|arg| arg.to_string())
+            }) {
+                let (key, value) = if let Some((key, value)) = arg.split_once('=') {
+                    (key.to_string(), Some(value.trim().to_string()))
+                } else {
+                    (arg, args.next())
+                };
+
+                match (key.as_str(), value) {
+                    ("help" | "h", _) => {
+                        eprintln!("{HELP}");
+                        std::process::exit(0);
+                    }
+                    ("version" | "V", _) => {
+                        println!("{}", env!("CARGO_PKG_VERSION"));
+                        std::process::exit(0);
+                    }
+                    ("config" | "c", Some(value)) => {
+                        config_path = Some(value);
+                    }
+                    (_, None) => {
+                        eprintln!("Unrecognized command '{key}', try '--help'.");
+                        std::process::exit(1);
+                    }
+                    (_, Some(_)) => {
+                        eprintln!("Missing value for argument '{key}', try '--help'.");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            if config_path.is_none() {
+                config_path = Some("/opt/osec/net_info.ini".to_string());
+                eprintln!("Missing '--config' argument. Using default config path: {}", config_path.as_ref().unwrap());
+            }
+        }
+
+        // Load the INI file using the configparser crate
+        let mut ini = Ini::new();
+        if let Some(path) = config_path {
+            println!("==========================={}",path);
+            ini.load(path.clone()).unwrap_or_else(|_| {
+                    eprintln!("Failed to load configuration file from '{}'", path);
+                    std::process::exit(1);
+                    });
+        }
+
+        // Retrieve the configuration values from the INI file and parse into NetInfoConfig
+        let netinfocfg = NetInfoConfig::from_ini(&ini); // 这里使用 from_ini 解析配置
+        println!("1===={:?}", netinfocfg);
+ // Initialize the NetClient with token and base_url from environment variables or config
+        let netclient = NetClient {
+            token: std::env::var("NETCLIENT_TOKEN").ok(),
+            //base_url: std::env::var("NETCLIENT_BASE_URL").unwrap_or_else(|_| "http://default.url".to_string()), // Default URL if not provided
+            base_url: netinfocfg.server_ip_port.clone(), 
+        };
+        println!("=={:?}", netclient);
+        let core = Core {
+            netinfocfg,
+            netclient,
+            is_online:false,
+        };
+
+        let inner = Arc::new(Inner {
+            shared_core: ArcSwap::from_pointee(core),
+        });
+
+        BootManager {
+        inner,
+        }
+    }
+
+    pub fn get_base_url(&self) -> String {
+        let core = self.inner.shared_core.load();
+        core.netinfocfg.server_ip_port.clone() // 返回克隆的值
+    }
+    pub fn host_is_online(&self) -> bool {
+        let core = self.inner.shared_core.load();
+        core.is_online == true // 返回克隆的值
+    }
+
+}
+
