@@ -1,0 +1,10 @@
+[package]
+name = "config"
+version = "0.10.6"
+edition = "2021"
+resolver = "2"
+
+[dependencies]
+configparser = "3.1.0"  # 选择适合的版本
+
+

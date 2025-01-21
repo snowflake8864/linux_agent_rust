@@ -1,0 +1,11 @@
+[package]
+name = "kernel_event"
+version = "0.10.6"
+edition = "2021"
+resolver = "2"
+
+[dependencies]
+tokio = { version = "1.23", features = ["net", "macros"] }
+netlink = { path = "../netlink" }
+common = { path =  "../common" }
+

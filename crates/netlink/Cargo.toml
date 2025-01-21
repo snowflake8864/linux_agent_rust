@@ -1,0 +1,9 @@
+[package]
+name = "netlink"
+version = "0.10.6"
+edition = "2021"
+resolver = "2"
+
+[dependencies]
+libc = "0.2"
+
