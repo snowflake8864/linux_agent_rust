@@ -6,5 +6,5 @@ resolver = "2"
 
 [dependencies]
 configparser = "3.1.0"  # 选择适合的版本
-
+hostinfo = { path =  "../hostinfo" }
 

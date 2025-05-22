@@ -1,10 +1,12 @@
 use configparser::ini::Ini;
 use std::fs::File;
 use std::io::{self, Write};
-
+use hostinfo::system_info::SystemInfo;
+use hostinfo::{ip_mac, agent_uid};
 #[derive(Debug, Default, Clone)]
 pub struct NetInfoConfig {
     pub mid: String,  // MID 字段
+    pub ver: String,  
     pub com_time: u32,
     pub cron_time: u32,
     pub extortion_protect: u32,
@@ -27,6 +29,17 @@ pub struct NetInfoConfig {
     pub usb_protect: u32,
     pub usb_switch: u32,
     pub user_id: String,  // USER_ID 字段
+//=====host info
+    pub dev_uid: String,  
+    pub macid: String,  
+    pub ips: String,  
+    //pub _type: u32,  
+    pub os: String,  
+    pub memsize: String,  
+    pub cpu: String,  
+    pub hdsize: String,  
+    pub auth: String,  
+    pub host_name: String,  
 }
 
 impl NetInfoConfig {
@@ -35,6 +48,9 @@ impl NetInfoConfig {
 
         if let Some(mid) = ini.get("CLIENTINFO", "MID") {
             config.mid = mid; // MID 存储到 mid 字段
+        }
+        if let Some(value) = ini.get("SERVERINFO", "VERSION") {
+            config.ver = value.parse().unwrap_or_default();
         }
 
         if let Some(user_id) = ini.get("SERVERINFO", "USER_ID") {
@@ -104,7 +120,33 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("SERVERINFO", "USB_SWITCH") {
             config.usb_switch = value.parse().unwrap_or_default();
         }
-
+        if let Some(value) = ini.get("HOSTINFO", "DEV_UID") {
+            config.dev_uid = value.parse().unwrap_or_default();
+        }
+        if let Some(value) = ini.get("HOSTINFO", "MACID") {
+            config.macid = value.parse().unwrap_or_default();
+        }
+        if let Some(value) = ini.get("HOSTINFO", "IPS") {
+            config.ips = value.parse().unwrap_or_default();
+        }
+        if let Some(value) = ini.get("HOSTINFO", "OS") {
+            config.os = value.parse().unwrap_or_default();
+        }
+        if let Some(value) = ini.get("HOSTINFO", "MEMSIZE") {
+            config.memsize = value.parse().unwrap_or_default();
+        }
+        if let Some(value) = ini.get("HOSTINFO", "CPU") {
+            config.cpu = value.parse().unwrap_or_default();
+        }
+        if let Some(value) = ini.get("HOSTINFO", "HDSIZE") {
+            config.hdsize = value.parse().unwrap_or_default();
+        }
+        if let Some(value) = ini.get("HOSTINFO", "AUTH") {
+            config.auth = value.parse().unwrap_or_default();
+        }
+        if let Some(value) = ini.get("HOSTINFO", "HOSTNAME") {
+            config.host_name = value.parse().unwrap_or_default();
+        }
         config
     }
     pub fn to_ini(&self, file_name: &str) -> Result<(), io::Error> {
@@ -135,9 +177,69 @@ impl NetInfoConfig {
         writeln!(file, "SERVER_PORT={}", self.server_port)?;
         writeln!(file, "USB_PROTECT={}", self.usb_protect)?;
         writeln!(file, "USB_SWITCH={}", self.usb_switch)?;
-
+        writeln!(file, "[HOSTINFO]")?;
+        writeln!(file, "DEV_UID={}", self.dev_uid)?;
+        writeln!(file, "MACID={}", self.macid)?;
+        writeln!(file, "IPS={}", self.ips)?;
+        writeln!(file, "VERSION={}", self.ver)?;
+        writeln!(file, "OS={}", self.os)?;
+        writeln!(file, "MEMSIZE={}", self.memsize)?;
+        writeln!(file, "CPU={}", self.cpu)?;
+        writeln!(file, "HDSIZE={}", self.hdsize)?;
+        writeln!(file, "AUTH={}", self.auth)?;
+        writeln!(file, "HOSTNAME={}", self.host_name)?;
         Ok(())
     }
 
-}
+    /// 获取系统主机信息以填充 HOSTINFO 字段
+    pub fn acquire_host_info(&mut self) -> io::Result<()> {
+        if self.dev_uid.is_empty() {
+             self.dev_uid = agent_uid::ensure_and_get_mgs_guid(".vedasystem").unwrap_or_else(|_| "unknown".to_string());
+        }
+        if self.macid.is_empty() {
+             self.macid = ip_mac::get_mac().unwrap_or("unknown".to_string());
+        }
 
+        // HOSTNAME
+        if self.host_name.is_empty() {
+            //let computer_name = system_info::SystemInfo::get_computer_name().unwrap_or_else(|_| "Unknown".to_string());
+            self.host_name = SystemInfo::get_computer_name().unwrap_or_else(|_| "Unknown".to_string());
+        }
+        // auth
+        if self.auth.is_empty() {
+;
+            self.auth = "123123".to_string();
+        }
+
+        // OS
+        if self.os.is_empty() {
+;
+            self.os = SystemInfo::get_computer_version().unwrap_or_else(|_| "Unknown".to_string());
+        }
+
+
+        // CPU
+        if self.cpu.is_empty() {
+            self.cpu = SystemInfo::get_cpu_cores().unwrap_or_else(|_| "Unknown".to_string());
+        }
+
+        // MEMSIZE (以 GB 为单位)
+        if self.memsize.is_empty() {
+            self.memsize = SystemInfo::get_memory_size().unwrap_or_else(|_| "Unknown".to_string());
+        }
+
+        // HDSIZE (以 GB 为单位)
+        if self.hdsize.is_empty() {
+            self.hdsize = SystemInfo::get_disk_size().unwrap_or_else(|_| "Unknown".to_string());
+        }
+
+        // IPS
+        if self.ips.is_empty() {
+             self.ips = ip_mac::get_ip().unwrap_or("unknown".to_string());
+        }
+        // IPS
+        Ok(())
+    }
+
+
+}

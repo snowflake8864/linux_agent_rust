@@ -17,11 +17,17 @@ name = "MagicArmor_0"
 path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-hostinfo = { path =  "../hostinfo" }
+openssl-sys = "0.9"
+openssl = {version = "0.10.33", features = ["vendored"]}
+#hostinfo = { path =  "../hostinfo" }
 online = { path =  "../online" }
 task = { path =  "../task" }
 common = { path = "../common" }
+config = { path = "../config" }
 kernel_event =  { path = "../kernel_event" }
+#[CKlibm]
+#libc ="/home/zebra/workspace/rustprj/linux_agent_rust_v10/lib/libc.so.6"
+#libm ="/home/zebra/workspace/rustprj/linux_agent_rust_v10/lib/libm.so.6"
 
 
 

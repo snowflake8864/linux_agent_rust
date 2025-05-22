@@ -248,6 +248,7 @@ impl StartKernelHandler for BootManager {
             Err(e) => return Err(format!("Failed to create socket: {}", e)),
         };
 
+        println!("2.debug==========\n");
         let mut event_handler = EventHandler::new();
          register_default_event_handlers(&mut event_handler);
          //send_data_to_kernel(&nl_sock)?;
