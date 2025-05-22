@@ -14,7 +14,7 @@ impl SystemInfo {
     }
 
     /// 获取操作系统版本
-    pub fn get_os_version() -> Result<String, Error> {
+    fn get_os_version() -> Result<String, Error> {
         let os_release = fs::read_to_string("/etc/os-release")?;
         for line in os_release.lines() {
             if line.starts_with("NAME=") {

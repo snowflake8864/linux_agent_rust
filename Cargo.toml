@@ -8,8 +8,9 @@ members = [
      "crates/net_client",
      "crates/online",
      "crates/task",
-     "crates/netlink",
+#     "crates/netlink",
      "crates/kernel_event",
+     "crates/system_metrics",
 ]
 
 [profile.dev]
@@ -54,3 +55,4 @@ incremental = false
 debug-assertions = false
 overflow-checks = false
 rpath = false
+

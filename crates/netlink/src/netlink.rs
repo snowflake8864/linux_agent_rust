@@ -1,10 +1,13 @@
-use std::io::{self, Write};
+use std::fs::File;
+use std::path::Path;
+use std::io::{self, Write, Read};
+use std::{thread, time};
 use std::ptr;
 use std::mem;
 use libc::{self, iovec, msghdr, sockaddr_nl, NLM_F_REQUEST};
 use std::convert::TryInto;
 
-const NETLINK_USER: i32 = 21;
+const NETLINK_USER: i32 = 20;
 
 pub struct NlSockInfo {
     pub sock: i32,
@@ -13,17 +16,56 @@ pub struct NlSockInfo {
 }
 
 impl NlSockInfo {
+    fn get_netlink_proto() -> io::Result<i32> {
+        let path = Path::new("/sys/osec/proto");
+        let retry_limit = 10;
+        let retry_interval = time::Duration::from_secs(2);
+
+        for attempt in 0..retry_limit {
+            if path.exists() {
+                // 文件存在，尝试读取和解析
+                let mut file = File::open(path)?;
+                let mut contents = String::new();
+                file.read_to_string(&mut contents)?;
+
+                if let Some(stripped) = contents.strip_prefix("netlink:") {
+                    if let Ok(proto) = stripped.trim().parse::<i32>() {
+                        return Ok(proto);
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Invalid protocol format in /sys/osec/proto",
+                        ));
+                    }
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Missing 'netlink:' prefix in /sys/osec/proto",
+                    ));
+                }
+            } else {
+                // 文件还没出现，等待后重试
+                if attempt < retry_limit - 1 {
+                    thread::sleep(retry_interval);
+                }
+            }
+        }
+
+        // 超过重试次数，使用默认协议号
+        Ok(21)
+    }
     // 创建并绑定 Netlink socket
     pub fn create_socket() -> io::Result<Self> {
-        let sock = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, NETLINK_USER) };
+         let proto = Self::get_netlink_proto()?;
+        let sock = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, proto) };
         if sock < 0 {
             return Err(io::Error::last_os_error());
         }
 
         let mut nl_sock = NlSockInfo {
             sock,
-            dest_addr: unsafe { std::mem::zeroed() },
-            src_addr: unsafe { std::mem::zeroed() },
+                dest_addr: unsafe { std::mem::zeroed() },
+                src_addr: unsafe { std::mem::zeroed() },
         };
 
         nl_sock.src_addr.nl_family = libc::AF_NETLINK as u16;
@@ -33,10 +75,10 @@ impl NlSockInfo {
 
         let ret = unsafe {
             libc::bind(
-                sock,
-                &nl_sock.src_addr as *const _ as *const libc::sockaddr,
-                mem::size_of::<libc::sockaddr_nl>() as u32,
-            )
+                    sock,
+                    &nl_sock.src_addr as *const _ as *const libc::sockaddr,
+                    mem::size_of::<libc::sockaddr_nl>() as u32,
+                    )
         };
 
         if ret < 0 {
@@ -54,20 +96,20 @@ impl NlSockInfo {
 
         // 初始化 Netlink 消息头
         let nlmsg_header = libc::nlmsghdr {
-            nlmsg_len: msg_len as u32,
-            nlmsg_type: msg_type,
-            nlmsg_flags: NLM_F_REQUEST as u16,
-            nlmsg_seq: 0,
-            nlmsg_pid: unsafe { libc::getpid() as u32 },
+nlmsg_len: msg_len as u32,
+               nlmsg_type: msg_type,
+               nlmsg_flags: NLM_F_REQUEST as u16,
+               nlmsg_seq: 0,
+               nlmsg_pid: unsafe { libc::getpid() as u32 },
         };
 
         // 将头部拷贝到缓冲区中
         unsafe {
             ptr::copy_nonoverlapping(
-                &nlmsg_header as *const libc::nlmsghdr as *const u8,
-                message.as_mut_ptr(),
-                header_len,
-            );
+                    &nlmsg_header as *const libc::nlmsghdr as *const u8,
+                    message.as_mut_ptr(),
+                    header_len,
+                    );
         }
 
         // 将数据有效负载拷贝到缓冲区中
@@ -75,62 +117,119 @@ impl NlSockInfo {
 
         message
     }
+    /*
+       pub fn send_message(&self, msg_type: u16, data: &[u8]) -> io::Result<isize> {
+       let message = Self::create_netlink_message(msg_type, data);
 
-    // 发送 Netlink 消息
-    pub fn send_message(&self, msg_type: u16, data: &[u8]) -> io::Result<isize> {
-        let message = Self::create_netlink_message(msg_type, data);
+       let iov = iovec {
+iov_base: message.as_ptr() as *mut libc::c_void,
+iov_len: message.len(),
+};
 
-        let iov = iovec {
-            iov_base: message.as_ptr() as *mut libc::c_void,
-            iov_len: message.len(),
-        };
+let msg = msghdr {
+msg_name: &self.dest_addr as *const _ as *mut libc::c_void,
+msg_namelen: mem::size_of::<libc::sockaddr_nl>() as u32,
+msg_iov: &iov as *const iovec as *mut libc::iovec,
+msg_iovlen: 1,
+msg_control: ptr::null_mut(),
+msg_controllen: 0,
+msg_flags: 0,
+};
 
-        let msg = msghdr {
-            msg_name: &self.dest_addr as *const _ as *mut libc::c_void,
-            msg_namelen: mem::size_of::<libc::sockaddr_nl>() as u32,
-            msg_iov: &iov as *const iovec as *mut libc::iovec,
-            msg_iovlen: 1,
-            msg_control: ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-        };
+// 发送 Netlink 消息
+let send_len = unsafe { libc::sendmsg(self.sock, &msg, 0) };
+if send_len < 0 {
+return Err(io::Error::last_os_error());
+}
+println!("msg:{}", msg_type);
+Ok(send_len)
+}
+     */
 
-        // 发送 Netlink 消息
-        let send_len = unsafe { libc::sendmsg(self.sock, &msg, 0) };
-        if send_len < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        println!("msg:{}", msg_type);
-        Ok(send_len)
+
+pub fn send_message(&self, msg_type: u16, data: &[u8]) -> io::Result<isize> {
+    let message = Self::create_netlink_message(msg_type, data);
+
+    let iov = libc::iovec {
+iov_base: message.as_ptr() as *mut libc::c_void,
+              iov_len: message.len(),
+    };
+
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = &self.dest_addr as *const _ as *mut libc::c_void;
+    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
+    msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
+    msg.msg_iovlen = 1;
+    msg.msg_control = std::ptr::null_mut();
+    msg.msg_controllen = 0;
+    msg.msg_flags = 0;
+
+    let send_len = unsafe { libc::sendmsg(self.sock, &msg, 0) };
+    if send_len < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    println!("msg:{}", msg_type);
+    Ok(send_len)
+}
+
+
+
+/*
+
+// 接收 Netlink 消息
+pub fn receive_netlink_message(&self) -> io::Result<Vec<u8>> {
+let mut buf = vec![0u8; 4096];
+let iov = libc::iovec {
+iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+iov_len: buf.len(),
+};
+
+let mut msg = libc::msghdr {
+msg_name: &self.src_addr as *const _ as *mut libc::c_void,
+msg_namelen: mem::size_of::<libc::sockaddr_nl>() as u32,
+msg_iov: &iov as *const libc::iovec as *mut libc::iovec,
+msg_iovlen: 1,
+msg_control: ptr::null_mut(),
+msg_controllen: 0,
+msg_flags: 0,
+};
+
+let ret = unsafe { libc::recvmsg(self.sock, &mut msg, 0) };
+
+if ret < 0 {
+return Err(io::Error::last_os_error());
+}
+
+buf.truncate(ret as usize);
+Ok(buf)
+}
+ */
+pub fn receive_netlink_message(&self) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; 4096];
+    let iov = libc::iovec {
+iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+              iov_len: buf.len(),
+    };
+
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = &self.src_addr as *const _ as *mut libc::c_void;
+    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
+    msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
+    msg.msg_iovlen = 1;
+    msg.msg_control = std::ptr::null_mut();
+    msg.msg_controllen = 0;
+    msg.msg_flags = 0;
+
+    let ret = unsafe { libc::recvmsg(self.sock, &mut msg, 0) };
+
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
     }
 
-    // 接收 Netlink 消息
-    pub fn receive_netlink_message(&self) -> io::Result<Vec<u8>> {
-        let mut buf = vec![0u8; 4096];
-        let iov = libc::iovec {
-            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-            iov_len: buf.len(),
-        };
+    buf.truncate(ret as usize);
+    Ok(buf)
+}
 
-        let mut msg = libc::msghdr {
-            msg_name: &self.src_addr as *const _ as *mut libc::c_void,
-            msg_namelen: mem::size_of::<libc::sockaddr_nl>() as u32,
-            msg_iov: &iov as *const libc::iovec as *mut libc::iovec,
-            msg_iovlen: 1,
-            msg_control: ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-        };
-
-        let ret = unsafe { libc::recvmsg(self.sock, &mut msg, 0) };
-
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        buf.truncate(ret as usize);
-        Ok(buf)
-    }
 }
 // 解析接收到的 Netlink 数据并返回所需的数据
 pub fn parse_kosecs_msg_data(data: &[u8]) -> io::Result<(u32, &[u8], usize)> {

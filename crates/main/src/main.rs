@@ -1,7 +1,8 @@
 use tokio::fs;
 use tokio::time::{sleep, Duration};
 use tokio::signal::unix::{signal, SignalKind};
-use hostinfo::HostInfo;
+//use config::net_info::NetInfoConfig; // 导入 NetInfoConfig
+//use config::net_info;
 //use online::BaseOnline;
 use online::StartOnline;
 use task::TaskService;
@@ -14,10 +15,7 @@ use tokio::sync::mpsc;
 async fn main() -> std::io::Result<()> {
 
     let mut init = BootManager::init().await;
-
-    // 生成 hostinfo.ini 文件
-    let file_path = "hostinfo.ini";
-    HostInfo::generate_host_info_file(file_path); 
+    
 
     let (token_tx, token_rx) = mpsc::channel::<String>(32);  // 32 是通道的缓冲大小
     let (host_is_offline_tx, host_is_offline_rx) = mpsc::channel::<bool>(32);  // 32 是通道的缓冲大小

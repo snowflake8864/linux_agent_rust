@@ -85,7 +85,8 @@ impl BootManager {
         }
 
         // Retrieve the configuration values from the INI file and parse into NetInfoConfig
-        let netinfocfg = NetInfoConfig::from_ini(&ini); // 这里使用 from_ini 解析配置
+        let mut netinfocfg = NetInfoConfig::from_ini(&ini); // 这里使用 from_ini 解析配置
+        NetInfoConfig::acquire_host_info(&mut netinfocfg);
         println!("1===={:?}", netinfocfg);
  // Initialize the NetClient with token and base_url from environment variables or config
         let netclient = NetClient {
@@ -116,6 +117,10 @@ impl BootManager {
     pub fn host_is_online(&self) -> bool {
         let core = self.inner.shared_core.load();
         core.is_online == true // 返回克隆的值
+    }
+    pub fn get_netinfocfg(&self) -> NetInfoConfig {
+        let core = self.inner.shared_core.load();
+        core.netinfocfg.clone() // 返回克隆的值
     }
 
 }
