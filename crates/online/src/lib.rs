@@ -143,7 +143,8 @@ impl StartOnline for BootManager {
                                             Duration::from_secs(10),
                                             Some(&token)
                                         ).await {
-                                            Ok(response) => println!("服务器响应: {}", response),
+                                            //Ok(response) => println!("服务器响应: {}", response),
+                                            Ok(response) => {},
                                             Err(err) => eprintln!("发送指标失败: {}", err),
                                         }
                                     } else {

@@ -6,16 +6,20 @@ use tokio::signal::unix::{signal, SignalKind};
 //use online::BaseOnline;
 use online::StartOnline;
 use task::TaskService;
-use kernel_event::{StartKernelHandler};
-use common::{manager::boot::BootManager};
+use kernel_event::StartKernelHandler;
+use common::manager::boot::BootManager;
 use tokio::sync::mpsc;
-
+use logging;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    logging::CustomLogger::init("/opt/osec/osec_backend.conf")
+        .await
+        .expect("无法初始化日志");
 
-    let mut init = BootManager::init().await;
-    
+    logging::log_info!("程序启动");
+    let init = BootManager::init().await;
+
 
     let (token_tx, token_rx) = mpsc::channel::<String>(32);  // 32 是通道的缓冲大小
     let (host_is_offline_tx, host_is_offline_rx) = mpsc::channel::<bool>(32);  // 32 是通道的缓冲大小

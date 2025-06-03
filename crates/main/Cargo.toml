@@ -17,7 +17,8 @@ name = "MagicArmor_0"
 path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-openssl-sys = "0.9"
+#openssl-sys = "0.9"
+openssl-sys = { version = "0.9", features = ["vendored"] } # 关键修复点
 openssl = {version = "0.10.33", features = ["vendored"]}
 #hostinfo = { path =  "../hostinfo" }
 online = { path =  "../online" }
@@ -25,6 +26,8 @@ task = { path =  "../task" }
 common = { path = "../common" }
 config = { path = "../config" }
 kernel_event =  { path = "../kernel_event" }
+logging = { path = "../logging" }
+log = "0.4"
 #[CKlibm]
 #libc ="/home/zebra/workspace/rustprj/linux_agent_rust_v10/lib/libc.so.6"
 #libm ="/home/zebra/workspace/rustprj/linux_agent_rust_v10/lib/libm.so.6"

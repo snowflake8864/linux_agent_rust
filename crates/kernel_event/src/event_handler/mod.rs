@@ -1,14 +1,15 @@
+//crates/kernel_event/src/event_handler/mod.rs
 #![allow(dead_code)]
 use std::io::{self, Write};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::fmt;
-
+use crate::msg_handler::KosecsMsgData;
+use logging::{log_info,log_error};
 use netlink::netlink::NlSockInfo; // 引入 NLPolicyType
 //use std::time::Duration;
-use common::{
-    manager::boot::{BootManager},
-};
+use common::
+    manager::boot::BootManager;
 use std::pin::Pin;
 use std::future::Future;
 //use tokio::sync::mpsc;
@@ -241,18 +242,46 @@ pub trait StartKernelHandler {
 impl StartKernelHandler for BootManager {
     fn start_kernel_handler(&mut self) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send  + '_>> {
         Box::pin(async move {
-        //let kernel_event_connect = KernelEventConnect::new();
-        //let nl_sock = NlSockInfo::create_socket();
-        let nl_sock = match NlSockInfo::create_socket() {
-            Ok(sock) => sock,
-            Err(e) => return Err(format!("Failed to create socket: {}", e)),
-        };
+            //let kernel_event_connect = KernelEventConnect::new();
+            //let nl_sock = NlSockInfo::create_socket();
+            let nl_sock = match NlSockInfo::create_socket() {
+                Ok(sock) => sock,
+                Err(e) => return Err(format!("Failed to create socket: {}", e)),
+            };
 
-        println!("2.debug==========\n");
-        let mut event_handler = EventHandler::new();
-         register_default_event_handlers(&mut event_handler);
-         //send_data_to_kernel(&nl_sock)?;
-         send_data_to_kernel(&nl_sock).map_err(|e| e.to_string())?;
+            let mut event_handler = EventHandler::new();
+            register_default_event_handlers(&mut event_handler);
+            //send_data_to_kernel(&nl_sock)?;
+            send_data_to_kernel(&nl_sock).map_err(|e| e.to_string())?;
+            // 循环阻塞接收内核消息
+            /*
+            if let Err(e) = nl_sock.receive_messages_loop() {
+                println!("Error during message receive loop: {}", e);
+                return Err(format!("Receive loop failed: {}", e));
+            }
+            */
+            nl_sock.receive_messages_loop(|data| {
+
+                let payload = &data[16..]; // 跳过 netlink header
+                match KosecsMsgData::parse(&payload) {
+                    Some(msg) => {
+                        log_info!(
+                            "收到事件 type: {:#x}, 长度: {}, 数据: {:x?}",
+                            msg.data_type, msg.data_len, msg.payload
+                        );
+                        if msg.data_type == 1 {
+                            //let data = msg.payload;
+                            let data = msg.payload;
+                            let data_str = String::from_utf8_lossy(data);
+                            log_info!("Handling ECHO data: {}", data_str);
+                        } else {
+                            println!("Unknown data type: {}", msg.data_type);
+                        }
+                    }
+                    None => {
+                        eprintln!("无法解析内核消息，格式错误或长度不足: {:x?}", data);
+                    }
+                }                }).map_err(|e| e.to_string())?;            
             Ok("=========后台任务已启动.".to_string())
         })
     }
@@ -260,31 +289,10 @@ impl StartKernelHandler for BootManager {
 
 
 use std::net::Ipv4Addr;
-/*
-pub fn send_data_to_kernel(nl_sock: &NlSockInfo) -> io::Result<()> {
-    // 这里是所有与内核交互的逻辑
-    // 发送消息到内核（消息类型、数据等完全隐藏在这里）
-
-    // 示例：发送固定的 "set portid" 消息
-    nl_sock.send_message(1, b"set portid")?;
-
-    // 示例：发送 IP 地址数据
-    let ip = Ipv4Addr::new(192, 168, 0, 1);
-    let ip_bytes = ip.octets();
-    nl_sock.send_message(1, &ip_bytes)?;
-
-    // 示例：发送自定义数据
-    let data: Vec<u8> = vec![1, 2, 3, 4, 5];
-    nl_sock.send_message(1, &data)?;
-
-    Ok(())
-}
-*/
 pub fn send_data_to_kernel(nl_sock: &NlSockInfo) -> Result<String, String> {
     // 这里是所有与内核交互的逻辑
     // 发送消息到内核（消息类型、数据等完全隐藏在这里）
 
-    // 示例：发送固定的 "set portid" 消息
     if let Err(e) = nl_sock.send_message(1, b"set portid") {
         return Err(format!("Failed to send set portid message: {}", e));
     }

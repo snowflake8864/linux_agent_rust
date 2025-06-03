@@ -1,0 +1,12 @@
+[package]
+name = "system_metrics"
+version = "0.1.0"
+edition = "2021"
+resolver = "2" 
+[dependencies]
+sysinfo = "0.29.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+lazy_static = "1.5"
+md-5 = { path = "../md5" }
+hex = "0.4"
