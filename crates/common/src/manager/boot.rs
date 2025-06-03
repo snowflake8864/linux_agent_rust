@@ -1,10 +1,11 @@
 //crates/common/src/manager/boot.rs
-use std::{sync::Arc};
+use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use configparser::ini::Ini;
 use crate::{Core, Inner};
 use config::net_info::NetInfoConfig; // 导入 NetInfoConfig
 use crate::NetClient;  // Import NetClient from the common module
+use pattern::pattern_rules_mgr;
 //use tokio::sync::mpsc;
 
 #[derive(Clone)]
@@ -99,6 +100,7 @@ impl BootManager {
             netinfocfg,
             netclient,
             is_online:false,
+            pattern_mgr: Arc::new(Mutex::new(pattern_rules_mgr::PatternRulesMgr::new())),
         };
 
         let inner = Arc::new(Inner {
@@ -123,5 +125,18 @@ impl BootManager {
         core.netinfocfg.clone() // 返回克隆的值
     }
 
+
+    pub fn pattern_mgr(&self) -> Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>> {
+        Arc::clone(&self.inner.shared_core.load().pattern_mgr)
+    }
+
+    pub fn with_pattern_mgr<F>(&self, f: F)
+    where
+        F: FnOnce(&mut pattern_rules_mgr::PatternRulesMgr),
+        {
+            let pattern_mgr = self.inner.shared_core.load().pattern_mgr.clone();
+            let mut guard = pattern_mgr.lock().unwrap();
+            f(&mut guard);
+        }
 }
 

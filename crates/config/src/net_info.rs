@@ -1,4 +1,6 @@
 use configparser::ini::Ini;
+
+use std::fs;
 use std::fs::File;
 use std::io::{self, Write};
 use hostinfo::system_info::SystemInfo;
@@ -9,18 +11,19 @@ pub struct NetInfoConfig {
     pub ver: String,  
     pub com_time: u32,
     pub cron_time: u32,
-    pub extortion_protect: u32,
-    pub extortion_switch: u32,
+    pub extortion_protect: bool,
+    pub extortion_switch: bool,
+    pub self_protect_switch: u32,
     pub fast_time: u32,
-    pub file_protect: u32,
-    pub file_switch: u32,
+    pub file_protect: bool,
+    pub file_switch: bool,
     pub log_ip_port: Option<String>,
     pub log_proto: u32,
     pub log_sent: u32,
     pub module_switch: u32,
-    pub open_port_switch: u32,
-    pub proc_protect: u32,
-    pub proc_switch: u32,
+    pub open_port_switch: bool,
+    pub proc_protect: bool,
+    pub proc_switch: bool,
     pub scan_file_time: u32,
     pub scan_proc_time: u32,
     pub server_ip_port: String,
@@ -28,6 +31,10 @@ pub struct NetInfoConfig {
     pub server_port: u32,
     pub usb_protect: u32,
     pub usb_switch: u32,
+    pub syslog_dns_switch: bool,
+    pub syslog_outer_switch: bool,
+    pub syslog_inner_switch: bool,
+    pub internet_switch: bool,
     pub user_id: String,  // USER_ID 字段
 //=====host info
     pub dev_uid: String,  
@@ -41,8 +48,44 @@ pub struct NetInfoConfig {
     pub auth: String,  
     pub host_name: String,  
 }
-
+enum NetRule<'a> {
+    ServerIpV4(&'a str),
+    ServerPort(u32),
+    LogIpPort(&'a str),
+    VirtualOpenPort(bool),
+}
+fn ip_str_to_u32(ip: &str) -> Result<u32, String> {
+    let parsed = ip.parse::<std::net::Ipv4Addr>().map_err(|e| e.to_string())?;
+    Ok(u32::from_be_bytes(parsed.octets()))
+}
 impl NetInfoConfig {
+
+    fn write_net_rule(&self, rule: NetRule) -> Result<(), String> {
+        match rule {
+            NetRule::ServerIpV4(ip) => {
+                let ip_u32 = match ip_str_to_u32(ip) {
+                    Ok(ip) => ip,
+                    Err(e) => return Err(e),
+                };
+                self.write_raw("server_ipv4 ", &ip_u32.to_string())
+            }
+            NetRule::ServerPort(port) => {
+                self.write_raw("server_port ", &port.to_string())
+            }
+            NetRule::LogIpPort(log_ip_port) => {
+                self.write_raw("log_ip_port ", log_ip_port)
+            }
+            NetRule::VirtualOpenPort(open_port_state) => {
+                self.write_raw("vir_open_port_switch ", if open_port_state { "1" } else { "0" })
+            }
+        }
+    }
+
+    fn write_raw(&self, rule_type: &str, value: &str) -> Result<(), String> {
+        let content = format!("{} {}\n", rule_type, value);
+        fs::write("/proc/osec/net_rules", content)
+            .map_err(|e| format!("Failed to write to /proc/osec/net_rules: {}", e))
+    }
     pub fn from_ini(ini: &Ini) -> Self {
         let mut config = NetInfoConfig::default();
 
@@ -92,6 +135,7 @@ impl NetInfoConfig {
         }
         if let Some(value) = ini.get("SERVERINFO", "OPEN_PORT_SWITCH") {
             config.open_port_switch = value.parse().unwrap_or_default();
+            config.write_net_rule(NetRule::VirtualOpenPort(config.open_port_switch));
         }
         if let Some(value) = ini.get("SERVERINFO", "PROC_PROTECT") {
             config.proc_protect = value.parse().unwrap_or_default();

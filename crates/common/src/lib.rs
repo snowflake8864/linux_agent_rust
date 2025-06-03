@@ -1,18 +1,10 @@
 //crates/common/src/lib.rs
+use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 //use libc::{sockaddr_nl};
 use config::net_info;
+use pattern::pattern_rules_mgr;
 pub mod manager;
-
-/*
-const NETLINK_USER: i32 = 21;
-
-pub struct NlSockInfo {
-    pub sock: i32,
-    pub dest_addr: sockaddr_nl,
-    pub src_addr: sockaddr_nl,
-}
-*/
 
 #[derive(Debug, Default, Clone)]
 pub struct NetClient {
@@ -25,6 +17,8 @@ pub struct Core {
     pub netclient: NetClient,
     pub netinfocfg: net_info::NetInfoConfig,
     pub is_online: bool,
+    //pub pattern_mgr : pattern_rules_mgr::PatternRulesMgr ,
+    pub pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>,
     //pub nl_sock: NlSockInfo,
 }
 
@@ -40,4 +34,19 @@ impl Default for Inner {
         }
     }
 }
-
+/*
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            shared_core: ArcSwap::from_pointee(Core {
+                netclient: NetClient {
+                    token: None,
+                    base_url: String::new(),
+                },
+                is_online: false,
+                pattern_mgr: Arc::new(Mutex::new(pattern::PatternRulesMgr::new())),
+            }),
+        }
+    }
+}
+*/
