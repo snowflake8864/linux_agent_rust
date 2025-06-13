@@ -1,0 +1,26 @@
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+
+#[target.mips-unknown-linux-gnu]
+#linker = "mips-linux-gnu-gcc"
+
+[target.mipsel-unknown-linux-gnu]
+linker = "mipsel-linux-gnu-gcc"
+[target.x86_64-unknown-linux-gnu]
+linker = "/usr/bin/gcc-12"
+[target.x86_64-unknown-linux-musl]
+#linker = "musl-gcc"
+rustflags = ["-C", "target-feature=-crt-static"]
+linker = "zig cc"
+#[toolchain]
+#channel = "nightly"
+[target.mips-unknown-linux-gnu]
+runner = "qemu-mips"                # 如果你将来要运行
+linker = "zig cc -target mips-linux-gnu"
+rustflags = ["-C", "target-feature=-soft-float"]
+[build]
+target = "mips-unknown-linux-gnu"
+

@@ -6,11 +6,13 @@ use crate::{Core, Inner};
 use config::net_info::NetInfoConfig; // 导入 NetInfoConfig
 use crate::NetClient;  // Import NetClient from the common module
 use pattern::pattern_rules_mgr;
+use tokio::sync;
 //use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub struct BootManager {
     pub inner: Arc<Inner>,
+    token: Arc<sync::Mutex<Option<String>>>,
 }
 
 const HELP: &str = concat!(
@@ -109,6 +111,7 @@ impl BootManager {
 
         BootManager {
         inner,
+        token: Arc::new(sync::Mutex::new(None)),
         }
     }
 
@@ -125,7 +128,15 @@ impl BootManager {
         core.netinfocfg.clone() // 返回克隆的值
     }
 
+    pub async fn set_token(&mut self, token: String) {
+        let mut guard = self.token.lock().await;
+        *guard = Some(token);
+    }
 
+    pub async fn get_token(&self) -> Option<String> {
+        let guard = self.token.lock().await;
+        guard.clone()
+    }
     pub fn pattern_mgr(&self) -> Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>> {
         Arc::clone(&self.inner.shared_core.load().pattern_mgr)
     }
