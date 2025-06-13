@@ -34,19 +34,4 @@ impl Default for Inner {
         }
     }
 }
-/*
-impl Default for Inner {
-    fn default() -> Self {
-        Self {
-            shared_core: ArcSwap::from_pointee(Core {
-                netclient: NetClient {
-                    token: None,
-                    base_url: String::new(),
-                },
-                is_online: false,
-                pattern_mgr: Arc::new(Mutex::new(pattern::PatternRulesMgr::new())),
-            }),
-        }
-    }
-}
-*/
+

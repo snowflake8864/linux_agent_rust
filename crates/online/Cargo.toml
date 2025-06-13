@@ -16,3 +16,5 @@ net_client = { path = "../net_client" }
 system_metrics = { path = "../system_metrics" }
 config = { path = "../config" }
 common = { path = "../common" }
+logging = { path = "../logging" }
+log = "0.4"

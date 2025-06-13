@@ -26,7 +26,9 @@ task = { path =  "../task" }
 common = { path = "../common" }
 config = { path = "../config" }
 kernel_event =  { path = "../kernel_event" }
+reporter = {path = "../reporter"}
 logging = { path = "../logging" }
+netlink = { path = "../netlink" }
 log = "0.4"
 #[CKlibm]
 #libc ="/home/zebra/workspace/rustprj/linux_agent_rust_v10/lib/libc.so.6"

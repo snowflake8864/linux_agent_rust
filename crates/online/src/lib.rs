@@ -3,14 +3,13 @@ use config::net_info;
 use system_metrics::get_system_metrics;
 use serde::{Serialize, Deserialize};
 use std::pin::Pin;
-use common::{
-    manager::boot::{BootManager},
-};
+use common::manager::boot::BootManager;
 use std::future::Future;
 use tokio::time::{interval, Duration};
 use tokio::task::JoinHandle;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use logging::{log_info,log_error};
 #[derive(Deserialize)]
 struct AuthResponse {
     code: String,
@@ -126,9 +125,9 @@ impl StartOnline for BootManager {
                             eprintln!("发送 token 失败: {}", err);
                             continue;
                         }
-                        println!("Token 已成功发送！");
-
-                        println!("开始监听 host_is_offline 信号和系统资源...");
+                        self.set_token(token.clone()).await;
+                        log_info!("Token 已成功发送！");
+                        log_info!("开始监听 host_is_offline 信号和系统资源...");
                         loop {
                             tokio::select! {
                                 _ = interval.tick() => {

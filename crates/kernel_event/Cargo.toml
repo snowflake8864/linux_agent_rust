@@ -10,4 +10,5 @@ netlink = { path = "../netlink" }
 common = { path =  "../common" }
 logging = { path =  "../logging" }
 log = "0.4"
-
+reporter = { path =  "../reporter" }
+zcopy_mgr = { path =  "../zcopy_mgr" }

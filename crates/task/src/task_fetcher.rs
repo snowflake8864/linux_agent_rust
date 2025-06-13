@@ -14,9 +14,7 @@ use std::sync::{Arc, Mutex};
 use tokio::fs::OpenOptions;
 use std::io;  // 引入 io 模块
 use logging::{log_info,log_error};
-use common::{
-    manager::boot::{BootManager},
-};
+use common::manager::boot::BootManager;
 use tokio::task::JoinHandle;
 //use hostinfo::HostInfo;
 use crate::virtual_port_rule::{VirtualPortRule, deserialize_port_range, deserialize_dest_port};
@@ -259,7 +257,6 @@ impl TaskFetcher {
              .fold(0, |acc, &(flag, shift)| acc | ((flag as u32) << shift));
          defense_switch |= enable_flag;
          if self.prev_defense_switch != Some(defense_switch) {
-             log_info!("========================================defense_switch: {:#034b}", defense_switch);
              self.prev_defense_switch = Some(defense_switch);
              self.write_net_rule(NetRule::DefenseSwitch(defense_switch))?;
          }

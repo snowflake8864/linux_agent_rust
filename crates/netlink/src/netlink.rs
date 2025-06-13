@@ -16,6 +16,16 @@ pub struct NlSockInfo {
     pub src_addr: sockaddr_nl,
 }
 
+
+impl Clone for NlSockInfo {
+    fn clone(&self) -> Self {
+        NlSockInfo {
+            sock: self.sock,
+            dest_addr: self.dest_addr,
+            src_addr: self.src_addr,
+        }
+    }
+}
 impl NlSockInfo {
     fn get_netlink_proto() -> io::Result<i32> {
         let path = Path::new("/sys/osec/proto");
