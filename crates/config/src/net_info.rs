@@ -1,3 +1,4 @@
+//crates/config/src/net_info.rs
 use configparser::ini::Ini;
 
 use std::fs;
@@ -29,8 +30,8 @@ pub struct NetInfoConfig {
     pub server_ip_port: String,
     pub server_ip: String,
     pub server_port: u32,
-    pub usb_protect: u32,
-    pub usb_switch: u32,
+    pub usb_protect: bool,
+    pub usb_switch: bool,
     pub syslog_dns_switch: bool,
     pub syslog_outer_switch: bool,
     pub syslog_inner_switch: bool,
@@ -47,6 +48,8 @@ pub struct NetInfoConfig {
     pub hdsize: String,  
     pub auth: String,  
     pub host_name: String,  
+    pub mod_ver: String,
+    pub arch_type: String,
 }
 enum NetRule<'a> {
     ServerIpV4(&'a str),
@@ -135,7 +138,7 @@ impl NetInfoConfig {
         }
         if let Some(value) = ini.get("SERVERINFO", "OPEN_PORT_SWITCH") {
             config.open_port_switch = value.parse().unwrap_or_default();
-            config.write_net_rule(NetRule::VirtualOpenPort(config.open_port_switch));
+            let _ = config.write_net_rule(NetRule::VirtualOpenPort(config.open_port_switch));
         }
         if let Some(value) = ini.get("SERVERINFO", "PROC_PROTECT") {
             config.proc_protect = value.parse().unwrap_or_default();
@@ -164,6 +167,21 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("SERVERINFO", "USB_SWITCH") {
             config.usb_switch = value.parse().unwrap_or_default();
         }
+
+        if let Some(value) = ini.get("SERVERINFO", "DNS_SWITCH") {
+            config.syslog_dns_switch = value.parse().unwrap_or_default();
+        }
+        if let Some(value) = ini.get("SERVERINFO", "INTERNAL_COMMUNICATION_SWITCH") {
+            config.syslog_inner_switch = value.parse().unwrap_or_default();
+        }
+        if let Some(value) = ini.get("SERVERINFO", "EXTERNAL_COMMUNICATION_SWITCH") {
+            config.syslog_outer_switch = value.parse().unwrap_or_default();
+        }
+
+        if let Some(value) = ini.get("SERVERINFO", "INTERNET_SWITCH") {
+            config.internet_switch = value.parse().unwrap_or_default();
+        }
+
         if let Some(value) = ini.get("HOSTINFO", "DEV_UID") {
             config.dev_uid = value.parse().unwrap_or_default();
         }
@@ -202,28 +220,34 @@ impl NetInfoConfig {
         writeln!(file, "USER_ID={}", self.user_id)?;
         writeln!(file, "COMTIME={}", self.com_time)?;
         writeln!(file, "CRONTIME={}", self.cron_time)?;
-        writeln!(file, "EXTORTION_PROTECT={}", self.extortion_protect)?;
-        writeln!(file, "EXTORTION_SWITCH={}", self.extortion_switch)?;
+        writeln!(file, "EXTORTION_PROTECT={}", self.extortion_protect as u8)?;
+        writeln!(file, "EXTORTION_SWITCH={}", self.extortion_switch as u8)?;
         writeln!(file, "FASTTIME={}", self.fast_time)?;
-        writeln!(file, "FILE_PROTECT={}", self.file_protect)?;
-        writeln!(file, "FILE_SWITCH={}", self.file_switch)?;
+        writeln!(file, "FILE_PROTECT={}", self.file_protect as u8)?;
+        writeln!(file, "FILE_SWITCH={}", self.file_switch as u8)?;
         writeln!(file, "LOGIPPORT={}", self.log_ip_port.clone().unwrap_or_default())?;
         writeln!(file, "LOGPROTO={}", self.log_proto)?;
         writeln!(file, "LOGSENT={}", self.log_sent)?;
         writeln!(file, "MODULE_SWITCH={}", self.module_switch)?;
-        writeln!(file, "OPEN_PORT_SWITCH={}", self.open_port_switch)?;
-        writeln!(file, "PROC_PROTECT={}", self.proc_protect)?;
-        writeln!(file, "PROC_SWITCH={}", self.proc_switch)?;
+        writeln!(file, "OPEN_PORT_SWITCH={}", self.open_port_switch as u8)?;
+        writeln!(file, "PROC_PROTECT={}", self.proc_protect as u8)?;
+        writeln!(file, "PROC_SWITCH={}", self.proc_switch as u8)?;
         writeln!(file, "SCANFILETIME={}", self.scan_file_time)?;
         writeln!(file, "SCANPROCTIME={}", self.scan_proc_time)?;
         writeln!(file, "SERVERIPPORT={}", self.server_ip_port)?;
         writeln!(file, "SERVER_IP={}", self.server_ip)?;
         writeln!(file, "SERVER_PORT={}", self.server_port)?;
-        writeln!(file, "USB_PROTECT={}", self.usb_protect)?;
-        writeln!(file, "USB_SWITCH={}", self.usb_switch)?;
+        writeln!(file, "USB_PROTECT={}", self.usb_protect as u8)?;
+        writeln!(file, "USB_SWITCH={}", self.usb_switch as u8)?;
+        writeln!(file, "DNS_SWITCH={}", self.syslog_dns_switch as u8)?;
+        writeln!(file, "INTERNAL_COMMUNICATION_SWITCH={}", self.syslog_outer_switch as u8)?;
+        writeln!(file, "EXTERNAL_COMMUNICATION_SWITCH={}", self.syslog_inner_switch as u8)?;
+        writeln!(file, "INTERNET_SWITCH={}", self.internet_switch as u8)?;
+        writeln!(file, "VERSION={}", self.ver)?;
         writeln!(file, "[HOSTINFO]")?;
         writeln!(file, "DEV_UID={}", self.dev_uid)?;
         writeln!(file, "MACID={}", self.macid)?;
+        /*
         writeln!(file, "IPS={}", self.ips)?;
         writeln!(file, "VERSION={}", self.ver)?;
         writeln!(file, "OS={}", self.os)?;
@@ -232,6 +256,7 @@ impl NetInfoConfig {
         writeln!(file, "HDSIZE={}", self.hdsize)?;
         writeln!(file, "AUTH={}", self.auth)?;
         writeln!(file, "HOSTNAME={}", self.host_name)?;
+        */
         Ok(())
     }
 
@@ -284,6 +309,27 @@ impl NetInfoConfig {
         // IPS
         Ok(())
     }
-
-
 }
+
+use once_cell::sync::Lazy;
+use std::path::Path;
+use std::sync::Mutex;
+// 全局配置
+pub static NETINFO_CONFIG: Lazy<Mutex<NetInfoConfig>> = Lazy::new(|| {
+    let config_path = std::env::var("CONFIG_PATH")
+        .ok()
+        .or_else(|| Some("/opt/osec/net_info.ini".to_string()));
+    let mut ini = Ini::new();
+    if let Some(path) = config_path {
+        if Path::new(&path).exists() {
+            ini.load(&path).unwrap_or_else(|err| {
+                eprintln!("Failed to load configuration file from '{}': {}", path, err);
+                std::process::exit(1);
+            });
+        } else {
+            eprintln!("Configuration file '{}' does not exist", path);
+            std::process::exit(1);
+        }
+    }
+    Mutex::new(NetInfoConfig::from_ini(&ini))
+});

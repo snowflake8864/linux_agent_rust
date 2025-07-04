@@ -138,16 +138,15 @@ pub fn parse_exipor_policy_from_json(data: &Value) -> Result<Vec<POLICY_EXIPOR_P
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-
         let mut map_comm = HashMap::new();
-        if let Some(process_info_array) = item.get("process_info").and_then(Value::as_array) {
+        if let Some(process_info_array) = item.get("process").and_then(Value::as_array) {
             for process in process_info_array {
                 if let (Some(name), Some(hash)) = (
                     process.get("name").and_then(Value::as_str),
                     process.get("hash").and_then(Value::as_str),
                 ) {
-                    // 注意：如果你想用 name 作为 key，就改成 map_comm.insert(name.to_string(), hash.to_string());
                     map_comm.insert(hash.to_string(), name.to_string());
+                    log_info!("=======================================hash:{},name:{}", hash, name);
                 }
             }
         }
@@ -178,6 +177,7 @@ pub fn parse_exipor_policy_from_json(data: &Value) -> Result<Vec<POLICY_EXIPOR_P
             let mut white_hash_vec = vec![];
 
             if let Some(process_array) = item["process"].as_array() {
+
                 for p in process_array {
                     if let Some(hash) = p["hash"].as_str() {
                         white_hash_vec.push(hash.to_string());
@@ -384,6 +384,7 @@ pub fn set_exiport_dir(&mut self, exports: Vec<POLICY_EXIPOR_PROTECT>) {
                 self.exiport_true_process
                     .push_str(&format!("{},{},99\n", k, rule_id));
                 }
+            log_info!("=====================================================true process [{:?}]", self.exiport_true_process);
             self.exiport_dir_rules.push_str(&format!(",TPNC={}", rule_id));
         }
 
@@ -562,18 +563,19 @@ pub fn set_exiport_dir(&mut self, exports: Vec<POLICY_EXIPOR_PROTECT>) {
             let _ = Self::write_to_proc_file("/proc/osec/dpi/file_patterns", &self.protect_dir_include_exe_patterns);
             let _ = Self::write_to_proc_file("/proc/osec/dpi/rules", &self.protect_dir_include_exe_rules);
         }
-        /*
         if !self.protect_dir_exclude_exe_patterns.is_empty() {
             let _ = Self::write_to_proc_file("/proc/osec/dpi/file_patterns", &self.protect_dir_exclude_exe_patterns);
             let _ = Self::write_to_proc_file("/proc/osec/dpi/rules", &self.protect_dir_exclude_exe_rules);
         }
         if !self.protect_true_process.is_empty() {
+            log_info!("00=====================================================true process [{:?}]", self.protect_true_process);
             let _ = Self::write_to_proc_file("/proc/osec/dpi/true_process_rt", &self.protect_true_process);
         }
-
         if !self.exiport_true_process.is_empty() {
+            
+            log_info!("=====================================================true process [{:?}]", self.exiport_true_process);
             let _ = Self::write_to_proc_file("/proc/osec/dpi/true_process_rt", &self.exiport_true_process);
-        }*/
+        }
 
         self.build_file_pattern();
     }

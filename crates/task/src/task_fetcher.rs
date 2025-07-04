@@ -1,7 +1,6 @@
 // task_fetcher.rs
 use std::fs;
-use std::io::Write;
-use config::net_info;
+use config::net_info::NETINFO_CONFIG;
 use std::pin::Pin;
 use std::future::Future;
 use serde_json::Value;
@@ -12,14 +11,13 @@ use std::net::Ipv4Addr;
 use tokio::io::AsyncWriteExt; // 
 use std::sync::{Arc, Mutex};
 use tokio::fs::OpenOptions;
-use std::io;  // 引入 io 模块
 use logging::{log_info,log_error};
 use common::manager::boot::BootManager;
-use tokio::task::JoinHandle;
-//use hostinfo::HostInfo;
-use crate::virtual_port_rule::{VirtualPortRule, deserialize_port_range, deserialize_dest_port};
+use crate::virtual_port_rule::VirtualPortRule;
+use crate::get_process_task::process_all_dirs;
 use pattern::pattern_rules_mgr;
 use tokio::sync::mpsc;
+use process_mgr::POLICY_MANAGER;
 
 fn get_u32(map: &serde_json::Map<String, Value>, key: &str) -> Result<u32, String> {
     map.get(key)
@@ -38,50 +36,49 @@ pub struct TaskFetcher {
     base_url: String,
     token: Option<String>,  // 'a 表示 token 的生命周期与 TaskFetcher 的生命周期相同
     api_interface: HashMap<String, String>,
-    cfg:net_info::NetInfoConfig,
     pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>,
     prev_defense_switch: Option<u32>,
     prev_open_port_switch: bool,
 }
 use num_derive::FromPrimitive; // 支持从整数到枚举的转换
 use num_traits::FromPrimitive;
-
 #[derive(Debug, FromPrimitive)]
-enum TASK_TYPE {
-    TASK_UPLOAD_PROCESS = 0,
-    TASK_UPDATE = 1,
-    TASK_UPLOAD_DIR = 2,
-    TASK_DOWN_WHITE = 3,
-    TASK_DOWN_DIR_POLICY = 4,
-    TASK_UPLOAD_CONF = 5, // no use
-    TASK_DOWN_CONF = 6,
-    TASK_DOWN_BLACK = 7,
-    TASK_DOWN_FILE_TTAP = 8,
-    TASK_UPLOAD_PORT = 9,
-    TASK_DOWN_VIRTUAL_PORT = 10,
-    TASK_AUTODOWN_NETBLOACK_POLICY = 11, // no use
-    TASK_AUTOUPLOAD_NETBLOACK_POLICY = 12, // no use
-    TASK_DOWN_NETBLOACK_POLICY = 13,
-    TASK_DOWN_WHITE_IP_POLICY = 14, // no use
-    TASK_DOWN_BLACK_IP_POLICY = 15,
-    TASK_DOWN_USB_UPLOAD = 16,
-    TASK_DOWN_USB_DOWN = 17, // no use
-    TASK_DOWN_EXTORT = 19,
-    TASK_UPLOAD_PROCESS_MODULE = 21,
-    TASK_UPLOAD_ALL_PROCESS_MODULE = 22,
-    TASK_UPLOAD_PROCESS_WHITE_MODULE = 23,
-    TASK_UPLOAD_PROCESS_BLACK_MODULE = 24,
-    TASK_UNINSTALL = 25,
-    TASK_GETWHITEPERIPHERALS = 26,
-    TASK_GETBLACKPERIPHERALS = 27,
-    TASK_UPLOADSAMPLE = 28,
-    TASK_SYSLOG_ENABLE = 29, // no use
-    TASK_SYSLOG_DISABLE = 30, // no use
-    TASK_GLOBAL_PROC = 31,
-    TASK_GLOBAL_DIR = 33,
-    TASK_UPDATE_UUID = 34,
-    TASK_OutreachDetect = 35,
+enum TaskTypeEnum {
+    TaskUploadProcess = 0,
+    TaskUpdate = 1,
+    TaskUploadDir = 2,
+    TaskDownWhite = 3,
+    TaskDownDirPolicy = 4,
+    TaskUploadConf = 5, // no use
+    TaskDownConf = 6,
+    TaskDownBlack = 7,
+    TaskDownFileTtap = 8,
+    TaskUploadPort = 9,
+    TaskDownVirtualPort = 10,
+    TaskAutoDownNetBlockPolicy = 11, // no use
+    TaskAutoUploadNetBlockPolicyy = 12, // no use
+    TaskDownNetBlockPolicy = 13,
+    TaskDownWhiteIpPolicy = 14, // no use
+    TaskDownBlackIpPolicy = 15,
+    TaskDownUsbUpload = 16,
+    TaskDownUsbDown = 17, // no use
+    TaskDownExtort = 19,
+    TaskUploadProcessModule = 21,
+    TaskUploadAllProcessModule = 22,
+    TaskUploadProcessWhiteModule = 23,
+    TaskUploadProcessBlackModule = 24,
+    TaskUninstall = 25,
+    TaskGetWhitePeripherals = 26,
+    TaskGetBlackPeripherals = 27,
+    TaskUploadSample = 28,
+    TaskSyslogEnable = 29, // no use
+    TaskSyslogDisable = 30, // no use
+    TaskGlobalProc = 31,
+    TaskGlobalDir = 33,
+    TaskUpdateUUI = 34,
+    TaskOutReachDetect = 35,
 }
+#[allow(dead_code)]
 enum NetRule<'a> {
     ServerIpV4(&'a str),
     ServerPort(u32),
@@ -90,11 +87,11 @@ enum NetRule<'a> {
     DefenseSwitch(u32),
 }
 fn ip_str_to_u32(ip: &str) -> Result<u32, String> {
-    let parsed = ip.parse::<std::net::Ipv4Addr>().map_err(|e| e.to_string())?;
+    let parsed = ip.parse::<Ipv4Addr>().map_err(|e| e.to_string())?;
     Ok(u32::from_be_bytes(parsed.octets()))
 }
 impl TaskFetcher {
-    pub fn new(base_url: &str, token: Option<String>, cfg:net_info::NetInfoConfig, pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>) -> Self 
+    pub fn new(base_url: &str, token: Option<String>, pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>) -> Self 
     {
         let mut api_interface = HashMap::new();
         api_interface.insert("download_white".to_string(), "v1/getprocwl".to_string());
@@ -105,12 +102,12 @@ impl TaskFetcher {
         api_interface.insert("upload_process".to_string(), "v1/uploadproc".to_string());
         api_interface.insert("gettrustdir".to_string(), "v1/gettrustdir".to_string());
         api_interface.insert("getvirtualport".to_string(), "v1/getvirtualport".to_string());
+        api_interface.insert("upload_gloabal_process".to_string(), "v1/upload/suffix/exe".to_string());
 
         TaskFetcher {
               base_url: base_url.to_string(),
               token,
               api_interface,
-              cfg,
               pattern_mgr,
               prev_defense_switch: None,
               prev_open_port_switch: false,
@@ -151,6 +148,8 @@ impl TaskFetcher {
             .map_err(|e| format!("Failed to write to /proc/osec/defense_switch: {}", e))
     }
      fn update_config_from_json(&mut self, conf: &serde_json::Map<String, Value>) -> Result<(), String> {
+
+        let mut cfg = NETINFO_CONFIG.lock().unwrap(); // 这里使用 from_ini 解析配置
          // 提取 serveripport 字段，并尝试拆分为 ip 和 port
          if let Some(url) = conf.get("serveripport")
              .and_then(|v| v.as_str())
@@ -170,12 +169,12 @@ impl TaskFetcher {
              let (ip_str, port_str) = rest.split_once(':')
                  .unwrap_or_else(|| (rest, ""));
 
-             if self.cfg.server_ip != ip_str {
-                 self.cfg.server_ip = ip_str.to_string();
+             if cfg.server_ip != ip_str {
+                 cfg.server_ip = ip_str.to_string();
                  self.write_net_rule(NetRule::ServerIpV4(ip_str))?;
              }
              // 转换端口
-             self.cfg.server_port = if !port_str.is_empty() {
+             cfg.server_port = if !port_str.is_empty() {
                  port_str.parse().expect("Invalid port number")
              } else {
                  match protocol.to_lowercase().as_str() {
@@ -186,46 +185,46 @@ impl TaskFetcher {
              };
 
          }
-         self.cfg.cron_time = get_u32(conf, "crontime")?;
-         self.cfg.extortion_protect = get_bool(conf, "extortion_protect")?;
-         self.cfg.extortion_switch = get_bool(conf, "extortion_switch")?;
-         self.cfg.file_protect = get_bool(conf, "file_protect")?;
-         self.cfg.file_switch = get_bool(conf, "file_switch")?;
-         self.cfg.log_proto = get_u32(conf, "logproto")?;
-         self.cfg.log_sent = get_u32(conf, "logsent")?;
+         cfg.cron_time = get_u32(conf, "crontime")?;
+         cfg.extortion_protect = get_bool(conf, "extortion_protect")?;
+         cfg.extortion_switch = get_bool(conf, "extortion_switch")?;
+         cfg.file_protect = get_bool(conf, "file_protect")?;
+         cfg.file_switch = get_bool(conf, "file_switch")?;
+         cfg.log_proto = get_u32(conf, "logproto")?;
+         cfg.log_sent = get_u32(conf, "logsent")?;
 
          // logipport 可能是空字符串，转成 Option<String>
-         self.cfg.log_ip_port = conf.get("logipport")
+         cfg.log_ip_port = conf.get("logipport")
              .and_then(|v| v.as_str())
              .filter(|s| !s.is_empty())
              .map(|s| s.to_string());
 
-         self.cfg.module_switch = get_u32(conf, "module_switch")?;
+         cfg.module_switch = get_u32(conf, "module_switch")?;
          let self_protect_switch = get_u32(conf, "self_protect_switch")?;
-         if (self.cfg.self_protect_switch != self_protect_switch) {
-             self.cfg.self_protect_switch = self_protect_switch;
+         if cfg.self_protect_switch != self_protect_switch {
+             cfg.self_protect_switch = self_protect_switch;
              let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
-             pattern_mgr.add_file_pattern(self.cfg.self_protect_switch == 1);
+             pattern_mgr.add_file_pattern(cfg.self_protect_switch == 1);
          }
-         self.cfg.open_port_switch = get_bool(conf, "open_port_switch")?;
-         if (self.cfg.open_port_switch != self.prev_open_port_switch) {
-             self.prev_open_port_switch = self.cfg.open_port_switch;
-             self.write_net_rule(NetRule::VirtualOpenPort(self.cfg.open_port_switch))?;
+         cfg.open_port_switch = get_bool(conf, "open_port_switch")?;
+         if cfg.open_port_switch != self.prev_open_port_switch {
+             self.prev_open_port_switch = cfg.open_port_switch;
+             self.write_net_rule(NetRule::VirtualOpenPort(cfg.open_port_switch))?;
          }
-         self.cfg.proc_protect = get_bool(conf, "proc_protect")?;
-         self.cfg.proc_switch = get_bool(conf, "proc_switch")?;
-         self.cfg.usb_protect = get_u32(conf, "usb_protect")?;
-         self.cfg.usb_switch = get_u32(conf, "usb_switch")?;
-         self.cfg.syslog_inner_switch = get_bool(conf, "syslog_inner_switch")?;
-         self.cfg.syslog_outer_switch = get_bool(conf, "syslog_outer_switch")?;
-         self.cfg.syslog_dns_switch = get_bool(conf, "syslog_dns_switch")?;
-         self.cfg.internet_switch = get_bool(conf, "internet_switch")?;
+         cfg.proc_protect = get_bool(conf, "proc_protect")?;
+         cfg.proc_switch = get_bool(conf, "proc_switch")?;
+         cfg.usb_protect = get_bool(conf, "usb_protect")?;
+         cfg.usb_switch = get_bool(conf, "usb_switch")?;
+         cfg.syslog_inner_switch = get_bool(conf, "syslog_inner_switch")?;
+         cfg.syslog_outer_switch = get_bool(conf, "syslog_outer_switch")?;
+         cfg.syslog_dns_switch = get_bool(conf, "syslog_dns_switch")?;
+         cfg.internet_switch = get_bool(conf, "internet_switch")?;
 
-
-         let mut enable_flag :u32 = 0;
-         let file_flag_temp  = self.cfg.file_switch|self.cfg.extortion_switch;
+         let _ = cfg.to_ini("/opt/osec/net_info.ini");
+         let file_flag_temp  = cfg.file_switch|cfg.extortion_switch;
          /*
 
+         let mut enable_flag :u32 = 0;
             if ( file_flag_temp && self.cfg.proc_switch ) {
             enable_flag = 3; 
             }    
@@ -239,19 +238,19 @@ impl TaskFetcher {
             enable_flag = 0; 
             } 
             */
-         let enable_flag = (file_flag_temp as u32) * 2 + (self.cfg.proc_switch as u32);
+         let enable_flag = (file_flag_temp as u32) * 2 + (cfg.proc_switch as u32);
          let mut defense_switch = [
-             (self.cfg.open_port_switch, 14),
-             (self.cfg.internet_switch, 13),
-             (self.cfg.syslog_dns_switch, 12),
-             (self.cfg.syslog_outer_switch, 11),
-             (self.cfg.syslog_inner_switch, 10),
-             (self.cfg.proc_switch, 9),
-             (self.cfg.file_switch, 8),
-             (self.cfg.extortion_switch, 7),
-             (self.cfg.proc_protect, 6),
-             (self.cfg.file_protect, 5),
-             (self.cfg.extortion_protect, 4),
+             (cfg.open_port_switch, 14),
+             (cfg.internet_switch, 13),
+             (cfg.syslog_dns_switch, 12),
+             (cfg.syslog_outer_switch, 11),
+             (cfg.syslog_inner_switch, 10),
+             (cfg.proc_switch, 9),
+             (cfg.file_switch, 8),
+             (cfg.extortion_switch, 7),
+             (cfg.proc_protect, 6),
+             (cfg.file_protect, 5),
+             (cfg.extortion_protect, 4),
          ]
              .iter()
              .fold(0, |acc, &(flag, shift)| acc | ((flag as u32) << shift));
@@ -264,9 +263,9 @@ impl TaskFetcher {
          Ok(())
      }
 
-    pub async fn run(net_client: &mut NetClient, token: Option<String>, cfg:net_info::NetInfoConfig,pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>) -> Result<(), String> {
+    pub async fn run(net_client: &mut NetClient, token: Option<String>,pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>) -> Result<(), String> {
         let token_str = token.as_ref().map(|s| s.as_str());
-        let mut task_fetcher = TaskFetcher::new(&net_client.base_url, token.clone(),cfg,pattern_mgr);
+        let mut task_fetcher = TaskFetcher::new(&net_client.base_url, token.clone(), pattern_mgr);
 
         loop {
             let url = format!("{}/v1/gettask", task_fetcher.base_url);
@@ -290,7 +289,7 @@ impl TaskFetcher {
                         
                         //println!("task list:{:?}", task_list);
                         for task_id in task_list {
-                            if let Some(task_type) = TASK_TYPE::from_u32(task_id) {
+                            if let Some(task_type) = TaskTypeEnum::from_u32(task_id) {
                                 //println!("task ID: {}", task_id);
                                 if let Err(e) = task_fetcher.handle_task(task_type).await {
                                     eprintln!("Failed to handle task {}: {}", task_id, e);
@@ -317,32 +316,32 @@ impl TaskFetcher {
 
 
    /// 根据任务类型处理任务
-    async fn handle_task(&mut self, task_type: TASK_TYPE) -> Result<(), String> {
+    async fn handle_task(&mut self, task_type: TaskTypeEnum) -> Result<(), String> {
         match task_type {
-            TASK_TYPE::TASK_UPLOAD_PROCESS => self.task_upload_process().await,
-            TASK_TYPE::TASK_UPDATE => self.task_update().await,
-            TASK_TYPE::TASK_UPLOAD_DIR => self.task_upload_dir().await,
-            TASK_TYPE::TASK_DOWN_WHITE => self.task_down_white().await,
-            TASK_TYPE::TASK_DOWN_DIR_POLICY => self.task_down_dir_policy().await,
-            TASK_TYPE::TASK_DOWN_CONF => self.task_down_conf().await,
-            TASK_TYPE::TASK_DOWN_BLACK => self.task_down_black().await,
-            TASK_TYPE::TASK_DOWN_FILE_TTAP => self.task_down_file_tt().await,
-            TASK_TYPE::TASK_UPLOAD_PORT => self.task_upload_port().await,
-            TASK_TYPE::TASK_DOWN_VIRTUAL_PORT => self.task_down_virtual_port().await,
-            TASK_TYPE::TASK_DOWN_NETBLOACK_POLICY => self.task_down_netblock_policy().await,
-            TASK_TYPE::TASK_DOWN_EXTORT => self.task_down_extort().await,
-            TASK_TYPE::TASK_UPLOAD_PROCESS_MODULE => self.task_upload_process_module().await,
-            TASK_TYPE::TASK_UPLOAD_ALL_PROCESS_MODULE => self.task_upload_all_process_module().await,
-            TASK_TYPE::TASK_UPLOAD_PROCESS_WHITE_MODULE => self.task_upload_process_white_module().await,
-            TASK_TYPE::TASK_UPLOAD_PROCESS_BLACK_MODULE => self.task_upload_process_black_module().await,
-            TASK_TYPE::TASK_UNINSTALL => self.task_uninstall().await,
-            TASK_TYPE::TASK_GETWHITEPERIPHERALS => self.task_get_white_peripherals().await,
-            TASK_TYPE::TASK_GETBLACKPERIPHERALS => self.task_get_black_peripherals().await,
-            TASK_TYPE::TASK_UPLOADSAMPLE => self.task_upload_sample().await,
-            TASK_TYPE::TASK_GLOBAL_PROC => self.task_global_proc().await,
-            TASK_TYPE::TASK_GLOBAL_DIR => self.task_global_dir().await,
-            TASK_TYPE::TASK_UPDATE_UUID => self.task_update_uuid().await,
-            TASK_TYPE::TASK_OutreachDetect => self.task_outreach_detect().await,
+            TaskTypeEnum::TaskUploadProcess => self.task_upload_process().await,
+            TaskTypeEnum::TaskUpdate => self.task_update().await,
+            TaskTypeEnum::TaskUploadDir => self.task_upload_dir().await,
+            TaskTypeEnum::TaskDownWhite => self.task_down_white().await,
+            TaskTypeEnum::TaskDownDirPolicy => self.task_down_dir_policy().await,
+            TaskTypeEnum::TaskDownConf => self.task_down_conf().await,
+            TaskTypeEnum::TaskDownBlack => self.task_down_black().await,
+            TaskTypeEnum::TaskDownFileTtap => self.task_down_file_tt().await,
+            TaskTypeEnum::TaskUploadPort => self.task_upload_port().await,
+            TaskTypeEnum::TaskDownVirtualPort => self.task_down_virtual_port().await,
+            TaskTypeEnum::TaskDownNetBlockPolicy => self.task_down_netblock_policy().await,
+            TaskTypeEnum::TaskDownExtort => self.task_down_extort().await,
+            TaskTypeEnum::TaskUploadProcessModule => self.task_upload_process_module().await,
+            TaskTypeEnum::TaskUploadAllProcessModule => self.task_upload_all_process_module().await,
+            TaskTypeEnum::TaskUploadProcessWhiteModule => self.task_upload_process_white_module().await,
+            TaskTypeEnum::TaskUploadProcessBlackModule => self.task_upload_process_black_module().await,
+            TaskTypeEnum::TaskUninstall => self.task_uninstall().await,
+            TaskTypeEnum::TaskGetWhitePeripherals => self.task_get_white_peripherals().await,
+            TaskTypeEnum::TaskGetBlackPeripherals => self.task_get_black_peripherals().await,
+            TaskTypeEnum::TaskUploadSample => self.task_upload_sample().await,
+            TaskTypeEnum::TaskGlobalProc => self.task_global_proc().await,
+            TaskTypeEnum::TaskGlobalDir => self.task_global_dir().await,
+            TaskTypeEnum::TaskUpdateUUI => self.task_update_uuid().await,
+            TaskTypeEnum::TaskOutReachDetect => self.task_outreach_detect().await,
              _ => Err("Unknown task type".to_string()), // 未知任务类型处理
             //_ => Err(format!("Task not implemented: {:?}", task_type)),
         }
@@ -378,7 +377,7 @@ impl TaskFetcher {
                 None => return Err("URL for download_white not found".to_string()),
         };
 
-        let mut net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true) {
             Ok(client) => client,
                 Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -429,7 +428,7 @@ impl TaskFetcher {
             None => return Err("URL for download_white not found".to_string()),
         };
 
-        let mut net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -458,7 +457,6 @@ impl TaskFetcher {
                     //for (key, value) in conf {
                       //  println!("{}: {}", key, value);
                     self.update_config_from_json(conf)?;                   //}
-                    println!("{:?}",self.cfg);
 
                     // 如果成功，返回 Ok(())，因为返回类型是 Result<(), String>
                 } else {
@@ -486,7 +484,7 @@ impl TaskFetcher {
             Some(url) => url,
             None => return Err("URL for download_white not found".to_string()),
         };
-        let mut net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -531,7 +529,6 @@ impl TaskFetcher {
                 return Err(err);
             }
         }
-        // 打印或处理 hash 列表
        // println!("Extracted hashes: {:?}", hash_list);
 
         println!("Processing TASK_DOWN_BLACK...");
@@ -539,7 +536,6 @@ impl TaskFetcher {
     }
 
 
-// 处理下载白名单任务
     pub async fn task_down_white(&self) -> Result<(), String> {
         // 获取 download_white 的 URL
         let download_url = match self.api_interface.get("download_white") {
@@ -548,7 +544,7 @@ impl TaskFetcher {
         };
 
 
-        let mut net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -580,6 +576,9 @@ impl TaskFetcher {
                     if hash_list.is_empty() {
                         return Err("No hashes found in the response".to_string());
                     }
+
+                    let mut mgr = POLICY_MANAGER.lock().unwrap();
+                    mgr.set_policy_process(&hash_list,true);
                     //println!("hash_list:{:?}",hash_list);
 
                 }
@@ -590,7 +589,6 @@ impl TaskFetcher {
                 return Err(err);
             }
         }
-
 
 
         Ok(())
@@ -616,7 +614,7 @@ impl TaskFetcher {
             None => return Err("URL for getvirtualport not found".to_string()),
         };
 
-        let mut net_client = NetClient::new(self.base_url.clone(), true)
+        let net_client = NetClient::new(self.base_url.clone(), true)
             .map_err(|e| format!("Failed to create NetClient: {}", e))?;
 
         let url = format!("{}/{}", self.base_url, download_url);
@@ -725,7 +723,7 @@ impl TaskFetcher {
             Some(url) => url,
             None => return Err("URL for download_white not found".to_string()),
         };
-        let mut net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -826,10 +824,25 @@ impl TaskFetcher {
         Ok(())
     }
 
+
     // 处理 TASK_GLOBAL_PROC 任务
     async fn task_global_proc(&self) -> Result<(), String> {
-        println!("Processing TASK_GLOBAL_PROC...");
-        // 全局进程的处理
+        let upload_url = match self.api_interface.get("upload_gloabal_process") {
+            Some(url) => url,
+            None => return Err("URL for upload_gloabal_process not found".to_string()),
+        };
+
+        let net_client = match NetClient::new(self.base_url.clone(), true) {
+            Ok(client) => client,
+            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
+        };
+
+        // 组合最终的 URL
+        let url = format!("{}/{}", self.base_url, upload_url);
+        let token = self.get_token();
+        let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
+        process_all_dirs(net_client, &url, token_str).await?;
+
         Ok(())
     }
 
@@ -840,7 +853,7 @@ impl TaskFetcher {
             Some(url) => url,
             None => return Err("URL for download_white not found".to_string()),
         };
-        let mut net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -911,7 +924,6 @@ impl TaskFetcher {
 pub trait TaskService {
     fn task_fetcher(&mut self, host_is_offline_tx: mpsc::Sender<bool>, token_rx: mpsc::Receiver<String>) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>; 
 }
-
 impl TaskService for BootManager {
     fn task_fetcher(
         &mut self,
@@ -920,8 +932,6 @@ impl TaskService for BootManager {
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
             let mut token_rx = token_rx;
-            //let mut host_is_offline_tx = host_is_offline_tx;
-
             loop {
                 let base_url = self.get_base_url();
 
@@ -932,16 +942,15 @@ impl TaskService for BootManager {
                         return Err("创建 NetClient 失败".to_string());
                     }
                 };
-
                 println!("等待接收 token...");
                 // 阻塞，等待接收到新的 token
                 if let Some(token) = token_rx.recv().await {
                     let token_option = Some(token); // 接收到的 token
 
                     println!("收到 token，开始任务处理...");
-                    let cfg = self.get_netinfocfg();
+                    
                     // 调用 TaskFetcher::run，处理任务
-                    match TaskFetcher::run(&mut net_client, token_option, cfg, self.pattern_mgr()).await {
+                    match TaskFetcher::run(&mut net_client, token_option, self.pattern_mgr()).await {
                         Ok(()) => {
                             println!("任务处理成功，继续监听 token...");
                         }
@@ -967,4 +976,5 @@ impl TaskService for BootManager {
         })
     }
 }
+
 
