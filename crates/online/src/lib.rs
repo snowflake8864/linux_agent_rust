@@ -1,16 +1,15 @@
 use net_client::core::NetClient;
-use config::net_info;
 use system_metrics::get_system_metrics;
 use serde::{Serialize, Deserialize};
 use std::pin::Pin;
 use common::manager::boot::BootManager;
 use std::future::Future;
 use tokio::time::{interval, Duration};
-use tokio::task::JoinHandle;
-use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use logging::{log_info,log_error};
+use logging::log_info;
+use config::net_info::NETINFO_CONFIG;
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct AuthResponse {
     code: String,
     data: AuthData,
@@ -40,37 +39,40 @@ pub struct BaseOnline {
     pub auth: String,
     pub userid: String,
     pub host_name: String,
+    pub mod_ver: String,
 }
 
 impl BaseOnline {
-    pub fn new(cfg:net_info::NetInfoConfig) -> Self {
+    pub fn new() -> Self {
+        let cfg = NETINFO_CONFIG.lock().unwrap(); // 这里使用 from_ini 解析配置
         BaseOnline {
-            uid: cfg.dev_uid,
-            macid: cfg.macid,
-            ip: cfg.ips,
-            ver: cfg.ver,
+            uid: cfg.dev_uid.clone(),
+            macid: cfg.macid.clone(),
+            ip: cfg.ips.clone(),
+            ver: cfg.ver.clone(),
             type_: 1,
-            os: cfg.os,
-            memsize: cfg.memsize,
-            cpu: cfg.cpu,
-            hdsize: cfg.hdsize,
+            os: cfg.os.clone(),
+            memsize: cfg.memsize.clone(),
+            cpu: cfg.cpu.clone(),
+            hdsize: cfg.hdsize.clone(),
             //astarttime: String::new(),
             //osstarttime: String::new(),
-            auth: cfg.auth,
-            userid: cfg.user_id,
-            host_name: cfg.host_name,
+            auth: cfg.auth.clone(),
+            userid: cfg.user_id.clone(),
+            host_name: cfg.host_name.clone(),
             asstarttime: "1731309829".to_string(),
             osstarttime:"1731309829".to_string(),
+            mod_ver: cfg.mod_ver.clone(),
         }
     }
 
 
-    pub async fn run(net_client: &mut NetClient, cfg:net_info::NetInfoConfig) -> Result<String, String> {
-        let mut base_online = BaseOnline::new(cfg);
+    pub async fn run(net_client: &mut NetClient) -> Result<String, String> {
+        let base_online = BaseOnline::new();
         let json_str = serde_json::to_string(&base_online)
             .map_err(|e| format!("Failed to serialize to JSON: {}", e))?;
 
-        println!("Serialized JSON: {}", json_str);
+        log_info!("===========================Serialized JSON: {}", json_str);
 
         let url = format!("{}/v1/auth", net_client.base_url);
         println!("==url:{}", url);
@@ -110,6 +112,7 @@ impl StartOnline for BootManager {
 
             loop {
                 let base_url = self.get_base_url();
+                println!("0====================================================="); 
                 let mut net_client = match NetClient::new(base_url, true) {
                     Ok(client) => client,
                     Err(err) => {
@@ -118,8 +121,8 @@ impl StartOnline for BootManager {
                     }
                 };
 
-                let netinfo_config = self.get_netinfocfg();
-                match BaseOnline::run(&mut net_client, netinfo_config).await {
+                log_info!("1====================================================="); 
+                match BaseOnline::run(&mut net_client).await {
                     Ok(token) => {
                         if let Err(err) = token_tx.send(token.clone()).await {
                             eprintln!("发送 token 失败: {}", err);

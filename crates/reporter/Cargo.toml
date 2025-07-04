@@ -15,3 +15,5 @@ log = "0.4"
 zcopy_mgr = { path = "../zcopy_mgr" }
 common = { path =  "../common" }
 net_client = { path = "../net_client" }
+#process_md5_cache = { path =  "../process_md5_cache" }
+process_mgr = { path =  "../process_mgr" }

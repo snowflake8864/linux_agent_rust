@@ -1,15 +1,13 @@
 [package]
-name = "hostinfo"
+name = "process_mgr"
 version = "0.10.6"
 edition = "2021"
 resolver = "2" 
 
 [dependencies]
-libc = "0.2"
-get_if_addrs = "0.5"
 md-5 = { path = "../md5" }
 uuid = { version = "1", features = ["v4"] }  # 开启 v4 版本支持
 hex = "0.4"
-#hostname = "0.3"
-#nix = "0.26"
-configparser = "3.1.0"
+once_cell = "1.17"
+logging = { path = "../logging" }
+log = "0.4"

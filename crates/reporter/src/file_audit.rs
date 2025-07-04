@@ -8,6 +8,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use zcopy_mgr::{AvFileInfo, ZcopyMgr};
 use crate::{RulesType,FileAuditLogInfo}; // 从 lib.rs 导入
+                                         
+use process_mgr::get_md5_global;
 // 定义 LogInfo
 pub struct FileAuditHandler {
     zcopy_mgr: Arc<ZcopyMgr>,
@@ -144,7 +146,7 @@ fn audit_file_oper_rename(&self, info: &AvFileInfo, level: u32, pos: u32) -> Res
         file_path: None,
         rename_dir: None,
         exception_process: Some(comm.to_string()),
-        md5: Some("7490fea7c270d57b4a90add0e7bf7852".to_string()), // 假设 md5 稍后由 process_md5_mgr 更新
+        md5: None,//Some("7490fea7c270d57b4a90add0e7bf7852".to_string()), // 假设 md5 稍后由 process_md5_mgr 更新
         n_type: info.log_type,
         n_level: level,
         n_time: 1692760326, // 应替换为实际时间戳
@@ -170,11 +172,20 @@ fn audit_file_oper_rename(&self, info: &AvFileInfo, level: u32, pos: u32) -> Res
         log.file_path = Some(path.to_string());
     }
 
+    match get_md5_global(&comm) {
+        Ok(md5) => log.md5 = Some(md5),
+        Err(e) => {
+            log.md5 = None;
+            eprintln!("Failed to get MD5: {}", e);
+        }
+    }
     if let Err(e) = self.file_audit_log_tx.try_send(log) {
         log_error!("日志发送失败或队列满: {}", e);
     } else {
         log_info!("log日志发送成功");
     }
+
+
     // TODO: 取消注释以启用 MD5 更新
     // self.process_md5_mgr.update_process_md5(comm, &mut log.md5);
     // self.report(&log)
@@ -220,7 +231,6 @@ fn audit_file_oper_rename(&self, info: &AvFileInfo, level: u32, pos: u32) -> Res
         //self.report_sender.send(&json)
         Ok(())
     }
-
 }
 
 const FILE_MODIFY: u32 = 1;

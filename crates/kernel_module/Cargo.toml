@@ -1,0 +1,13 @@
+[package]
+name = "kernel_module"
+version = "0.10.6"
+edition = "2021"
+resolver = "2" 
+
+[dependencies]
+tokio = { version = "1.23", features = ["net", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+common = { path = "../common" }
+logging = { path = "../logging" }
+log = "0.4"
+levenshtein = "1.0"

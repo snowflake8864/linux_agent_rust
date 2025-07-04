@@ -9,8 +9,8 @@ linker = "arm-linux-gnueabihf-gcc"
 
 [target.mipsel-unknown-linux-gnu]
 linker = "mipsel-linux-gnu-gcc"
-[target.x86_64-unknown-linux-gnu]
-linker = "/usr/bin/gcc-12"
+#[target.x86_64-unknown-linux-gnu]
+#linker = "/usr/bin/gcc-12"
 [target.x86_64-unknown-linux-musl]
 #linker = "musl-gcc"
 rustflags = ["-C", "target-feature=-crt-static"]
@@ -21,6 +21,69 @@ linker = "zig cc"
 runner = "qemu-mips"                # 如果你将来要运行
 linker = "zig cc -target mips-linux-gnu"
 rustflags = ["-C", "target-feature=-soft-float"]
-[build]
-target = "mips-unknown-linux-gnu"
+#[build]
+#target = "mips-unknown-linux-gnu"
+
+#[target.mips64-unknown-linux-muslabi64]
+#linker = "/home/zebra/mips64-linux-musl-cross/bin/mips64-linux-musl-gcc"
+#rustflags = [
+#    "-C", "link-arg=--sysroot=/home/zebra/mips64-linux-musl-cross/mips64-linux-musl",
+#    "-C", "link-arg=-L/home/zebra/mips64-linux-musl-cross/mips64-linux-musl/lib"
+#]
+
+[target.mipsel-unknown-linux-musl]
+linker = "/home/zebra/mipsel-linux-muslsf-cross/bin/mipsel-linux-muslsf-gcc"
+[target.mips-unknown-linux-musl]
+linker = "/home/zebra/mips-linux-musl-cross/bin/mips-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
+#[target.mips64-linux-musl]
+#linker = "zig"
+
+[target.mips64-unknown-linux-muslabi64]
+linker = "/home/zebra/mips64-linux-musl-cross/bin/mips64-linux-musl-gcc"
+
+[target.mips64el-unknown-linux-muslabi64]
+linker = "/home/zebra/mips64el-linux-musl-cross/bin/mips64el-linux-musl-gcc"
+[target.mips64-unknown-linux-musln32sf]
+linker = "/home/zebra/mips64-linux-musln32sf-cross/bin/mips64-linux-musln32sf-gcc"
+
+#ok
+# 通用MIPS64配置
+[target.mips64el-unknown-linux-gnuabi64]
+linker = "/usr/bin/mips64el-linux-gnuabi64-gcc" 
+#rustflags = ["-C", "target-cpu=mips64r2", "target-feature=+crt-static", "-C", "link-arg=-static"] 
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"] 
+
+
+# 龙芯专用配置
+#[target.'cfg(all(target_arch = "mips64", target_vendor = "loongson"))']
+#rustflags = ["-C", "target-cpu=loongson3b"] 
+
+#[target.loongarch64-unknown-linux-gnu]
+#linker = "/home/zebra/toolchain-loongarch64-linux-gnu-gcc8/bin/loongarch64-linux-gnu-gcc"
+
+#nightly
+[target.loongarch64-unknown-linux-gnu]
+linker = "/home/zebra/loongarch64-toolchain/cross-tools/bin/loongarch64-unknown-linux-gnu-gcc"
+#rustflags = ["-C", "target-cpu=generic-la64"]
+
+rustflags = [
+  "-C", "link-arg=--sysroot=/root/workspace/loongarch-rootfs",
+  "-C", "link-arg=-Wl,--dynamic-linker=/lib/ld-linux-loongarch64.so.1"
+]
+
+#[target.loongarch64-unknown-linux-gnu]
+#linker = "loongarch64-unknown-linux-gnu-gcc"
+#ar = "loongarch64-unknown-linux-gnu-ar"
+#rustflags = ["-C", "target-feature=+crt-static"]
+#rustflags = ["-C", "link-args=-Wl,--no-as-needed"]
+#rustflags = [
+#  "-C", "link-arg=--sysroot=/data/docker_shared/loongarch-rootfs"
+#]
+
+#[target.loongarch64-unknown-linux-musl]
+#linker = "zig cc -target loongarch64-linux-musl"
+
+#[target.loongarch64-unknown-linux-musl]
+#linker = "zig"
 

@@ -1,11 +1,8 @@
-use serde::{Serialize, Deserialize};
 use std::pin::Pin;
 use common::
     manager::boot::BootManager;
 use std::future::Future;
 use tokio::time::{interval, Duration};
-use tokio::task::JoinHandle;
-use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use crate::FileAuditLogInfo;
 use crate::build_alert_log_json;
@@ -26,7 +23,7 @@ impl StartBashLog for BootManager {
             let mut log_buffer: Vec<FileAuditLogInfo> = Vec::new();
             let mut interval = interval(Duration::from_secs(30));
             let base_url = self.get_base_url();
-            let mut net_client = match NetClient::new(base_url, true) {
+            let net_client = match NetClient::new(base_url, true) {
                 Ok(client) => client,
                 Err(err) => {
                     eprintln!("创建 NetClient 失败: {}", err);

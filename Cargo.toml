@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/main",
+    "crates/kernel_module",
     "crates/hostinfo",
      "crates/md5",
      "crates/common",
@@ -15,6 +16,8 @@ members = [
      "crates/pattern",
      "crates/reporter",
      "crates/zcopy_mgr",
+  #     "crates/process_md5_cache",
+     "crates/process_mgr",
 ]
 
 [profile.dev]
@@ -23,7 +26,7 @@ debug = 1
 codegen-units = 4
 lto = false
 incremental = true
-panic = 'unwind'
+#panic = 'unwind'
 debug-assertions = true
 overflow-checks = false
 rpath = false
@@ -34,7 +37,8 @@ debug = false
 codegen-units = 1
 lto = true
 incremental = false
-panic = 'unwind'
+#panic = 'unwind'
+#panic = "abort"
 debug-assertions = false
 overflow-checks = false
 rpath = false

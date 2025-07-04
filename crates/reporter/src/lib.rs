@@ -24,23 +24,6 @@ impl RulesType {
         }
     }
 }
-/*
-#[derive(Serialize,Debug)]
-pub struct FileAuditLogInfo {
-    pub file_path: String,
-    pub rename_dir: String,
-    pub exception_process: String,
-    pub md5: String,
-    pub n_type: u16,
-    pub n_level: u32,
-    pub n_time: u64,
-    pub notice_remark: String,
-    pub peripheral_name: String,
-    pub peripheral_remark: String,
-    pub peripheral_eid: String,
-    pub p_param: String,
-}
-*/
 #[derive(Serialize,  Debug)]
 pub struct FileAuditLogInfo {
     pub file_path: Option<String>,

@@ -5,9 +5,10 @@ edition = "2021"
 resolver = "2"
 
 [dependencies]
-ring = { version = "0.17" }
+#ring = { version = "0.17" }
 tokio = { version = "1.23", features = ["net", "macros", "fs", "io-util"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+#tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
 arc-swap = "1.6.0"
 configparser = "3.1.0"  # 选择适合的版本
 serde = { version = "1.0", features = ["derive"] }
@@ -19,8 +20,9 @@ common = { path =  "../common" }
 hostinfo = { path =  "../hostinfo" }
 config = { path = "../config"} 
 logging = { path = "../logging" }
-pattern = { path = "../pattern" }
 log = "0.4"
+pattern = { path = "../pattern" }
+process_mgr = { path =  "../process_mgr" }
 
 [features]
 test_mode = []

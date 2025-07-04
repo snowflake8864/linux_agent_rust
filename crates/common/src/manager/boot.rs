@@ -3,10 +3,10 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use configparser::ini::Ini;
 use crate::{Core, Inner};
-use config::net_info::NetInfoConfig; // 导入 NetInfoConfig
 use crate::NetClient;  // Import NetClient from the common module
 use pattern::pattern_rules_mgr;
 use tokio::sync;
+use config::net_info::NETINFO_CONFIG;
 //use tokio::sync::mpsc;
 
 #[derive(Clone)]
@@ -80,7 +80,6 @@ impl BootManager {
         // Load the INI file using the configparser crate
         let mut ini = Ini::new();
         if let Some(path) = config_path {
-            println!("==========================={}",path);
             ini.load(path.clone()).unwrap_or_else(|_| {
                     eprintln!("Failed to load configuration file from '{}'", path);
                     std::process::exit(1);
@@ -88,9 +87,10 @@ impl BootManager {
         }
 
         // Retrieve the configuration values from the INI file and parse into NetInfoConfig
-        let mut netinfocfg = NetInfoConfig::from_ini(&ini); // 这里使用 from_ini 解析配置
-        NetInfoConfig::acquire_host_info(&mut netinfocfg);
-        println!("1===={:?}", netinfocfg);
+        let mut netinfocfg = NETINFO_CONFIG.lock().unwrap(); // 这里使用 from_ini 解析配置
+        let _ =  netinfocfg.acquire_host_info();
+
+        //println!("1===={:?}", netinfocfg);
  // Initialize the NetClient with token and base_url from environment variables or config
         let netclient = NetClient {
             token: std::env::var("NETCLIENT_TOKEN").ok(),
@@ -99,7 +99,6 @@ impl BootManager {
         };
         println!("=={:?}", netclient);
         let core = Core {
-            netinfocfg,
             netclient,
             is_online:false,
             pattern_mgr: Arc::new(Mutex::new(pattern_rules_mgr::PatternRulesMgr::new())),
@@ -116,16 +115,12 @@ impl BootManager {
     }
 
     pub fn get_base_url(&self) -> String {
-        let core = self.inner.shared_core.load();
-        core.netinfocfg.server_ip_port.clone() // 返回克隆的值
+        let netinfocfg = NETINFO_CONFIG.lock().unwrap(); // 这里使用 from_ini 解析配置
+        netinfocfg.server_ip_port.clone() // 返回克隆的值
     }
     pub fn host_is_online(&self) -> bool {
         let core = self.inner.shared_core.load();
         core.is_online == true // 返回克隆的值
-    }
-    pub fn get_netinfocfg(&self) -> NetInfoConfig {
-        let core = self.inner.shared_core.load();
-        core.netinfocfg.clone() // 返回克隆的值
     }
 
     pub async fn set_token(&mut self, token: String) {
