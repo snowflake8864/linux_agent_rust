@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use logging::{log_info, log_error};
 use serde_json;
-use crate::FileAuditLogInfo;
+use crate::{AuditLogInfo,AuditProcess, EdrProcessLog};
+use process_mgr::get_md5_global;
 
 /*
 // build_alert_log_json 函数，接受切片 &[FileAuditLogInfo]
@@ -77,7 +78,7 @@ pub fn build_alert_log_json(log_info: &[FileAuditLogInfo], str_json: &mut String
 }
 */
 
-pub fn build_alert_log_json(log_info: &[FileAuditLogInfo], str_json: &mut String) -> Result<(), String> {
+pub fn build_alert_log_json(log_info: &[AuditLogInfo], str_json: &mut String) -> Result<(), String> {
     #[derive(Serialize)]
     struct LogEntry {
         level: u32,
@@ -140,3 +141,107 @@ pub fn build_alert_log_json(log_info: &[FileAuditLogInfo], str_json: &mut String
 
     Ok(())
 }
+
+pub fn build_auto_process_list_json(process_info: &[AuditProcess], str_json: &mut String) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct ProcessEntry {
+        id: u32,
+        user: String,
+        dir: String,
+        hash: String,
+        copyright: &'static str,
+        introduce: &'static str,
+    }
+
+    let entries: Vec<ProcessEntry> = process_info
+        .iter()
+        .map(|p| {
+            let hash = if p.hash.is_empty() {
+                get_md5_global(&p.str_executable_path).unwrap_or_default()
+            } else {
+                p.hash.clone()
+            };
+
+            ProcessEntry {
+                id: p.n_process_id,
+                user: p.str_user.clone(),
+                dir: p.str_executable_path.clone(),
+                hash,
+                copyright: "linux gun",
+                introduce: "linux",
+            }
+        })
+        .collect();
+
+    if entries.is_empty() {
+        log_error!("没有有效的进程条目可添加到 JSON。");
+        return Err("No valid process entries".to_string());
+    }
+
+    let entries_str = serde_json::to_string(&entries)
+        .map_err(|e| format!("Entries序列化失败: {}", e))?;
+
+    let json_obj = serde_json::json!({
+        "proclist": entries_str
+    });
+
+    *str_json = serde_json::to_string(&json_obj)
+        .map_err(|e| format!("JSON序列化失败: {}", e))?;
+
+    Ok(())
+}
+
+
+pub fn build_batch_process_edr_json(logs: &[EdrProcessLog], str_json: &mut String) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct EdrLogEntry {
+        uid: String,
+        hash: String,
+        p_id: u32,
+        p_dir: String,
+        p_param: String,
+        pp_hash: String,
+        pp_id: u32,
+        pp_dir: String,
+        pp_param: String,
+        log_type: u32,
+        time: i32,
+    }
+
+    let entries: Vec<EdrLogEntry> = logs
+        .iter()
+        .map(|log| {
+            EdrLogEntry {
+                uid: log.uid.clone(),
+                hash: log.hash.clone(),
+                p_id: log.p_id as u32,
+                p_dir: log.p_dir.clone(),
+                p_param: log.p_param.clone().unwrap_or_else(|| log.p_dir.clone()),
+                pp_hash: log.pp_hash.clone(),
+                pp_id: log.pp_id as u32,
+                pp_dir: log.pp_dir.clone(),
+                pp_param: log.pp_param.clone().unwrap_or_default(),
+                log_type: log.log_type as u32,
+                time: log.time,
+            }
+        })
+        .collect();
+
+    if entries.is_empty() {
+        log_error!("没有有效的 EDR 日志条目可添加到 JSON。");
+        return Err("No valid EDR log entries".to_string());
+    }
+
+    let entries_str = serde_json::to_string(&entries)
+        .map_err(|e| format!("Entries序列化失败: {}", e))?;
+
+    let json_obj = serde_json::json!({
+        "list": entries_str
+    });
+
+    *str_json = serde_json::to_string(&json_obj)
+        .map_err(|e| format!("JSON序列化失败: {}", e))?;
+
+    Ok(())
+}
+

@@ -1,30 +1,27 @@
-//crates/kernel_event/src/event_handler/mod.rs
+// crates/kernel_event/src/event_handler/mod.rs
+
 #![allow(dead_code)]
-use std::io::{self, Write};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex; // 使用 tokio::sync::Mutex
-use tokio::sync::mpsc;
-use reporter::FileAuditLogInfo;
 use std::fmt;
-use crate::msg_handler::KosecsMsgData;
-use super::{CallbackFn, EventCallback}; // 从 lib.rs 导入
-use logging::{log_info,log_error};
-use netlink::netlink::NlSockInfo; // 引入 NLPolicyType
-use common::
-    manager::boot::BootManager;
 use std::pin::Pin;
 use std::future::Future;
+
+use tokio::sync::{Mutex, mpsc};
+
+use reporter::AuditLogInfo;
+use crate::msg_handler::KosecsMsgData;
+use super::{CallbackFn}; // 删除 EventCallback
+use logging::{log_info, log_error};
+use netlink::netlink::NlSockInfo; // 引入 NLPolicyType
+use common::manager::boot::BootManager;
 use reporter::file_audit::FileAuditHandler;
+use reporter::process_audit::ProcessAuditHandler;
 use zcopy_mgr::ZcopyMgr;
 
-
-//use tokio::sync::mpsc;
-
-// 枚举：NLPolicyType
-#[derive(Eq, Hash, PartialEq, Debug)] // 自动实现 Debug 和 Hash, Eq, PartialEq
+#[derive(Eq, Hash, PartialEq, Debug)]
 #[allow(non_camel_case_types)]
-enum NLPolicyType {
+pub enum NLPolicyType {
     NL_POLICY_CMD_UNSPEC,
     NL_POLICY_CMD_ECHO = 1,
     NL_POLICY_SIMPLE_END,
@@ -118,7 +115,7 @@ impl NLPolicyType {
         }
     }
 }
-// 实现 Display trait，便于以字符串形式输出 NLPolicyType
+
 impl fmt::Display for NLPolicyType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let result = match *self {
@@ -169,7 +166,6 @@ impl fmt::Display for NLPolicyType {
     }
 }
 
-
 pub struct EventHandler {
     callbacks: Arc<Mutex<HashMap<NLPolicyType, CallbackFn>>>,
 }
@@ -181,119 +177,154 @@ impl EventHandler {
         }
     }
 
-    // 注册事件回调
-    pub async fn register_event_handler(&mut self, policy_type: NLPolicyType, callback: CallbackFn) {
-        self.callbacks.lock().await.insert(policy_type, callback);
+    pub async fn register_event_handler<F, Fut>(&mut self, policy_type: NLPolicyType, callback: F)
+    where
+        F: Fn(&[u8], u32) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let boxed_callback: CallbackFn = Box::new(move |data, len| {
+            Box::pin(callback(data, len)) as Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        });
+        self.callbacks.lock().await.insert(policy_type, boxed_callback);
     }
-    // 处理事件
-    pub async fn handle_event(&self, data_type: u32, data: &[u8], data_len: u32) -> Result<(), String> {
+
+    pub async fn handle_event(
+        &self,
+        data_type: u32,
+         data:&[u8],
+        data_len: u32,
+    ) -> Result<(), String> {
         if let Some(policy_type) = NLPolicyType::from_u32(data_type) {
             log_info!("Handling event for policy type: {}", policy_type);
             if let Some(callback) = self.callbacks.lock().await.get(&policy_type) {
-                callback(data, data_len)
+                callback(data, data_len).await
             } else {
-                Err(format!("No callback registered for policy type {:?}", policy_type))
+                Err(format!(
+                    "No callback registered for policy type {:?}",
+                    policy_type
+                ))
             }
         } else {
             Err(format!("Unknown data type: {}", data_type))
         }
     }
-
 }
 
-
-// 定义 ECHO 命令的处理函数
-fn handle_echo(data: &[u8], data_len: u32) -> Result<(), String> {
-    let data_str = String::from_utf8_lossy(data); // 将字节数据转换为字符串
-    println!("Handling ECHO data: {}", data_str);  // 打印字符串
-    // 处理复杂逻辑
+async fn handle_echo(data: &[u8], data_len: u32) -> Result<(), String> {
+    let data_str = String::from_utf8_lossy(data);
+    println!("Handling ECHO data: {}", data_str);
     Ok(())
 }
 
-// 定义 REGISTER 命令的处理函数
-fn handle_register(data: &[u8], _data_len: u32) -> Result<(), String> {
+async fn handle_register(data: &[u8], _data_len: u32) -> Result<(), String> {
     println!("Handling REGISTER data: {:?}", data);
     Ok(())
 }
-// 定义 ADD_SYMBOL 命令的处理函数
-fn handle_add_symbol(data: &[u8], _data_len: u32) -> Result<(), String> {
+
+async fn handle_add_symbol(data: &[u8], _data_len: u32) -> Result<(), String> {
     println!("Handling ADD_SYMBOL data: {:?}", data);
     Ok(())
 }
 
-
-// 定义 UNREGISTER 命令的处理函数
-fn handle_unregister(data: &[u8], _data_len: u32) -> Result<(), String> {
+async fn handle_unregister(data: &[u8], _data_len: u32) -> Result<(), String> {
     println!("Handling UNREGISTER data: {:?}", data);
     Ok(())
 }
 
 
-
 pub async fn register_default_event_handlers(event_handler: &Arc<Mutex<EventHandler>>) {
-    async fn register<T: EventCallback>(
-        event_handler: &Arc<Mutex<EventHandler>>,
-        policy_type: NLPolicyType,
-        handler: T,
-    ) {
     log_info!("Starting to register default event handlers");
-        let mut handler_guard = event_handler.lock().await;
-        handler_guard
-            .register_event_handler(
-                policy_type,
-                Box::new(move |data: &[u8], data_len: u32| handler.handle_event(data, data_len)),
-            )
-            .await;
-    }
+    let mut handler = event_handler.lock().await;
 
-    register(event_handler, NLPolicyType::NL_POLICY_CMD_ECHO, handle_echo).await;
-    register(event_handler, NLPolicyType::NL_POLICY_CMD_REGISTER, handle_register).await;
-    register(event_handler, NLPolicyType::NL_POLICY_CMD_ADD_SYMBOL, handle_add_symbol).await;
-    register(event_handler, NLPolicyType::NL_POLICY_CMD_UNREGISTER, handle_unregister).await;
+    // 注册 ECHO handler
+    handler
+        .register_event_handler(
+            NLPolicyType::NL_POLICY_CMD_ECHO,
+            move |data, len| {
+                let data = data.to_vec();
+                Box::pin(async move { handle_echo(&data, len).await })
+            },
+        )
+        .await;
+
+    // 注册 REGISTER handler
+    handler
+        .register_event_handler(
+            NLPolicyType::NL_POLICY_CMD_REGISTER,
+            move |data, len| {
+                let data = data.to_vec();
+                Box::pin(async move { handle_register(&data, len).await })
+            },
+        )
+        .await;
+
+    // 注册 ADD_SYMBOL handler
+    handler
+        .register_event_handler(
+            NLPolicyType::NL_POLICY_CMD_ADD_SYMBOL,
+            move |data, len| {
+                let data = data.to_vec();
+                Box::pin(async move { handle_add_symbol(&data, len).await })
+            },
+        )
+        .await;
+
+    // 注册 UNREGISTER handler
+    handler
+        .register_event_handler(
+            NLPolicyType::NL_POLICY_CMD_UNREGISTER,
+            move |data, len| {
+                let data = data.to_vec();
+                Box::pin(async move { handle_unregister(&data, len).await })
+            },
+        )
+        .await;
 }
+
 
 pub async fn register_user_event_handlers(
     event_handler: &Arc<Mutex<EventHandler>>,
-    file_audit_log_tx: mpsc::Sender<FileAuditLogInfo>,
+    file_audit_log_tx: mpsc::Sender<AuditLogInfo>,
+    boot_manager: Arc<BootManager>,
 ) {
     log_info!("Starting to register user event handlers");
 
     let zcopy_mgr = match ZcopyMgr::new() {
-        Ok(zcopy_mgr) => {
-            log_info!("ZcopyMgr created successfully");
-            Arc::new(zcopy_mgr)
-        }
+        Ok(mgr) => Arc::new(mgr),
         Err(e) => {
-            log_error!("Failed to create ZcopyMgr: {}, skipping ZcopyMgr-dependent registrations", e);
+            log_error!("Failed to create ZcopyMgr: {}", e);
             return;
         }
     };
 
-    async fn register<T: EventCallback>(
-        event_handler: &Arc<Mutex<EventHandler>>,
-        policy_type: NLPolicyType,
-        handler: T,
-    ) {
-        log_info!("Registering callback for policy_type: {:?}", policy_type);
-        let mut handler_guard = event_handler.lock().await;
-        handler_guard
-            .register_event_handler(
-                policy_type,
-                Box::new(move |data: &[u8], data_len: u32| handler.handle_event(data, data_len)),
-            )
-            .await;
-        log_info!("Callback registered ===========");
-    }
-
     let file_audit_handler = FileAuditHandler::new(zcopy_mgr.clone(), file_audit_log_tx);
-    log_info!("Registering NL_POLICY_AV_FILE_AUDIT_ZCOPY_NOTIFY callback");
-    register(
-        event_handler,
-        NLPolicyType::NL_POLICY_AV_FILE_AUDIT_ZCOPY_NOTIFY,
-        move |data: &[u8], data_len: u32| file_audit_handler.handle_file_zcopy_oper(data, data_len),
+    let process_audit_handler = ProcessAuditHandler::new(zcopy_mgr, boot_manager);
+
+    let mut handler = event_handler.lock().await;
+    handler
+        .register_event_handler(
+            NLPolicyType::NL_POLICY_AV_FILE_AUDIT_ZCOPY_NOTIFY,
+            move |data, len| {
+                let handler = file_audit_handler.clone();
+            let data = data.to_vec(); // 拷贝数据
+                Box::pin(async move {
+                    handler.handle_file_zcopy_oper(&data, len).await
+                })
+            },
+        )
+        .await;
+    handler
+    .register_event_handler(
+        NLPolicyType::NL_POLICY_AV_PROCESS_EXEC_ZCOPY_NOTIFY,
+        move |data, len| {
+            let handler = process_audit_handler.clone();
+            let data = data.to_vec(); // 拷贝数据
+            Box::pin(async move {
+                handler.handle_process_zcopy_oper(&data, len).await
+            })
+        },
     )
     .await;
-    log_info!("NL_POLICY_AV_FILE_AUDIT_ZCOPY_NOTIFY callback registered");
 }
 
 pub trait StartKernelHandler {
@@ -301,13 +332,13 @@ pub trait StartKernelHandler {
         &mut self,
         nl_sock: NlSockInfo,
         event_handler: Arc<Mutex<EventHandler>>,
-        file_audit_log_tx: mpsc::Sender<FileAuditLogInfo>
+        file_audit_log_tx: mpsc::Sender<AuditLogInfo>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
 
     fn start_kernel_rcv_handler(
         &mut self,
         nl_sock: NlSockInfo,
-        event_handler: Arc<Mutex<EventHandler>>
+        event_handler: Arc<Mutex<EventHandler>>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
 }
 
@@ -316,14 +347,14 @@ impl StartKernelHandler for BootManager {
         &mut self,
         nl_sock: NlSockInfo,
         event_handler: Arc<Mutex<EventHandler>>,
-        file_audit_log_tx: mpsc::Sender<FileAuditLogInfo>,
+        file_audit_log_tx: mpsc::Sender<AuditLogInfo>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
-
             register_default_event_handlers(&event_handler).await;
-            register_user_event_handlers(&event_handler, file_audit_log_tx).await;
+            let boot_manager_arc = Arc::new(self.clone());
+            register_user_event_handlers(&event_handler, file_audit_log_tx, boot_manager_arc).await;
             send_data_to_kernel(&nl_sock).map_err(|e| e.to_string())?;
-            Ok("=========后台任务已启动.".to_string())
+            Ok("后台任务已启动".to_string())
         })
     }
 
@@ -334,58 +365,52 @@ impl StartKernelHandler for BootManager {
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                nl_sock
-                    .receive_messages_loop(|data| {
-                        let payload = &data[16..];
-                        match KosecsMsgData::parse(&payload) {
-                            Some(msg) => {
-                                if msg.data_type == 1 {
-                                    let data = msg.payload;
-                                    let data_str = String::from_utf8_lossy(data);
-                                    log_info!("Handling ECHO data: {}", data_str);
-                                } else {
-                                    log_info!(
-                                        "Handling event for policy type: {},{:?}",
-                                        msg.data_type,
-                                        msg.payload
-                                    );
-                                    let event_handler = event_handler.clone();
-                                    let payload_owned = msg.payload.to_vec();
-                                    let data_type = msg.data_type;
-                                    let data_len = msg.data_len;
-                                    tokio::spawn(async move {
-                                        if let Err(e) = event_handler
-                                            .lock()
-                                                .await
-                                                .handle_event(data_type, &payload_owned, data_len)
-                                                .await
-                                        {
-                                            log_error!("Failed to handle event: {}", e);
-                                        }
-                                    });
-                                }
-                            }
-                            None => {
-                                log_error!("无法解析内核消息，格式错误或长度不足: {:x?}", data);
+                nl_sock.receive_messages_loop(|data| {
+                    let payload = &data[16..];
+                    match KosecsMsgData::parse(payload) {
+                        Some(msg) => {
+                            if msg.data_type == 1 {
+                                let data_str = String::from_utf8_lossy(msg.payload);
+                                log_info!("Handling ECHO data: {}", data_str);
+                            } else {
+                                log_info!(
+                                    "Handling event for policy type: {}, {:?}",
+                                    msg.data_type,
+                                    msg.payload
+                                );
+                                let event_handler = event_handler.clone();
+                                let payload_owned = msg.payload.to_vec();
+                                let data_type = msg.data_type;
+                                let data_len = msg.data_len;
+                                tokio::spawn(async move {
+                                    if let Err(e) = event_handler
+                                        .lock()
+                                        .await
+                                        .handle_event(data_type, &payload_owned, data_len)
+                                        .await
+                                    {
+                                        log_error!("Failed to handle event: {}", e);
+                                    }
+                                });
                             }
                         }
-                    })
+                        None => {
+                            log_error!("无法解析内核消息，格式错误或长度不足: {:x?}", data);
+                        }
+                    }
+                })
                 .map_err(|e| e.to_string())
             })
             .await
-                .unwrap()?;
-            Ok("=========后台任务已启动.".to_string())
+            .unwrap()?;
+            Ok("后台任务已启动".to_string())
         })
     }
-
 }
 
-
 use std::net::Ipv4Addr;
-pub fn send_data_to_kernel(nl_sock: &NlSockInfo) -> Result<String, String> {
-    // 这里是所有与内核交互的逻辑
-    // 发送消息到内核（消息类型、数据等完全隐藏在这里）
 
+pub fn send_data_to_kernel(nl_sock: &NlSockInfo) -> Result<String, String> {
     if let Err(e) = nl_sock.send_message(1, b"set portid") {
         return Err(format!("Failed to send set portid message: {}", e));
     }
@@ -403,5 +428,3 @@ pub fn send_data_to_kernel(nl_sock: &NlSockInfo) -> Result<String, String> {
 
     Ok("Data sent successfully".to_string())
 }
-
-

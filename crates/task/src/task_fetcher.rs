@@ -18,7 +18,8 @@ use crate::get_process_task::process_all_dirs;
 use pattern::pattern_rules_mgr;
 use tokio::sync::mpsc;
 use process_mgr::POLICY_MANAGER;
-
+use netlink::netlink::NlSockInfo; // 引入 NLPolicyType
+                                  //
 fn get_u32(map: &serde_json::Map<String, Value>, key: &str) -> Result<u32, String> {
     map.get(key)
         .and_then(|v| v.as_number().and_then(|n| n.as_u64()))
@@ -39,6 +40,11 @@ pub struct TaskFetcher {
     pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>,
     prev_defense_switch: Option<u32>,
     prev_open_port_switch: bool,
+    prev_file_switch: bool,
+    prev_extortion_switch:bool,
+    prev_proc_switch:bool,
+    prev_syslog_process_switch:bool,
+    nl_sock: Option<NlSockInfo>,
 }
 use num_derive::FromPrimitive; // 支持从整数到枚举的转换
 use num_traits::FromPrimitive;
@@ -85,13 +91,15 @@ enum NetRule<'a> {
     LogIpPort(&'a str),
     VirtualOpenPort(bool),
     DefenseSwitch(u32),
+    SelfProtect(u32),
+    NetLogPolicy((bool, bool)),
 }
 fn ip_str_to_u32(ip: &str) -> Result<u32, String> {
     let parsed = ip.parse::<Ipv4Addr>().map_err(|e| e.to_string())?;
     Ok(u32::from_be_bytes(parsed.octets()))
 }
 impl TaskFetcher {
-    pub fn new(base_url: &str, token: Option<String>, pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>) -> Self 
+    pub fn new(base_url: &str, token: Option<String>, pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>, nl_sock: Option<NlSockInfo>) -> Self 
     {
         let mut api_interface = HashMap::new();
         api_interface.insert("download_white".to_string(), "v1/getprocwl".to_string());
@@ -111,6 +119,11 @@ impl TaskFetcher {
               pattern_mgr,
               prev_defense_switch: None,
               prev_open_port_switch: false,
+              prev_file_switch:false,
+              prev_extortion_switch:false,
+              prev_proc_switch:false,
+              prev_syslog_process_switch:false,
+              nl_sock,
         }
     }
     pub fn get_token(&self) -> Option<String> {
@@ -134,9 +147,31 @@ impl TaskFetcher {
             NetRule::DefenseSwitch(defense_state) => {
                 self.write_defense_switch("defense_switch ", &defense_state.to_string())
             }
+            NetRule::SelfProtect(self_protect_state) => {
+                log::info!("=======================self_protect_state: {}", self_protect_state);
+                self.nl_sock
+                    .as_ref()
+                    .ok_or("Netlink socket not initialized".to_string())?
+                    .send_uint32(0x103, self_protect_state)
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            NetRule::NetLogPolicy((syslog_process_switch,proc_switch)) => {
+                let buf = [
+                    syslog_process_switch as u8,
+                    proc_switch as u8,
+                    0,
+                    0,
+                ];
+                self.nl_sock
+                    .as_ref()
+                    .ok_or("Netlink socket not initialized".to_string())?
+                    .send_message(0x702, &buf)
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            } 
         }
     }
-
     fn write_raw(&self, rule_type: &str, value: &str) -> Result<(), String> {
         let content = format!("{} {}\n", rule_type, value);
         fs::write("/proc/osec/net_rules", content)
@@ -199,17 +234,24 @@ impl TaskFetcher {
              .filter(|s| !s.is_empty())
              .map(|s| s.to_string());
 
+         cfg.cli_port = get_u32(conf, "debug_switch")?;
          cfg.module_switch = get_u32(conf, "module_switch")?;
          let self_protect_switch = get_u32(conf, "self_protect_switch")?;
          if cfg.self_protect_switch != self_protect_switch {
              cfg.self_protect_switch = self_protect_switch;
-             let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
-             pattern_mgr.add_file_pattern(cfg.self_protect_switch == 1);
+            
+             if !cfg.mod_ver.is_empty() {
+                 let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
+                 pattern_mgr.add_file_pattern(cfg.self_protect_switch == 1);
+                 self.write_net_rule(NetRule::SelfProtect(cfg.self_protect_switch))?;
+             }
          }
          cfg.open_port_switch = get_bool(conf, "open_port_switch")?;
          if cfg.open_port_switch != self.prev_open_port_switch {
              self.prev_open_port_switch = cfg.open_port_switch;
-             self.write_net_rule(NetRule::VirtualOpenPort(cfg.open_port_switch))?;
+             if !cfg.mod_ver.is_empty() {
+                 self.write_net_rule(NetRule::VirtualOpenPort(cfg.open_port_switch))?;
+             }
          }
          cfg.proc_protect = get_bool(conf, "proc_protect")?;
          cfg.proc_switch = get_bool(conf, "proc_switch")?;
@@ -219,6 +261,7 @@ impl TaskFetcher {
          cfg.syslog_outer_switch = get_bool(conf, "syslog_outer_switch")?;
          cfg.syslog_dns_switch = get_bool(conf, "syslog_dns_switch")?;
          cfg.internet_switch = get_bool(conf, "internet_switch")?;
+         cfg.syslog_process_switch = get_bool(conf, "syslog_process_switch")?;
 
          let _ = cfg.to_ini("/opt/osec/net_info.ini");
          let file_flag_temp  = cfg.file_switch|cfg.extortion_switch;
@@ -257,15 +300,41 @@ impl TaskFetcher {
          defense_switch |= enable_flag;
          if self.prev_defense_switch != Some(defense_switch) {
              self.prev_defense_switch = Some(defense_switch);
-             self.write_net_rule(NetRule::DefenseSwitch(defense_switch))?;
+             if !cfg.mod_ver.is_empty() {
+                 self.write_net_rule(NetRule::DefenseSwitch(defense_switch))?;
+             }
          }
+         if self.prev_file_switch != cfg.file_switch {
+             if !cfg.mod_ver.is_empty() {
+                 if !cfg.file_switch {
+                     let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
+                     pattern_mgr.clear_protect_dir();
+                 }
+
+             }
+             self.prev_file_switch = cfg.file_switch;
+         }
+         if self.prev_extortion_switch !=cfg.extortion_protect {
+             if !cfg.mod_ver.is_empty() {
+                 if !cfg.extortion_protect {
+                     let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
+                     pattern_mgr.clear_exiport_dir();
+                 }
+             }
+         }
+         if self.prev_proc_switch != cfg.proc_switch || self.prev_syslog_process_switch != cfg.syslog_process_switch {
+             log_info!("===============================proc_switch:{},syslog_process_switch:{}",cfg.proc_switch,cfg.syslog_process_switch);
+             self.write_net_rule(NetRule::NetLogPolicy((cfg.syslog_process_switch, cfg.proc_switch)))?;
+             self.prev_syslog_process_switch = cfg.syslog_process_switch;
+             self.prev_proc_switch = cfg.proc_switch;
+         }         
 
          Ok(())
      }
 
-    pub async fn run(net_client: &mut NetClient, token: Option<String>,pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>) -> Result<(), String> {
+    pub async fn run(net_client: &mut NetClient, token: Option<String>,pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>,nl_sock: Option<NlSockInfo>) -> Result<(), String> {
         let token_str = token.as_ref().map(|s| s.as_str());
-        let mut task_fetcher = TaskFetcher::new(&net_client.base_url, token.clone(), pattern_mgr);
+        let mut task_fetcher = TaskFetcher::new(&net_client.base_url, token.clone(), pattern_mgr, nl_sock);
 
         loop {
             let url = format!("{}/v1/gettask", task_fetcher.base_url);
@@ -452,13 +521,8 @@ impl TaskFetcher {
                     let conf = parsed["data"]["conf"]
                         .as_object()
                         .ok_or("Missing 'conf' object in response")?;
+                    self.update_config_from_json(conf)?;                   
 
-                    // 打印 "conf" 的内容
-                    //for (key, value) in conf {
-                      //  println!("{}: {}", key, value);
-                    self.update_config_from_json(conf)?;                   //}
-
-                    // 如果成功，返回 Ok(())，因为返回类型是 Result<(), String>
                 } else {
                     eprintln!("Error: Invalid response code: {}", parsed["code"]);
                     // 返回错误的 Result 类型
@@ -506,17 +570,20 @@ impl TaskFetcher {
             };
 
             if parsed["code"] == "000000" {
-            
-                let data_list = parsed["data"]["proclist"]
-                    .as_array()
-                    .ok_or("Missing task list in response")?
-                    .iter()
-                    .filter_map(|v| v.as_u64().map(|n| n as u32))
-                    .collect::<Vec<u32>>();
 
-                    println!("======={}======={:?}", url, data_list);
+                    let hash_list = parsed["data"]["proclist"]
+                        .as_array()
+                        .ok_or("Missing or invalid proclist in response")?
+                        .iter()
+                        .filter_map(|item| item["hash"].as_str().map(|s| s.to_string()))
+                        .collect::<Vec<String>>();
 
-                    // 如果成功，返回 Ok(())，因为返回类型是 Result<(), String>
+                    if hash_list.is_empty() {
+                        return Err("No hashes found in the response".to_string());
+                    }
+
+                    let mut mgr = POLICY_MANAGER.lock().unwrap();
+                    mgr.set_policy_process(&hash_list, false);
                 } else {
                     eprintln!("Error: Invalid response code: {}", parsed["code"]);
                     // 返回错误的 Result 类型
@@ -529,9 +596,7 @@ impl TaskFetcher {
                 return Err(err);
             }
         }
-       // println!("Extracted hashes: {:?}", hash_list);
 
-        println!("Processing TASK_DOWN_BLACK...");
         Ok(())
     }
 
@@ -564,8 +629,6 @@ impl TaskFetcher {
                 };
 
                 if parsed["code"] == "000000" {
-           
-                        // 获取 hash 列表
                     let hash_list = parsed["data"]["proclist"]
                         .as_array()
                         .ok_or("Missing or invalid proclist in response")?
@@ -580,7 +643,6 @@ impl TaskFetcher {
                     let mut mgr = POLICY_MANAGER.lock().unwrap();
                     mgr.set_policy_process(&hash_list,true);
                     //println!("hash_list:{:?}",hash_list);
-
                 }
             }
             Err(err) => {
@@ -716,7 +778,6 @@ impl TaskFetcher {
         Ok(())
     }
 
-    // 处理 TASK_DOWN_BLACK 任务
     async fn task_down_extort(&self) -> Result<(), String> {
         // 获取 download_white 的 URL
         let download_url = match self.api_interface.get("getprotect") {
@@ -922,13 +983,14 @@ impl TaskFetcher {
 }
 // 定义返回类型为 `impl Future`，并显式添加 `Send` trait bound
 pub trait TaskService {
-    fn task_fetcher(&mut self, host_is_offline_tx: mpsc::Sender<bool>, token_rx: mpsc::Receiver<String>) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>; 
+    fn task_fetcher(&mut self, host_is_offline_tx: mpsc::Sender<bool>, token_rx: mpsc::Receiver<String>, nl_sock: Option<NlSockInfo>) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>; 
 }
 impl TaskService for BootManager {
     fn task_fetcher(
         &mut self,
         host_is_offline_tx: mpsc::Sender<bool>,
         token_rx: mpsc::Receiver<String>,
+    nl_sock: Option<NlSockInfo>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
             let mut token_rx = token_rx;
@@ -948,9 +1010,9 @@ impl TaskService for BootManager {
                     let token_option = Some(token); // 接收到的 token
 
                     println!("收到 token，开始任务处理...");
-                    
+                    let nl_sock = nl_sock.clone(); 
                     // 调用 TaskFetcher::run，处理任务
-                    match TaskFetcher::run(&mut net_client, token_option, self.pattern_mgr()).await {
+                    match TaskFetcher::run(&mut net_client, token_option, self.pattern_mgr(),nl_sock).await {
                         Ok(()) => {
                             println!("任务处理成功，继续监听 token...");
                         }

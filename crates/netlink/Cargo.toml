@@ -6,4 +6,5 @@ resolver = "2"
 
 [dependencies]
 libc = "0.2"
-
+logging = { path =  "../logging" }
+log = "0.4"

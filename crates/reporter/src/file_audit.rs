@@ -7,21 +7,21 @@ use std::ptr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use zcopy_mgr::{AvFileInfo, ZcopyMgr};
-use crate::{RulesType,FileAuditLogInfo}; // 从 lib.rs 导入
+use crate::{RulesType,AuditLogInfo}; // 从 lib.rs 导入
                                          
 use process_mgr::get_md5_global;
 // 定义 LogInfo
+#[derive(Clone)]
 pub struct FileAuditHandler {
     zcopy_mgr: Arc<ZcopyMgr>,
-    file_audit_log_tx: mpsc::Sender<FileAuditLogInfo>,
+    file_audit_log_tx: mpsc::Sender<AuditLogInfo>,
 }
 impl FileAuditHandler {
-    // 构造函数，接收 ZcopyMgr 实例
-    pub fn new(zcopy_mgr: Arc<ZcopyMgr>, file_audit_log_tx: mpsc::Sender<FileAuditLogInfo>) -> Self {
+    pub fn new(zcopy_mgr: Arc<ZcopyMgr>, file_audit_log_tx: mpsc::Sender<AuditLogInfo>) -> Self {
         FileAuditHandler { zcopy_mgr, file_audit_log_tx}
     }
 
-    pub fn handle_file_zcopy_oper(
+    pub async fn handle_file_zcopy_oper(
         &self,
         data: &[u8],
         data_len: u32,
@@ -142,7 +142,7 @@ fn audit_file_oper_rename(&self, info: &AvFileInfo, level: u32, pos: u32) -> Res
         .to_str()
         .map_err(|_| "无效 UTF-8 comm")?;
 
-    let mut log = FileAuditLogInfo {
+    let mut log = AuditLogInfo {
         file_path: None,
         rename_dir: None,
         exception_process: Some(comm.to_string()),
@@ -225,7 +225,7 @@ fn audit_file_oper_rename(&self, info: &AvFileInfo, level: u32, pos: u32) -> Res
         }
         Ok(())
     }
-    fn report(&self, log: &FileAuditLogInfo) -> Result<(), String> {
+    fn report(&self, log: &AuditLogInfo) -> Result<(), String> {
         let json = serde_json::to_string(log)
             .map_err(|e| format!("JSON 序列化失败: {}", e))?;
         //self.report_sender.send(&json)
