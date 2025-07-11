@@ -4,23 +4,23 @@ use common::
 use std::future::Future;
 use tokio::time::{interval, Duration};
 use tokio::sync::mpsc;
-use crate::FileAuditLogInfo;
+use crate::AuditLogInfo;
 use crate::build_alert_log_json;
 use logging::{log_info,log_error};
 use net_client::core::NetClient;
 
 
 pub trait StartBashLog {
-    fn start_log_services(&mut self,  file_audit_log_rx: mpsc::Receiver<FileAuditLogInfo>) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
+    fn start_log_services(&mut self,  file_audit_log_rx: mpsc::Receiver<AuditLogInfo>) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
 }
 
 impl StartBashLog for BootManager {
     fn start_log_services(
         &mut self,
-        mut file_audit_log_rx: mpsc::Receiver<FileAuditLogInfo>,
+        mut file_audit_log_rx: mpsc::Receiver<AuditLogInfo>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
-            let mut log_buffer: Vec<FileAuditLogInfo> = Vec::new();
+            let mut log_buffer: Vec<AuditLogInfo> = Vec::new();
             let mut interval = interval(Duration::from_secs(30));
             let base_url = self.get_base_url();
             let net_client = match NetClient::new(base_url, true) {

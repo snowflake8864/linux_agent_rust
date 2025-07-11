@@ -127,39 +127,39 @@ impl PatternRulesMgr {
             inited: false,
         }
     }
-pub fn parse_exipor_policy_from_json(data: &Value) -> Result<Vec<POLICY_EXIPOR_PROTECT>, String> {
-    let array = data.as_array().ok_or("data is not an array")?;
-    let mut result = Vec::new();
+    pub fn parse_exipor_policy_from_json(data: &Value) -> Result<Vec<POLICY_EXIPOR_PROTECT>, String> {
+        let array = data.as_array().ok_or("data is not an array")?;
+        let mut result = Vec::new();
 
-    for item in array {
-        let typ = item.get("type").and_then(Value::as_u64).unwrap_or(0) as u8;
-        let file_type = item
-            .get("file_suffix")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let mut map_comm = HashMap::new();
-        if let Some(process_info_array) = item.get("process").and_then(Value::as_array) {
-            for process in process_info_array {
-                if let (Some(name), Some(hash)) = (
-                    process.get("name").and_then(Value::as_str),
-                    process.get("hash").and_then(Value::as_str),
-                ) {
-                    map_comm.insert(hash.to_string(), name.to_string());
-                    log_info!("=======================================hash:{},name:{}", hash, name);
+        for item in array {
+            let typ = item.get("type").and_then(Value::as_u64).unwrap_or(0) as u8;
+            let file_type = item
+                .get("file_suffix")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let mut map_comm = HashMap::new();
+            if let Some(process_info_array) = item.get("process").and_then(Value::as_array) {
+                for process in process_info_array {
+                    if let (Some(name), Some(hash)) = (
+                        process.get("name").and_then(Value::as_str),
+                        process.get("hash").and_then(Value::as_str),
+                    ) {
+                        map_comm.insert(hash.to_string(), name.to_string());
+                        log_info!("=======================================hash:{},name:{}", hash, name);
+                    }
                 }
             }
+
+            result.push(POLICY_EXIPOR_PROTECT {
+                file_type,
+                typ,
+                map_comm,
+            });
         }
 
-        result.push(POLICY_EXIPOR_PROTECT {
-            file_type,
-            typ,
-            map_comm,
-        });
+        Ok(result)
     }
-
-    Ok(result)
-}
     pub fn parse_policy_from_json(data: &Value) -> Result<Vec<POLICY_PROTECT_DIR>, String> {
         let array = data.as_array().ok_or("data is not an array")?;
         let mut result = Vec::new();
@@ -245,8 +245,8 @@ pub fn parse_exipor_policy_from_json(data: &Value) -> Result<Vec<POLICY_EXIPOR_P
         true
     }
 
-    
-/// 只在文件存在时写入内容，否则返回错误
+
+    /// 只在文件存在时写入内容，否则返回错误
     fn write_to_proc_file(path: &str, content: &str) -> std::io::Result<()> {
         // 检查文件是否存在
         if !std::path::Path::new(path).exists() {
@@ -312,92 +312,98 @@ pub fn parse_exipor_policy_from_json(data: &Value) -> Result<Vec<POLICY_EXIPOR_P
     }
 
     // 设置全局信任目录
-pub fn set_global_trust_dir(&mut self, dirs: Vec<GlobalTrusrDir>) {
-    self.global_trust_dir_patterns.clear();
-    self.global_trust_dir_rules.clear();
+    pub fn set_global_trust_dir(&mut self, dirs: Vec<GlobalTrusrDir>) {
+        self.global_trust_dir_patterns.clear();
+        self.global_trust_dir_rules.clear();
 
-    for (i, dir) in dirs.iter().enumerate().take(50) {
-        let name = format!("trueDir_{}", i);
-        self.global_trust_dir_patterns.push_str(&format!("name={},key={}", name, dir.dir));
+        for (i, dir) in dirs.iter().enumerate().take(50) {
+            let name = format!("trueDir_{}", i);
+            self.global_trust_dir_patterns.push_str(&format!("name={},key={}", name, dir.dir));
 
-        if dir.is_extend == 0 {
-            self.global_trust_dir_patterns.push_str(",isnot_extend=1");
+            if dir.is_extend == 0 {
+                self.global_trust_dir_patterns.push_str(",isnot_extend=1");
+            }
+
+            if dir.typ == 1 {
+                let depth = dir.dir.len();
+                self.global_trust_dir_patterns.push_str(&format!(",depth={}", depth));
+            } else {
+                self.global_trust_dir_patterns.push_str(",pkt_len=-1");
+            }
+
+            self.global_trust_dir_patterns.push_str(",case_offset=1\n");
+
+            self.global_trust_dir_rules.push_str(&format!(
+                    "target=TDir_rule,type=0,pattern={}\n",
+                    name
+            ));
         }
 
-        if dir.typ == 1 {
-            let depth = dir.dir.len();
-            self.global_trust_dir_patterns.push_str(&format!(",depth={}", depth));
-        } else {
-            self.global_trust_dir_patterns.push_str(",pkt_len=-1");
-        }
-
-        self.global_trust_dir_patterns.push_str(",case_offset=1\n");
-
-        self.global_trust_dir_rules.push_str(&format!(
-                "target=TDir_rule,type=0,pattern={}\n",
-                name
-        ));
+        self.set_pattern_rules();
     }
-
-    self.set_pattern_rules();
-}
 
     // 设置导出目录保护
 
-pub fn set_exiport_dir(&mut self, exports: Vec<POLICY_EXIPOR_PROTECT>) {
-    self.exiport_dir_patterns.clear();
-    self.exiport_dir_rules.clear();
-    self.exiport_true_process.clear();
+    pub fn set_exiport_dir(&mut self, exports: Vec<POLICY_EXIPOR_PROTECT>) {
+        self.exiport_dir_patterns.clear();
+        self.exiport_dir_rules.clear();
+        self.exiport_true_process.clear();
 
-    let mut trusted_process_rule_number = 0;
+        let mut trusted_process_rule_number = 0;
 
-    for (i, export) in exports.iter().enumerate().take(50) {
-        let name = format!("exiportInfo_{}", i);
+        for (i, export) in exports.iter().enumerate().take(50) {
+            let name = format!("exiportInfo_{}", i);
 
-        self.exiport_dir_patterns.push_str(&format!("name={}", name));
-        self.exiport_dir_rules.push_str(&format!("target={},pattern={}", name, name));
+            self.exiport_dir_patterns.push_str(&format!("name={}", name));
+            self.exiport_dir_rules.push_str(&format!("target={},pattern={}", name, name));
 
-        if export.typ == 1 {
-            // 后缀匹配
-            self.exiport_dir_patterns.push_str(",key=.");
-            self.exiport_dir_patterns.push_str(&export.file_type);
+            if export.typ == 1 {
+                // 后缀匹配
+                self.exiport_dir_patterns.push_str(",key=.");
+                self.exiport_dir_patterns.push_str(&export.file_type);
 
-            let offset = -(export.file_type.len() as isize + 1);
-            self.exiport_dir_patterns
-                .push_str(&format!(",offset={}", offset));
+                let offset = -(export.file_type.len() as isize + 1);
+                self.exiport_dir_patterns
+                    .push_str(&format!(",offset={}", offset));
 
-            self.exiport_dir_rules.push_str(",action=3"); // include file suffix
-        } else {
-            // 普通前缀匹配
-            self.exiport_dir_patterns.push_str(",case_offset=1");
-            self.exiport_dir_patterns.push_str(",key=");
-            self.exiport_dir_patterns.push_str(&export.file_type);
+                self.exiport_dir_rules.push_str(",action=3"); // include file suffix
+            } else {
+                // 普通前缀匹配
+                self.exiport_dir_patterns.push_str(",case_offset=1");
+                self.exiport_dir_patterns.push_str(",key=");
+                self.exiport_dir_patterns.push_str(&export.file_type);
 
-            self.exiport_dir_patterns
-                .push_str(&format!(",depth={}", export.file_type.len()));
+                self.exiport_dir_patterns
+                    .push_str(&format!(",depth={}", export.file_type.len()));
+            }
+
+            if !export.map_comm.is_empty() {
+                trusted_process_rule_number += 1;
+                let rule_id = trusted_process_rule_number.to_string();
+                for (k, _) in &export.map_comm {
+                    self.exiport_true_process
+                        .push_str(&format!("{},{},99\n", k, rule_id));
+                    }
+                log_info!("=====================================================true process [{:?}]", self.exiport_true_process);
+                self.exiport_dir_rules.push_str(&format!(",TPNC={}", rule_id));
+            }
+
+            self.exiport_dir_rules.push_str(",type=1\n");
+            self.exiport_dir_patterns.push_str("\n");
         }
 
-        if !export.map_comm.is_empty() {
-            trusted_process_rule_number += 1;
-            let rule_id = trusted_process_rule_number.to_string();
-            for (k, _) in &export.map_comm {
-                self.exiport_true_process
-                    .push_str(&format!("{},{},99\n", k, rule_id));
-                }
-            log_info!("=====================================================true process [{:?}]", self.exiport_true_process);
-            self.exiport_dir_rules.push_str(&format!(",TPNC={}", rule_id));
+        if exports.len() > 50 {
+            log::info!("exiport global dir is too big and break, size: {}", exports.len());
         }
 
-        self.exiport_dir_rules.push_str(",type=1\n");
-        self.exiport_dir_patterns.push_str("\n");
+        self.set_pattern_rules();
     }
+    pub fn clear_exiport_dir(&mut self) {
+        self.exiport_dir_patterns.clear();
+        self.exiport_dir_rules.clear();
+        self.set_pattern_rules();
+    } 
 
-    if exports.len() > 50 {
-        log::info!("exiport global dir is too big and break, size: {}", exports.len());
-    }
-
-    self.set_pattern_rules();
-}
     pub fn set_protect_dir(&mut self, dirs: Vec<POLICY_PROTECT_DIR>) {
         let mut trusted_process_rule_number = 0;
 
@@ -430,20 +436,20 @@ pub fn set_exiport_dir(&mut self, exports: Vec<POLICY_EXIPOR_PROTECT>) {
                 for (j, white_path) in dir.is_white.split('|').enumerate() {
                     let j_str = format!("_{}", j);
                     self.protect_dir_white_patterns.push_str(&format!(
-                        "name=protectExcludeDir_{}{},key={}\n",
-                        i_str, j_str, white_path
+                            "name=protectExcludeDir_{}{},key={}\n",
+                            i_str, j_str, white_path
                     ));
                     self.protect_dir_white_rules.push_str(&format!(
-                        "target=protectExcludeDir,pattern=protectExcludeDir_{}{},type=2,action=1,rule_idx={},level=1\n",
-                        i_str, j_str, i_str
+                            "target=protectExcludeDir,pattern=protectExcludeDir_{}{},type=2,action=1,rule_idx={},level=1\n",
+                            i_str, j_str, i_str
                     ));
                 }
             }
 
             // 目录规则 pattern
             self.protect_dir_patterns.push_str(&format!(
-                "name=ProtectDir_{},type=2,key={}",
-                i_str, dir.dir
+                    "name=ProtectDir_{},type=2,key={}",
+                    i_str, dir.dir
             ));
 
             if dir.typ == 1 {
@@ -462,13 +468,13 @@ pub fn set_exiport_dir(&mut self, exports: Vec<POLICY_EXIPOR_PROTECT>) {
                 for (j, suffix) in dir.include_file.split('|').enumerate() {
                     let j_str = format!("_{}", j);
                     self.protect_dir_include_exe_patterns.push_str(&format!(
-                        "name=protectIncFileExe_{}{},key=.{},offset=-{}\n",
-                        i_str, j_str, suffix, suffix.len() + 1
+                            "name=protectIncFileExe_{}{},key=.{},offset=-{}\n",
+                            i_str, j_str, suffix, suffix.len() + 1
                     ));
 
                     self.protect_dir_include_exe_rules.push_str(&format!(
-                        "target=protectIncFileExe_{},pattern=ProtectDir_{}>protectIncFileExe_{}{},rule_idx={},action=3,protect_rw={}",
-                        i_str, i_str, i_str, j_str, i_str, dir.protect_rw
+                            "target=protectIncFileExe_{},pattern=ProtectDir_{}>protectIncFileExe_{}{},rule_idx={},action=3,protect_rw={}",
+                            i_str, i_str, i_str, j_str, i_str, dir.protect_rw
                     ));
 
                     if has_white_hash {
@@ -490,8 +496,8 @@ pub fn set_exiport_dir(&mut self, exports: Vec<POLICY_EXIPOR_PROTECT>) {
             // file_ext 排除规则
             else if !dir.file_ext.is_empty() {
                 self.protect_dir_rules.push_str(&format!(
-                    "target=ProtectDir_{},pattern=ProtectDir_{},rule_idx={},protect_rw={}",
-                    i_str, i_str, i_str, dir.protect_rw
+                        "target=ProtectDir_{},pattern=ProtectDir_{},rule_idx={},protect_rw={}",
+                        i_str, i_str, i_str, dir.protect_rw
                 ));
                 if has_white_hash {
                     self.protect_dir_rules
@@ -502,18 +508,18 @@ pub fn set_exiport_dir(&mut self, exports: Vec<POLICY_EXIPOR_PROTECT>) {
                 for (j, suffix) in dir.file_ext.split('|').enumerate() {
                     let j_str = format!("_{}", j);
                     self.protect_dir_exclude_exe_patterns.push_str(&format!(
-                        "name=protectExcFileExe_{}{},key=.{},offset=-{}\n",
-                        i_str, j_str, suffix, suffix.len() + 1
+                            "name=protectExcFileExe_{}{},key=.{},offset=-{}\n",
+                            i_str, j_str, suffix, suffix.len() + 1
                     ));
                     self.protect_dir_exclude_exe_rules.push_str(&format!(
-                        "target=protectExcFileExe_{}{},pattern=ProtectDir_{}>protectExcFileExe_{}{},rule_idx={},action=2,type=2\n",
-                        i_str, j_str, i_str, i_str, j_str, i_str
+                            "target=protectExcFileExe_{}{},pattern=ProtectDir_{}>protectExcFileExe_{}{},rule_idx={},action=2,type=2\n",
+                            i_str, j_str, i_str, i_str, j_str, i_str
                     ));
                 }
             } else {
                 self.protect_dir_rules.push_str(&format!(
-                    "target=ProtectDir_{},pattern=ProtectDir_{},rule_idx={},protect_rw={}",
-                    i_str, i_str, i_str, dir.protect_rw
+                        "target=ProtectDir_{},pattern=ProtectDir_{},rule_idx={},protect_rw={}",
+                        i_str, i_str, i_str, dir.protect_rw
                 ));
                 if has_white_hash {
                     self.protect_dir_rules
@@ -530,6 +536,22 @@ pub fn set_exiport_dir(&mut self, exports: Vec<POLICY_EXIPOR_PROTECT>) {
         log_info!("protect_dir_exclude_exe_rules:{}", self.protect_dir_exclude_exe_rules);
         log_info!("protect_dir_white_rules:{}", self.protect_dir_white_rules);
         log_info!("protect_true_process:{}", self.protect_true_process);
+
+        self.set_pattern_rules();
+    }
+
+
+    pub fn clear_protect_dir(&mut self) {
+
+        self.protect_dir_patterns.clear();
+        self.protect_dir_white_patterns.clear();
+        self.protect_dir_rules.clear();
+        self.protect_dir_white_rules.clear();
+        self.protect_dir_include_exe_patterns.clear();
+        self.protect_dir_include_exe_rules.clear();
+        self.protect_dir_exclude_exe_patterns.clear();
+        self.protect_dir_exclude_exe_rules.clear();
+        self.protect_true_process.clear();
 
         self.set_pattern_rules();
     }
@@ -572,7 +594,7 @@ pub fn set_exiport_dir(&mut self, exports: Vec<POLICY_EXIPOR_PROTECT>) {
             let _ = Self::write_to_proc_file("/proc/osec/dpi/true_process_rt", &self.protect_true_process);
         }
         if !self.exiport_true_process.is_empty() {
-            
+
             log_info!("=====================================================true process [{:?}]", self.exiport_true_process);
             let _ = Self::write_to_proc_file("/proc/osec/dpi/true_process_rt", &self.exiport_true_process);
         }
@@ -583,14 +605,14 @@ pub fn set_exiport_dir(&mut self, exports: Vec<POLICY_EXIPOR_PROTECT>) {
     // 判断是否变更
     fn patterns_has_changed(&self) -> bool {
         self.pre_global_trust_dir_patterns != self.global_trust_dir_patterns ||
-        self.pre_exiport_dir_patterns != self.exiport_dir_patterns ||
-        self.pre_const_file_patterns != self.const_file_patterns ||
-        self.pre_protect_dir_patterns != self.protect_dir_patterns ||
-        self.pre_protect_dir_white_patterns != self.protect_dir_white_patterns ||
-        self.pre_protect_dir_include_exe_patterns != self.protect_dir_include_exe_patterns ||
-        self.pre_protect_dir_exclude_exe_patterns != self.protect_dir_exclude_exe_patterns ||
-        self.pre_exiport_true_process != self.exiport_true_process ||
-        self.pre_protect_true_process != self.protect_true_process
+            self.pre_exiport_dir_patterns != self.exiport_dir_patterns ||
+            self.pre_const_file_patterns != self.const_file_patterns ||
+            self.pre_protect_dir_patterns != self.protect_dir_patterns ||
+            self.pre_protect_dir_white_patterns != self.protect_dir_white_patterns ||
+            self.pre_protect_dir_include_exe_patterns != self.protect_dir_include_exe_patterns ||
+            self.pre_protect_dir_exclude_exe_patterns != self.protect_dir_exclude_exe_patterns ||
+            self.pre_exiport_true_process != self.exiport_true_process ||
+            self.pre_protect_true_process != self.protect_true_process
     }
 
     // 备份当前状态

@@ -21,6 +21,7 @@ pub struct NetInfoConfig {
     pub log_ip_port: Option<String>,
     pub log_proto: u32,
     pub log_sent: u32,
+    pub cli_port: u32,
     pub module_switch: u32,
     pub open_port_switch: bool,
     pub proc_protect: bool,
@@ -35,6 +36,7 @@ pub struct NetInfoConfig {
     pub syslog_dns_switch: bool,
     pub syslog_outer_switch: bool,
     pub syslog_inner_switch: bool,
+    pub syslog_process_switch:bool,
     pub internet_switch: bool,
     pub user_id: String,  // USER_ID 字段
 //=====host info
@@ -95,9 +97,13 @@ impl NetInfoConfig {
         if let Some(mid) = ini.get("CLIENTINFO", "MID") {
             config.mid = mid; // MID 存储到 mid 字段
         }
+        /*
         if let Some(value) = ini.get("SERVERINFO", "VERSION") {
             config.ver = value.parse().unwrap_or_default();
         }
+        */
+        config.ver = ini.get("SERVERINFO", "VERSION")
+            .unwrap_or_else(|| "3.0.1_T9".to_string());
 
         if let Some(user_id) = ini.get("SERVERINFO", "USER_ID") {
             config.user_id = user_id; // USER_ID 存储到 user_id 字段
@@ -182,6 +188,9 @@ impl NetInfoConfig {
             config.internet_switch = value.parse().unwrap_or_default();
         }
 
+        if let Some(value) = ini.get("SERVERINFO", "SYSLOG_PROCESS_SWITCH") {
+            config.syslog_process_switch = value.parse().unwrap_or_default();
+        }
         if let Some(value) = ini.get("HOSTINFO", "DEV_UID") {
             config.dev_uid = value.parse().unwrap_or_default();
         }
@@ -242,6 +251,9 @@ impl NetInfoConfig {
         writeln!(file, "DNS_SWITCH={}", self.syslog_dns_switch as u8)?;
         writeln!(file, "INTERNAL_COMMUNICATION_SWITCH={}", self.syslog_outer_switch as u8)?;
         writeln!(file, "EXTERNAL_COMMUNICATION_SWITCH={}", self.syslog_inner_switch as u8)?;
+        writeln!(file, "SYSLOG_PROCESS_SWITCH={}", self.syslog_process_switch as u8)?;
+        writeln!(file, "PROC_SWITCH={}", self.proc_switch as u8)?;
+
         writeln!(file, "INTERNET_SWITCH={}", self.internet_switch as u8)?;
         writeln!(file, "VERSION={}", self.ver)?;
         writeln!(file, "[HOSTINFO]")?;

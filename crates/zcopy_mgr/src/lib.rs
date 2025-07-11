@@ -57,15 +57,79 @@ pub struct OsecDnsReport {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct AvProcessInfo {
-    pid: i32,
-    ppid: i32,
-    uid: i32,
-    type_: i32,
-    flags: u32, // 合并 is_dir, deny, param_pos, level, is_monitor_mode
-    timestamp: u64,
-    path: [u8; MAX_PROCESS_PATH],
+    pub pid: i32,
+    pub ppid: i32,
+    pub uid: i32,
+    pub type_: i32,
+    pub flags: u32, // 合并 is_dir, deny, param_pos, level, is_monitor_mode
+    pub timestamp: u64,
+    pub path: [u8; MAX_PROCESS_PATH],
 }
+
+// 拆解后的 flags 字段结构体
+#[derive(Debug)]
+pub struct AvProcessFlags {
+    pub is_dir: u8,
+    pub deny: u8,
+    pub param_pos: u16,
+    pub level: u8,
+    pub is_monitor_mode: u8,
+}
+
+impl From<u32> for AvProcessFlags {
+    fn from(flags: u32) -> Self {
+        AvProcessFlags {
+            is_dir:           ((flags >> 0) & 0b0000_0111) as u8,
+            deny:             ((flags >> 3) & 0b0000_0111) as u8,
+            param_pos:        ((flags >> 6) & 0b0000_0011_1111_1111) as u16,
+            level:            ((flags >> 16) & 0b0000_0111) as u8,
+            is_monitor_mode:  ((flags >> 19) & 0b0000_0011) as u8,
+        }
+    }
+}
+
+impl AvProcessInfo {
+    /// 提取位字段结构体
+    pub fn flags_parsed(&self) -> AvProcessFlags {
+        self.flags.into()
+    }
+
+    /// 获取单个字段方法（你可以在业务代码中直接调用）
+    pub fn is_dir(&self) -> u8 {
+        self.flags_parsed().is_dir
+    }
+
+    pub fn deny(&self) -> u8 {
+        self.flags_parsed().deny
+    }
+
+    pub fn param_pos(&self) -> u16 {
+        self.flags_parsed().param_pos
+    }
+
+    pub fn level(&self) -> u8 {
+        self.flags_parsed().level
+    }
+
+    pub fn is_monitor_mode(&self) -> u8 {
+        self.flags_parsed().is_monitor_mode
+    }
+
+    /// 安全解析路径为字符串
+    pub fn get_path_str(&self) -> Option<String> {
+        let ptr = self.path.as_ptr();
+        unsafe {
+            CStr::from_ptr(ptr as *const i8)
+                .to_str()
+                .ok()
+                .map(|s| s.to_string())
+        }
+    }
+}
+
+
 
 #[repr(C)]
 #[derive(Clone, Copy)]

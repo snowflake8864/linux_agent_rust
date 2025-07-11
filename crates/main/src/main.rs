@@ -5,7 +5,7 @@ use task::TaskService;
 use kernel_event::{StartKernelHandler, EventHandler};
 use kernel_module::{LoadKernelDriver, unload_driver};
 use common::manager::boot::BootManager;
-use reporter::{FileAuditLogInfo, StartBashLog};
+use reporter::{AuditLogInfo, StartBashLog};
 use tokio::sync::mpsc;
 use logging::{log_info, CustomLogger};
 use netlink::netlink::NlSockInfo;
@@ -32,7 +32,7 @@ async fn main() -> std::io::Result<()> {
 
     let _ = unload_driver().ok();
     let init = BootManager::init().await;
-    let (file_audit_log_tx, file_audit_log_rx) = mpsc::channel::<FileAuditLogInfo>(512);
+    let (file_audit_log_tx, file_audit_log_rx) = mpsc::channel::<AuditLogInfo>(512);
     let (token_tx, token_rx) = mpsc::channel::<String>(8);
     let (host_is_offline_tx, host_is_offline_rx) = mpsc::channel::<bool>(8);
 
@@ -45,7 +45,13 @@ async fn main() -> std::io::Result<()> {
         });
         cfg.mod_ver = mod_ver;
     }
-
+    let nl_sock = NlSockInfo::create_socket()
+        .map_err(|e| {
+            logging::log_error!("Netlink套接字创建失败: {}", e);
+            e
+        })
+    .ok(); // 转换为Option
+           //
     let start_services_handle = tokio::spawn({
         let mut init = init.clone();
         async move {
@@ -62,8 +68,9 @@ async fn main() -> std::io::Result<()> {
 
     let task_fetcher_handle = tokio::spawn({
         let mut init = init.clone();
+        let nl_sock = nl_sock.clone();
         async move {
-            init.task_fetcher(host_is_offline_tx, token_rx).await.unwrap();
+            init.task_fetcher(host_is_offline_tx, token_rx, nl_sock).await.unwrap();
         }
     });
 
@@ -73,7 +80,8 @@ async fn main() -> std::io::Result<()> {
     let mut task_kernel_send_handler = None;
     let mut task_kernel_rcv_handler = None;
 
-    if let Ok(nl_sock) = NlSockInfo::create_socket() {
+    if let Some(nl_sock) = nl_sock
+    {
         task_kernel_send_handler = Some(tokio::spawn({
             let mut init = init.clone();
             let tx = file_audit_log_tx.clone();

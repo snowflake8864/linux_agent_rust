@@ -7,6 +7,7 @@ use std::ptr;
 use std::mem;
 use libc::{self, iovec, msghdr, sockaddr_nl, NLM_F_REQUEST};
 use std::convert::TryInto;
+use logging::{log_info,log_error};
 
 const NETLINK_USER: i32 = 20;
 
@@ -150,12 +151,17 @@ impl NlSockInfo {
         if send_len < 0 {
             return Err(io::Error::last_os_error());
         }
-        println!("msg:{}", msg_type);
+        log_info!("msg:{}", msg_type);
         Ok(send_len)
     }
-
-
-
+    pub fn send_bool(&self, msg_type: u16, value: bool) -> io::Result<isize> {
+        let data = if value { b"\x01\x00\x00\x00" } else { b"\x00\x00\x00\x00" };
+        self.send_message(msg_type, data)
+    }
+    pub fn send_uint32(&self, msg_type: u16, value: u32) -> io::Result<isize> {
+        let bytes = value.to_ne_bytes(); // 保持原生字节序
+        self.send_message(msg_type, &bytes)
+    }
     pub fn receive_netlink_message(&self) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; 4096];
         let iov = libc::iovec {

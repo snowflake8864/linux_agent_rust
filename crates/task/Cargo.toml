@@ -23,7 +23,7 @@ logging = { path = "../logging" }
 log = "0.4"
 pattern = { path = "../pattern" }
 process_mgr = { path =  "../process_mgr" }
-
+netlink = { path = "../netlink" }
 [features]
 test_mode = []
 
