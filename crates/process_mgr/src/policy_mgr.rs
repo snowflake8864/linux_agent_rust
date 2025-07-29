@@ -71,7 +71,7 @@ impl ProcessPolicyManager {
 
             for path in &self.prev_white_set {
                 if !self.white_set.contains(path) {
-                    let rule = format!("del {}\n", path);
+                    let rule = format!("del 0 {}\n", path);
                     Self::add_md5_rules(&rule);
                     is_changed = true;
                 }
@@ -101,7 +101,7 @@ impl ProcessPolicyManager {
 
             for path in &self.prev_black_set {
                 if !self.black_set.contains(path) {
-                    let rule = format!("del {}\n", path);
+                    let rule = format!("del 1 {}\n", path);
                     Self::add_md5_rules(&rule);
                     is_changed = true;
                 }

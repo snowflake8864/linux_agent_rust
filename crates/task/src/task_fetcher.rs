@@ -19,7 +19,9 @@ use pattern::pattern_rules_mgr;
 use tokio::sync::mpsc;
 use process_mgr::POLICY_MANAGER;
 use netlink::netlink::NlSockInfo; // 引入 NLPolicyType
-                                  //
+use hostinfo::net_app::model::get_netapp_json; 
+use netblock::ip_policy::{IpPolicy, update_and_write_policies, is_ipv6};
+                                
 fn get_u32(map: &serde_json::Map<String, Value>, key: &str) -> Result<u32, String> {
     map.get(key)
         .and_then(|v| v.as_number().and_then(|n| n.as_u64()))
@@ -44,6 +46,7 @@ pub struct TaskFetcher {
     prev_extortion_switch:bool,
     prev_proc_switch:bool,
     prev_syslog_process_switch:bool,
+    prev_dynamic_switch:bool,
     nl_sock: Option<NlSockInfo>,
 }
 use num_derive::FromPrimitive; // 支持从整数到枚举的转换
@@ -93,6 +96,7 @@ enum NetRule<'a> {
     DefenseSwitch(u32),
     SelfProtect(u32),
     NetLogPolicy((bool, bool)),
+    NetBlockSwitch(u32),
 }
 fn ip_str_to_u32(ip: &str) -> Result<u32, String> {
     let parsed = ip.parse::<Ipv4Addr>().map_err(|e| e.to_string())?;
@@ -111,6 +115,9 @@ impl TaskFetcher {
         api_interface.insert("gettrustdir".to_string(), "v1/gettrustdir".to_string());
         api_interface.insert("getvirtualport".to_string(), "v1/getvirtualport".to_string());
         api_interface.insert("upload_gloabal_process".to_string(), "v1/upload/suffix/exe".to_string());
+        api_interface.insert("getPlugging".to_string(), "v1/getPlugging".to_string());
+        api_interface.insert("getipblacklist".to_string(), "v1/getipblacklist".to_string());
+        api_interface.insert("upserviceport".to_string(), "v1/upserviceport".to_string());
 
         TaskFetcher {
               base_url: base_url.to_string(),
@@ -123,6 +130,7 @@ impl TaskFetcher {
               prev_extortion_switch:false,
               prev_proc_switch:false,
               prev_syslog_process_switch:false,
+              prev_dynamic_switch:false,
               nl_sock,
         }
     }
@@ -170,6 +178,9 @@ impl TaskFetcher {
                     .map_err(|e| e.to_string())?;
                 Ok(())
             } 
+            NetRule::NetBlockSwitch(block_switch) => {
+                self.write_netblock_switch(&block_switch.to_string())
+            }
         }
     }
     fn write_raw(&self, rule_type: &str, value: &str) -> Result<(), String> {
@@ -182,6 +193,12 @@ impl TaskFetcher {
         fs::write("/proc/osec/defense_switch", content)
             .map_err(|e| format!("Failed to write to /proc/osec/defense_switch: {}", e))
     }
+
+     fn write_netblock_switch(&self, value: &str) -> Result<(), String> {
+        let content = format!("{}\n", value);
+        fs::write("/proc/osec/osec_conn/block_switch", content)
+            .map_err(|e| format!("Failed to write to /proc/osec/osec_conn/block_switch: {}", e))
+    }
      fn update_config_from_json(&mut self, conf: &serde_json::Map<String, Value>) -> Result<(), String> {
 
         let mut cfg = NETINFO_CONFIG.lock().unwrap(); // 这里使用 from_ini 解析配置
@@ -191,11 +208,9 @@ impl TaskFetcher {
                  .map(|s| s.to_string()) 
          {
 
-             // 分割协议和主体部分
              let (protocol, mut rest) = url.split_once("://")
                  .expect("Invalid URL format");
 
-             // 移除路径部分（如果有）
              if let Some(path_idx) = rest.find('/') {
                  rest = &rest[..path_idx];
              }
@@ -253,6 +268,12 @@ impl TaskFetcher {
                  self.write_net_rule(NetRule::VirtualOpenPort(cfg.open_port_switch))?;
              }
          }
+         cfg.dynamic_switch = get_bool(conf, "dynamic_switch")?;
+         if cfg.dynamic_switch != self.prev_dynamic_switch {
+             self.prev_dynamic_switch = cfg.dynamic_switch;
+             self.write_net_rule(NetRule::NetBlockSwitch(cfg.dynamic_switch as u32))?;
+         }
+
          cfg.proc_protect = get_bool(conf, "proc_protect")?;
          cfg.proc_switch = get_bool(conf, "proc_switch")?;
          cfg.usb_protect = get_bool(conf, "usb_protect")?;
@@ -359,7 +380,7 @@ impl TaskFetcher {
                         //println!("task list:{:?}", task_list);
                         for task_id in task_list {
                             if let Some(task_type) = TaskTypeEnum::from_u32(task_id) {
-                                //println!("task ID: {}", task_id);
+                                log_info!("task ID: {}, task type: {:?}", task_id, task_type);
                                 if let Err(e) = task_fetcher.handle_task(task_type).await {
                                     eprintln!("Failed to handle task {}: {}", task_id, e);
                                 }
@@ -399,6 +420,7 @@ impl TaskFetcher {
             TaskTypeEnum::TaskDownVirtualPort => self.task_down_virtual_port().await,
             TaskTypeEnum::TaskDownNetBlockPolicy => self.task_down_netblock_policy().await,
             TaskTypeEnum::TaskDownExtort => self.task_down_extort().await,
+            TaskTypeEnum::TaskDownBlackIpPolicy => self.task_down_black_ip_policy().await,
             TaskTypeEnum::TaskUploadProcessModule => self.task_upload_process_module().await,
             TaskTypeEnum::TaskUploadAllProcessModule => self.task_upload_all_process_module().await,
             TaskTypeEnum::TaskUploadProcessWhiteModule => self.task_upload_process_white_module().await,
@@ -490,7 +512,6 @@ impl TaskFetcher {
     }
 
 
-    // 处理 TASK_DOWN_CONF 任务
     async fn task_down_conf(&mut self) -> Result<(), String> {
         let download_url = match self.api_interface.get("getconf") {
             Some(url) => url,
@@ -503,7 +524,6 @@ impl TaskFetcher {
         };
         let url = format!("{}/{}", self.base_url, download_url);
 
-        //println!("Processing TASK_DOWN_CONF...{}", url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
         match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
@@ -663,10 +683,32 @@ impl TaskFetcher {
         Ok(())
     }
 
-    // 处理 TASK_UPLOAD_PORT 任务
     async fn task_upload_port(&self) -> Result<(), String> {
         //println!("Processing TASK_UPLOAD_PORT...");
-        // 端口上传处理
+
+        let upload_url = match self.api_interface.get("upserviceport") {
+            Some(url) => url,
+            None => return Err("URL for upload_gloabal_process not found".to_string()),
+        };
+
+        let net_client = match NetClient::new(self.base_url.clone(), true) {
+            Ok(client) => client,
+            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
+        };
+
+        let url = format!("{}/{}", self.base_url, upload_url);
+        let token = self.get_token();
+        let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
+// Get JSON string using get_netapp_json
+        let json_data = match get_netapp_json() {
+            Ok(json) => json,
+            Err(e) => return Err(format!("Failed to serialize port data to JSON: {}", e)),
+        };
+        log_info!("准备上传的数据: {}", json_data);
+        match net_client.post_data_async(&url, &json_data, Duration::from_secs(10), token_str).await {
+            Ok(response) => log_info!("服务器响应: {}", response),
+            Err(err) => log_error!("发送指标失败: {}", err),
+        }
         Ok(())
     }
 
@@ -771,13 +813,127 @@ impl TaskFetcher {
 
         Ok(())
     }
-    // 处理 TASK_DOWN_NETBLOCK_POLICY 任务
+   
+
     async fn task_down_netblock_policy(&self) -> Result<(), String> {
-        println!("Processing TASK_DOWN_NETBLOCK_POLICY...");
-        // 下载网络阻塞策略
-        Ok(())
+        let download_url = match self.api_interface.get("getPlugging") {
+            Some(url) => url,
+            None => return Err("未找到 netblock 策略的 URL".to_string()),
+        };
+        let net_client = match NetClient::new(self.base_url.clone(), true) {
+            Ok(client) => client,
+            Err(e) => return Err(format!("创建 NetClient 失败: {}", e)),
+        };
+
+        let url = format!("{}/{}", self.base_url, download_url);
+        let token = self.get_token();
+        let token_str = token.as_ref().map(|s| s.as_str());
+        let response = match net_client
+            .post_data_async(&url, "", Duration::from_secs(10), token_str)
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    eprintln!("获取 netblock 策略失败: {}", err);
+                    return Err(err);
+                }
+            };
+
+        // 解析 JSON 响应
+        let parsed: Value = match serde_json::from_str(&response) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                eprintln!("解析 netblock 响应失败: {}", e);
+                return Err("解析 netblock 响应失败".to_string());
+            }
+        };
+
+        if parsed["code"] != "000000" {
+            eprintln!("错误: netblock 响应代码无效: {}", parsed["code"]);
+            return Err("netblock 响应代码无效".to_string());
+        }
+
+        // 提取策略
+        let mut policies: Vec<IpPolicy> = Vec::new();
+        if let Some(data) = parsed["data"].as_array() {
+            for entry in data {
+                if let (Some(ip), Some(direction), Some(duration)) = (
+                    entry["ip"].as_str(),
+                    entry["direction"].as_u64().map(|d| d as u32),
+                    entry["duration"].as_u64(),
+                ) {
+                    policies.push(IpPolicy {
+                        ip: ip.to_string(),
+                        direction,
+                        duration,
+                        is_ipv6: is_ipv6(ip),
+                    });
+                }
+            }
+        }
+
+        update_and_write_policies(policies).await
     }
 
+    async fn task_down_black_ip_policy(&self) -> Result<(), String> {
+        let download_url = match self.api_interface.get("getipblacklist") {
+            Some(url) => url,
+            None => return Err("未找到 black IP 策略的 URL".to_string()),
+        };
+        let net_client = match NetClient::new(self.base_url.clone(), true) {
+            Ok(client) => client,
+            Err(e) => return Err(format!("创建 NetClient 失败: {}", e)),
+        };
+
+        let url = format!("{}/{}", self.base_url, download_url);
+        let token = self.get_token();
+        let token_str = token.as_ref().map(|s| s.as_str());
+        let response = match net_client
+            .post_data_async(&url, "", Duration::from_secs(10), token_str)
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    eprintln!("获取 black IP 策略失败: {}", err);
+                    return Err(err);
+                }
+            };
+
+        // 解析 JSON 响应
+        let parsed: Value = match serde_json::from_str(&response) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                eprintln!("解析 black IP 响应失败: {}", e);
+                return Err("解析 black IP 响应失败".to_string());
+            }
+        };
+
+        if parsed["code"] != "000000" {
+            eprintln!("错误: black IP 响应代码无效: {}", parsed["code"]);
+            return Err("black IP 响应代码无效".to_string());
+        }
+
+        // 提取策略
+        let mut policies: Vec<IpPolicy> = Vec::new();
+        if let Some(data) = parsed["data"].as_array() {
+            for entry in data {
+                if let (Some(ip), Some(direction)) = (
+                    entry["ip"].as_str(),
+                    entry["direction"].as_u64().map(|d| d as u32),
+                ) {
+                    policies.push(IpPolicy {
+                        ip: ip.to_string(),
+                        direction,
+                        duration: 0, // black_ip_policy 没有 duration，设为 0
+                        is_ipv6: is_ipv6(ip),
+                    });
+                }
+            }
+        }
+
+        // 更新全局 Map 并下发到内核
+        update_and_write_policies(policies).await
+    }
     async fn task_down_extort(&self) -> Result<(), String> {
         // 获取 download_white 的 URL
         let download_url = match self.api_interface.get("getprotect") {
@@ -822,7 +978,6 @@ impl TaskFetcher {
             }
         }
 
-       // println!("Extracted hashes: {:?}", hash_list);
 
         Ok(())
     }
@@ -907,7 +1062,6 @@ impl TaskFetcher {
         Ok(())
     }
 
-    // 处理 TASK_GLOBAL_DIR 任务
     async fn task_global_dir(&self) -> Result<(), String> {
         // 获取 download_white 的 URL
         let download_url = match self.api_interface.get("gettrustdir") {
@@ -919,7 +1073,6 @@ impl TaskFetcher {
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
 
-        // 组合最终的 URL
         let url = format!("{}/{}", self.base_url, download_url);
         println!("=================={}",url);
         let token = self.get_token();

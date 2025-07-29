@@ -531,11 +531,17 @@ checksum = "6fe2267d4ed49bc07b63801559be28c718ea06c4738b7a03c94df7386d2cde46"
 name = "hostinfo"
 version = "0.10.6"
 dependencies = [
+ "chrono",
  "configparser",
  "get_if_addrs",
  "hex",
+ "lazy_static",
  "libc",
+ "log",
+ "logging",
  "md-5",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -836,6 +842,7 @@ name = "kernel_event"
 version = "0.10.6"
 dependencies = [
  "common",
+ "hostinfo",
  "log",
  "logging",
  "netlink",
@@ -1002,6 +1009,18 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "netblock"
+version = "0.1.0"
+dependencies = [
+ "lazy_static",
+ "log",
+ "logging",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1674,6 +1693,7 @@ dependencies = [
  "log",
  "logging",
  "net_client",
+ "netblock",
  "netlink",
  "num-derive",
  "num-traits",

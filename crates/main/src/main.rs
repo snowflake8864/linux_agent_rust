@@ -1,7 +1,7 @@
 use libc::{sigaction, sighandler_t, SIGPIPE, SIG_IGN, SA_RESTART, sigemptyset};
 use tokio::signal::unix::{signal as unix_signal, SignalKind};
 use online::StartOnline;
-use task::TaskService;
+use task::{TaskService, TimerTask};
 use kernel_event::{StartKernelHandler, EventHandler};
 use kernel_module::{LoadKernelDriver, unload_driver};
 use common::manager::boot::BootManager;
@@ -50,7 +50,7 @@ async fn main() -> std::io::Result<()> {
             logging::log_error!("Netlink套接字创建失败: {}", e);
             e
         })
-    .ok(); // 转换为Option
+    .ok(); 
            //
     let start_services_handle = tokio::spawn({
         let mut init = init.clone();
@@ -74,6 +74,12 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
+    let timer_task_handle = tokio::spawn({
+        let mut init = init.clone();
+        async move {
+            init.start_timer_task().await.unwrap();
+        }
+    });
     let event_handler = Arc::new(Mutex::new(EventHandler::new()));
     let event_handler_send = Arc::clone(&event_handler);
 
@@ -111,6 +117,7 @@ async fn main() -> std::io::Result<()> {
     start_services_handle.await.unwrap();
     task_fetcher_handle.await.unwrap();
     log_services_handler.await.unwrap();
+    timer_task_handle.await.unwrap();
 
     if let Some(handle) = task_kernel_send_handler {
         handle.await.unwrap();
