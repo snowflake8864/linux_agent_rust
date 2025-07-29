@@ -12,3 +12,4 @@ logging = { path =  "../logging" }
 log = "0.4"
 reporter = { path =  "../reporter" }
 zcopy_mgr = { path =  "../zcopy_mgr" }
+hostinfo = { path =  "../hostinfo" }

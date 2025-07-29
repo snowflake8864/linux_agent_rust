@@ -18,6 +18,7 @@ members = [
      "crates/zcopy_mgr",
   #     "crates/process_md5_cache",
      "crates/process_mgr",
+     "crates/netblock",
 ]
 
 [profile.dev]

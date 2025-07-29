@@ -17,6 +17,7 @@ use netlink::netlink::NlSockInfo; // 引入 NLPolicyType
 use common::manager::boot::BootManager;
 use reporter::file_audit::FileAuditHandler;
 use reporter::process_audit::ProcessAuditHandler;
+use hostinfo::net_app::handler::NetAppHandler;
 use zcopy_mgr::ZcopyMgr;
 
 #[derive(Eq, Hash, PartialEq, Debug)]
@@ -63,6 +64,7 @@ pub enum NLPolicyType {
     NL_POLICY_NET_DNS_PORT_ZCOPY_NOTIFY,
     NL_POLICY_INFO_KERN_TO_APP_NOTIFY,
     NL_POLICY_UPDATE_PROCESS_RULE_NOTIFY,
+    NL_POLICY_SERVER_LISTEN_NOTIFY,
     NL_MAX_INDEX = 0x1000, // 4096
 }
 
@@ -110,6 +112,7 @@ impl NLPolicyType {
             0x511 => Some(NLPolicyType::NL_POLICY_NET_DNS_PORT_ZCOPY_NOTIFY),
             0x512 => Some(NLPolicyType::NL_POLICY_INFO_KERN_TO_APP_NOTIFY),
             0x513 => Some(NLPolicyType::NL_POLICY_UPDATE_PROCESS_RULE_NOTIFY),
+            0x514 => Some(NLPolicyType::NL_POLICY_SERVER_LISTEN_NOTIFY),
             0x1000 => Some(NLPolicyType::NL_MAX_INDEX),
             _ => None,
         }
@@ -160,6 +163,7 @@ impl fmt::Display for NLPolicyType {
             NLPolicyType::NL_POLICY_NET_DNS_PORT_ZCOPY_NOTIFY => "NL_POLICY_NET_DNS_PORT_ZCOPY_NOTIFY",
             NLPolicyType::NL_POLICY_INFO_KERN_TO_APP_NOTIFY => "NL_POLICY_INFO_KERN_TO_APP_NOTIFY",
             NLPolicyType::NL_POLICY_UPDATE_PROCESS_RULE_NOTIFY => "NL_POLICY_UPDATE_PROCESS_RULE_NOTIFY",
+            NLPolicyType::NL_POLICY_SERVER_LISTEN_NOTIFY => "NL_POLICY_SERVER_LISTEN_NOTIFY",
             NLPolicyType::NL_MAX_INDEX => "NL_MAX_INDEX",
         };
         write!(f, "{}", result)
@@ -299,6 +303,7 @@ pub async fn register_user_event_handlers(
 
     let file_audit_handler = FileAuditHandler::new(zcopy_mgr.clone(), file_audit_log_tx);
     let process_audit_handler = ProcessAuditHandler::new(zcopy_mgr, boot_manager);
+    let net_app_handler = NetAppHandler::new();
 
     let mut handler = event_handler.lock().await;
     handler
@@ -318,13 +323,26 @@ pub async fn register_user_event_handlers(
         NLPolicyType::NL_POLICY_AV_PROCESS_EXEC_ZCOPY_NOTIFY,
         move |data, len| {
             let handler = process_audit_handler.clone();
-            let data = data.to_vec(); // 拷贝数据
+            let data = data.to_vec(); 
             Box::pin(async move {
                 handler.handle_process_zcopy_oper(&data, len).await
             })
         },
     )
     .await;
+    handler
+    .register_event_handler(
+        NLPolicyType::NL_POLICY_SERVER_LISTEN_NOTIFY,
+        move |data, len| {
+            let handler = net_app_handler.clone();
+            let data = data.to_vec(); 
+            Box::pin(async move {
+                handler.get_net_app_handler(&data, len).await
+            })
+        },
+    )
+    .await;
+
 }
 
 pub trait StartKernelHandler {

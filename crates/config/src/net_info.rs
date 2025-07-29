@@ -18,6 +18,7 @@ pub struct NetInfoConfig {
     pub fast_time: u32,
     pub file_protect: bool,
     pub file_switch: bool,
+    pub dynamic_switch: bool,
     pub log_ip_port: Option<String>,
     pub log_proto: u32,
     pub log_sent: u32,
@@ -130,6 +131,9 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("SERVERINFO", "FILE_SWITCH") {
             config.file_switch = value.parse().unwrap_or_default();
         }
+        if let Some(value) = ini.get("SERVERINFO", "DYNAMIC_SWITCH") {
+            config.dynamic_switch = value.parse().unwrap_or_default();
+        }
         if let Some(value) = ini.get("SERVERINFO", "LOGIPPORT") {
             config.log_ip_port = Some(value);
         }
@@ -241,6 +245,7 @@ impl NetInfoConfig {
         writeln!(file, "OPEN_PORT_SWITCH={}", self.open_port_switch as u8)?;
         writeln!(file, "PROC_PROTECT={}", self.proc_protect as u8)?;
         writeln!(file, "PROC_SWITCH={}", self.proc_switch as u8)?;
+        writeln!(file, "DYNAMIC_SWITCH={}", self.dynamic_switch as u8)?;
         writeln!(file, "SCANFILETIME={}", self.scan_file_time)?;
         writeln!(file, "SCANPROCTIME={}", self.scan_proc_time)?;
         writeln!(file, "SERVERIPPORT={}", self.server_ip_port)?;

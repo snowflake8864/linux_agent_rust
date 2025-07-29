@@ -135,17 +135,15 @@ impl StartOnline for BootManager {
                             tokio::select! {
                                 _ = interval.tick() => {
                                     if let Some(json_data) = get_system_metrics() {
-                                        //println!("系统指标: {}", json_data);
 
                                         // 发送到服务器
                                         let url = format!("{}/v1/puthardwareinfo", net_client.base_url);
                                         match net_client.post_data_async(
                                             &url,
                                             &json_data,
-                                            Duration::from_secs(10),
+                                            Duration::from_secs(180),
                                             Some(&token)
                                         ).await {
-                                            //Ok(response) => println!("服务器响应: {}", response),
                                             Ok(response) => {},
                                             Err(err) => eprintln!("发送指标失败: {}", err),
                                         }
