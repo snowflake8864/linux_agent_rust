@@ -186,7 +186,6 @@ fn audit_file_oper_rename(&self, info: &AvFileInfo, level: u32, pos: u32) -> Res
     }
 
 
-    // TODO: 取消注释以启用 MD5 更新
     // self.process_md5_mgr.update_process_md5(comm, &mut log.md5);
     // self.report(&log)
 

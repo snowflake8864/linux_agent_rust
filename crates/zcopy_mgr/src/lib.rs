@@ -11,7 +11,7 @@ use std::io::{self, Read};
 use std::os::unix::io::RawFd;
 use std::path::Path;
 use std::ptr;
-
+use std::net::{Ipv4Addr, Ipv6Addr};
 // 常量定义
 const UIO_BASE_PATH: &str = "/sys/class/uio/";
 const UIO_DEV_PREFIX: &str = "/dev/uio";
@@ -21,24 +21,68 @@ const MAX_PROCESS_PATH: usize = 512;
 // 结构体定义
 #[repr(C)]
 pub struct OsecNetworkReport {
-    src: IpAddrUnion,
-    src_port: u16,
-    dst: IpAddrUnion,
-    dest_port: u16,
-    pid: u32,
-    comm: [u8; 128],
+    pub src: IpAddrUnion,
+    pub src_port: u16,
+    pub dst: IpAddrUnion,
+    pub dest_port: u16,
+    pub pid: u32,
+    pub comm: [u8; 128],
 }
 
 #[repr(C)]
 pub struct OsecOpenportReport {
-    type_: u32,
-    src_ip: IpAddrUnion,
-    src_port: u16,
-    dest_ip: IpAddrUnion,
-    attack_dest_ip: IpAddrUnion,
-    dest_port: u16,
-    pid: u32,
-    comm: [u8; 128],
+    pub type_: u32,
+    pub src_ip: IpAddrUnion,
+    pub src_port: u16,
+    pub dest_ip: IpAddrUnion,
+    pub attack_dest_ip: IpAddrUnion,
+    pub dest_port: u16,
+    pub pid: u32,
+    pub comm: [u8; 128],
+}
+impl OsecOpenportReport {
+    /// 判断 src_ip 是否为 IPv4（通过 IPv4-mapped IPv6 格式识别）
+    pub unsafe fn src_is_ipv4(&self) -> bool {
+        self.is_ipv4_mapped(&self.src_ip)
+    }
+
+    /// 判断任意 IpAddrUnion 是否为 IPv4-mapped IPv6
+    unsafe fn is_ipv4_mapped(&self, ip: &IpAddrUnion) -> bool {
+        let bytes = &ip.as_u8;
+        // IPv4-mapped IPv6: ::ffff:0.0.0.0 格式
+        bytes[0..12] == [0u8; 12] && bytes[12] == 0 && bytes[13] == 0 && bytes[14] == 0 && bytes[15] == 0
+            || (bytes[0..10] == [0u8; 10] && bytes[10] == 0xFF && bytes[11] == 0xFF)
+    }
+
+    /// 提取 IPv4 地址，失败返回 0.0.0.0
+    pub unsafe fn extract_ipv4(&self, ip: &IpAddrUnion) -> Ipv4Addr {
+        if self.is_ipv4_mapped(ip) {
+            // 从 as_u8 的最后 4 字节提取
+            Ipv4Addr::new(ip.as_u8[12], ip.as_u8[13], ip.as_u8[14], ip.as_u8[15])
+        } else {
+            Ipv4Addr::UNSPECIFIED // 0.0.0.0
+        }
+    }
+
+    /// 提取 IPv6 地址
+    pub unsafe fn extract_ipv6(&self, ip: &IpAddrUnion) -> Ipv6Addr {
+        Ipv6Addr::new(
+            u16::from_be(ip.v6[0]),
+            u16::from_be(ip.v6[1]),
+            u16::from_be(ip.v6[2]),
+            u16::from_be(ip.v6[3]),
+            u16::from_be(ip.v6[4]),
+            u16::from_be(ip.v6[5]),
+            u16::from_be(ip.v6[6]),
+            u16::from_be(ip.v6[7]),
+        )
+    }
+
+    /// 安全获取 comm 字段（C 字符串转 Rust String）
+    pub unsafe fn get_comm(&self) -> String {
+        let len = self.comm.iter().position(|&c| c == 0).unwrap_or(128);
+        String::from_utf8_lossy(&self.comm[..len]).to_string()
+    }
 }
 
 #[repr(C)]
@@ -121,7 +165,8 @@ impl AvProcessInfo {
     pub fn get_path_str(&self) -> Option<String> {
         let ptr = self.path.as_ptr();
         unsafe {
-            CStr::from_ptr(ptr as *const i8)
+            //CStr::from_ptr(ptr as *const u8)
+            CStr::from_ptr(ptr as *const std::os::raw::c_char)
                 .to_str()
                 .ok()
                 .map(|s| s.to_string())
@@ -154,10 +199,10 @@ pub struct SymbolMsg {
 // IP 地址联合体
 #[repr(C)]
 pub union IpAddrUnion {
-    v4: std::mem::ManuallyDrop<IpV4Addr>,
-    v6: [u16; 8],
-    as_u8: [u8; 16],
-    as_u64: [u64; 2],
+    pub v4: std::mem::ManuallyDrop<IpV4Addr>,
+    pub v6: [u16; 8],
+    pub as_u8: [u8; 16],
+    pub as_u64: [u64; 2],
 }
 
 // 手动实现 Debug for IpAddrUnion
@@ -173,8 +218,8 @@ impl fmt::Debug for IpAddrUnion {
 
 #[repr(C)]
 pub struct IpV4Addr {
-    pad: [u32; 3],
-    ip4: u32,
+    pub pad: [u32; 3],
+    pub ip4: u32,
 }
 
 impl fmt::Debug for IpV4Addr {
@@ -216,7 +261,7 @@ impl fmt::Debug for OsecNetworkReport {
             .finish()
     }
 }
-
+/*
 impl fmt::Debug for OsecOpenportReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OsecOpenportReport")
@@ -229,6 +274,46 @@ impl fmt::Debug for OsecOpenportReport {
             .field("pid", &self.pid)
             .field("comm", &self.comm)
             .finish()
+    }
+}
+*/
+impl fmt::Debug for OsecOpenportReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        unsafe {
+            let src_ip_str = if self.src_is_ipv4() {
+                format!("{}", self.extract_ipv4(&self.src_ip))
+            } else {
+                format!("{}", self.extract_ipv6(&self.src_ip))
+            };
+
+            let dest_ip_str = if self.is_ipv4_mapped(&self.dest_ip) {
+                format!("{}", self.extract_ipv4(&self.dest_ip))
+            } else {
+                format!("{}", self.extract_ipv6(&self.dest_ip))
+            };
+
+            let attack_dest_ip_str = if self.is_ipv4_mapped(&self.attack_dest_ip) {
+                format!("{}", self.extract_ipv4(&self.attack_dest_ip))
+            } else {
+                format!("{}", self.extract_ipv6(&self.attack_dest_ip))
+            };
+
+            let comm_str = {
+                let len = self.comm.iter().position(|&c| c == 0).unwrap_or(128);
+                String::from_utf8_lossy(&self.comm[..len])
+            };
+
+            f.debug_struct("OsecOpenportReport")
+                .field("type_", &self.type_)
+                .field("src_ip", &src_ip_str)
+                .field("src_port", &self.src_port)
+                .field("dest_ip", &dest_ip_str)
+                .field("attack_dest_ip", &attack_dest_ip_str)
+                .field("dest_port", &self.dest_port)
+                .field("pid", &self.pid)
+                .field("comm", &comm_str)
+                .finish()
+        }
     }
 }
 

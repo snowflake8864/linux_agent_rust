@@ -55,35 +55,4 @@ linker = "/usr/bin/mips64el-linux-gnuabi64-gcc"
 rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"] 
 
 
-# 龙芯专用配置
-#[target.'cfg(all(target_arch = "mips64", target_vendor = "loongson"))']
-#rustflags = ["-C", "target-cpu=loongson3b"] 
-
-#[target.loongarch64-unknown-linux-gnu]
-#linker = "/home/zebra/toolchain-loongarch64-linux-gnu-gcc8/bin/loongarch64-linux-gnu-gcc"
-
-#nightly
-[target.loongarch64-unknown-linux-gnu]
-linker = "/home/zebra/loongarch64-toolchain/cross-tools/bin/loongarch64-unknown-linux-gnu-gcc"
-#rustflags = ["-C", "target-cpu=generic-la64"]
-
-rustflags = [
-  "-C", "link-arg=--sysroot=/root/workspace/loongarch-rootfs",
-  "-C", "link-arg=-Wl,--dynamic-linker=/lib/ld-linux-loongarch64.so.1"
-]
-
-#[target.loongarch64-unknown-linux-gnu]
-#linker = "loongarch64-unknown-linux-gnu-gcc"
-#ar = "loongarch64-unknown-linux-gnu-ar"
-#rustflags = ["-C", "target-feature=+crt-static"]
-#rustflags = ["-C", "link-args=-Wl,--no-as-needed"]
-#rustflags = [
-#  "-C", "link-arg=--sysroot=/data/docker_shared/loongarch-rootfs"
-#]
-
-#[target.loongarch64-unknown-linux-musl]
-#linker = "zig cc -target loongarch64-linux-musl"
-
-#[target.loongarch64-unknown-linux-musl]
-#linker = "zig"
 

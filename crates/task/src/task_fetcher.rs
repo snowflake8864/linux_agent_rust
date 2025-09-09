@@ -15,13 +15,16 @@ use logging::{log_info,log_error};
 use common::manager::boot::BootManager;
 use crate::virtual_port_rule::VirtualPortRule;
 use crate::get_process_task::process_all_dirs;
-use pattern::pattern_rules_mgr;
+use pattern::{pattern_rules_mgr,process_pattern_rules_mgr::{PROCESS_PATTERN_RULES_MGR,GlobalTrustDir}};
 use tokio::sync::mpsc;
 use process_mgr::POLICY_MANAGER;
 use netlink::netlink::NlSockInfo; // 引入 NLPolicyType
 use hostinfo::net_app::model::get_netapp_json; 
 use netblock::ip_policy::{IpPolicy, update_and_write_policies, is_ipv6};
-                                
+use udisk::{list::SHARED_USB_LIST, device::UsbInfo,monitor::{get_all_local_usb_devices, build_usb_json}};
+use procinfo::{get_running_process_infos,build_process_list_json};
+use tokio::task;
+
 fn get_u32(map: &serde_json::Map<String, Value>, key: &str) -> Result<u32, String> {
     map.get(key)
         .and_then(|v| v.as_number().and_then(|n| n.as_u64()))
@@ -65,7 +68,7 @@ enum TaskTypeEnum {
     TaskUploadPort = 9,
     TaskDownVirtualPort = 10,
     TaskAutoDownNetBlockPolicy = 11, // no use
-    TaskAutoUploadNetBlockPolicyy = 12, // no use
+    TaskAutoUploadNetBockPolicyy = 12, // no use
     TaskDownNetBlockPolicy = 13,
     TaskDownWhiteIpPolicy = 14, // no use
     TaskDownBlackIpPolicy = 15,
@@ -105,7 +108,9 @@ fn ip_str_to_u32(ip: &str) -> Result<u32, String> {
 impl TaskFetcher {
     pub fn new(base_url: &str, token: Option<String>, pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>, nl_sock: Option<NlSockInfo>) -> Self 
     {
+        PROCESS_PATTERN_RULES_MGR.lock().init();
         let mut api_interface = HashMap::new();
+        api_interface.insert("upload_process".to_string(), "v1/upload_process".to_string());
         api_interface.insert("download_white".to_string(), "v1/getprocwl".to_string());
         api_interface.insert("download_black".to_string(), "v1/getprocbl".to_string());
         api_interface.insert("getconf".to_string(), "v1/getconf".to_string());
@@ -118,6 +123,9 @@ impl TaskFetcher {
         api_interface.insert("getPlugging".to_string(), "v1/getPlugging".to_string());
         api_interface.insert("getipblacklist".to_string(), "v1/getipblacklist".to_string());
         api_interface.insert("upserviceport".to_string(), "v1/upserviceport".to_string());
+        api_interface.insert("addperipherals".to_string(), "v1/addperipherals".to_string());
+        api_interface.insert("getwhiteperipherals".to_string(), "v1/getwhiteperipherals".to_string());
+        api_interface.insert("getblackperipherals".to_string(), "v1/getblackperipherals".to_string());
 
         TaskFetcher {
               base_url: base_url.to_string(),
@@ -428,6 +436,7 @@ impl TaskFetcher {
             TaskTypeEnum::TaskUninstall => self.task_uninstall().await,
             TaskTypeEnum::TaskGetWhitePeripherals => self.task_get_white_peripherals().await,
             TaskTypeEnum::TaskGetBlackPeripherals => self.task_get_black_peripherals().await,
+            TaskTypeEnum::TaskDownUsbUpload => self.task_usb_upload().await,
             TaskTypeEnum::TaskUploadSample => self.task_upload_sample().await,
             TaskTypeEnum::TaskGlobalProc => self.task_global_proc().await,
             TaskTypeEnum::TaskGlobalDir => self.task_global_dir().await,
@@ -440,7 +449,51 @@ impl TaskFetcher {
 
     // 处理 TASK_UPLOAD_PROCESS 任务
     async fn task_upload_process(&self) -> Result<(), String> {
-        println!("Processing TASK_UPLOAD_PROCESS...");
+
+        let upload_url = match self.api_interface.get("upload_process") {
+            Some(url) => url,
+            None => return Err("URL for upload_gloabal_process not found".to_string()),
+        };
+        let net_client = match NetClient::new(self.base_url.clone(), true) {
+            Ok(client) => client,
+            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
+        };
+
+        let url = format!("{}/{}", self.base_url, upload_url);
+        let token = self.get_token();
+        let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
+                                                            // 
+        let processes = task::spawn_blocking(|| {
+            get_running_process_infos().map_err(|e| e.to_string())
+        })
+        .await
+            .map_err(|e| format!("Spawn error: {:?}", e))?
+            .map_err(|e| format!("Collection error: {}", e))?;
+
+        //log_info!("Collected {} processes", processes.len());
+        //for p in &processes {
+        //    log_info!("[{}] {} -> {}", p.pid, p.name, p.exe_path);
+        //}
+
+        let mut json_str = String::new();
+        match build_process_list_json(&processes, &mut json_str, None) {
+            Ok(()) => {
+                match net_client.post_data_async(
+                    &url,
+                    &json_str,
+                    Duration::from_secs(10),
+                    token_str,
+                ).await {
+                    Ok(response) => {log_info!("服务器响应: {}", response)},
+                    Err(err) => eprintln!("发送指标失败: {}", err),
+                }
+
+            }
+            Err(e) => {
+                log_error!("构建 JSON 失败: {}", e);
+            }
+        }
+
         // 实际上传逻辑代码
         Ok(())
     }
@@ -1019,20 +1072,164 @@ impl TaskFetcher {
         Ok(())
     }
 
-    // 处理 TASK_getwhiteperipherals 任务
     async fn task_get_white_peripherals(&self) -> Result<(), String> {
-        println!("Processing TASK_getwhiteperipherals...");
+
+        let download_url = match self.api_interface.get("getwhiteperipherals") {
+            Some(url) => url,
+            None => return Err("URL for download_white not found".to_string()),
+        };
+        let net_client = match NetClient::new(self.base_url.clone(), true) {
+            Ok(client) => client,
+            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
+        };
+        
+        let url = format!("{}/{}", self.base_url, download_url);
+        let token = self.get_token();
+        let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
+        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+            Ok(response) => {
+                // 解析 JSON 响应
+                let parsed: Value = match serde_json::from_str(&response) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        eprintln!("Failed to parse response: {}", e);
+                        return Err("Failed to parse response.".to_string());
+                    }
+                };
+
+                if parsed["code"] == "000000" {
+                    log_info!("peripherals: {}", parsed["data"]);
+                    let data = &parsed["data"];
+                    let whitelist: Vec<UsbInfo> = serde_json::from_value::<Vec<UsbInfo>>(data.clone())
+                        .map_err(|e| {
+                            log_error!("Failed to deserialize usb info: {}", e);
+                            "反序列化失败".to_string()
+                        })?
+                    .into_iter()
+                        .map(|mut item| {
+                            item.allow = true;
+                            item
+                        })
+                    .collect();
+
+                    let mut guard = SHARED_USB_LIST.lock().unwrap();
+                    guard.update_whitelist(whitelist);
+                }
+            }
+            Err(err) => {
+                eprintln!("Error fetching task: {}", err);
+                // 返回错误的 Result 类型
+                return Err(err);
+            }
+        }
+
+
         // 获取白名单外设的处理
         Ok(())
     }
 
     // 处理 TASK_getblackperipherals 任务
     async fn task_get_black_peripherals(&self) -> Result<(), String> {
-        println!("Processing TASK_getblackperipherals...");
-        // 获取黑名单外设的处理
+
+        // 获取 download_white 的 URL
+        let download_url = match self.api_interface.get("getblackperipherals") {
+            Some(url) => url,
+            None => return Err("URL for download_white not found".to_string()),
+        };
+        let net_client = match NetClient::new(self.base_url.clone(), true) {
+            Ok(client) => client,
+            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
+        };
+        
+        let url = format!("{}/{}", self.base_url, download_url);
+        let token = self.get_token();
+        let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
+        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+            Ok(response) => {
+                // 解析 JSON 响应
+                let parsed: Value = match serde_json::from_str(&response) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        eprintln!("Failed to parse response: {}", e);
+                        return Err("Failed to parse response.".to_string());
+                    }
+                };
+
+
+                if parsed["code"] == "000000" {
+                    log_info!("peripherals: {}", parsed["data"]);
+                    let data = &parsed["data"];
+                    let blacklist: Vec<UsbInfo> = serde_json::from_value::<Vec<UsbInfo>>(data.clone())
+                        .map_err(|e| {
+                            log_error!("Failed to deserialize usb info: {}", e);
+                            "反序列化失败".to_string()
+                        })?
+                    .into_iter()
+                        .map(|mut item| {
+                            item.allow = false;
+                            item
+                        })
+                    .collect();
+
+                    let mut guard = SHARED_USB_LIST.lock().unwrap();
+                    guard.update_blacklist(blacklist);
+                }
+            }
+            Err(err) => {
+                eprintln!("Error fetching task: {}", err);
+                // 返回错误的 Result 类型
+                return Err(err);
+            }
+        }
+
         Ok(())
     }
+    async fn task_usb_upload(&self) -> Result<(), String> {
 
+        let upload_url = match self.api_interface.get("addperipherals") {
+            Some(url) => url,
+            None => return Err("URL for upload_gloabal_process not found".to_string()),
+        };
+        let net_client = match NetClient::new(self.base_url.clone(), true) {
+            Ok(client) => client,
+            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
+        };
+
+        let url = format!("{}/{}", self.base_url, upload_url);
+        let token = self.get_token();
+        let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
+
+
+        let devices = get_all_local_usb_devices();
+        //if !devices.is_empty() 
+        {
+            log_info!("发现 {} 台可上传的 USB 设备", devices.len());
+            let mut json_str = String::new();
+
+            log_info!("准备上传的数据: {}", json_str);
+            match build_usb_json(&devices,  &mut json_str) {
+
+                Ok(()) => {
+                    match net_client.post_data_async(
+                        &url,
+                        &json_str,
+                        Duration::from_secs(10),
+                        token_str
+                    ).await {
+                        Ok(response) => {log_info!("服务器响应: {}", response)},
+                        Err(err) => eprintln!("发送指标失败: {}", err),
+                    }
+
+                    log_info!("========================生成 JSON: {}", json_str);
+                }
+                Err(e) => {
+                    log_error!("构建 JSON 失败: {}", e);
+                }
+            }
+
+        }
+        Ok(())
+    }
     // 处理 TASK_UPLOADSAMPLE 任务
     async fn task_upload_sample(&self) -> Result<(), String> {
         println!("Processing TASK_UPLOADSAMPLE...");
@@ -1063,62 +1260,54 @@ impl TaskFetcher {
     }
 
     async fn task_global_dir(&self) -> Result<(), String> {
-        // 获取 download_white 的 URL
         let download_url = match self.api_interface.get("gettrustdir") {
             Some(url) => url,
             None => return Err("URL for download_white not found".to_string()),
         };
+
         let net_client = match NetClient::new(self.base_url.clone(), true) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
 
         let url = format!("{}/{}", self.base_url, download_url);
-        println!("=================={}",url);
         let token = self.get_token();
-        let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
+        let token_str = token.as_ref().map(|s| s.as_str());
+
         match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
             Ok(response) => {
-            println!("======={}", response);
-            // 解析 JSON 响应
-            let parsed: Value = match serde_json::from_str(&response) {
-                Ok(parsed) => parsed,
+                let parsed: Value = match serde_json::from_str(&response) {
+                    Ok(parsed) => parsed,
                     Err(e) => {
                         eprintln!("Failed to parse response: {}", e);
                         return Err("Failed to parse response.".to_string());
                     }
-            };
+                };
 
-            if parsed["code"] == "000000" {
-            
-                let data_list = parsed["data"]
-                    .as_array()
-                    .ok_or("Missing task list in response")?
-                    .iter()
-                    .filter_map(|v| v.as_u64().map(|n| n as u32))
-                    .collect::<Vec<u32>>();
+                if parsed["code"] == "000000" {
+                    let data_value = &parsed["data"];
+                    let trust_dirs: Vec<GlobalTrustDir> = match serde_json::from_value(data_value.clone()) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("Failed to deserialize data to GlobalTrustDir: {}", e);
+                            return Err("Failed to deserialize data.".to_string());
+                        }
+                    };
 
-                    println!("======={}======={:?}", url, data_list);
-
-                    // 如果成功，返回 Ok(())，因为返回类型是 Result<(), String>
+                    PROCESS_PATTERN_RULES_MGR.lock().set_global_trust_dir(trust_dirs);
                 } else {
                     eprintln!("Error: Invalid response code: {}", parsed["code"]);
-                    // 返回错误的 Result 类型
                     return Err("Invalid response code.".to_string());
                 }
             }
             Err(err) => {
                 eprintln!("Error fetching task: {}", err);
-                // 返回错误的 Result 类型
                 return Err(err);
             }
         }
 
- 
-        // 全局目录的处理
         Ok(())
     }
-
     // 处理 TASK_UPDATE_UUID 任务
     async fn task_update_uuid(&self) -> Result<(), String> {
         println!("Processing TASK_UPDATE_UUID...");

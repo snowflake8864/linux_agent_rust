@@ -32,7 +32,7 @@ impl ProcessPolicyManager {
                 let _ = file.write_all(data.as_bytes());
             }
             Err(e) => {
-                log_error!("open {} failed: {}", MD5_RULE_FILE, e);
+                //log_error!("open {} failed: {}", MD5_RULE_FILE, e);
             }
         }
     }
@@ -51,8 +51,9 @@ impl ProcessPolicyManager {
     }
 
     fn kill_process(process_path: &str) {
-        println!("Killing blacklisted process: {}", process_path);
+       log_info!("Killing blacklisted process: {}", process_path);
     }
+
 
     pub fn set_policy_process(&mut self, process_list: &[String], is_white: bool) {
         let mut is_changed = false;
@@ -60,6 +61,16 @@ impl ProcessPolicyManager {
         if is_white {
             self.white_set.clear();
             self.white_set.extend(process_list.iter().cloned());
+
+            // 👇 清理原来的黑名单中的路径
+            for path in &self.white_set {
+                if self.prev_black_set.contains(path) {
+                    let rule = format!("del 1 {}\n", path);
+                    Self::add_md5_rules(&rule);
+                    self.prev_black_set.remove(path); // 同时更新 prev_black_set
+                    is_changed = true;
+                }
+            }
 
             for path in &self.white_set {
                 if !self.prev_white_set.contains(path) {
@@ -85,9 +96,20 @@ impl ProcessPolicyManager {
             self.black_set.clear();
             self.black_set.extend(process_list.iter().cloned());
 
+            //  杀掉进程
             for path in process_list {
                 if self.run_process_mode {
                     Self::kill_process(path);
+                }
+            }
+
+            //  清理原来的白名单中的路径
+            for path in &self.black_set {
+                if self.prev_white_set.contains(path) {
+                    let rule = format!("del 0 {}\n", path);
+                    Self::add_md5_rules(&rule);
+                    self.prev_white_set.remove(path); // 同时更新 prev_white_set
+                    is_changed = true;
                 }
             }
 

@@ -6,6 +6,8 @@ use common::manager::boot::BootManager;
 use std::future::Future;
 use tokio::time::{interval, Duration};
 use tokio::sync::mpsc;
+use std::fs;
+use chrono::Utc;
 use logging::log_info;
 use config::net_info::NETINFO_CONFIG;
 #[derive(Deserialize)]
@@ -41,10 +43,24 @@ pub struct BaseOnline {
     pub host_name: String,
     pub mod_ver: String,
 }
-
+fn get_os_start_time() -> String {
+    if let Ok(content) = fs::read_to_string("/proc/uptime") {
+        if let Some(uptime_str) = content.split_whitespace().next() {
+            if let Ok(uptime_secs) = uptime_str.parse::<f64>() {
+                let now_ts = Utc::now().timestamp() as f64;
+                let boot_ts = now_ts - uptime_secs;
+                return (boot_ts.round() as i64).to_string();
+            }
+        }
+    }
+    // fallback
+    Utc::now().timestamp().to_string()
+}
 impl BaseOnline {
     pub fn new() -> Self {
         let cfg = NETINFO_CONFIG.lock().unwrap(); // 这里使用 from_ini 解析配置
+        let asstarttime = Utc::now().timestamp().to_string();       // 程序启动时间
+        let osstarttime = get_os_start_time();                      // 系统启动时间
         BaseOnline {
             uid: cfg.dev_uid.clone(),
             macid: cfg.macid.clone(),
@@ -60,8 +76,10 @@ impl BaseOnline {
             auth: cfg.auth.clone(),
             userid: cfg.user_id.clone(),
             host_name: cfg.host_name.clone(),
-            asstarttime: "1731309829".to_string(),
-            osstarttime:"1731309829".to_string(),
+            //asstarttime: "1731309829".to_string(),
+            //osstarttime:"1731309829".to_string(),
+            asstarttime,
+            osstarttime,
             mod_ver: cfg.mod_ver.clone(),
         }
     }

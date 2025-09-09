@@ -2,11 +2,13 @@
 use serde::Serialize;
 pub mod file_audit;
 pub mod process_audit;
+pub mod fake_port_audit;
 pub mod netlink_msg;
+pub mod net_service_log; 
 pub mod log_worker;
 pub use log_worker::StartBashLog;
 pub mod build_json;
-pub use build_json::{build_alert_log_json,build_auto_process_list_json,build_batch_process_edr_json};
+pub use build_json::{build_alert_log_json,build_auto_process_list_json,build_batch_process_edr_json, build_open_port_json};
 
 use std::fs;
 use std::path::PathBuf;
@@ -44,6 +46,7 @@ pub struct AuditLogInfo {
     pub peripheral_eid: Option<String>,
     pub p_param: Option<String>,
 }
+
 #[derive(Debug)]
 pub struct EdrProcessLog {
     pub uid: String,
@@ -78,6 +81,21 @@ pub struct AuditProcess {
 }
 
 
+#[derive(Serialize,  Debug)]
+pub struct SysNetLog {
+    pub uid: Option<String>,
+    pub p_id: i32,
+    pub p_dir: Option<String>,
+    pub res_ip: Option<String>,
+    pub rs_port: u16,
+    pub proto: u32,
+    pub time: i32,
+    pub log_type: i32,
+    pub hash: Option<String>,
+    pub source_ip: Option<String>,
+    pub source_port: u16,
+}
+
 pub fn get_user_name(uid: u32) -> String {
     match get_user_by_uid(uid) {
         Some(user) => user.name().to_string_lossy().to_string(),
@@ -94,3 +112,13 @@ pub fn get_process_path(pid: u32) -> Option<String> {
     }
 }
 
+#[derive(Serialize, Debug)]
+pub struct OpenPortLog {
+    pub weight: i32,
+    pub time: i32,
+    pub attack_ip: String,
+    pub destination_ip: String,
+    pub open_port: i32,
+    pub redirect_ip: String,
+    pub redirect_port: i32,
+}

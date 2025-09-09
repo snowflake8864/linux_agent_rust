@@ -58,7 +58,7 @@ impl CustomLogger {
                 _ => LevelFilter::Info,
             },
         };
-
+        print!("======日志级别: {}", level_filter);
         let logger = CustomLogger::new(config);
         log::set_boxed_logger(Box::new(logger))?;
         log::set_max_level(level_filter);

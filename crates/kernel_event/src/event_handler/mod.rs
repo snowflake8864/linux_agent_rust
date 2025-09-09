@@ -9,7 +9,7 @@ use std::future::Future;
 
 use tokio::sync::{Mutex, mpsc};
 
-use reporter::AuditLogInfo;
+use reporter::{net_service_log, AuditLogInfo};
 use crate::msg_handler::KosecsMsgData;
 use super::{CallbackFn}; // 删除 EventCallback
 use logging::{log_info, log_error};
@@ -17,7 +17,10 @@ use netlink::netlink::NlSockInfo; // 引入 NLPolicyType
 use common::manager::boot::BootManager;
 use reporter::file_audit::FileAuditHandler;
 use reporter::process_audit::ProcessAuditHandler;
+use reporter::net_service_log::NetServiceLogHandler;
+use reporter::fake_port_audit::FakePortAuditHandler;
 use hostinfo::net_app::handler::NetAppHandler;
+use docker::monitor::KernelDockerHandler;
 use zcopy_mgr::ZcopyMgr;
 
 #[derive(Eq, Hash, PartialEq, Debug)]
@@ -199,7 +202,6 @@ impl EventHandler {
         data_len: u32,
     ) -> Result<(), String> {
         if let Some(policy_type) = NLPolicyType::from_u32(data_type) {
-            log_info!("Handling event for policy type: {}", policy_type);
             if let Some(callback) = self.callbacks.lock().await.get(&policy_type) {
                 callback(data, data_len).await
             } else {
@@ -302,8 +304,14 @@ pub async fn register_user_event_handlers(
     };
 
     let file_audit_handler = FileAuditHandler::new(zcopy_mgr.clone(), file_audit_log_tx);
-    let process_audit_handler = ProcessAuditHandler::new(zcopy_mgr, boot_manager);
+    let process_audit_handler = ProcessAuditHandler::new(zcopy_mgr.clone(), boot_manager.clone());
     let net_app_handler = NetAppHandler::new();
+    let kernel_docker_handler = KernelDockerHandler::new(5);
+    // let service_port_log_handler = NetServiceLogHandler::new(zcopy_mgr, boot_manager);
+    let service_port_log_handler = Arc::new(NetServiceLogHandler::new(zcopy_mgr.clone(), boot_manager.clone()));
+    let service_port_log_handler_in = service_port_log_handler.clone();
+    let service_port_log_handler_out = service_port_log_handler.clone();
+    let fake_port_log_handler = FakePortAuditHandler::new(zcopy_mgr, boot_manager);
 
     let mut handler = event_handler.lock().await;
     handler
@@ -343,11 +351,62 @@ pub async fn register_user_event_handlers(
     )
     .await;
 
+    handler
+    .register_event_handler(
+        NLPolicyType::NL_POLICY_NET_CONNECT_PORT_IN_NOTIFY,
+        move |data, len| {
+            let handler = service_port_log_handler_in.clone();
+            let data = data.to_vec(); 
+            Box::pin(async move {
+                handler.handle_internal_communication_log(&data, len).await
+            })
+        },
+    )
+    .await;
+
+    handler
+    .register_event_handler(
+        NLPolicyType::NL_POLICY_NET_CONNECT_PORT_OUT_NOTIFY,
+        move |data, len| {
+            let handler = service_port_log_handler_out.clone();
+            let data = data.to_vec(); 
+            Box::pin(async move {
+                handler.handle_external_communication_log(&data, len).await
+            })
+        },
+    )
+    .await;
+
+    handler
+    .register_event_handler(
+        NLPolicyType::NL_POLICY_NET_PORT_ZCOPY_NOTIFY,
+        move |data, len| {
+            let handler = fake_port_log_handler.clone();
+            let data = data.to_vec(); 
+            Box::pin(async move {
+                handler.handle_fake_port_zcopy_oper(&data, len).await
+            })
+        },
+    )
+    .await;
+
+    handler
+    .register_event_handler(
+        NLPolicyType::NL_POLICY_INFO_KERN_TO_APP_NOTIFY,
+        move |data, len| {
+            let handler = kernel_docker_handler.clone();
+            let data = data.to_vec(); 
+            Box::pin(async move {
+                handler.handle_kernel_docker_oper(&data, len).await
+            })
+        },
+    )
+    .await;
 }
 
 pub trait StartKernelHandler {
     fn start_kernel_send_handler(
-        &mut self,
+        &mut  self,
         nl_sock: NlSockInfo,
         event_handler: Arc<Mutex<EventHandler>>,
         file_audit_log_tx: mpsc::Sender<AuditLogInfo>,
@@ -369,6 +428,7 @@ impl StartKernelHandler for BootManager {
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
             register_default_event_handlers(&event_handler).await;
+
             let boot_manager_arc = Arc::new(self.clone());
             register_user_event_handlers(&event_handler, file_audit_log_tx, boot_manager_arc).await;
             send_data_to_kernel(&nl_sock).map_err(|e| e.to_string())?;
@@ -391,11 +451,6 @@ impl StartKernelHandler for BootManager {
                                 let data_str = String::from_utf8_lossy(msg.payload);
                                 log_info!("Handling ECHO data: {}", data_str);
                             } else {
-                                log_info!(
-                                    "Handling event for policy type: {}, {:?}",
-                                    msg.data_type,
-                                    msg.payload
-                                );
                                 let event_handler = event_handler.clone();
                                 let payload_owned = msg.payload.to_vec();
                                 let data_type = msg.data_type;

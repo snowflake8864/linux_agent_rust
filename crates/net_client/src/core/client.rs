@@ -1,5 +1,4 @@
 use reqwest::{Client, Response, Proxy};
-use reqwest::blocking::Client as BlockingClient; // 添加阻塞客户端支持
 use std::time::Duration;
 use serde::{Deserialize};
 use std::env;
@@ -100,40 +99,6 @@ impl NetClient {
             Ok(r) => {
                 let status_code = r.status();
                 let response_text = r.text().await.map_err(|e| format!("Failed to read response text: {}", e))?;
-                if status_code.is_success() {
-                    Ok(response_text)
-                } else {
-                    Err(format!("POST request failed with status: {} - {}", status_code, response_text))
-                }
-            }
-            Err(e) => Err(format!("Failed to send POST request: {}", e)),
-        }
-    }
-
-    // 同步版本的 POST 请求
-    pub fn post_data(
-        &self,
-        url: &str,
-        json_data: &str,
-        timeout: Duration,
-        token: Option<&str>, // 添加 token 参数
-    ) -> Result<String, String> {
-        let mut request = BlockingClient::new()
-            .post(url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .timeout(timeout)
-            .body(json_data.to_string());
-
-        if let Some(token_str) = token {
-            request = request.header("Authorization", format!("{}", token_str));
-        }
-
-        let response = request.send();
-        match response {
-            Ok(r) => {
-                let status_code = r.status();
-                let response_text = r.text().map_err(|e| format!("Failed to read response text: {}", e))?;
                 if status_code.is_success() {
                     Ok(response_text)
                 } else {

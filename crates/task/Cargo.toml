@@ -25,6 +25,8 @@ pattern = { path = "../pattern" }
 process_mgr = { path =  "../process_mgr" }
 netlink = { path = "../netlink" }
 netblock = {path = "../netblock"}
+udisk = {path = "../udisk"}
+procinfo = { path = "../procinfo" }
 [features]
 test_mode = []
 
