@@ -19,3 +19,4 @@ config = { path = "../config" }
 common = { path = "../common" }
 logging = { path = "../logging" }
 log = "0.4"
+chrono = "0.4"

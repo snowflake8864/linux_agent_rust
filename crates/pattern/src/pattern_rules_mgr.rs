@@ -1,10 +1,6 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::File;
-use std::fs;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use logging::{log_info,log_error};
 use std::fs::OpenOptions;
 use std::io::{Write, Error, ErrorKind};

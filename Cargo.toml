@@ -16,9 +16,11 @@ members = [
      "crates/pattern",
      "crates/reporter",
      "crates/zcopy_mgr",
-  #     "crates/process_md5_cache",
      "crates/process_mgr",
+     "crates/procinfo",
      "crates/netblock",
+     "crates/udisk",
+     "crates/docker",
 ]
 
 [profile.dev]

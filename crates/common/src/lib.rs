@@ -14,7 +14,6 @@ pub struct NetClient {
 pub struct Core {
     pub netclient: NetClient,
     pub is_online: bool,
-    //pub pattern_mgr : pattern_rules_mgr::PatternRulesMgr ,
     pub pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>,
     //pub nl_sock: NlSockInfo,
 }

@@ -9,7 +9,7 @@ use zcopy_mgr::{AvProcessInfo, ZcopyMgr};
 use crate::{AuditLogInfo, EdrProcessLog, AuditProcess, get_user_name, get_process_path, build_alert_log_json, build_auto_process_list_json, build_batch_process_edr_json};
 use process_mgr::get_md5_global;
 use net_client::core::NetClient;
-use tokio::time::{interval, Duration};
+use tokio::time::Duration;
 use common::manager::boot::BootManager;
 #[derive(Clone)]
 pub struct ProcessAuditHandler {
@@ -108,7 +108,7 @@ impl ProcessAuditHandler {
                         Duration::from_secs(10),
                         self.boot_manager.get_token().await.as_deref(),
                     ).await {
-                        Ok(response) => {log_info!("服务器响应: {}", response)},
+                        Ok(response) => {/*log_info!("服务器响应: {}", response)*/},
                         Err(err) => eprintln!("发送指标失败: {}", err),
                     }
 
@@ -132,7 +132,7 @@ impl ProcessAuditHandler {
                         Duration::from_secs(10),
                         self.boot_manager.get_token().await.as_deref(),
                     ).await {
-                        Ok(response) => {log_info!("服务器响应: {}", response)},
+                        Ok(response) => {},//{log_info!("服务器响应: {}", response)},
                         Err(err) => eprintln!("发送指标失败: {}", err),
                     }
 
@@ -157,7 +157,8 @@ impl ProcessAuditHandler {
                         Duration::from_secs(10),
                         self.boot_manager.get_token().await.as_deref(),
                     ).await {
-                        Ok(response) => {log_info!("服务器响应: {}", response)},
+                        //Ok(response) => {log_info!("服务器响应: {}", response)},
+                        Ok(_) => {},
                         Err(err) => eprintln!("发送指标失败: {}", err),
                     }
 
@@ -183,7 +184,12 @@ fn process_one(
     loginfo: &mut Vec<AuditLogInfo>,
     edr_logs: &mut Vec<EdrProcessLog>,
 ) {
-    let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const i8) };
+    /*
+let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const u8) };
+*/
+let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::raw::c_char) };
+
+
     let path_str = match cstr.to_str() {
         Ok(s) => s,
         Err(_) => return,

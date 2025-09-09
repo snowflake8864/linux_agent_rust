@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use md5::{Md5, Digest};
 use hex;
 use std::collections::HashMap;
+use logging::log_info;
 
 #[derive(Clone, Default)]
 struct CpuUseState {
@@ -180,16 +181,45 @@ pub fn get_system_metrics() -> Option<String> {
 
     // CPU 核心数
     let cpu_number = sys.cpus().len().to_string();
-
+/*
     // 内存信息
     let total_memory = sys.total_memory(); // 单位：KB
     let used_memory = sys.used_memory();
     let mem_size = format!("{}KB", total_memory);
+    log_info!("内存总量: {}, 已用内存: {}", mem_size,used_memory);
     let mem_usage = if total_memory > 0 {
         ((used_memory as f32 / total_memory as f32) * 100.0).to_string()
     } else {
         "0".to_string()
     };
+*/
+    let bytes_to_kb = |bytes: u64| (bytes + 1023) / 1024; // 四舍五入
+
+    let total_memory_kb = bytes_to_kb(sys.total_memory());
+    let available_memory_kb = bytes_to_kb(sys.available_memory());
+    let free_memory_kb = bytes_to_kb(sys.free_memory());
+
+    let used_memory_kb = total_memory_kb.saturating_sub(available_memory_kb);
+
+    let mem_size = format!("{}KB", total_memory_kb); // 或转为 MiB 显示
+    let mem_usage = if total_memory_kb > 0 {
+        ((used_memory_kb as f32 / total_memory_kb as f32) * 100.0).to_string()
+    } else {
+        "0".to_string()
+    };
+
+    // 日志用 MiB 显示更直观
+    let kb_to_mib = |kb: u64| kb as f64 / 1024.0;
+/*
+    log_info!(
+        "内存总量: {:.2}MiB, 实际已用: {:.2}MiB, 可用: {:.2}MiB (free: {:.2}MiB), 使用率: {}%",
+        kb_to_mib(total_memory_kb),
+        kb_to_mib(used_memory_kb),
+        kb_to_mib(available_memory_kb),
+        kb_to_mib(free_memory_kb),
+        mem_usage
+        );
+*/
 
     // 磁盘信息
     let mut total_disk = 0;

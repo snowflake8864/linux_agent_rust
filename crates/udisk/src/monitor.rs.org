@@ -1,0 +1,625 @@
+
+use std::pin::Pin;
+use common::
+    manager::boot::BootManager;
+use std::future::Future;
+use net_client::core::NetClient;
+use std::sync::{Arc, Mutex};
+use logging::{log_info,log_debug,log_error};
+use rusb::{Context, HotplugBuilder, UsbContext};
+use std::fs::OpenOptions;
+use std::io::{Write,Read};
+use crate::device::UsbInfo;
+use crate::utils::md5sum;
+use tokio::time::{interval, sleep, Duration};
+use config::net_info::NETINFO_CONFIG;
+use serde::Serialize;
+use serde_json::json;
+use std::path::Path;
+
+/// USB 热插拔回调
+struct HotplugCallback {
+    black_list: Arc<Mutex<Vec<UsbInfo>>>,
+    white_list: Arc<Mutex<Vec<UsbInfo>>>,
+    usb_protect: bool,
+    seen_devices: Arc<Mutex<Vec<String>>>,
+}
+
+impl rusb::Hotplug<Context> for HotplugCallback {
+    fn device_arrived(&mut self, device: rusb::Device<Context>) {
+        if let Ok(desc) = device.device_descriptor() {
+            let is_storage = {
+                let device_class = desc.class_code();
+                let interface_class = match device.open() {
+                    Ok(handle) => match device.active_config_descriptor() {
+                        Ok(config) => config.interfaces()
+                            .flat_map(|interface| interface.descriptors())
+                            .find_map(|interface_desc| {
+                                log_debug!(
+                                    "Device: vid={}, pid={}, class={}, interface class={}",
+                                    desc.vendor_id(),
+                                    desc.product_id(),
+                                    device_class,
+                                    interface_desc.class_code()
+                                );
+                                if interface_desc.class_code() == 0x08 {
+                                    Some(true)
+                                } else {
+                                    None
+                                }
+                            })
+                        .unwrap_or(false),
+                        Err(e) => {
+                            log_debug!(
+                                "Failed to get config descriptor for vid={}, pid={}: {:?}",
+                                desc.vendor_id(), desc.product_id(), e
+                            );
+                            false
+                        }
+                    },
+                    Err(e) => {
+                        log_debug!(
+                            "Failed to open device for vid={}, pid={}: {:?}",
+                            desc.vendor_id(), desc.product_id(), e
+                        );
+                        false
+                    }
+                };
+                device_class == 0x08 || interface_class
+            };
+            log_info!("USB device arrived: vid={}, pid={}, class={}", desc.vendor_id(), desc.product_id(), desc.class_code());
+            if !is_storage {
+                log_debug!("Ignoring non-storage USB device: class={}", desc.class_code());
+                return;
+            }
+
+            let vid = desc.vendor_id();
+            let pid = desc.product_id();
+            let serial = device.open()
+                .and_then(|handle| handle.read_serial_number_string_ascii(&desc))
+                .unwrap_or_else(|_| format!("vid{:04x}_pid{:04x}", vid, pid));
+            let name = device.open()
+                .and_then(|handle| handle.read_manufacturer_string_ascii(&desc))
+                .unwrap_or_else(|_| format!("vid{:04x}_pid{:04x}", vid, pid));
+            let eid_raw = format!("{}_{}_{}", serial, pid, vid);
+            let eid = md5sum(&eid_raw);
+
+            // 记录已检测设备（只用于避免重复日志，不影响阻断）
+            {
+                let mut seen = self.seen_devices.lock().unwrap();
+                if !seen.contains(&eid) {
+                    seen.push(eid.clone());
+                    log_debug!("USB storage device arrived: eid={}, vid={}, pid={}, name={}", eid, vid, pid, name);
+                } else {
+                    log_debug!("Duplicate USB event: eid={}, still checking whitelist/blacklist", eid);
+                }
+            }
+
+            let cfg = NETINFO_CONFIG.lock().unwrap();
+            if cfg.usb_protect {
+                let black = self.black_list.lock().unwrap();
+                if black.iter().any(|b| b.perpheral_eid == eid) {
+                    if let Err(e) = disable_usb_device(&device) {
+                        log_error!("Failed to disable blacklisted USB (eid={}): {:?}", eid, e);
+                    } else {
+                        log_error!("Blocked blacklisted USB: {} (eid={})", name, eid);
+                    }
+                    return;
+                }
+
+                let white = self.white_list.lock().unwrap();
+                if !white.iter().any(|w| w.perpheral_eid == eid) {
+                    if let Err(e) = disable_usb_device(&device) {
+                        log_error!("Failed to disable unknown USB (eid={}): {:?}", eid, e);
+                    } else {
+                        log_error!("Blocked unknown USB: {} (eid={})", name, eid);
+                    }
+                    return;
+                }
+
+                log_info!("Allowed USB: {} (eid={})", name, eid);
+            }
+        } else {
+            log_error!("Failed to read device descriptor");
+        }
+    }
+
+    
+    fn device_left(&mut self, device: rusb::Device<Context>) {
+        if let Ok(desc) = device.device_descriptor() {
+            let vid = desc.vendor_id();
+            let pid = desc.product_id();
+            let serial = device.open()
+                .and_then(|handle| handle.read_serial_number_string_ascii(&desc))
+                .unwrap_or_default();
+            let eid = md5sum(&format!("{}_{}_{}", serial, pid, vid));
+
+            let mut seen = self.seen_devices.lock().unwrap();
+            seen.retain(|e| e != &eid);
+            log_debug!("USB storage device removed: eid={}", eid);
+        }
+    }
+
+}
+
+/// USB 监控器
+pub struct UsbMonitor {
+    running: Arc<Mutex<bool>>,
+    black_list: Arc<Mutex<Vec<UsbInfo>>>,
+    white_list: Arc<Mutex<Vec<UsbInfo>>>,
+    usb_protect: bool,
+    seen_devices: Arc<Mutex<Vec<String>>>,
+    _context: Option<Context>,
+}
+
+impl UsbMonitor {
+    pub fn new(usb_protect: bool) -> Self {
+        Self {
+            running: Arc::new(Mutex::new(false)),
+            black_list: Arc::new(Mutex::new(vec![])),
+            white_list: Arc::new(Mutex::new(vec![])),
+            usb_protect,
+            seen_devices: Arc::new(Mutex::new(vec![])),
+            _context: None,
+        }
+    }
+/*
+    pub fn run_old(&mut self) -> rusb::Result<()> {
+        let context = Context::new()?;
+        *self.running.lock().unwrap() = true;
+
+        let callback = HotplugCallback {
+            black_list: self.black_list.clone(),
+            white_list: self.white_list.clone(),
+            usb_protect: self.usb_protect,
+            seen_devices: self.seen_devices.clone(),
+        };
+
+        let _registration = HotplugBuilder::new()
+            .enumerate(true)
+            .register(&context, Box::new(callback))
+            .ok();
+
+        self._context = Some(context);
+        log_info!("USB 监控器已启动=================================");
+        let context = self._context.as_ref().unwrap();
+        while *self.running.lock().unwrap() {
+            context.handle_events(Some(Duration::from_millis(100)))?;
+        }
+        Ok(())
+    }
+*/
+/*
+    pub async fn run(&mut self) -> rusb::Result<()> {
+        let context = Context::new()?;
+        *self.running.lock().unwrap() = true;
+
+        let callback = HotplugCallback {
+            black_list: self.black_list.clone(),
+            white_list: self.white_list.clone(),
+            usb_protect: self.usb_protect,
+            seen_devices: self.seen_devices.clone(),
+        };
+
+        let _registration = HotplugBuilder::new()
+            .enumerate(true)
+            .register(&context, Box::new(callback))
+            .ok();
+
+        self._context = Some(context);
+        log_info!("USB 监控器已启动=================================");
+
+        let context = self._context.as_ref().unwrap();
+        let mut interval = interval(Duration::from_millis(100)); // 每 100ms 检查一次
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if !*self.running.lock().unwrap() {
+                        break;
+                    }
+                    if let Err(e) = context.handle_events(None) { // None 表示非阻塞
+                        log_error!("Handle events failed: {:?}", e);
+                        break;
+                    }
+                }
+                else => break, // 运行时取消时退出
+            }
+        }
+
+        log_info!("USB 监控器已停止=================================");
+        Ok(())
+    }
+*/
+    pub async fn run(&mut self) -> rusb::Result<()> {
+        let context = Context::new()?;
+        *self.running.lock().unwrap() = true;
+
+        let callback = HotplugCallback {
+            black_list: self.black_list.clone(),
+            white_list: self.white_list.clone(),
+            usb_protect: self.usb_protect,
+            seen_devices: self.seen_devices.clone(),
+        };
+
+        let _registration = HotplugBuilder::new()
+            .enumerate(true)
+            .register(&context, Box::new(callback))
+            .ok();
+
+        self._context = Some(context);
+        log_info!("USB 监控器已启动=================================");
+
+        let context = self._context.as_ref().unwrap();
+        let mut interval = interval(Duration::from_millis(100));
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if !*self.running.lock().unwrap() {
+                        break;
+                    }
+                    if let Err(e) = context.handle_events(None) {
+                        log_error!("Handle events failed: {:?}", e);
+                        break;
+                    }
+                }
+                else => break,
+            }
+        }
+
+        log_info!("USB 监控器已停止=================================");
+        Ok(())
+    }
+    pub fn quit(&mut self) {
+        *self.running.lock().unwrap() = false;
+        self._context = None;
+    }
+
+    pub fn set_black_list(&mut self, list: Vec<UsbInfo>) {
+        let mut black = self.black_list.lock().unwrap();
+        *black = list;
+    }
+
+    pub fn set_white_list(&mut self, list: Vec<UsbInfo>) {
+        let mut white = self.white_list.lock().unwrap();
+        *white = list;
+    }
+    pub fn get_local_all_devices_old(&self) -> Vec<UsbInfo> {
+        let mut devices = Vec::new();
+        let context = match Context::new() {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                log_error!("Failed to create libusb context: {:?}", e);
+                return devices;
+            }
+        };
+
+        match context.devices() {
+            Ok(device_list) => {
+                for device in device_list.iter() {
+                    if let Ok(desc) = device.device_descriptor() {
+                        let is_storage = {
+                            let device_class = desc.class_code();
+                            let interface_class = match device.active_config_descriptor() {
+                                Ok(config) => config.interfaces().flat_map(|i| i.descriptors())
+                                    .any(|d| d.class_code() == 0x08),
+                                Err(_) => false,
+                            };
+                            device_class == 0x08 || interface_class
+                        };
+
+                        if is_storage {
+                            let vid = desc.vendor_id();
+                            let pid = desc.product_id();
+                            let serial = device.open()
+                                .and_then(|handle| handle.read_serial_number_string_ascii(&desc))
+                                .unwrap_or_else(|_| format!("vid{:04x}_pid{:04x}", vid, pid));
+                            let name = device.open()
+                                .and_then(|handle| handle.read_manufacturer_string_ascii(&desc))
+                                .unwrap_or_else(|_| format!("vid{:04x}_pid{:04x}", vid, pid));
+
+                            let eid = md5sum(&format!("{}_{}_{}", serial, pid, vid));
+
+                            devices.push(UsbInfo {
+                                perpheral_eid: eid,
+                                perpheral_name: name.clone(),
+                                intro: name,
+                                type_: "usb_mass_storage".to_string(),
+                                allow: false,
+                            });
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log_error!("Failed to get device list: {:?}", e);
+            }
+        }
+
+        devices
+    }
+
+    pub fn get_local_all_devices(&self) -> Vec<UsbInfo> {
+        let mut devices = Vec::new();
+        let sysfs_dir = "/sys/bus/usb/devices";
+
+            log_info!("1============================================");
+        let entries = match std::fs::read_dir(sysfs_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                log_error!("Failed to read sysfs dir {}: {:?}", sysfs_dir, e);
+                return devices;
+            }
+        };
+
+            log_info!("2============================================");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let id_vendor_path = path.join("idVendor");
+            let id_product_path = path.join("idProduct");
+
+            if !id_vendor_path.exists() || !id_product_path.exists() {
+                continue;
+            }
+
+            let vendor = Self::read_sysfs_string(&id_vendor_path);
+            let product = Self::read_sysfs_string(&id_product_path);
+            log_info!("============================================");
+            if vendor.is_empty() || product.is_empty() {
+                continue;
+            }
+
+            let dev_class = Self::read_sysfs_string(&path.join("bDeviceClass"));
+            log_info!("bDeviceClass: {}", dev_class);
+            let is_storage = dev_class.trim() == "08"
+                || Self::has_mass_storage_interface(&path);
+
+            if !is_storage {
+                continue;
+            }
+            log_info!("==============bDeviceClass: {}", dev_class);
+            let manufacturer = Self::read_sysfs_string(&path.join("manufacturer"));
+            let serial = Self::read_sysfs_string(&path.join("serial"));
+
+            let name = if manufacturer.is_empty() {
+                format!("vid{}_pid{}", vendor, product)
+            } else {
+                manufacturer.clone()
+            };
+
+            let serial_id = if serial.is_empty() {
+                format!("vid{}_pid{}", vendor, product)
+            } else {
+                serial.clone()
+            };
+
+            let eid = md5sum(&format!("{}_{}_{}", serial_id, product, vendor));
+
+            devices.push(UsbInfo {
+                perpheral_eid: eid,
+                perpheral_name: name.clone(),
+                intro: name,
+                type_: "usb_mass_storage".to_string(),
+                allow:  if Self::read_sysfs_string(&path.join("authorized")).trim() == "1" {
+                    true
+                } else {
+                    false
+                },
+            });
+        }
+        devices
+    }
+    
+    fn read_sysfs_string(path: &Path) -> String {
+        let mut buf = String::new();
+        if let Ok(mut file) = OpenOptions::new().read(true).open(path) {
+            let _ = file.read_to_string(&mut buf);
+        }
+        buf.trim().to_string()
+    }
+
+    fn has_mass_storage_interface(dev_path: &Path) -> bool {
+        if let Ok(entries) = std::fs::read_dir(dev_path) {
+            for entry in entries.flatten() {
+                let sub = entry.path();
+                if sub.is_dir() {
+                    let class_path = sub.join("bInterfaceClass");
+                    if class_path.exists() {
+                        if Self::read_sysfs_string(&class_path).trim() == "08" {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+/// 获取 sysfs 设备名
+fn sysfs_device_name(device: &rusb::Device<Context>) -> String {
+    let bus = device.bus_number();
+    let ports = device.port_numbers().unwrap_or_default();
+    if ports.is_empty() {
+        return format!("{}", bus);
+    }
+    let ports_str = ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(".");
+    format!("{}-{}", bus, ports_str)
+}
+
+/// 禁用 USB 设备
+fn disable_usb_device(device: &rusb::Device<Context>) -> rusb::Result<()> {
+    let sysfs_name = sysfs_device_name(device);
+    let auth_path = format!("/sys/bus/usb/devices/{}/authorized", sysfs_name);
+    let path = std::path::Path::new(&auth_path);
+
+    for _ in 0..5 {
+        if path.exists() {
+            match OpenOptions::new().write(true).open(path) {
+                Ok(mut file) => {
+                    if file.write_all(b"0").is_ok() {
+                        log_info!("USB device disabled via {}", auth_path);
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    log_error!("Failed to open {}: {:?}", auth_path, e);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    Err(rusb::Error::Other)
+}
+
+pub trait StartUsbService {
+    fn start_usb_services(&mut self) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
+}
+
+/*
+impl StartUsbService for BootManager {
+    fn start_usb_services(
+        &mut self
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        Box::pin(async move {
+            let base_url = self.get_base_url();
+            let net_client = match NetClient::new(base_url, true) {
+                Ok(client) => client,
+                Err(err) => {
+                    eprintln!("创建 NetClient 失败: {}", err);
+                    return Err("创建 NetClient 失败".to_string());
+                }
+            };
+
+            let url = format!("{}/v1/addperipherals", net_client.base_url);
+            let devices = USB_MONITOR.lock().unwrap().get_local_all_devices();
+            loop {
+                if let Some(_) = self.get_token().await {
+                    upload_usb_info(&devices, &net_client, &url, self).await;
+                    break;
+                } else {
+                    log::warn!("token 尚未准备好，等待中...");
+                    sleep(Duration::from_secs(2)).await;
+                }
+            }
+/*
+            let result = tokio::task::spawn_blocking(move || {
+                USB_MONITOR.lock().unwrap().run()
+            }).await;
+
+            match result {
+                Ok(Ok(())) => Ok("USB服务正常退出".to_string()),
+                Ok(Err(e)) => Err(format!("USB服务运行出错: {:?}", e)),
+                Err(e) => Err(format!("阻塞任务被取消或出错: {:?}", e)),
+            }
+*/
+            Ok("USB服务正常退出".to_string())
+        })
+    }
+}
+*/
+
+impl StartUsbService for BootManager {
+    fn start_usb_services(
+        &mut self
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        Box::pin(async move {
+            let base_url = self.get_base_url();
+            let net_client = match NetClient::new(base_url, true) {
+                Ok(client) => client,
+                Err(err) => {
+                    eprintln!("创建 NetClient 失败: {}", err);
+                    return Err("创建 NetClient 失败".to_string());
+                }
+            };
+
+            let url = format!("{}/v1/addperipherals", net_client.base_url);
+            Ok("USB服务正常退出".to_string())
+        })
+    }
+}
+
+pub async fn upload_usb_info(
+    devices: &[UsbInfo],
+    net_client: &NetClient,
+    url: &str,
+    boot_mgr: &BootManager
+) {
+
+//    if devices.is_empty() {
+//        log_info!("未发现可上传的 USB 设备");
+//        return;
+ //   }
+    log_info!("发现 {} 台可上传的 USB 设备", devices.len());
+    let mut json_str = String::new();
+
+    match build_usb_json(&devices,  &mut json_str) {
+
+        Ok(()) => {
+            match net_client.post_data_async(
+                &url,
+                &json_str,
+                Duration::from_secs(10),
+                boot_mgr.get_token().await.as_deref(),
+            ).await {
+                Ok(response) => {log_info!("服务器响应: {}", response)},
+                Err(err) => eprintln!("发送指标失败: {}", err),
+            }
+
+            log_info!("========================生成 JSON: {}", json_str);
+        }
+        Err(e) => {
+            log_error!("构建 JSON 失败: {}", e);
+        }
+    }
+
+}
+
+
+#[derive(Serialize)]
+struct UsbInfoJson<'a> {
+    peripheral_eid: &'a str,
+    peripheral_name: &'a str,
+    peripheral_intro: &'a str,
+    peripheral_type: &'a str,
+}
+
+pub fn build_usb_json(devices: &[UsbInfo], str_json: &mut String) -> Result<(), String> {
+    let entries: Vec<UsbInfoJson> = devices
+        .iter()
+        .map(|d| UsbInfoJson {
+            peripheral_eid: &d.perpheral_eid,
+            peripheral_name: &d.perpheral_name,
+            peripheral_intro: &d.intro,
+            peripheral_type: &d.type_,
+        })
+        .collect();
+
+//    if entries.is_empty() {
+//        return Err("没有有效的 USB 设备信息".to_string());
+//    }
+
+    let entries_str = if entries.is_empty() {
+        "{}".to_string() 
+    } else {
+        serde_json::to_string(&entries)
+            .map_err(|e| format!("entries 序列化失败: {}", e))?
+    };
+
+    let obj = json!({
+        "data": entries_str
+    });
+    log_info!("obj:{:?}",obj);
+    *str_json = serde_json::to_string(&obj)
+        .map_err(|e| format!("最终 JSON 序列化失败: {}", e))?;
+
+    Ok(())
+}
+use once_cell::sync::Lazy;
+
+/// 全局 USB 监控器
+pub static USB_MONITOR: Lazy<Mutex<UsbMonitor>> = Lazy::new(|| {
+    Mutex::new(UsbMonitor::new(true))
+});
+

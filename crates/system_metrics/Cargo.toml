@@ -10,3 +10,5 @@ serde_json = "1.0"
 lazy_static = "1.5"
 md-5 = { path = "../md5" }
 hex = "0.4"
+logging = { path = "../logging" }
+log="0.4"

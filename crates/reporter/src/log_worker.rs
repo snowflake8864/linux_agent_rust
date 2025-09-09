@@ -37,7 +37,7 @@ impl StartBashLog for BootManager {
                     result = file_audit_log_rx.recv() => {
                         match result {
                             Some(log) => {
-                                //log_info!("收到 FileAuditLogInfo: {:?}", log);
+                                log_info!("收到 FileAuditLogInfo: {:?}", log);
                                 log_buffer.push(log);
                             }
                             None => {
@@ -51,7 +51,7 @@ impl StartBashLog for BootManager {
                             let mut json_str = String::new();
                             match build_alert_log_json(&log_buffer, &mut json_str) {
                                 Ok(()) => {
-                                    //log_info!("生成 JSON: {}", json_str);
+                                    log_info!("生成 JSON: {}", json_str);
                                     match net_client.post_data_async(
                                         &url,
                                         &json_str,
@@ -78,7 +78,7 @@ impl StartBashLog for BootManager {
                 let mut json_str = String::new();
                 match build_alert_log_json(&log_buffer, &mut json_str) {
                     Ok(()) => {
-                        //log_info!("生成 JSON: {}", json_str);
+                        log_info!("生成 JSON: {}", json_str);
                         match net_client.post_data_async(
                             &url,
                             &json_str,
@@ -102,3 +102,4 @@ impl StartBashLog for BootManager {
         })
     }
 }
+

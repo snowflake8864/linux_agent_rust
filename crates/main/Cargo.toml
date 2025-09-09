@@ -32,7 +32,9 @@ reporter = {path = "../reporter"}
 logging = { path = "../logging" }
 log = "0.4"
 netlink = { path = "../netlink" }
+udisk = { path = "../udisk"}
 kernel_module = { path = "../kernel_module" }
+docker = { path = "../docker"}
 #[CKlibm]
 #libc ="/home/zebra/workspace/rustprj/linux_agent_rust_v10/lib/libc.so.6"
 #libm ="/home/zebra/workspace/rustprj/linux_agent_rust_v10/lib/libm.so.6"

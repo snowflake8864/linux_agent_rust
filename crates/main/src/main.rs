@@ -12,6 +12,8 @@ use netlink::netlink::NlSockInfo;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use config::net_info::NETINFO_CONFIG;
+use udisk::StartUsbService;
+use docker::StartDockerMonitor;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -112,12 +114,27 @@ async fn main() -> std::io::Result<()> {
     } else {
         logging::log_error!("无法创建 socket，跳过内核事件处理");
     }
-
-    // 等待所有任务完成
+    
+    let usb_monitor_handle = tokio::spawn({
+        let mut init = init.clone();
+        let tx = file_audit_log_tx.clone();
+        async move {
+            init.start_usb_services(tx).await.unwrap();
+        }
+    });
+    
+    let start_docker_monitor_handle = tokio::spawn({
+        let mut init = init.clone();
+        async move {
+            init.start_docker_monitor_services().await.unwrap();            
+        } 
+    });
     start_services_handle.await.unwrap();
     task_fetcher_handle.await.unwrap();
     log_services_handler.await.unwrap();
     timer_task_handle.await.unwrap();
+    usb_monitor_handle.await.unwrap();
+    start_docker_monitor_handle.await.unwrap();
 
     if let Some(handle) = task_kernel_send_handler {
         handle.await.unwrap();
