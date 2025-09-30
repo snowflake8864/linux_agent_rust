@@ -135,6 +135,66 @@ pub fn build_alert_log_json(log_info: &[AuditLogInfo], str_json: &mut String) ->
     Ok(())
 }
 
+pub fn serialize_alert_logs_to_json(log_info: &[AuditLogInfo], str_json: &mut String) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct LogEntry {
+        level: u32,
+        time: u64,
+        #[serde(rename = "type")]
+        n_type: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dir: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hash: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rename_dir: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        notice_remark: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exception_process: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peripheral_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peripheral_remark: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peripheral_eid: Option<String>,
+        p_param: Option<String>,
+    }
+
+    let entries: Vec<LogEntry> = log_info
+        .iter()
+        .map(|log| LogEntry {
+            level: log.n_level,
+            time: log.n_time,
+            n_type: log.n_type,
+            dir: log.file_path.clone(),
+            hash: log.md5.clone(),
+            rename_dir: log.rename_dir.clone(),
+            notice_remark: log.notice_remark.clone(),
+            exception_process: log.exception_process.clone(),
+            peripheral_name: log.peripheral_name.clone(),
+            peripheral_remark: log.peripheral_remark.clone(),
+            peripheral_eid: log.peripheral_eid.clone(),
+            p_param: log.p_param.clone().or(log.file_path.clone()),
+        })
+    .collect();
+
+    if entries.is_empty() {
+        log_error!("没有有效的日志条目可添加到 JSON。");
+        return Err("No valid log entries".to_string());
+    }
+
+    // 直接构建包含数组的 JSON 对象（不转成字符串！）
+    let json_obj = serde_json::json!({
+        "alert": entries  // ← 这里直接传入 Vec<LogEntry>，serde_json 会正确序列化为数组
+    });
+
+    *str_json = serde_json::to_string(&json_obj)
+        .map_err(|e| format!("JSON序列化失败: {}", e))?;
+
+    Ok(())
+}
+
 pub fn build_auto_process_list_json(process_info: &[AuditProcess], str_json: &mut String) -> Result<(), String> {
     #[derive(Serialize)]
     struct ProcessEntry {

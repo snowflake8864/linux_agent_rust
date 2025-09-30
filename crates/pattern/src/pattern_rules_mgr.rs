@@ -6,7 +6,7 @@ use std::fs::OpenOptions;
 use std::io::{Write, Error, ErrorKind};
 use serde::Deserialize;
 use serde_json::Value;
-
+use crate::GlobalTrustDir;
 
 // 枚举类型
 #[derive(Debug, Clone, Copy)]
@@ -24,7 +24,7 @@ enum PatternType {
     LesouProtectionType,
     TamperProtectionType,
 }
-
+/*
 // 结构体定义
 #[derive(Clone, Debug)]
 pub struct GlobalTrusrDir {
@@ -32,6 +32,7 @@ pub struct GlobalTrusrDir {
     pub typ: u8,
     pub is_extend: u8,
 }
+*/
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct POLICY_EXIPOR_PROTECT {
@@ -308,7 +309,7 @@ impl PatternRulesMgr {
     }
 
     // 设置全局信任目录
-    pub fn set_global_trust_dir(&mut self, dirs: Vec<GlobalTrusrDir>) {
+    pub fn set_global_trust_dir(&mut self, dirs: Vec<GlobalTrustDir>) {
         self.global_trust_dir_patterns.clear();
         self.global_trust_dir_rules.clear();
 

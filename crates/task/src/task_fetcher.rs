@@ -1,4 +1,4 @@
-// task_fetcher.rs
+//crates/task/src/task_fetcher.rs
 use std::fs;
 use config::net_info::NETINFO_CONFIG;
 use std::pin::Pin;
@@ -15,7 +15,7 @@ use logging::{log_info,log_error};
 use common::manager::boot::BootManager;
 use crate::virtual_port_rule::VirtualPortRule;
 use crate::get_process_task::process_all_dirs;
-use pattern::{pattern_rules_mgr,process_pattern_rules_mgr::{PROCESS_PATTERN_RULES_MGR,GlobalTrustDir}};
+use pattern::{pattern_rules_mgr,GlobalTrustDir,process_pattern_rules_mgr::{PROCESS_PATTERN_RULES_MGR}};
 use tokio::sync::mpsc;
 use process_mgr::POLICY_MANAGER;
 use netlink::netlink::NlSockInfo; // 引入 NLPolicyType
@@ -50,7 +50,10 @@ pub struct TaskFetcher {
     prev_proc_switch:bool,
     prev_syslog_process_switch:bool,
     prev_dynamic_switch:bool,
+    prev_self_protect_switch:bool,
     nl_sock: Option<NlSockInfo>,
+    app_path: Option<String>,
+    offline_mode: bool,
 }
 use num_derive::FromPrimitive; // 支持从整数到枚举的转换
 use num_traits::FromPrimitive;
@@ -126,7 +129,9 @@ impl TaskFetcher {
         api_interface.insert("addperipherals".to_string(), "v1/addperipherals".to_string());
         api_interface.insert("getwhiteperipherals".to_string(), "v1/getwhiteperipherals".to_string());
         api_interface.insert("getblackperipherals".to_string(), "v1/getblackperipherals".to_string());
-
+        let cfg = NETINFO_CONFIG.lock().unwrap();
+        let app_path = Some(cfg.app_path.clone());
+        let offline_mode = cfg.is_offline_mode;
         TaskFetcher {
               base_url: base_url.to_string(),
               token,
@@ -139,7 +144,10 @@ impl TaskFetcher {
               prev_proc_switch:false,
               prev_syslog_process_switch:false,
               prev_dynamic_switch:false,
+              prev_self_protect_switch:false,
               nl_sock,
+              app_path,
+              offline_mode,
         }
     }
     pub fn get_token(&self) -> Option<String> {
@@ -176,8 +184,6 @@ impl TaskFetcher {
                 let buf = [
                     syslog_process_switch as u8,
                     proc_switch as u8,
-                    0,
-                    0,
                 ];
                 self.nl_sock
                     .as_ref()
@@ -241,6 +247,8 @@ impl TaskFetcher {
                      _ => panic!("Unsupported protocol"),
                  }
              };
+            cfg.server_ip_port = format!("https://{}:{}", cfg.server_ip, cfg.server_port);
+            log::info!("serveripport: {}", cfg.server_ip_port);
 
          }
          cfg.cron_time = get_u32(conf, "crontime")?;
@@ -259,14 +267,14 @@ impl TaskFetcher {
 
          cfg.cli_port = get_u32(conf, "debug_switch")?;
          cfg.module_switch = get_u32(conf, "module_switch")?;
-         let self_protect_switch = get_u32(conf, "self_protect_switch")?;
-         if cfg.self_protect_switch != self_protect_switch {
-             cfg.self_protect_switch = self_protect_switch;
-            
+         cfg.self_protect_switch = get_bool(conf, "self_protect_switch")?;
+         if cfg.self_protect_switch != self.prev_self_protect_switch {
+             self.prev_self_protect_switch = cfg.self_protect_switch;
+
              if !cfg.mod_ver.is_empty() {
                  let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
-                 pattern_mgr.add_file_pattern(cfg.self_protect_switch == 1);
-                 self.write_net_rule(NetRule::SelfProtect(cfg.self_protect_switch))?;
+                 pattern_mgr.add_file_pattern(cfg.self_protect_switch);
+                 self.write_net_rule(NetRule::SelfProtect(cfg.self_protect_switch as u32))?;
              }
          }
          cfg.open_port_switch = get_bool(conf, "open_port_switch")?;
@@ -292,9 +300,11 @@ impl TaskFetcher {
          cfg.internet_switch = get_bool(conf, "internet_switch")?;
          cfg.syslog_process_switch = get_bool(conf, "syslog_process_switch")?;
 
-         let _ = cfg.to_ini("/opt/osec/net_info.ini");
-         let file_flag_temp  = cfg.file_switch|cfg.extortion_switch;
-         /*
+         let _ = cfg.to_ini(&self.app_path.clone()
+             .map(|path| path + "/net_info.ini")
+             .unwrap_or_else(|| "/opt/osec/net_info.ini".to_string()));
+             let file_flag_temp  = cfg.file_switch|cfg.extortion_switch;
+             /*
 
          let mut enable_flag :u32 = 0;
             if ( file_flag_temp && self.cfg.proc_switch ) {
@@ -367,7 +377,7 @@ impl TaskFetcher {
 
         loop {
             let url = format!("{}/v1/gettask", task_fetcher.base_url);
-            match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+            match net_client.post_data_async_with_cache(&url, "", Duration::from_secs(10), token_str, Some("gettask.json"), None).await {
                 Ok(response) => {
                     let parsed: Value = match serde_json::from_str(&response) {
                         Ok(parsed) => parsed,
@@ -385,11 +395,10 @@ impl TaskFetcher {
                             .filter_map(|v| v.as_u64().map(|n| n as u32))
                             .collect::<Vec<u32>>();
                         
-                        //println!("task list:{:?}", task_list);
                         for task_id in task_list {
                             if let Some(task_type) = TaskTypeEnum::from_u32(task_id) {
                                 log_info!("task ID: {}, task type: {:?}", task_id, task_type);
-                                if let Err(e) = task_fetcher.handle_task(task_type).await {
+                                if let Err(e) = task_fetcher.handle_task(task_type,net_client.offline).await {
                                     eprintln!("Failed to handle task {}: {}", task_id, e);
                                 }
                             } else {
@@ -414,7 +423,7 @@ impl TaskFetcher {
 
 
    /// 根据任务类型处理任务
-    async fn handle_task(&mut self, task_type: TaskTypeEnum) -> Result<(), String> {
+    async fn handle_task(&mut self, task_type: TaskTypeEnum, offline_mode: bool) -> Result<(), String> {
         match task_type {
             TaskTypeEnum::TaskUploadProcess => self.task_upload_process().await,
             TaskTypeEnum::TaskUpdate => self.task_update().await,
@@ -454,7 +463,7 @@ impl TaskFetcher {
             Some(url) => url,
             None => return Err("URL for upload_gloabal_process not found".to_string()),
         };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true, self.offline_mode, self.app_path.clone()) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -483,6 +492,7 @@ impl TaskFetcher {
                     &json_str,
                     Duration::from_secs(10),
                     token_str,
+                    None
                 ).await {
                     Ok(response) => {log_info!("服务器响应: {}", response)},
                     Err(err) => eprintln!("发送指标失败: {}", err),
@@ -521,7 +531,7 @@ impl TaskFetcher {
                 None => return Err("URL for download_white not found".to_string()),
         };
 
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true, self.offline_mode, self.app_path.clone()) {
             Ok(client) => client,
                 Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -530,8 +540,9 @@ impl TaskFetcher {
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
 
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str, Some("getdirpolicy.json")).await {
             Ok(response) => {
+                log_info!("=====================服务器响应: {}", response);
                 // 解析 JSON 响应
                 let parsed: Value = match serde_json::from_str(&response) {
                     Ok(parsed) => parsed,
@@ -571,7 +582,7 @@ impl TaskFetcher {
             None => return Err("URL for download_white not found".to_string()),
         };
 
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true, self.offline_mode, self.app_path.clone()) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -579,9 +590,9 @@ impl TaskFetcher {
 
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str, Some("getconf.json")).await {
             Ok(response) => {
-                // 解析 JSON 响应
+                log_info!("111111111111111111111===================down conf 服务器响应: {}", response);
                 let parsed: Value = match serde_json::from_str(&response) {
                     Ok(parsed) => parsed,
                         Err(e) => {
@@ -621,7 +632,7 @@ impl TaskFetcher {
             Some(url) => url,
             None => return Err("URL for download_white not found".to_string()),
         };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true, self.offline_mode, self.app_path.clone()) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -630,7 +641,7 @@ impl TaskFetcher {
         let url = format!("{}/{}", self.base_url, download_url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str, None).await {
             Ok(response) => {
 
             // 解析 JSON 响应
@@ -682,7 +693,7 @@ impl TaskFetcher {
         };
 
 
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true, self.offline_mode, self.app_path.clone() ) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -691,7 +702,7 @@ impl TaskFetcher {
 
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str, Some("whitelist.json")).await {
             Ok(response) => {
                 let parsed: Value = match serde_json::from_str(&response) {
                     Ok(parsed) => parsed,
@@ -744,7 +755,7 @@ impl TaskFetcher {
             None => return Err("URL for upload_gloabal_process not found".to_string()),
         };
 
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true, self.offline_mode, self.app_path.clone()) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -758,7 +769,7 @@ impl TaskFetcher {
             Err(e) => return Err(format!("Failed to serialize port data to JSON: {}", e)),
         };
         log_info!("准备上传的数据: {}", json_data);
-        match net_client.post_data_async(&url, &json_data, Duration::from_secs(10), token_str).await {
+        match net_client.post_data_async(&url, &json_data, Duration::from_secs(10), token_str, None).await {
             Ok(response) => log_info!("服务器响应: {}", response),
             Err(err) => log_error!("发送指标失败: {}", err),
         }
@@ -771,14 +782,14 @@ impl TaskFetcher {
             None => return Err("URL for getvirtualport not found".to_string()),
         };
 
-        let net_client = NetClient::new(self.base_url.clone(), true)
+        let net_client = NetClient::new(self.base_url.clone(), true, self.offline_mode, self.app_path.clone())
             .map_err(|e| format!("Failed to create NetClient: {}", e))?;
 
         let url = format!("{}/{}", self.base_url, download_url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str());
 
-        let response = net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await?;
+        let response = net_client.post_data_async(&url, "", Duration::from_secs(10), token_str, None).await?;
         let parsed: Value = serde_json::from_str(&response)
             .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
 
@@ -873,7 +884,7 @@ impl TaskFetcher {
             Some(url) => url,
             None => return Err("未找到 netblock 策略的 URL".to_string()),
         };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true, self.offline_mode, self.app_path.clone()) {
             Ok(client) => client,
             Err(e) => return Err(format!("创建 NetClient 失败: {}", e)),
         };
@@ -882,7 +893,7 @@ impl TaskFetcher {
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str());
         let response = match net_client
-            .post_data_async(&url, "", Duration::from_secs(10), token_str)
+            .post_data_async(&url, "", Duration::from_secs(10), token_str, None)
             .await
             {
                 Ok(response) => response,
@@ -933,7 +944,7 @@ impl TaskFetcher {
             Some(url) => url,
             None => return Err("未找到 black IP 策略的 URL".to_string()),
         };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true, self.offline_mode, self.app_path.clone()) {
             Ok(client) => client,
             Err(e) => return Err(format!("创建 NetClient 失败: {}", e)),
         };
@@ -942,7 +953,7 @@ impl TaskFetcher {
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str());
         let response = match net_client
-            .post_data_async(&url, "", Duration::from_secs(10), token_str)
+            .post_data_async(&url, "", Duration::from_secs(10), token_str, None)
             .await
             {
                 Ok(response) => response,
@@ -993,7 +1004,7 @@ impl TaskFetcher {
             Some(url) => url,
             None => return Err("URL for download_white not found".to_string()),
         };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true, self.offline_mode, self.app_path.clone()) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -1001,7 +1012,7 @@ impl TaskFetcher {
         let url = format!("{}/{}", self.base_url, download_url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str, Some("getprotect.json")).await {
             Ok(response) => {
 
             // 解析 JSON 响应
@@ -1078,7 +1089,7 @@ impl TaskFetcher {
             Some(url) => url,
             None => return Err("URL for download_white not found".to_string()),
         };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true, self.offline_mode, self.app_path.clone()) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -1086,7 +1097,7 @@ impl TaskFetcher {
         let url = format!("{}/{}", self.base_url, download_url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str, None).await {
             Ok(response) => {
                 // 解析 JSON 响应
                 let parsed: Value = match serde_json::from_str(&response) {
@@ -1136,7 +1147,7 @@ impl TaskFetcher {
             Some(url) => url,
             None => return Err("URL for download_white not found".to_string()),
         };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true, self.offline_mode, self.app_path.clone()) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -1144,7 +1155,7 @@ impl TaskFetcher {
         let url = format!("{}/{}", self.base_url, download_url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str, None).await {
             Ok(response) => {
                 // 解析 JSON 响应
                 let parsed: Value = match serde_json::from_str(&response) {
@@ -1190,7 +1201,7 @@ impl TaskFetcher {
             Some(url) => url,
             None => return Err("URL for upload_gloabal_process not found".to_string()),
         };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true, self.offline_mode, self.app_path.clone()) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -1214,7 +1225,8 @@ impl TaskFetcher {
                         &url,
                         &json_str,
                         Duration::from_secs(10),
-                        token_str
+                        token_str,
+                        None
                     ).await {
                         Ok(response) => {log_info!("服务器响应: {}", response)},
                         Err(err) => eprintln!("发送指标失败: {}", err),
@@ -1245,7 +1257,7 @@ impl TaskFetcher {
             None => return Err("URL for upload_gloabal_process not found".to_string()),
         };
 
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true, self.offline_mode, self.app_path.clone()) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -1265,7 +1277,7 @@ impl TaskFetcher {
             None => return Err("URL for download_white not found".to_string()),
         };
 
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(self.base_url.clone(), true, self.offline_mode, self.app_path.clone()) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -1274,8 +1286,9 @@ impl TaskFetcher {
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str());
 
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str, Some("gettrustdir.json")).await {
             Ok(response) => {
+                log_info!("===gettrustdir 服务器响应: {}", response);
                 let parsed: Value = match serde_json::from_str(&response) {
                     Ok(parsed) => parsed,
                     Err(e) => {
@@ -1285,8 +1298,9 @@ impl TaskFetcher {
                 };
 
                 if parsed["code"] == "000000" {
-                    let data_value = &parsed["data"];
-                    let trust_dirs: Vec<GlobalTrustDir> = match serde_json::from_value(data_value.clone()) {
+                    //let data_value = &parsed["data"];
+                    let data_value = parsed["data"].clone();
+                    let process_trust_dirs: Vec<GlobalTrustDir> = match serde_json::from_value(data_value.clone()) {
                         Ok(v) => v,
                         Err(e) => {
                             eprintln!("Failed to deserialize data to GlobalTrustDir: {}", e);
@@ -1294,7 +1308,21 @@ impl TaskFetcher {
                         }
                     };
 
-                    PROCESS_PATTERN_RULES_MGR.lock().set_global_trust_dir(trust_dirs);
+                    PROCESS_PATTERN_RULES_MGR.lock().set_global_trust_dir(process_trust_dirs);
+
+                    let file_trust_dirs: Vec<GlobalTrustDir> = match serde_json::from_value(data_value) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("Failed to deserialize data to GlobalTrustDir: {}", e);
+                            return Err("Failed to deserialize data.".to_string());
+                        }
+                    };
+
+                    let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
+                    pattern_mgr.set_global_trust_dir(file_trust_dirs);
+
+
+                    
                 } else {
                     eprintln!("Error: Invalid response code: {}", parsed["code"]);
                     return Err("Invalid response code.".to_string());
@@ -1334,12 +1362,15 @@ impl TaskService for BootManager {
         token_rx: mpsc::Receiver<String>,
     nl_sock: Option<NlSockInfo>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        let cfg = NETINFO_CONFIG.lock().unwrap();
+        let offline_mode = cfg.is_offline_mode;
+        let app_path = Some(cfg.app_path.clone());
         Box::pin(async move {
             let mut token_rx = token_rx;
             loop {
                 let base_url = self.get_base_url();
 
-                let mut net_client = match NetClient::new(base_url, true) {
+                let mut net_client = match NetClient::new(base_url, true, offline_mode, app_path.clone()) {
                     Ok(client) => client,
                     Err(err) => {
                         eprintln!("创建 NetClient 失败: {}", err);

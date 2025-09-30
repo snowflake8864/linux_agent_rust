@@ -18,7 +18,23 @@ impl LoadKernelDriver for BootManager {
     fn load_kernel_driver(&mut self) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
 //            let _ = unload_driver();
+            // Ensure /opt/osec/Data/ exists
+            let data_dir = PathBuf::from("/opt/osec/Data");
+            if !data_dir.exists() {
+                fs::create_dir_all(&data_dir)
+                    .map_err(|e| format!("Failed to create directory /opt/osec/Data: {}", e))?;
+            }
 
+            // Copy /proc/kallsyms to /opt/osec/Data/kallsyms
+            let kallsyms_src = PathBuf::from("/proc/kallsyms");
+            let kallsyms_dst = data_dir.join("kallsyms");
+            if kallsyms_src.exists() {
+                fs::copy(&kallsyms_src, &kallsyms_dst)
+                    .map_err(|e| format!("Failed to copy /proc/kallsyms to {:?}: {}", kallsyms_dst, e))?;
+                log_info!("Copied /proc/kallsyms to {:?}", kallsyms_dst);
+            } else {
+                log_error!("/proc/kallsyms not found, skipping copy");
+            }
             let mut interval = interval(Duration::from_secs(1));
             let mut failed_drivers = HashSet::new();
 

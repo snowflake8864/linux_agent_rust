@@ -72,22 +72,27 @@ impl BootManager {
             }
 
             if config_path.is_none() {
-                config_path = Some("/opt/osec/net_info.ini".to_string());
+                config_path = Some("/opt/osec/".to_string());
                 eprintln!("Missing '--config' argument. Using default config path: {}", config_path.as_ref().unwrap());
             }
         }
 
+        let config_path_clone = config_path.clone();
         // Load the INI file using the configparser crate
         let mut ini = Ini::new();
+
         if let Some(path) = config_path {
-            ini.load(path.clone()).unwrap_or_else(|_| {
-                    eprintln!("Failed to load configuration file from '{}'", path);
-                    std::process::exit(1);
-                    });
+            let config_file = format!("{}/net_info.ini", path);
+            ini.load(config_file).unwrap_or_else(|_| {
+                eprintln!("Failed to load configuration file from '{}/net_info.ini'", path);
+                std::process::exit(1);
+            });
         }
+
 
         // Retrieve the configuration values from the INI file and parse into NetInfoConfig
         let mut netinfocfg = NETINFO_CONFIG.lock().unwrap(); // 这里使用 from_ini 解析配置
+        netinfocfg.app_path = config_path_clone.unwrap_or_else(|| "/opt/osec/".to_string());
         let _ =  netinfocfg.acquire_host_info();
 
         //println!("1===={:?}", netinfocfg);

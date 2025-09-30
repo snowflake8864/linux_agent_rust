@@ -2,6 +2,7 @@ use std::fs::read_dir;
 use std::time::Duration;
 use process_mgr::get_md5_global;
 use net_client::core::NetClient;
+use net_client::WriteMode;
 use serde::Serialize;
 use serde_json::{json, to_string};
 use logging::{log_info,log_error};
@@ -68,7 +69,7 @@ pub async fn process_all_dirs(
             if vec_info.len() >= 200 {
                 let json_str = build_linux_dir_json(&vec_info);
                 log_info!("准备上传的数据: {}", json_str);
-                match net_client.post_data_async(&url, &json_str, Duration::from_secs(10), token).await {
+                match net_client.post_data_write_async(&url, &json_str, Duration::from_secs(10), token, Some("upload_gloabal_process.json"), Some(WriteMode::Overwrite)).await {
                     Ok(response) => log_info!("服务器响应: {}", response),
                     Err(err) => log_error!("发送指标失败: {}", err),
                 }
@@ -79,7 +80,7 @@ pub async fn process_all_dirs(
 
     if !vec_info.is_empty() {
         let json_str = build_linux_dir_json(&vec_info);
-        match net_client.post_data_async(&url, &json_str, Duration::from_secs(10), token).await {
+        match net_client.post_data_write_async(&url, &json_str, Duration::from_secs(10), token, Some("upload_gloabal_process.json"), Some(WriteMode::Append)).await {
             Ok(response) => log_info!("服务器响应: {}", response),
             Err(err) => log_error!("发送指标失败: {}", err),
         }

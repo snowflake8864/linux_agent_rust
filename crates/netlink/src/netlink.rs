@@ -160,6 +160,7 @@ impl NlSockInfo {
     }
     pub fn send_uint32(&self, msg_type: u16, value: u32) -> io::Result<isize> {
         let bytes = value.to_ne_bytes(); // 保持原生字节序
+        log_info!("==msg:{},bytes:{:?}", msg_type, bytes);
         self.send_message(msg_type, &bytes)
     }
     pub fn receive_netlink_message(&self) -> io::Result<Vec<u8>> {

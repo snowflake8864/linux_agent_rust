@@ -431,7 +431,7 @@ impl StartKernelHandler for BootManager {
 
             let boot_manager_arc = Arc::new(self.clone());
             register_user_event_handlers(&event_handler, file_audit_log_tx, boot_manager_arc).await;
-            send_data_to_kernel(&nl_sock).map_err(|e| e.to_string())?;
+            //send_data_to_kernel(&nl_sock).map_err(|e| e.to_string())?;
             Ok("后台任务已启动".to_string())
         })
     }
@@ -499,5 +499,9 @@ pub fn send_data_to_kernel(nl_sock: &NlSockInfo) -> Result<String, String> {
         return Err(format!("Failed to send custom data: {}", e));
     }
 
+    let data: Vec<u8> = vec![1,0,0,0];
+    if let Err(e) = nl_sock.send_message(4, &data) {
+        return Err(format!("Failed to send custom data: {}", e));
+    }
     Ok("Data sent successfully".to_string())
 }

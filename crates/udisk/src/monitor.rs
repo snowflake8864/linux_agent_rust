@@ -485,6 +485,7 @@ pub async fn upload_usb_info(
                 &json_str,
                 Duration::from_secs(10),
                 boot_mgr.get_token().await.as_deref(),
+                None
             ).await {
                 Ok(response) => {log_info!("服务器响应: {}", response)},
                 Err(err) => eprintln!("发送指标失败: {}", err),
@@ -508,9 +509,11 @@ impl StartUsbService for BootManager {
     fn start_usb_services(
         &mut self, usb_audit_log_tx: mpsc::Sender<AuditLogInfo>
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        let cfg = NETINFO_CONFIG.lock().unwrap();
+        let app_path = Some(cfg.app_path.clone());
         Box::pin(async move {
             let base_url = self.get_base_url();
-            let net_client = match NetClient::new(base_url, true) {
+            let net_client = match NetClient::new(base_url, true,false, app_path) {
                 Ok(client) => client,
                 Err(err) => {
                     eprintln!("创建 NetClient 失败: {}", err);

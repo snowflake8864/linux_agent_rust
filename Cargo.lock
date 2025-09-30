@@ -173,6 +173,8 @@ version = "0.10.6"
 dependencies = [
  "configparser",
  "hostinfo",
+ "log",
+ "logging",
  "once_cell",
 ]
 
@@ -1065,10 +1067,15 @@ dependencies = [
 name = "net_client"
 version = "0.10.6"
 dependencies = [
+ "config",
  "futures",
+ "log",
+ "logging",
+ "once_cell",
  "reqwest",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
