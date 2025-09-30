@@ -6,6 +6,7 @@ use log::{info, error};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::Deserialize;
+use crate::GlobalTrustDir;
 
 // 定义常量文件路径
 const FILE_PATTERNS_PROC_FILE: &str = "/proc/osec/process_dpi/file_patterns";
@@ -18,7 +19,7 @@ struct ProcessPattern {
     typ: u8,              // 类型：0 表示普通进程，1 表示系统进程
     param: &'static str,  // 额外参数，如 match_full_path=1 或 pkt_len=-1
 }
-
+/*
 #[derive(Debug, Deserialize)]
 pub struct GlobalTrustDir {
     pub dir: String,
@@ -26,6 +27,7 @@ pub struct GlobalTrustDir {
     pub typ: u8,
     pub is_extend: u8,
 }
+*/
 // 预定义的进程模式
 const PROCESS_PATTERNS: &[ProcessPattern] = &[
     ProcessPattern { key: "bin/sudo", typ: 0, param: "" },

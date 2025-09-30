@@ -5,6 +5,8 @@ edition = "2021"
 resolver = "2"
 
 [dependencies]
-configparser = "3.1.0"  # 选择适合的版本
+configparser = "3.1.0"  
 hostinfo = { path =  "../hostinfo" }
 once_cell = "1.17"
+logging = { path = "../logging" }
+log = "0.4"

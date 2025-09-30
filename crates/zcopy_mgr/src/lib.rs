@@ -100,6 +100,7 @@ pub struct OsecDnsReport {
     dns_name: [u8; 255],
 }
 
+/*
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AvProcessInfo {
@@ -174,8 +175,187 @@ impl AvProcessInfo {
     }
 }
 
+*/
 
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AvProcessInfo {
+    // 私有字段：承载 union { struct { pid, ppid, uid, unused }; uint8_t md5[16]; }
+    _union_data: [u8; 16],
+
+    pub type_: i32,
+
+    pub flags: u32,
+
+    // 路径（512 字节）
+    pub path: [u8; MAX_PROCESS_PATH],
+}
+
+// 编译时断言：确保 Rust 结构体大小与内核一致
+// 内核布局：16 (union) + 2 (type)  + 4 (flags) + 512 (path) = 534
+const _: () = assert!(std::mem::size_of::<AvProcessInfo>() == 536);
+
+// 位字段解析结构体
+#[derive(Debug)]
+pub struct AvProcessFlags {
+    pub is_dir: u8,
+    pub deny: u8,
+    pub param_pos: u16,
+    pub level: u8,
+    pub is_monitor_mode: u8,
+    pub is_docker_process: bool, // 新增字段
+}
+
+impl From<u32> for AvProcessFlags {
+    fn from(flags: u32) -> Self {
+        AvProcessFlags {
+            is_dir: ((flags >> 0) & 0b111) as u8,
+            deny: ((flags >> 3) & 0b111) as u8,
+            param_pos: ((flags >> 6) & 0b11_1111_1111) as u16,
+            level: ((flags >> 16) & 0b111) as u8,
+            is_monitor_mode: ((flags >> 19) & 0b11) as u8,
+            is_docker_process: ((flags >> 21) & 1) != 0,
+        }
+    }
+}
+
+impl AvProcessInfo {
+    // === 以下方法与你旧代码完全一致，无需任何修改 ===
+
+    /// 获取进程 ID（与旧版完全兼容）
+    pub fn pid(&self) -> i32 {
+        let data = unsafe {
+            std::ptr::read_unaligned(self._union_data.as_ptr() as *const [i32; 4])
+        };
+        data[0]
+    }
+
+    /// 获取父进程 ID（与旧版完全兼容）
+    pub fn ppid(&self) -> i32 {
+        let data = unsafe {
+            std::ptr::read_unaligned(self._union_data.as_ptr() as *const [i32; 4])
+        };
+        data[1]
+    }
+
+    /// 获取用户 ID（与旧版完全兼容）
+    pub fn uid(&self) -> i32 {
+        let data = unsafe {
+            std::ptr::read_unaligned(self._union_data.as_ptr() as *const [i32; 4])
+        };
+        data[2]
+    }
+
+    // === 位字段解析方法（新增 is_docker_process，其余不变）===
+
+    pub fn flags_parsed(&self) -> AvProcessFlags {
+        self.flags.into()
+    }
+
+    pub fn is_dir(&self) -> u8 {
+        self.flags_parsed().is_dir
+    }
+
+    pub fn deny(&self) -> u8 {
+        self.flags_parsed().deny
+    }
+
+    pub fn param_pos(&self) -> u16 {
+        self.flags_parsed().param_pos
+    }
+
+    pub fn level(&self) -> u8 {
+        self.flags_parsed().level
+    }
+
+    pub fn is_monitor_mode(&self) -> u8 {
+        self.flags_parsed().is_monitor_mode
+    }
+
+    /// 新增：是否为 Docker 进程
+    pub fn is_docker_process(&self) -> bool {
+        self.flags_parsed().is_docker_process
+    }
+
+
+    /// 获取 MD5 哈希值（16 字节）
+    pub fn md5(&self) -> [u8; 16] {
+        self._union_data
+    }
+
+
+    /// 安全地将路径解析为字符串
+    pub fn get_path_str(&self) -> Option<String> {
+        unsafe {
+            CStr::from_ptr(self.path.as_ptr() as *const std::os::raw::c_char)
+                .to_str()
+                .ok()
+                .map(|s| s.to_string())
+        }
+    }
+}
+
+
+use std::mem::{size_of, offset_of};
+
+impl fmt::Debug for AvProcessInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // 获取布局信息
+        let struct_size = size_of::<AvProcessInfo>();
+        let path_offset = offset_of!(AvProcessInfo, path);
+        let flags_raw = self.flags;
+        let flags_hex = format!("{:#010x}", flags_raw);
+        let parsed = self.flags_parsed();
+
+        // 安全解析 path
+        let path_str = unsafe {
+            std::ffi::CStr::from_ptr(self.path.as_ptr() as *const std::os::raw::c_char)
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        f.debug_struct("AvProcessInfo")
+            .field("layout", &format!("size={}, path_offset={}", struct_size, path_offset))
+            .field("pid", &self.pid())
+            .field("ppid", &self.ppid())
+            .field("uid", &self.uid())
+            .field("type_", &self.type_)
+            .field("flags (raw)", &flags_raw)
+            .field("flags (hex)", &flags_hex)
+            .field("is_dir", &parsed.is_dir)
+            .field("deny", &parsed.deny)
+            .field("param_pos", &parsed.param_pos)
+            .field("level", &parsed.level)
+            .field("is_monitor_mode", &parsed.is_monitor_mode)
+            .field("is_docker_process", &parsed.is_docker_process)
+            .field("path", &path_str)
+            .field("path[0..10] (hex)", &&self.path[0..10])
+            .finish()
+    }
+}
+/*
+impl fmt::Debug for AvProcessInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // 安全地将 path 转为字符串用于调试
+        let path_str = unsafe {
+            std::ffi::CStr::from_ptr(self.path.as_ptr() as *const std::os::raw::c_char)
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        f.debug_struct("AvProcessInfo")
+            .field("pid", &self.pid())
+            .field("ppid", &self.ppid())
+            .field("uid", &self.uid())
+            .field("type_", &self.type_)
+            .field("flags", &self.flags)
+            .field("is_docker_process", &self.is_docker_process())
+            .field("path", &path_str)
+            .finish()
+    }
+}
+*/
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AvFileInfo {
@@ -335,19 +515,8 @@ impl fmt::Debug for OsecDnsReport {
     }
 }
 
-impl fmt::Debug for AvProcessInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AvProcessInfo")
-            .field("pid", &self.pid)
-            .field("ppid", &self.ppid)
-            .field("uid", &self.uid)
-            .field("type_", &self.type_)
-            .field("flags", &self.flags)
-            .field("timestamp", &self.timestamp)
-            .field("path", &self.path)
-            .finish()
-    }
-}
+
+
 
 impl fmt::Debug for AvFileInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

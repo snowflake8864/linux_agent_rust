@@ -8,7 +8,7 @@ pub mod net_service_log;
 pub mod log_worker;
 pub use log_worker::StartBashLog;
 pub mod build_json;
-pub use build_json::{build_alert_log_json,build_auto_process_list_json,build_batch_process_edr_json, build_open_port_json};
+pub use build_json::{build_alert_log_json,serialize_alert_logs_to_json, build_auto_process_list_json,build_batch_process_edr_json, build_open_port_json};
 
 use std::fs;
 use std::path::PathBuf;

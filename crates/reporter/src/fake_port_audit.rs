@@ -8,17 +8,22 @@ use std::sync::Arc;
 use zcopy_mgr::{OsecOpenportReport, ZcopyMgr, IpAddrUnion};
 use crate::{OpenPortLog, build_open_port_json};
 use net_client::core::NetClient;
+use net_client::WriteMode;
 use tokio::time::Duration;
 use common::manager::boot::BootManager;
+use config::net_info::NETINFO_CONFIG;
 #[derive(Clone)]
 pub struct FakePortAuditHandler {
     zcopy_mgr: Arc<ZcopyMgr>,
     boot_manager: Arc<BootManager>,
+    app_path: Option<String>,
 }
 
 impl FakePortAuditHandler {
     pub fn new(zcopy_mgr: Arc<ZcopyMgr>, boot_manager: Arc<BootManager>) -> Self {
-        FakePortAuditHandler { zcopy_mgr, boot_manager }
+        let cfg = NETINFO_CONFIG.lock().unwrap(); // 这里使用 from_ini 解析配置
+        let app_path = Some(cfg.app_path.clone());
+        FakePortAuditHandler { zcopy_mgr, boot_manager, app_path}
     }
 
     pub async fn handle_fake_port_zcopy_oper(
@@ -77,7 +82,7 @@ impl FakePortAuditHandler {
             iterate(0, netlog.start_idx);
             iterate(netlog.end_idx, netlog.max_idx);
         }
-        let net_client = match NetClient::new(self.boot_manager.get_base_url(), true) {
+        let net_client = match NetClient::new(self.boot_manager.get_base_url(), true, false, self.app_path.clone()) {
             Ok(client) => client,
             Err(err) => {
                 eprintln!("创建 NetClient 失败: {}", err);
@@ -92,11 +97,13 @@ impl FakePortAuditHandler {
             match build_open_port_json(&logVec, &mut json_str) {
                 Ok(()) => {
                     //log_info!("生成 JSON: {}", json_str);
-                    match net_client.post_data_async(
+                    match net_client.post_data_write_async(
                         &url,
                         &json_str,
                         Duration::from_secs(10),
                         self.boot_manager.get_token().await.as_deref(),
+                        Some("upOpenPort.json"),
+                        Some(WriteMode::Append)
                     ).await {
                         Ok(response) => {},//{log_info!("服务器响应: {}", response)},
                         Err(err) => eprintln!("发送指标失败: {}", err),

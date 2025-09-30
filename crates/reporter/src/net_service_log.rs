@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{SystemTime, UNIX_EPOCH};
 use net_client::core::NetClient;
+use net_client::WriteMode;
 use crate::build_json::build_batch_syslog_net_json;
 use crate::netlink_msg::NetlinkNetlog;
 use logging::{log_error, log_info};
@@ -14,6 +15,7 @@ use hostinfo::net_app::model::{get_port_from_state};
 use tokio::time::Duration;
 use crate::SysNetLog;
 use common::manager::boot::BootManager;
+use config::net_info::NETINFO_CONFIG;
 
 fn ip46_address_is_ip4(addr: &IpAddrUnion) -> bool {
     unsafe {
@@ -71,13 +73,17 @@ fn is_change(last: &OsecNetworkReport, current: &OsecNetworkReport) -> bool {
 pub struct NetServiceLogHandler {
     zcopy_mgr: Arc<ZcopyMgr>,
     boot_manager: Arc<BootManager>,
+    app_path: Option<String>,
 }
 
 impl NetServiceLogHandler {
     pub fn new(zcopy_mgr: Arc<ZcopyMgr>, boot_manager: Arc<BootManager>) -> Self {
+        let cfg = NETINFO_CONFIG.lock().unwrap(); // 这里使用 from_ini 解析配置
+        let app_path = Some(cfg.app_path.clone());
         NetServiceLogHandler {
             zcopy_mgr,
             boot_manager,
+            app_path,
         }
     }
 
@@ -318,7 +324,7 @@ impl NetServiceLogHandler {
             // self.upload_http_syslog(batch_json).await?;
             //log_info!("===={:?}",vec_net_log);
 
-                let net_client = match NetClient::new(self.boot_manager.get_base_url(), true) {
+                let net_client = match NetClient::new(self.boot_manager.get_base_url(), true, false, self.app_path.clone()) {
                     Ok(client) => client,
                     Err(err) => {
                         eprintln!("创建 NetClient 失败: {}", err);
@@ -331,11 +337,13 @@ impl NetServiceLogHandler {
             match build_batch_syslog_net_json(&vec_net_log, &mut json_str) {
                 Ok(()) => {
                     //log_info!("生成 JSON: {}", json_str);
-                    match net_client.post_data_async(
+                    match net_client.post_data_write_async(
                         &url,
                         &json_str,
                         Duration::from_secs(10),
                         self.boot_manager.get_token().await.as_deref(),
+                        Some("putsyslog.json"),
+                        Some(WriteMode::Append)
                     ).await {
                         Ok(response) => {/*log_info!("服务器响应: {}", response)*/},
                         Err(err) => eprintln!("发送指标失败: {}", err),
@@ -543,7 +551,7 @@ impl NetServiceLogHandler {
             // self.upload_http_syslog(batch_json).await?;
             //log_info!("===={:?}",vec_net_log);
 
-                let net_client = match NetClient::new(self.boot_manager.get_base_url(), true) {
+                let net_client = match NetClient::new(self.boot_manager.get_base_url(), true, false, self.app_path.clone()) {
                     Ok(client) => client,
                     Err(err) => {
                         eprintln!("创建 NetClient 失败: {}", err);
@@ -556,11 +564,13 @@ impl NetServiceLogHandler {
             match build_batch_syslog_net_json(&vec_net_log, &mut json_str) {
                 Ok(()) => {
                     //log_info!("生成 JSON: {}", json_str);
-                    match net_client.post_data_async(
+                    match net_client.post_data_write_async(
                         &url,
                         &json_str,
                         Duration::from_secs(10),
                         self.boot_manager.get_token().await.as_deref(),
+                        Some("putsyslog.json"),
+                        Some(WriteMode::Append)
                     ).await {
                         Ok(response) => {/*log_info!("服务器响应: {}", response)*/},
                         Err(err) => eprintln!("发送指标失败: {}", err),
