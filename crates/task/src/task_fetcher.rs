@@ -1,4 +1,4 @@
-// task_fetcher.rs
+//crates/task/src/task_fetcher.rs
 use std::fs;
 use config::net_info::NETINFO_CONFIG;
 use std::pin::Pin;
@@ -50,6 +50,7 @@ pub struct TaskFetcher {
     prev_proc_switch:bool,
     prev_syslog_process_switch:bool,
     prev_dynamic_switch:bool,
+    prev_self_protect_switch:bool,
     nl_sock: Option<NlSockInfo>,
 }
 use num_derive::FromPrimitive; // 支持从整数到枚举的转换
@@ -139,6 +140,7 @@ impl TaskFetcher {
               prev_proc_switch:false,
               prev_syslog_process_switch:false,
               prev_dynamic_switch:false,
+              prev_self_protect_switch:false,
               nl_sock,
         }
     }
@@ -241,6 +243,8 @@ impl TaskFetcher {
                      _ => panic!("Unsupported protocol"),
                  }
              };
+            cfg.server_ip_port = format!("https://{}:{}", cfg.server_ip, cfg.server_port);
+            log::info!("serveripport: {}", cfg.server_ip_port);
 
          }
          cfg.cron_time = get_u32(conf, "crontime")?;
@@ -259,16 +263,19 @@ impl TaskFetcher {
 
          cfg.cli_port = get_u32(conf, "debug_switch")?;
          cfg.module_switch = get_u32(conf, "module_switch")?;
-         let self_protect_switch = get_u32(conf, "self_protect_switch")?;
-         if cfg.self_protect_switch != self_protect_switch {
-             cfg.self_protect_switch = self_protect_switch;
-            
+
+
+         cfg.self_protect_switch = get_bool(conf, "self_protect_switch")?;
+         if cfg.self_protect_switch != self.prev_self_protect_switch {
+             self.prev_self_protect_switch = cfg.self_protect_switch;
+
              if !cfg.mod_ver.is_empty() {
                  let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
-                 pattern_mgr.add_file_pattern(cfg.self_protect_switch == 1);
-                 self.write_net_rule(NetRule::SelfProtect(cfg.self_protect_switch))?;
+                 pattern_mgr.add_file_pattern(cfg.self_protect_switch);
+                 self.write_net_rule(NetRule::SelfProtect(cfg.self_protect_switch as u32))?;
              }
          }
+
          cfg.open_port_switch = get_bool(conf, "open_port_switch")?;
          if cfg.open_port_switch != self.prev_open_port_switch {
              self.prev_open_port_switch = cfg.open_port_switch;
@@ -292,7 +299,7 @@ impl TaskFetcher {
          cfg.internet_switch = get_bool(conf, "internet_switch")?;
          cfg.syslog_process_switch = get_bool(conf, "syslog_process_switch")?;
 
-         let _ = cfg.to_ini("/opt/osec/net_info.ini");
+         let _ = cfg.to_ini(&(cfg.app_path.clone() + "/net_info.ini"));
          let file_flag_temp  = cfg.file_switch|cfg.extortion_switch;
          /*
 
