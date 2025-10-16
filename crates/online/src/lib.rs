@@ -41,7 +41,7 @@ pub struct BaseOnline {
     pub auth: String,
     pub userid: String,
     pub host_name: String,
-    pub mod_ver: String,
+    //pub mod_ver: String,
 }
 fn get_os_start_time() -> String {
     if let Ok(content) = fs::read_to_string("/proc/uptime") {
@@ -80,7 +80,7 @@ impl BaseOnline {
             //osstarttime:"1731309829".to_string(),
             asstarttime,
             osstarttime,
-            mod_ver: cfg.mod_ver.clone(),
+            //mod_ver: cfg.mod_ver.clone(),
         }
     }
 
@@ -90,28 +90,29 @@ impl BaseOnline {
         let json_str = serde_json::to_string(&base_online)
             .map_err(|e| format!("Failed to serialize to JSON: {}", e))?;
 
-        log_info!("===========================Serialized JSON: {}", json_str);
+        log_info!("Serialized JSON: {}", json_str);
 
         let url = format!("{}/v1/auth", net_client.base_url);
         println!("==url:{}", url);
-        match net_client.post_data_async(&url, &json_str, Duration::from_secs(10), None).await {
+        match net_client.post_data_async(&url, &json_str, Duration::from_secs(30), None).await {
             Ok(response) => {
-                println!("response: {:?}", response);
+                log_info!("response: {:?}", response);
                 // 尝试将响应解析为 AuthResponse 结构
                 match serde_json::from_str::<AuthResponse>(&response) {
                     Ok(auth_response) => {
                         // 成功解析 token
-                        println!("Token: {}", auth_response.data.token);
+                        log_info!("Token: {}", auth_response.data.token);
                         return Ok(auth_response.data.token);  // 返回 token
                     }
                     Err(e) => {
                         eprintln!("Failed to parse response: {}", e);
+                        log_info!("Failed to parse response: {}", e);
                         return Err("Failed to parse token from response".to_string());
                     }
                 }
             }
 
-            Err(err) => eprintln!("Error: {}", err),
+            Err(err) =>{log_info!("获取 token 失败 Error:{}",err);eprintln!("Error: {}", err)},
         }
 
         Err("Failed to get token.".to_string()) // 如果没有 token，返回错误

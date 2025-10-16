@@ -67,7 +67,7 @@ pub async fn process_all_dirs(
 
             if vec_info.len() >= 200 {
                 let json_str = build_linux_dir_json(&vec_info);
-                log_info!("准备上传的数据: {}", json_str);
+                //log_info!("准备上传的数据: {}", json_str);
                 match net_client.post_data_async(&url, &json_str, Duration::from_secs(10), token).await {
                     Ok(response) => log_info!("服务器响应: {}", response),
                     Err(err) => log_error!("发送指标失败: {}", err),

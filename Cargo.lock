@@ -173,6 +173,8 @@ version = "0.10.6"
 dependencies = [
  "configparser",
  "hostinfo",
+ "log",
+ "logging",
  "once_cell",
 ]
 

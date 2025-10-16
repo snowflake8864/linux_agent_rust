@@ -2,6 +2,7 @@
 pub mod event_handler;
 pub use event_handler::StartKernelHandler;
 pub use event_handler::EventHandler;
+pub use event_handler::send_data_to_kernel;
 pub mod msg_handler;
 pub use msg_handler::KosecsMsgData;
 use std::future::Future;

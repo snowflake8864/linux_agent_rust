@@ -309,7 +309,7 @@ async fn update_docker_state() {
             }
         }
         Err(e) => {
-            log_error!("Failed to scan container processes: {}", e);
+            //log_error!("Failed to scan container processes: {}", e);
         }
     }
 }
