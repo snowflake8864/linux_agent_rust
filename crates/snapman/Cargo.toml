@@ -1,0 +1,18 @@
+[package]
+name = "snapman"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "snapman"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+regex = "1.10"
+tempfile = "3.6"
+which = "5.0"
+chrono = "0.4"
+logging = { path = "../logging" }
+log = "0.4"
+tokio = { version = "1.23", features = ["net", "macros", "fs", "io-util"] }
