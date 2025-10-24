@@ -77,7 +77,7 @@ impl FakePortAuditHandler {
             iterate(0, netlog.start_idx);
             iterate(netlog.end_idx, netlog.max_idx);
         }
-        let net_client = match NetClient::new(self.boot_manager.get_base_url(), true) {
+        let net_client = match NetClient::new(Some(self.boot_manager.get_base_url()), true) {
             Ok(client) => client,
             Err(err) => {
                 eprintln!("创建 NetClient 失败: {}", err);
@@ -87,7 +87,7 @@ impl FakePortAuditHandler {
 
         
         if logVec.len() > 0 {
-            let url = format!("{}/v1/upOpenPort", net_client.base_url);
+            let url = format!("{}/v1/upOpenPort", net_client.get_base_url().unwrap_or_default());
             let mut json_str = String::new();
             match build_open_port_json(&logVec, &mut json_str) {
                 Ok(()) => {

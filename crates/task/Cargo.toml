@@ -27,6 +27,8 @@ netlink = { path = "../netlink" }
 netblock = {path = "../netblock"}
 udisk = {path = "../udisk"}
 procinfo = { path = "../procinfo" }
+snapman = { path = "../snapman"}
+rules_jump_mgr = { path = "../rules_jump_mgr"}
 [features]
 test_mode = []
 

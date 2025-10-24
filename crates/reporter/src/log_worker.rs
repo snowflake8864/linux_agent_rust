@@ -23,7 +23,7 @@ impl StartBashLog for BootManager {
             let mut log_buffer: Vec<AuditLogInfo> = Vec::new();
             let mut interval = interval(Duration::from_secs(30));
             let base_url = self.get_base_url();
-            let net_client = match NetClient::new(base_url, true) {
+            let net_client = match NetClient::new(Some(base_url), true) {
                 Ok(client) => client,
                 Err(err) => {
                     eprintln!("创建 NetClient 失败: {}", err);
@@ -31,7 +31,7 @@ impl StartBashLog for BootManager {
                 }
             };
 
-            let url = format!("{}/v1/alertupload", net_client.base_url);
+            let url = format!("{}/v1/alertupload", net_client.get_base_url().unwrap_or_default());
             loop {
                 tokio::select! {
                     result = file_audit_log_rx.recv() => {

@@ -1,17 +1,18 @@
 //crates/config/src/net_info.rs
 use configparser::ini::Ini;
-
 use std::fs;
 use std::fs::File;
 use std::io::{self, Write};
+use std::process::Command;
 use hostinfo::system_info::SystemInfo;
 use hostinfo::{ip_mac, agent_uid};
-use logging::{log_info,log_error};
+use logging::{log_info, log_error};
+
 #[derive(Debug, Default, Clone)]
 pub struct NetInfoConfig {
     pub app_path: String,
-    pub mid: String,  // MID 字段
-    pub ver: String,  
+    pub mid: String,
+    pub ver: String,
     pub com_time: u32,
     pub cron_time: u32,
     pub extortion_protect: bool,
@@ -39,35 +40,68 @@ pub struct NetInfoConfig {
     pub syslog_dns_switch: bool,
     pub syslog_outer_switch: bool,
     pub syslog_inner_switch: bool,
-    pub syslog_process_switch:bool,
+    pub syslog_process_switch: bool,
     pub internet_switch: bool,
-    pub user_id: String,  // USER_ID 字段
-//=====host info
-    pub dev_uid: String,  
-    pub macid: String,  
-    pub ips: String,  
-    //pub _type: u32,  
-    pub os: String,  
-    pub memsize: String,  
-    pub cpu: String,  
-    pub hdsize: String,  
-    pub auth: String,  
-    pub host_name: String,  
+    pub user_id: String,
+    //=====host info
+    pub dev_uid: String,
+    pub macid: String,
+    pub ips: String,
+    pub ifcfg: String,
+    pub os: String,
+    pub memsize: String,
+    pub cpu: String,
+    pub hdsize: String,
+    pub auth: String,
+    pub host_name: String,
     pub mod_ver: String,
     pub arch_type: String,
     pub is_offline_mode: bool,
 }
+
 enum NetRule<'a> {
     ServerIpV4(&'a str),
     ServerPort(u32),
     LogIpPort(&'a str),
     VirtualOpenPort(bool),
 }
+
 fn ip_str_to_u32(ip: &str) -> Result<u32, String> {
     let parsed = ip.parse::<std::net::Ipv4Addr>().map_err(|e| e.to_string())?;
     Ok(u32::from_be_bytes(parsed.octets()))
 }
+
+fn run_cmd_capture(cmd: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(cmd)
+        .args(args)
+        .output()
+        .map_err(|e| format!("Failed to execute {}: {}", cmd, e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Command {} failed with status {}: {}", cmd, output.status, stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.trim().to_string())
+}
+
 impl NetInfoConfig {
+    /// 获取主接口（基于 server_ip）
+    fn get_main_interface(server_ip: &str) -> Result<String, String> {
+        let out = run_cmd_capture("ip", &["route", "get", server_ip])
+            .map_err(|e| format!("ip route get {} failed: {}", server_ip, e))?;
+        let re = regex::Regex::new(r"dev\s+(\S+)").map_err(|e| format!("Regex error: {}", e))?;
+        for line in out.lines() {
+            if let Some(cap) = re.captures(line) {
+                let iface = cap.get(1).unwrap().as_str();
+                if iface != "lo" {
+                    return Ok(iface.to_string());
+                }
+            }
+        }
+        Err(format!("No valid interface found for server_ip {}", server_ip))
+    }
 
     fn write_net_rule(&self, rule: NetRule) -> Result<(), String> {
         match rule {
@@ -100,14 +134,14 @@ impl NetInfoConfig {
         let mut config = NetInfoConfig::default();
 
         if let Some(mid) = ini.get("CLIENTINFO", "MID") {
-            config.mid = mid; // MID 存储到 mid 字段
+            config.mid = mid;
         }
 
         config.ver = ini.get("SERVERINFO", "VERSION")
             .unwrap_or_else(|| "3.0.1_T9".to_string());
 
         if let Some(user_id) = ini.get("SERVERINFO", "USER_ID") {
-            config.user_id = user_id; // USER_ID 存储到 user_id 字段
+            config.user_id = user_id;
         }
 
         if let Some(value) = ini.get("SERVERINFO", "COMTIME") {
@@ -116,73 +150,28 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("SERVERINFO", "CRONTIME") {
             config.cron_time = value.parse().unwrap_or_default();
         }
-
-        // ===== 以下是 bool 字段，全部替换解析逻辑 =====
         if let Some(value) = ini.get("SERVERINFO", "EXTORTION_PROTECT") {
-            config.extortion_protect = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Invalid boolean value for EXTORTION_PROTECT: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.extortion_protect = matches!(value.trim(), "1");
         }
         if let Some(value) = ini.get("SERVERINFO", "EXTORTION_SWITCH") {
-            config.extortion_switch = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Invalid boolean value for EXTORTION_SWITCH: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.extortion_switch = matches!(value.trim(), "1");
             log_info!("===extortion_switch: {}", config.extortion_switch);
         }
         if let Some(value) = ini.get("SERVERINFO", "SELF_PROTECT_SWITCH") {
-            config.self_protect_switch = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Invalid boolean value for EXTORTION_SWITCH: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.self_protect_switch = matches!(value.trim(), "1");
             log_info!("===self_protect_switch: {}", config.self_protect_switch);
         }
-
         if let Some(value) = ini.get("SERVERINFO", "FASTTIME") {
             config.fast_time = value.parse().unwrap_or_default();
         }
         if let Some(value) = ini.get("SERVERINFO", "FILE_PROTECT") {
-            config.file_protect = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Invalid boolean value for FILE_PROTECT: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.file_protect = matches!(value.trim(), "1");
         }
         if let Some(value) = ini.get("SERVERINFO", "FILE_SWITCH") {
-            config.file_switch = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Invalid boolean value for FILE_SWITCH: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.file_switch = matches!(value.trim(), "1");
         }
         if let Some(value) = ini.get("SERVERINFO", "DYNAMIC_SWITCH") {
-            config.dynamic_switch = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Invalid boolean value for DYNAMIC_SWITCH: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.dynamic_switch = matches!(value.trim(), "1");
         }
         if let Some(value) = ini.get("SERVERINFO", "LOGIPPORT") {
             config.log_ip_port = Some(value);
@@ -197,35 +186,14 @@ impl NetInfoConfig {
             config.module_switch = value.parse().unwrap_or_default();
         }
         if let Some(value) = ini.get("SERVERINFO", "OPEN_PORT_SWITCH") {
-            config.open_port_switch = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Invalid boolean value for OPEN_PORT_SWITCH: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.open_port_switch = matches!(value.trim(), "1");
             let _ = config.write_net_rule(NetRule::VirtualOpenPort(config.open_port_switch));
         }
         if let Some(value) = ini.get("SERVERINFO", "PROC_PROTECT") {
-            config.proc_protect = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Invalid boolean value for PROC_PROTECT: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.proc_protect = matches!(value.trim(), "1");
         }
         if let Some(value) = ini.get("SERVERINFO", "PROC_SWITCH") {
-            config.proc_switch = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Invalid boolean value for PROC_SWITCH: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.proc_switch = matches!(value.trim(), "1");
         }
         if let Some(value) = ini.get("SERVERINFO", "SCANFILETIME") {
             config.scan_file_time = value.parse().unwrap_or_default();
@@ -238,129 +206,76 @@ impl NetInfoConfig {
         }
         if let Some(value) = ini.get("SERVERINFO", "SERVER_IP") {
             config.server_ip = value;
+            // 在获取 server_ip 后，获取主接口
+            if !config.server_ip.is_empty() {
+                config.ifcfg = Self::get_main_interface(&config.server_ip)
+                    .unwrap_or_else(|e| {
+                        log_error!("Failed to get main interface for server_ip {}: {}, using default 'eth0'", config.server_ip, e);
+                        "eth0".to_string()
+                    });
+                log_info!("Main interface set to: {}", config.ifcfg);
+            }
         }
         if let Some(value) = ini.get("SERVERINFO", "SERVER_PORT") {
             config.server_port = value.parse().unwrap_or_default();
         }
         if let Some(value) = ini.get("SERVERINFO", "USB_PROTECT") {
-            config.usb_protect = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Invalid boolean value for USB_PROTECT: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.usb_protect = matches!(value.trim(), "1");
         }
         if let Some(value) = ini.get("SERVERINFO", "USB_SWITCH") {
-            config.usb_switch = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Invalid boolean value for USB_SWITCH: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.usb_switch = matches!(value.trim(), "1");
         }
-
         if let Some(value) = ini.get("SERVERINFO", "DNS_SWITCH") {
-            config.syslog_dns_switch = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Invalid boolean value for DNS_SWITCH: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.syslog_dns_switch = matches!(value.trim(), "1");
         }
         if let Some(value) = ini.get("SERVERINFO", "INTERNAL_COMMUNICATION_SWITCH") {
-            config.syslog_inner_switch = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Invalid boolean value for INTERNAL_COMMUNICATION_SWITCH: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.syslog_inner_switch = matches!(value.trim(), "1");
         }
         if let Some(value) = ini.get("SERVERINFO", "EXTERNAL_COMMUNICATION_SWITCH") {
-            config.syslog_outer_switch = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Invalid boolean value for EXTERNAL_COMMUNICATION_SWITCH: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.syslog_outer_switch = matches!(value.trim(), "1");
         }
-
         if let Some(value) = ini.get("SERVERINFO", "INTERNET_SWITCH") {
-            config.internet_switch = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Unexpected INTERNET_SWITCH value: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.internet_switch = matches!(value.trim(), "1");
         }
-
         if let Some(value) = ini.get("SERVERINFO", "OFFLINE_MODE") {
-            config.is_offline_mode = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Unexpected OFFLINE_MODE value: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.is_offline_mode = matches!(value.trim(), "1");
         }
-
         if let Some(value) = ini.get("SERVERINFO", "SYSLOG_PROCESS_SWITCH") {
-            config.syslog_process_switch = match value.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    log_error!("Invalid boolean value for SYSLOG_PROCESS_SWITCH: '{}', defaulting to false", value);
-                    false
-                }
-            };
+            config.syslog_process_switch = matches!(value.trim(), "1");
         }
-
-        // ===== HOSTINFO 字段（都是 String，不动） =====
         if let Some(value) = ini.get("HOSTINFO", "DEV_UID") {
-            config.dev_uid = value.parse().unwrap_or_default();
+            config.dev_uid = value;
         }
         if let Some(value) = ini.get("HOSTINFO", "MACID") {
-            config.macid = value.parse().unwrap_or_default();
+            config.macid = value;
         }
         if let Some(value) = ini.get("HOSTINFO", "IPS") {
-            config.ips = value.parse().unwrap_or_default();
+            config.ips = value;
         }
         if let Some(value) = ini.get("HOSTINFO", "OS") {
-            config.os = value.parse().unwrap_or_default();
+            config.os = value;
         }
         if let Some(value) = ini.get("HOSTINFO", "MEMSIZE") {
-            config.memsize = value.parse().unwrap_or_default();
+            config.memsize = value;
         }
         if let Some(value) = ini.get("HOSTINFO", "CPU") {
-            config.cpu = value.parse().unwrap_or_default();
+            config.cpu = value;
         }
         if let Some(value) = ini.get("HOSTINFO", "HDSIZE") {
-            config.hdsize = value.parse().unwrap_or_default();
+            config.hdsize = value;
         }
         if let Some(value) = ini.get("HOSTINFO", "AUTH") {
-            config.auth = value.parse().unwrap_or_default();
+            config.auth = value;
         }
         if let Some(value) = ini.get("HOSTINFO", "HOSTNAME") {
-            config.host_name = value.parse().unwrap_or_default();
+            config.host_name = value;
         }
 
         config
     }
+
     pub fn to_ini(&self, file_name: &str) -> Result<(), io::Error> {
         let mut file = File::create(file_name)?;
-
         writeln!(file, "[CLIENTINFO]")?;
         writeln!(file, "MID={}", self.mid)?;
         writeln!(file, "[SERVERINFO]")?;
@@ -389,79 +304,57 @@ impl NetInfoConfig {
         writeln!(file, "USB_PROTECT={}", self.usb_protect as u8)?;
         writeln!(file, "USB_SWITCH={}", self.usb_switch as u8)?;
         writeln!(file, "DNS_SWITCH={}", self.syslog_dns_switch as u8)?;
-        writeln!(file, "INTERNAL_COMMUNICATION_SWITCH={}", self.syslog_outer_switch as u8)?;
-        writeln!(file, "EXTERNAL_COMMUNICATION_SWITCH={}", self.syslog_inner_switch as u8)?;
+        writeln!(file, "INTERNAL_COMMUNICATION_SWITCH={}", self.syslog_inner_switch as u8)?;
+        writeln!(file, "EXTERNAL_COMMUNICATION_SWITCH={}", self.syslog_outer_switch as u8)?;
         writeln!(file, "SYSLOG_PROCESS_SWITCH={}", self.syslog_process_switch as u8)?;
-        writeln!(file, "PROC_SWITCH={}", self.proc_switch as u8)?;
-
         writeln!(file, "INTERNET_SWITCH={}", self.internet_switch as u8)?;
         writeln!(file, "OFFLINE_MODE={}", self.is_offline_mode as u8)?;
         writeln!(file, "VERSION={}", self.ver)?;
         writeln!(file, "[HOSTINFO]")?;
         writeln!(file, "DEV_UID={}", self.dev_uid)?;
         writeln!(file, "MACID={}", self.macid)?;
-        /*
         writeln!(file, "IPS={}", self.ips)?;
-        writeln!(file, "VERSION={}", self.ver)?;
+        writeln!(file, "IFCFG={}", self.ifcfg)?;
         writeln!(file, "OS={}", self.os)?;
         writeln!(file, "MEMSIZE={}", self.memsize)?;
         writeln!(file, "CPU={}", self.cpu)?;
         writeln!(file, "HDSIZE={}", self.hdsize)?;
         writeln!(file, "AUTH={}", self.auth)?;
         writeln!(file, "HOSTNAME={}", self.host_name)?;
-        */
         Ok(())
     }
 
-    /// 获取系统主机信息以填充 HOSTINFO 字段
     pub fn acquire_host_info(&mut self) -> io::Result<()> {
-        log_info!("========dev_id:{}",self.dev_uid);
+        log_info!("========dev_id:{}", self.dev_uid);
         if self.dev_uid.is_empty() {
-             self.dev_uid = agent_uid::ensure_and_get_mgs_guid(&(self.app_path.clone() + "/.vedasystem")).unwrap_or_else(|_| "unknown".to_string());
+            self.dev_uid = agent_uid::ensure_and_get_mgs_guid(&(self.app_path.clone() + "/.vedasystem"))
+                .unwrap_or_else(|_| "unknown".to_string());
         }
-        log_info!("=====dev_id:{}",self.dev_uid);
+        log_info!("=====dev_id:{}", self.dev_uid);
         if self.macid.is_empty() {
-             self.macid = ip_mac::get_mac().unwrap_or("unknown".to_string());
+            self.macid = ip_mac::get_mac().unwrap_or("unknown".to_string());
         }
-
-        // HOSTNAME
         if self.host_name.is_empty() {
-            //let computer_name = system_info::SystemInfo::get_computer_name().unwrap_or_else(|_| "Unknown".to_string());
             self.host_name = SystemInfo::get_computer_name().unwrap_or_else(|_| "Unknown".to_string());
         }
-        // auth
         if self.auth.is_empty() {
-;
             self.auth = "123123".to_string();
         }
-
-        // OS
         if self.os.is_empty() {
-;
             self.os = SystemInfo::get_computer_version().unwrap_or_else(|_| "Unknown".to_string());
         }
-
-
-        // CPU
         if self.cpu.is_empty() {
             self.cpu = SystemInfo::get_cpu_cores().unwrap_or_else(|_| "Unknown".to_string());
         }
-
-        // MEMSIZE (以 GB 为单位)
         if self.memsize.is_empty() {
             self.memsize = SystemInfo::get_memory_size().unwrap_or_else(|_| "Unknown".to_string());
         }
-
-        // HDSIZE (以 GB 为单位)
         if self.hdsize.is_empty() {
             self.hdsize = SystemInfo::get_disk_size().unwrap_or_else(|_| "Unknown".to_string());
         }
-
-        // IPS
         if self.ips.is_empty() {
-             self.ips = ip_mac::get_ip().unwrap_or("unknown".to_string());
+            self.ips = ip_mac::get_ip().unwrap_or("unknown".to_string());
         }
-        // IPS
         Ok(())
     }
 }
@@ -469,7 +362,7 @@ impl NetInfoConfig {
 use once_cell::sync::Lazy;
 use std::path::Path;
 use std::sync::Mutex;
-// 全局配置
+
 pub static NETINFO_CONFIG: Lazy<Mutex<NetInfoConfig>> = Lazy::new(|| {
     let base_path = std::env::var("CONFIG_PATH")
         .ok()

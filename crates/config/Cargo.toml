@@ -10,3 +10,5 @@ hostinfo = { path =  "../hostinfo" }
 once_cell = "1.17"
 logging = { path = "../logging" }
 log = "0.4"
+regex = "1"
+

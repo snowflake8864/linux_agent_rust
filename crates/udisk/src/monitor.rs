@@ -510,14 +510,14 @@ impl StartUsbService for BootManager {
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
             let base_url = self.get_base_url();
-            let net_client = match NetClient::new(base_url, true) {
+            let net_client = match NetClient::new(Some(base_url), true) {
                 Ok(client) => client,
                 Err(err) => {
                     eprintln!("创建 NetClient 失败: {}", err);
                     return Err("创建 NetClient 失败".to_string());
                 }
             };
-            let url = format!("{}/v1/addperipherals", net_client.base_url);
+            let url = format!("{}/v1/addperipherals", net_client.get_base_url().unwrap_or_default());
 
             let current_devices = get_all_local_usb_devices();
             loop {
@@ -527,7 +527,7 @@ impl StartUsbService for BootManager {
                     upload_usb_info(&devices, &net_client, &url, self).await;
                     break;
                 } else {
-                    log_error!("token 尚未准备好，等待中...");
+                    //log_error!("token 尚未准备好，等待中...");
                     sleep(Duration::from_secs(2)).await;
                 }
             }

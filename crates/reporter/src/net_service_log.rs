@@ -318,7 +318,7 @@ impl NetServiceLogHandler {
             // self.upload_http_syslog(batch_json).await?;
             //log_info!("===={:?}",vec_net_log);
 
-                let net_client = match NetClient::new(self.boot_manager.get_base_url(), true) {
+                let net_client = match NetClient::new(Some(self.boot_manager.get_base_url()), true) {
                     Ok(client) => client,
                     Err(err) => {
                         eprintln!("创建 NetClient 失败: {}", err);
@@ -326,7 +326,7 @@ impl NetServiceLogHandler {
                     }
                 };
 
-            let url = format!("{}/v1/putsyslog", net_client.base_url);
+            let url = format!("{}/v1/putsyslog", net_client.get_base_url().unwrap_or_default());
             let mut json_str = String::new();
             match build_batch_syslog_net_json(&vec_net_log, &mut json_str) {
                 Ok(()) => {
@@ -543,7 +543,7 @@ impl NetServiceLogHandler {
             // self.upload_http_syslog(batch_json).await?;
             //log_info!("===={:?}",vec_net_log);
 
-                let net_client = match NetClient::new(self.boot_manager.get_base_url(), true) {
+                let net_client = match NetClient::new(Some(self.boot_manager.get_base_url()), true) {
                     Ok(client) => client,
                     Err(err) => {
                         eprintln!("创建 NetClient 失败: {}", err);
@@ -551,7 +551,7 @@ impl NetServiceLogHandler {
                     }
                 };
 
-            let url = format!("{}/v1/putsyslog", net_client.base_url);
+            let url = format!("{}/v1/putsyslog", net_client.get_base_url().unwrap_or_default());
             let mut json_str = String::new();
             match build_batch_syslog_net_json(&vec_net_log, &mut json_str) {
                 Ok(()) => {
