@@ -39,12 +39,12 @@ impl ProcessAuditHandler {
             ptr::read_unaligned(data.as_ptr() as *const NetlinkNetlog)
         };
 
-        //log_info!("收到 NetlinkNetlog: {:?}", netlog);
 
         if !self.zcopy_mgr.process_audit_succeed {
             return Err("ZcopyMgr file audit not initialized".to_string());
         }
 
+        //log_info!("收到 NetlinkNetlog: {:?}", netlog);
         let mut processvec: Vec<AuditProcess> = Vec::new();
         let mut loginfo: Vec<AuditLogInfo> = Vec::new();
         let mut edr_logs: Vec<EdrProcessLog> = Vec::new();
@@ -53,7 +53,7 @@ impl ProcessAuditHandler {
         let mut iterate = |start: u32, end: u32| {
             for idx in start..end {
                 if let Some(report) = self.zcopy_mgr.get_process_audit_data(idx as usize) {
-
+                    //log_info!("report:{:?}",report);
                     process_one(report, &mut processvec, &mut loginfo, &mut edr_logs);
                 } else {
                     log_error!("无法获取索引 {} 的进程审计数据", idx);
@@ -88,7 +88,7 @@ impl ProcessAuditHandler {
             iterate(0, netlog.start_idx);
             iterate(netlog.end_idx, netlog.max_idx);
         }
-        let net_client = match NetClient::new(self.boot_manager.get_base_url(), true) {
+        let net_client = match NetClient::new(Some(self.boot_manager.get_base_url()), true) {
             Ok(client) => client,
             Err(err) => {
                 eprintln!("创建 NetClient 失败: {}", err);
@@ -97,7 +97,7 @@ impl ProcessAuditHandler {
         };
 
         if processvec.len() > 0 {
-            let url = format!("{}/v1/autouploadprocess", net_client.base_url);
+            let url = format!("{}/v1/autouploadprocess", net_client.get_base_url().unwrap_or_default());
             let mut json_str = String::new();
             match build_auto_process_list_json(&processvec, &mut json_str) {
                 Ok(()) => {
@@ -121,7 +121,7 @@ impl ProcessAuditHandler {
         }
         
         if loginfo.len() > 0 {
-            let url = format!("{}/v1/alertupload", net_client.base_url);
+            let url = format!("{}/v1/alertupload", net_client.get_base_url().unwrap_or_default());
             let mut json_str = String::new();
             match build_alert_log_json(&loginfo, &mut json_str) {
                 Ok(()) => {
@@ -146,7 +146,7 @@ impl ProcessAuditHandler {
         
         if edr_logs.len() > 0 {
 //            log_info!("edr_logs{:?}", edr_logs);
-            let url = format!("{}/v1/putsyslog", net_client.base_url);
+            let url = format!("{}/v1/putsyslog", net_client.get_base_url().unwrap_or_default());
             let mut json_str = String::new();
             match build_batch_process_edr_json(&edr_logs, &mut json_str) {
                 Ok(()) => {
@@ -197,6 +197,8 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
     let cfg = NETINFO_CONFIG.lock().unwrap();
     let parts: Vec<&str> = path_str.split(';').collect();
     let p_dir = parts.get(0).unwrap_or(&"").to_string();
+
+    //log_info!("proc_info: {:?}  p_dir: {:?}", proc_info, p_dir);
     if p_dir.is_empty() || !file_exists(&p_dir) {
         return;
     }
@@ -205,23 +207,23 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
         Ok(h) => h,
         Err(_) => return,
     };
-
+    //log_info!("proc_info: {:?}  p_dir: {:?}  hash: {:?} ", proc_info, p_dir, hash);
     // 处理 AuditProcess
     if cfg.proc_switch {
         if proc_info.type_ == 1101 || proc_info.type_ == 1001 {
             processvec.push(AuditProcess {
-                n_time: proc_info.timestamp as i64,
+                n_time: 1692760326 as i64,
                 str_name: "".into(),
                 str_vendor: "".into(),
                 str_package: "".into(),
-                n_process_id: proc_info.pid as u32,
-                n_parent_id: proc_info.ppid as u32,
+                n_process_id: proc_info.pid() as u32,
+                n_parent_id: proc_info.ppid() as u32,
                 n_priority: 0,
                 n_thread_count: 0,
                 n_working_set_size: 0,
                 str_start_time: "".into(),
                 str_executable_path: p_dir.clone(),
-                str_user: get_user_name(proc_info.uid as u32),
+                str_user: get_user_name(proc_info.uid() as u32),
                 hash: hash.clone(),
                 map_depends: vec![],
             });
@@ -234,7 +236,7 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
                 md5: Some(hash.clone()),
                 n_type: proc_info.type_ as u16,
                 n_level: flags.level as u32,
-                n_time: proc_info.timestamp,
+                n_time: 1692760326 as u64,
                 rename_dir: None,
                 notice_remark: None,
                 exception_process: None,
@@ -259,7 +261,7 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
                     Err(_) => return,
                 };
             }
-        } else if let Some(pp) = get_process_path(proc_info.ppid as u32) {
+        } else if let Some(pp) = get_process_path(proc_info.ppid() as u32) {
             if file_exists(&pp) {
                 pp_hash = match get_md5_global(&pp) {
                     Ok(h) => h,
@@ -274,18 +276,19 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
         }
 
         edr_logs.push(EdrProcessLog {
-            uid: proc_info.uid.to_string(),
+            uid: proc_info.uid().to_string(),
             hash,
-            p_id: proc_info.pid,
+            p_id: proc_info.pid(),
             p_dir,
             p_param: None,
             pp_hash,
-            pp_id: proc_info.ppid,
+            pp_id: proc_info.ppid(),
             pp_dir,
             pp_param: None,
-            time: proc_info.timestamp as i32,
+            time: 1692760326 as i32,
             log_type: 4,
         });
     }
 }
+
 

@@ -21,6 +21,8 @@ members = [
      "crates/netblock",
      "crates/udisk",
      "crates/docker",
+     "crates/snapman",
+     "crates/rules_jump_mgr",
 ]
 
 [profile.dev]

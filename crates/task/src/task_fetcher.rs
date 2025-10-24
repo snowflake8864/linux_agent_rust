@@ -24,6 +24,12 @@ use netblock::ip_policy::{IpPolicy, update_and_write_policies, is_ipv6};
 use udisk::{list::SHARED_USB_LIST, device::UsbInfo,monitor::{get_all_local_usb_devices, build_usb_json}};
 use procinfo::{get_running_process_infos,build_process_list_json};
 use tokio::task;
+use serde_json::json;
+use snapman::{create_snapshot, restore_snapshot, list_snapshots, clean_snapshot, clean_all_snapshots};
+use rules_jump_mgr::{IpJumpManager, PasswordManager, IpJumpConfig, PutIpJumpInfo, PutPwJumpInfo};
+use tokio::process::Command;
+
+
 
 fn get_u32(map: &serde_json::Map<String, Value>, key: &str) -> Result<u32, String> {
     map.get(key)
@@ -52,6 +58,9 @@ pub struct TaskFetcher {
     prev_dynamic_switch:bool,
     prev_self_protect_switch:bool,
     nl_sock: Option<NlSockInfo>,
+    net_client: NetClient,
+    ip_jump_manager: Arc<IpJumpManager>,
+
 }
 use num_derive::FromPrimitive; // 支持从整数到枚举的转换
 use num_traits::FromPrimitive;
@@ -90,6 +99,10 @@ enum TaskTypeEnum {
     TaskGlobalDir = 33,
     TaskUpdateUUI = 34,
     TaskOutReachDetect = 35,
+    TaskPwJump =36,
+    TaskIpJump = 37,
+    TaskSystemBackup = 38,
+    TaskSystemRollback = 39,
 }
 #[allow(dead_code)]
 enum NetRule<'a> {
@@ -111,6 +124,7 @@ impl TaskFetcher {
     {
         PROCESS_PATTERN_RULES_MGR.lock().init();
         let mut api_interface = HashMap::new();
+        api_interface.insert("closetask".to_string(), "v1/closetask".to_string());
         api_interface.insert("upload_process".to_string(), "v1/upload_process".to_string());
         api_interface.insert("download_white".to_string(), "v1/getprocwl".to_string());
         api_interface.insert("download_black".to_string(), "v1/getprocbl".to_string());
@@ -127,7 +141,27 @@ impl TaskFetcher {
         api_interface.insert("addperipherals".to_string(), "v1/addperipherals".to_string());
         api_interface.insert("getwhiteperipherals".to_string(), "v1/getwhiteperipherals".to_string());
         api_interface.insert("getblackperipherals".to_string(), "v1/getblackperipherals".to_string());
+        api_interface.insert("getPwJump".to_string(), "v1/getPwJump".to_string());
+        api_interface.insert("putPwJump".to_string(), "v1/putPwJump".to_string());
 
+        api_interface.insert("getIpJump".to_string(), "v1/getIpJump".to_string());
+        api_interface.insert("putIpJump".to_string(), "v1/putIpJump".to_string());
+        api_interface.insert("getBackups".to_string(), "v1/getBackups".to_string());
+        api_interface.insert("getRollbacks".to_string(), "v1/getRollbacks".to_string());
+        api_interface.insert("uploadRollback".to_string(), "v1/uploadRollback".to_string());
+        api_interface.insert("uploadBackup".to_string(), "v1/uploadBackup".to_string());
+        let net_client = NetClient::new(
+            Some(base_url.to_string()),
+            true,
+        ).expect("创建 NetClient 失败");
+
+        let cfg = NETINFO_CONFIG.lock().unwrap(); // 这里使用 from_ini 解析配置
+        let ip_jump_manager = IpJumpManager::new(&cfg.ifcfg.clone()); 
+        // Clone the Arc for the periodic cleanup task
+        let manager_clone = Arc::clone(&ip_jump_manager.clone());
+        tokio::spawn(async move {
+            manager_clone.start_periodic_cleanup(Duration::from_secs(60)).await;
+        });
         TaskFetcher {
               base_url: base_url.to_string(),
               token,
@@ -142,6 +176,8 @@ impl TaskFetcher {
               prev_dynamic_switch:false,
               prev_self_protect_switch:false,
               nl_sock,
+              net_client,
+              ip_jump_manager,
         }
     }
     pub fn get_token(&self) -> Option<String> {
@@ -370,7 +406,11 @@ impl TaskFetcher {
 
     pub async fn run(net_client: &mut NetClient, token: Option<String>,pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>,nl_sock: Option<NlSockInfo>) -> Result<(), String> {
         let token_str = token.as_ref().map(|s| s.as_str());
-        let mut task_fetcher = TaskFetcher::new(&net_client.base_url, token.clone(), pattern_mgr, nl_sock);
+        let base_url = net_client
+            .get_base_url()
+            .ok_or("task_provider_base_url not set")?;
+
+        let mut task_fetcher = TaskFetcher::new(base_url, token.clone(), pattern_mgr, nl_sock);
 
         loop {
             let url = format!("{}/v1/gettask", task_fetcher.base_url);
@@ -405,6 +445,7 @@ impl TaskFetcher {
                         }
                     } else {
                         eprintln!("Invalid response code: {}", parsed["code"]);
+                        log_info!("Invalid response code: {}", parsed["code"]);
                          return Err("无效响应码".to_string()); // 返回错误，通知主流程
                     }
                 }
@@ -423,47 +464,47 @@ impl TaskFetcher {
    /// 根据任务类型处理任务
     async fn handle_task(&mut self, task_type: TaskTypeEnum) -> Result<(), String> {
         match task_type {
-            TaskTypeEnum::TaskUploadProcess => self.task_upload_process().await,
-            TaskTypeEnum::TaskUpdate => self.task_update().await,
-            TaskTypeEnum::TaskUploadDir => self.task_upload_dir().await,
-            TaskTypeEnum::TaskDownWhite => self.task_down_white().await,
-            TaskTypeEnum::TaskDownDirPolicy => self.task_down_dir_policy().await,
-            TaskTypeEnum::TaskDownConf => self.task_down_conf().await,
-            TaskTypeEnum::TaskDownBlack => self.task_down_black().await,
-            TaskTypeEnum::TaskDownFileTtap => self.task_down_file_tt().await,
-            TaskTypeEnum::TaskUploadPort => self.task_upload_port().await,
-            TaskTypeEnum::TaskDownVirtualPort => self.task_down_virtual_port().await,
-            TaskTypeEnum::TaskDownNetBlockPolicy => self.task_down_netblock_policy().await,
-            TaskTypeEnum::TaskDownExtort => self.task_down_extort().await,
-            TaskTypeEnum::TaskDownBlackIpPolicy => self.task_down_black_ip_policy().await,
-            TaskTypeEnum::TaskUploadProcessModule => self.task_upload_process_module().await,
-            TaskTypeEnum::TaskUploadAllProcessModule => self.task_upload_all_process_module().await,
-            TaskTypeEnum::TaskUploadProcessWhiteModule => self.task_upload_process_white_module().await,
-            TaskTypeEnum::TaskUploadProcessBlackModule => self.task_upload_process_black_module().await,
-            TaskTypeEnum::TaskUninstall => self.task_uninstall().await,
-            TaskTypeEnum::TaskGetWhitePeripherals => self.task_get_white_peripherals().await,
-            TaskTypeEnum::TaskGetBlackPeripherals => self.task_get_black_peripherals().await,
-            TaskTypeEnum::TaskDownUsbUpload => self.task_usb_upload().await,
-            TaskTypeEnum::TaskUploadSample => self.task_upload_sample().await,
-            TaskTypeEnum::TaskGlobalProc => self.task_global_proc().await,
-            TaskTypeEnum::TaskGlobalDir => self.task_global_dir().await,
-            TaskTypeEnum::TaskUpdateUUI => self.task_update_uuid().await,
-            TaskTypeEnum::TaskOutReachDetect => self.task_outreach_detect().await,
+            TaskTypeEnum::TaskUploadProcess => self.task_upload_process(0).await,
+            TaskTypeEnum::TaskUpdate => self.task_update(1).await,
+            TaskTypeEnum::TaskUploadDir => self.task_upload_dir(2).await,
+            TaskTypeEnum::TaskDownWhite => self.task_down_white(3).await,
+            TaskTypeEnum::TaskDownDirPolicy => self.task_down_dir_policy(4).await,
+            TaskTypeEnum::TaskDownConf => self.task_down_conf(6).await,
+            TaskTypeEnum::TaskDownBlack => self.task_down_black(7).await,
+            TaskTypeEnum::TaskDownFileTtap => self.task_down_file_tt(8).await,
+            TaskTypeEnum::TaskUploadPort => self.task_upload_port(9).await,
+            TaskTypeEnum::TaskDownVirtualPort => self.task_down_virtual_port(10).await,
+            TaskTypeEnum::TaskDownNetBlockPolicy => self.task_down_netblock_policy(13).await,
+            TaskTypeEnum::TaskDownExtort => self.task_down_extort(19).await,
+            TaskTypeEnum::TaskDownBlackIpPolicy => self.task_down_black_ip_policy(15).await,
+            TaskTypeEnum::TaskUploadProcessModule => self.task_upload_process_module(21).await,
+            TaskTypeEnum::TaskUploadAllProcessModule => self.task_upload_all_process_module(22).await,
+            TaskTypeEnum::TaskUploadProcessWhiteModule => self.task_upload_process_white_module(23).await,
+            TaskTypeEnum::TaskUploadProcessBlackModule => self.task_upload_process_black_module(24).await,
+            TaskTypeEnum::TaskUninstall => self.task_uninstall(25).await,
+            TaskTypeEnum::TaskGetWhitePeripherals => self.task_get_white_peripherals(26).await,
+            TaskTypeEnum::TaskGetBlackPeripherals => self.task_get_black_peripherals(27).await,
+            TaskTypeEnum::TaskDownUsbUpload => self.task_usb_upload(16).await,
+            TaskTypeEnum::TaskUploadSample => self.task_upload_sample(28).await,
+            TaskTypeEnum::TaskGlobalProc => self.task_global_proc(31).await,
+            TaskTypeEnum::TaskGlobalDir => self.task_global_dir(33).await,
+            TaskTypeEnum::TaskUpdateUUI => self.task_update_uuid(34).await,
+            TaskTypeEnum::TaskOutReachDetect => self.task_outreach_detect(35).await,
+            TaskTypeEnum::TaskPwJump => self.task_down_pwjump(36).await, 
+            TaskTypeEnum::TaskIpJump => self.task_down_ipjump(37).await, 
+            TaskTypeEnum::TaskSystemBackup => self.task_get_system_backups(38).await,
+            TaskTypeEnum::TaskSystemRollback => self.task_system_rollback(39).await,
              _ => Err("Unknown task type".to_string()), // 未知任务类型处理
             //_ => Err(format!("Task not implemented: {:?}", task_type)),
         }
     }
 
     // 处理 TASK_UPLOAD_PROCESS 任务
-    async fn task_upload_process(&self) -> Result<(), String> {
+    async fn task_upload_process(&self, task_type: u64) -> Result<(), String> {
 
         let upload_url = match self.api_interface.get("upload_process") {
             Some(url) => url,
             None => return Err("URL for upload_gloabal_process not found".to_string()),
-        };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
-            Ok(client) => client,
-            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
 
         let url = format!("{}/{}", self.base_url, upload_url);
@@ -485,7 +526,7 @@ impl TaskFetcher {
         let mut json_str = String::new();
         match build_process_list_json(&processes, &mut json_str, None) {
             Ok(()) => {
-                match net_client.post_data_async(
+                match self.net_client.post_data_async(
                     &url,
                     &json_str,
                     Duration::from_secs(10),
@@ -500,20 +541,20 @@ impl TaskFetcher {
                 log_error!("构建 JSON 失败: {}", e);
             }
         }
-
+        self.report_task_completion(task_type).await?;
         // 实际上传逻辑代码
         Ok(())
     }
 
     // 处理 TASK_UPDATE 任务
-    async fn task_update(&self) -> Result<(), String> {
+    async fn task_update(&self, task_type: u64) -> Result<(), String> {
         println!("Processing TASK_UPDATE...");
         // 实际更新逻辑代码
         Ok(())
     }
 
     // 处理 TASK_UPLOAD_DIR 任务
-    async fn task_upload_dir(&self) -> Result<(), String> {
+    async fn task_upload_dir(&self, task_type: u64) -> Result<(), String> {
         println!("Processing TASK_UPLOAD_DIR...");
         // 上传目录的处理逻辑
         Ok(())
@@ -521,23 +562,19 @@ impl TaskFetcher {
 
 
     // 处理 TASK_DOWN_DIR_POLICY 任务
-    async fn task_down_dir_policy(&self) -> Result<(), String> {
+    async fn task_down_dir_policy(&self, task_type: u64) -> Result<(), String> {
         // 获取 download_white 的 URL
         let download_url = match self.api_interface.get("getdirpolicy") {
             Some(url) => url,
                 None => return Err("URL for download_white not found".to_string()),
         };
 
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
-            Ok(client) => client,
-                Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
-        };
 
         let url = format!("{}/{}", self.base_url, download_url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
 
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
             Ok(response) => {
                 // 解析 JSON 响应
                 let parsed: Value = match serde_json::from_str(&response) {
@@ -572,21 +609,17 @@ impl TaskFetcher {
     }
 
 
-    async fn task_down_conf(&mut self) -> Result<(), String> {
+    async fn task_down_conf(&mut self, task_type: u64) -> Result<(), String> {
         let download_url = match self.api_interface.get("getconf") {
             Some(url) => url,
             None => return Err("URL for download_white not found".to_string()),
         };
 
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
-            Ok(client) => client,
-            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
-        };
         let url = format!("{}/{}", self.base_url, download_url);
 
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
             Ok(response) => {
                 // 解析 JSON 响应
                 let parsed: Value = match serde_json::from_str(&response) {
@@ -622,22 +655,18 @@ impl TaskFetcher {
     }
 
     // 处理 TASK_DOWN_BLACK 任务
-    async fn task_down_black(&self) -> Result<(), String> {
+    async fn task_down_black(&self, task_type: u64) -> Result<(), String> {
         // 获取 download_white 的 URL
         let download_url = match self.api_interface.get("download_black") {
             Some(url) => url,
             None => return Err("URL for download_white not found".to_string()),
-        };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
-            Ok(client) => client,
-            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
 
         // 组合最终的 URL
         let url = format!("{}/{}", self.base_url, download_url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
             Ok(response) => {
 
             // 解析 JSON 响应
@@ -681,7 +710,7 @@ impl TaskFetcher {
     }
 
 
-    pub async fn task_down_white(&self) -> Result<(), String> {
+    pub async fn task_down_white(&self, task_type: u64) -> Result<(), String> {
         // 获取 download_white 的 URL
         let download_url = match self.api_interface.get("download_white") {
             Some(url) => url,
@@ -689,16 +718,11 @@ impl TaskFetcher {
         };
 
 
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
-            Ok(client) => client,
-            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
-        };
-
         let url = format!("{}/{}", self.base_url, download_url);
 
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
             Ok(response) => {
                 let parsed: Value = match serde_json::from_str(&response) {
                     Ok(parsed) => parsed,
@@ -737,13 +761,13 @@ impl TaskFetcher {
     }
 
     // 处理 TASK_DOWN_FILE_TT 任务
-    async fn task_down_file_tt(&self) -> Result<(), String> {
+    async fn task_down_file_tt(&self, task_type: u64) -> Result<(), String> {
         println!("Processing TASK_DOWN_FILE_TT...");
         // 下载文件 TT 的处理
         Ok(())
     }
 
-    async fn task_upload_port(&self) -> Result<(), String> {
+    async fn task_upload_port(&self, task_type: u64) -> Result<(), String> {
         //println!("Processing TASK_UPLOAD_PORT...");
 
         let upload_url = match self.api_interface.get("upserviceport") {
@@ -751,10 +775,6 @@ impl TaskFetcher {
             None => return Err("URL for upload_gloabal_process not found".to_string()),
         };
 
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
-            Ok(client) => client,
-            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
-        };
 
         let url = format!("{}/{}", self.base_url, upload_url);
         let token = self.get_token();
@@ -765,27 +785,25 @@ impl TaskFetcher {
             Err(e) => return Err(format!("Failed to serialize port data to JSON: {}", e)),
         };
         log_info!("准备上传的数据: {}", json_data);
-        match net_client.post_data_async(&url, &json_data, Duration::from_secs(10), token_str).await {
+        match self.net_client.post_data_async(&url, &json_data, Duration::from_secs(10), token_str).await {
             Ok(response) => log_info!("服务器响应: {}", response),
             Err(err) => log_error!("发送指标失败: {}", err),
         }
         Ok(())
     }
 
-    pub async fn task_down_virtual_port(&self) -> Result<(), String> {
+    pub async fn task_down_virtual_port(&self, task_type: u64) -> Result<(), String> {
         let download_url = match self.api_interface.get("getvirtualport") {
             Some(url) => url,
             None => return Err("URL for getvirtualport not found".to_string()),
         };
 
-        let net_client = NetClient::new(self.base_url.clone(), true)
-            .map_err(|e| format!("Failed to create NetClient: {}", e))?;
 
         let url = format!("{}/{}", self.base_url, download_url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str());
 
-        let response = net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await?;
+        let response = self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await?;
         let parsed: Value = serde_json::from_str(&response)
             .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
 
@@ -875,20 +893,16 @@ impl TaskFetcher {
     }
    
 
-    async fn task_down_netblock_policy(&self) -> Result<(), String> {
+    async fn task_down_netblock_policy(&self, task_type: u64) -> Result<(), String> {
         let download_url = match self.api_interface.get("getPlugging") {
             Some(url) => url,
             None => return Err("未找到 netblock 策略的 URL".to_string()),
-        };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
-            Ok(client) => client,
-            Err(e) => return Err(format!("创建 NetClient 失败: {}", e)),
         };
 
         let url = format!("{}/{}", self.base_url, download_url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str());
-        let response = match net_client
+        let response = match self.net_client
             .post_data_async(&url, "", Duration::from_secs(10), token_str)
             .await
             {
@@ -935,20 +949,16 @@ impl TaskFetcher {
         update_and_write_policies(policies).await
     }
 
-    async fn task_down_black_ip_policy(&self) -> Result<(), String> {
+    async fn task_down_black_ip_policy(&self, task_type: u64) -> Result<(), String> {
         let download_url = match self.api_interface.get("getipblacklist") {
             Some(url) => url,
             None => return Err("未找到 black IP 策略的 URL".to_string()),
-        };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
-            Ok(client) => client,
-            Err(e) => return Err(format!("创建 NetClient 失败: {}", e)),
         };
 
         let url = format!("{}/{}", self.base_url, download_url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str());
-        let response = match net_client
+        let response = match self.net_client
             .post_data_async(&url, "", Duration::from_secs(10), token_str)
             .await
             {
@@ -994,21 +1004,17 @@ impl TaskFetcher {
         // 更新全局 Map 并下发到内核
         update_and_write_policies(policies).await
     }
-    async fn task_down_extort(&self) -> Result<(), String> {
+    async fn task_down_extort(&self, task_type: u64) -> Result<(), String> {
         // 获取 download_white 的 URL
         let download_url = match self.api_interface.get("getprotect") {
             Some(url) => url,
             None => return Err("URL for download_white not found".to_string()),
         };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
-            Ok(client) => client,
-            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
-        };
         
         let url = format!("{}/{}", self.base_url, download_url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
             Ok(response) => {
 
             // 解析 JSON 响应
@@ -1045,55 +1051,51 @@ impl TaskFetcher {
 
 
     // 处理 TASK_UPLOAD_PROCESS_MODULE 任务
-    async fn task_upload_process_module(&self) -> Result<(), String> {
+    async fn task_upload_process_module(&self, task_type: u64) -> Result<(), String> {
         println!("Processing TASK_UPLOAD_PROCESS_MODULE...");
         // 上传进程模块的处理
         Ok(())
     }
 
     // 处理 TASK_UPLOAD_ALL_PROCESS_MODULE 任务
-    async fn task_upload_all_process_module(&self) -> Result<(), String> {
+    async fn task_upload_all_process_module(&self, task_type: u64) -> Result<(), String> {
         println!("Processing TASK_UPLOAD_ALL_PROCESS_MODULE...");
         // 上传所有进程模块的处理
         Ok(())
     }
 
     // 处理 TASK_UPLOAD_PROCESS_WHITE_MODULE 任务
-    async fn task_upload_process_white_module(&self) -> Result<(), String> {
+    async fn task_upload_process_white_module(&self, task_type: u64) -> Result<(), String> {
         println!("Processing TASK_UPLOAD_PROCESS_WHITE_MODULE...");
         // 上传白名单进程模块的处理
         Ok(())
     }
 
     // 处理 TASK_UPLOAD_PROCESS_BLACK_MODULE 任务
-    async fn task_upload_process_black_module(&self) -> Result<(), String> {
+    async fn task_upload_process_black_module(&self, task_type: u64) -> Result<(), String> {
         println!("Processing TASK_UPLOAD_PROCESS_BLACK_MODULE...");
         // 上传黑名单进程模块的处理
         Ok(())
     }
 
     // 处理 TASK_UNINSTALL 任务
-    async fn task_uninstall(&self) -> Result<(), String> {
+    async fn task_uninstall(&self, task_type: u64) -> Result<(), String> {
         println!("Processing TASK_UNINSTALL...");
         // 卸载任务处理
         Ok(())
     }
 
-    async fn task_get_white_peripherals(&self) -> Result<(), String> {
+    async fn task_get_white_peripherals(&self, task_type: u64) -> Result<(), String> {
 
         let download_url = match self.api_interface.get("getwhiteperipherals") {
             Some(url) => url,
             None => return Err("URL for download_white not found".to_string()),
         };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
-            Ok(client) => client,
-            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
-        };
-        
+       
         let url = format!("{}/{}", self.base_url, download_url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
             Ok(response) => {
                 // 解析 JSON 响应
                 let parsed: Value = match serde_json::from_str(&response) {
@@ -1136,22 +1138,18 @@ impl TaskFetcher {
     }
 
     // 处理 TASK_getblackperipherals 任务
-    async fn task_get_black_peripherals(&self) -> Result<(), String> {
+    async fn task_get_black_peripherals(&self, task_type: u64) -> Result<(), String> {
 
         // 获取 download_white 的 URL
         let download_url = match self.api_interface.get("getblackperipherals") {
             Some(url) => url,
             None => return Err("URL for download_white not found".to_string()),
         };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
-            Ok(client) => client,
-            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
-        };
         
         let url = format!("{}/{}", self.base_url, download_url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
             Ok(response) => {
                 // 解析 JSON 响应
                 let parsed: Value = match serde_json::from_str(&response) {
@@ -1191,15 +1189,11 @@ impl TaskFetcher {
 
         Ok(())
     }
-    async fn task_usb_upload(&self) -> Result<(), String> {
+    async fn task_usb_upload(&self, task_type: u64) -> Result<(), String> {
 
         let upload_url = match self.api_interface.get("addperipherals") {
             Some(url) => url,
             None => return Err("URL for upload_gloabal_process not found".to_string()),
-        };
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
-            Ok(client) => client,
-            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
 
         let url = format!("{}/{}", self.base_url, upload_url);
@@ -1217,7 +1211,7 @@ impl TaskFetcher {
             match build_usb_json(&devices,  &mut json_str) {
 
                 Ok(()) => {
-                    match net_client.post_data_async(
+                    match self.net_client.post_data_async(
                         &url,
                         &json_str,
                         Duration::from_secs(10),
@@ -1238,7 +1232,7 @@ impl TaskFetcher {
         Ok(())
     }
     // 处理 TASK_UPLOADSAMPLE 任务
-    async fn task_upload_sample(&self) -> Result<(), String> {
+    async fn task_upload_sample(&self, task_type: u64) -> Result<(), String> {
         println!("Processing TASK_UPLOADSAMPLE...");
         // 上传样本的处理
         Ok(())
@@ -1246,13 +1240,13 @@ impl TaskFetcher {
 
 
     // 处理 TASK_GLOBAL_PROC 任务
-    async fn task_global_proc(&self) -> Result<(), String> {
+    async fn task_global_proc(&self, task_type: u64) -> Result<(), String> {
         let upload_url = match self.api_interface.get("upload_gloabal_process") {
             Some(url) => url,
             None => return Err("URL for upload_gloabal_process not found".to_string()),
         };
 
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
+        let net_client = match NetClient::new(Some(self.base_url.clone()), true) {
             Ok(client) => client,
             Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
         };
@@ -1266,22 +1260,18 @@ impl TaskFetcher {
         Ok(())
     }
 
-    async fn task_global_dir(&self) -> Result<(), String> {
+    async fn task_global_dir(&self,task_type: u64) -> Result<(), String> {
         let download_url = match self.api_interface.get("gettrustdir") {
             Some(url) => url,
             None => return Err("URL for download_white not found".to_string()),
         };
 
-        let net_client = match NetClient::new(self.base_url.clone(), true) {
-            Ok(client) => client,
-            Err(e) => return Err(format!("Failed to create NetClient: {}", e)),
-        };
 
         let url = format!("{}/{}", self.base_url, download_url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str());
 
-        match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+        match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
             Ok(response) => {
                 let parsed: Value = match serde_json::from_str(&response) {
                     Ok(parsed) => parsed,
@@ -1316,20 +1306,386 @@ impl TaskFetcher {
         Ok(())
     }
     // 处理 TASK_UPDATE_UUID 任务
-    async fn task_update_uuid(&self) -> Result<(), String> {
+    async fn task_update_uuid(&self, task_type: u64) -> Result<(), String> {
         println!("Processing TASK_UPDATE_UUID...");
         // 更新 UUID 处理
         Ok(())
     }
 
     // 处理 TASK_OutreachDetect 任务
-    async fn task_outreach_detect(&self) -> Result<(), String> {
+    async fn task_outreach_detect(&self, task_type: u64) -> Result<(), String> {
         println!("Processing TASK_OutreachDetect...");
         // 外围探测任务处理
         Ok(())
     }
 
+    async fn task_down_pwjump(&self, task_type: u64) -> Result<(), String> {
+        let download_url = match self.api_interface.get("getPwJump") {
+            Some(url) => url,
+            None => return Err("URL for getPwJump not found".to_string()),
+        };
+
+        let url = format!("{}/{}", self.base_url, download_url);
+        let token = self.get_token();
+        let token_str = token.as_ref().map(|s| s.as_str());
+
+        let response = match self
+            .net_client
+            .post_data_async(&url, "", Duration::from_secs(10), token_str)
+            .await
+            {
+                Ok(res) => res,
+                Err(err) => {
+                    eprintln!("Error fetching task: {}", err);
+                    return Err(err);
+                }
+            };
+
+        // 解析 JSON
+        let parsed: Value = match serde_json::from_str(&response) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Failed to parse response: {}", e);
+                return Err("Failed to parse response.".to_string());
+            }
+        };
+
+        // 检查 code
+        if parsed["code"] != "000000" {
+            let msg = parsed["msg"].as_str().unwrap_or("Unknown error");
+            return Err(format!("API error: {}", msg));
+        }
+
+        // 正确提取 pw 字符串
+        let new_password = parsed["data"]["pw"]
+            .as_str()
+            .ok_or("Missing or invalid 'pw' field in response")?;
+
+        // 构造 info
+        let mut info = PutPwJumpInfo {
+            user: "".to_string(),
+            pw: "".to_string(),
+            status: 0,
+            reason: "".to_string(),
+        };
+        let mgr = PasswordManager::new();
+        let jump_result = mgr.do_pw_jump_async("zebra", new_password, &mut info).await;
+        match jump_result {
+            Ok(_) => {
+                log_info!("pw jump success: {:?}", info);
+                info.user = "zebra".to_string(); // 补充 user 和 pw
+                info.pw = new_password.to_string();
+                info.status = 1; // 成功状态
+            },
+            Err(e) => {
+                log_info!("pw jump fail: {:?}", e);
+                info.user = "zebra".to_string();
+                info.pw = new_password.to_string();
+                info.status = 2; // 失败状态
+                info.reason = e.to_string(); // 记录失败原因
+            }
+        }
+        self.upload_passwd_result(&info.user, &info.pw, info.status, &info.reason).await?;
+        self.report_task_completion(task_type).await
+            .map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
+    async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
+        let download_url = match self.api_interface.get("getIpJump") {
+            Some(url) => url,
+            None => return Err("URL for getIpJump not found".to_string()),
+        };
+        let url = format!("{}/{}", self.base_url, download_url);
+        log_info!("url: {}", url);
+        let token = self.get_token();
+        let token_str = token.as_ref().map(|s| s.as_str());
+        match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+            Ok(response) => {
+                let parsed: Value = match serde_json::from_str(&response) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        log_error!("Failed to parse response: {}", e);
+                        return Err("Failed to parse response.".to_string());
+                    }
+                };
+                if parsed["code"] != "000000" {
+                    let msg = parsed["msg"].as_str().unwrap_or("Unknown error");
+                    return Err(format!("API error: {}", msg));
+                }
+                let data = parsed["data"].as_object().ok_or("Missing 'data' object in response")?;
+                log_info!("data: {:?}", data);
+                let gateway = data.get("gateway").and_then(|v| v.as_str()).unwrap_or("");
+                let source_ip = data.get("source_ip").and_then(|v| v.as_str()).unwrap_or("");
+                let target_ip = data.get("target_ip").and_then(|v| v.as_str()).unwrap_or("");
+                let mode = data.get("mode").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                let allow_size = data.get("allow_size").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let aging_time = data.get("aging_time").and_then(|v| v.as_u64()).unwrap_or(300) as u32;
+                log_info!(
+                    "IP Jump Task: source_ip={}, target_ip={}, gateway={}, mode={}, allow_size={}, aging_time={}",
+                    source_ip, target_ip, gateway, mode, allow_size, aging_time
+                );
+                if source_ip.is_empty() && target_ip.is_empty() {
+                    log_info!("Both source_ip and target_ip are empty; skipping IP jump.");
+                    self.report_task_completion(task_type).await?;
+                    return Ok(());
+                }
+                let config = IpJumpConfig {
+                    source_ip: source_ip.to_string(),
+                    target_ip: target_ip.to_string(),
+                    gateway: gateway.to_string(),
+                };
+                let mut info = PutIpJumpInfo {
+                    source_ip: "".to_string(),
+                    target_ip: "".to_string(),
+                    gateway: "".to_string(),
+                    agent_ip: "".to_string(),
+                    status: 0,
+                    reason: "".to_string(),
+                };
+                let jump_result = self.ip_jump_manager.do_ip_jump_async(config, &mut info).await;
+                match jump_result {
+                    Ok(_) => {
+                        log_info!("ip jump success: {:?}", info);
+                        info.status = 1;
+                    }
+                    Err(e) => {
+                        log_error!("ip jump fail: {:?}", e);
+                        info.status = 2;
+                        info.reason = e.to_string();
+                    }
+                }
+                self.upload_ip_jump_result(
+                    &info.source_ip,
+                    &info.target_ip,
+                    &info.gateway,
+                    &info.agent_ip,
+                    info.status as u8,
+                    &info.reason,
+                ).await?;
+            }
+            Err(err) => {
+                log_error!("Error fetching task: {}", err);
+                return Err(err);
+            }
+        }
+        self.report_task_completion(task_type).await?;
+        Ok(())
+    }
+
+
+    async fn task_get_system_backups(&self, task_type: u64) -> Result<(), String> {
+
+        let download_url = match self.api_interface.get("getBackups") {
+            Some(url) => url,
+            None => return Err("URL for download_white not found".to_string()),
+        };
+        
+        let url = format!("{}/{}", self.base_url, download_url);
+        let token = self.get_token();
+        let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
+        match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+            Ok(response) => {
+                // 解析 JSON 响应
+                let parsed: Value = match serde_json::from_str(&response) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        eprintln!("Failed to parse response: {}", e);
+                        return Err("Failed to parse response.".to_string());
+                    }
+                };
+                if parsed["code"] == "000000" {
+                    if let Some(arr) = parsed["data"].as_array() {
+                        for obj in arr {
+                            if let Some(id) = obj["id"].as_str() {
+                                match snapman::create_snapshot(id, "").await {  // 添加 .await
+                                    Ok(size) => {
+                                        log_info!("✅ 快照创建成功: {}", id);
+                                        // 成功上报
+                                        if let Err(e) = self.upload_backup(id, 1, &size, "").await {
+                                            eprintln!("上报成功状态失败: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log_error!("❌ 快照创建失败: {} -> {}", id, e);
+                                        // 失败上报
+                                        if let Err(report_err) = self.upload_backup(id, 0, "", &e).await {
+                                            eprintln!("上报失败状态失败: {}", report_err);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("Error fetching task: {}", err);
+                // 返回错误的 Result 类型
+                return Err(err);
+            }
+        }
+        self.report_task_completion(task_type).await?;
+
+        Ok(())
+    }
+    async fn task_system_rollback(&self, task_type: u64) -> Result<(), String> {
+        let download_url = match self.api_interface.get("getRollbacks") {
+            Some(url) => url,
+            None => return Err("URL for download_white not found".to_string()),
+        };
+        let url = format!("{}/{}", self.base_url, download_url);
+        let token = self.get_token();
+        let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
+        match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+            Ok(response) => {
+                // 解析 JSON 响应
+                let parsed: Value = match serde_json::from_str(&response) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        eprintln!("Failed to parse response: {}", e);
+                        return Err("Failed to parse response.".to_string());
+                    }
+                };
+                if parsed["code"] == "000000" {
+                    if let Some(arr) = parsed["data"].as_array() {
+                        for obj in arr {
+                            if let Some(id) = obj["id"].as_str() {
+                                match snapman::restore_snapshot(id).await {  // 添加 .await
+                                    Ok(_) => {
+                                        log_info!("✅ 系统恢复成功: {}", id);
+                                        // 成功上报
+                                        if let Err(e) = self.upload_rollback(id, 1, "").await {
+                                            eprintln!("上报成功状态失败: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log_error!("❌ 系统恢复失败: {} -> {}", id, e);
+                                        // 失败上报
+                                        if let Err(report_err) = self.upload_rollback(id, 0, &e).await {
+                                            eprintln!("上报失败状态失败: {}", report_err);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("Error fetching task: {}", err);
+                // 返回错误的 Result 类型
+                return Err(err);
+            }
+        }
+        self.report_task_completion(task_type).await?;
+        self.reboot_system().await?;
+
+        Ok(())
+    }
+
+    async fn reboot_system(&self) -> Result<(), String> {
+        log_info!("系统即将重启以应用快照恢复...");
+
+        match Command::new("systemctl").arg("reboot").spawn() {
+            Ok(_) => {
+                log_info!("systemctl reboot 已触发");
+            }
+            Err(_) => {
+                Command::new("reboot")
+                    .spawn()
+                    .map_err(|e| format!("reboot 命令启动失败: {}", e))?;
+                log_info!("直接调用 reboot");
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        Ok(())
+    }
+    async fn report_task_completion(&self, task_type: u64) -> Result<(), String> {
+        let token_option = self.get_token();
+        let token_str = token_option.as_ref().map(|s| s.as_str());
+        let url = self.full_url("closetask")?; // 提取为 helper
+        let json_data = build_closetask_json(task_type);
+
+        log_info!("Reporting completion: {} => {}", url, json_data);
+
+        self.net_client
+            .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
+            .await?;
+
+        Ok(())
+    }
+    fn full_url(&self, key: &str) -> Result<String, String> {
+        let suffix = self.api_interface.get(key).ok_or_else(|| format!("URL key '{}' not found", key))?;
+        Ok(format!("{}/{}", self.base_url, suffix))
+    }
+    async fn upload_backup(&self, id: &str, state: i32, size: &str, fail_reason: &str) -> Result<(), String> {
+        let token_option = self.get_token();
+        let token_str = token_option.as_ref().map(|s| s.as_str());
+        let url = self.full_url("uploadBackup")?;
+        let json_data = build_upload_backup_json(id, state, size, fail_reason);
+        log_info!("Reporting upload_backup: {} => {}", url, json_data);
+
+        self.net_client
+            .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
+            .await?;
+
+        Ok(())
+    }
+    async fn upload_rollback(&self, id: &str, state: i32, fail_reason: &str) -> Result<(), String> {
+        let token_option = self.get_token();
+        let token_str = token_option.as_ref().map(|s| s.as_str());
+        let url = self.full_url("uploadRollback")?;
+        let json_data = build_upload_rollback_json(id, state, fail_reason);
+        log_info!("Reporting upload_rollback: {} => {}", url, json_data);
+
+        self.net_client
+            .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn upload_passwd_result(&self, user: &str, pw: &str, state: u8, fail_reason: &str) -> Result<(), String> {
+        let token_option = self.get_token();
+        let token_str = token_option.as_ref().map(|s| s.as_str());
+        let url = self.full_url("putPwJump")?;
+        let json_data = build_upload_passwd_json(user, pw, state,fail_reason);
+        log_info!("Reporting putPwJump: {} => {}", url, json_data);
+
+        self.net_client
+            .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn upload_ip_jump_result(&self, source_ip: &str, target_ip: &str, gateway: &str, agent_ip: &str, state: u8, fail_reason: &str) -> Result<(), String> {
+        let token_option = self.get_token();
+        let token_str = token_option.as_ref().map(|s| s.as_str());
+        let url = self.full_url("putIpJump")?;
+        let json_data = build_upload_ip_jump_json(source_ip, target_ip, gateway, agent_ip, state , fail_reason);
+        log_info!("Reporting putIpJump: {} => {}", url, json_data);
+
+        self.net_client
+            .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
+            .await?;
+
+        Ok(())
+    }
 }
+
+pub fn build_closetask_json(tasklist: u64) -> String {
+    let json_data = json!({
+        "tasklist": tasklist
+    });
+    json_data.to_string()
+}
+
+
 // 定义返回类型为 `impl Future`，并显式添加 `Send` trait bound
 pub trait TaskService {
     fn task_fetcher(&mut self, host_is_offline_tx: mpsc::Sender<bool>, token_rx: mpsc::Receiver<String>, nl_sock: Option<NlSockInfo>) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>; 
@@ -1344,9 +1700,9 @@ impl TaskService for BootManager {
         Box::pin(async move {
             let mut token_rx = token_rx;
             loop {
-                let base_url = self.get_base_url();
 
-                let mut net_client = match NetClient::new(base_url, true) {
+                let base_url = self.get_base_url();
+                let mut net_client = match NetClient::new(Some(base_url), true) {
                     Ok(client) => client,
                     Err(err) => {
                         eprintln!("创建 NetClient 失败: {}", err);
@@ -1388,4 +1744,45 @@ impl TaskService for BootManager {
     }
 }
 
+pub fn build_upload_backup_json(id: &str, state: i32, size: &str, fail_reason: &str) -> String {
+    let json_data = json!({
+        "id": id,
+        "state": state,
+        "storage_dir": "",
+        "file_name": "",
+        "file_size": size,
+        "fail_reason": fail_reason,
+        "param": ""
+    });
+    json_data.to_string()
+}
+pub fn build_upload_rollback_json(id: &str, state: i32, fail_reason: &str) -> String {
+    let json_data = json!({
+        "id": id,
+        "state": state,
+        "fail_reason": fail_reason,
+    });
+    json_data.to_string()
+}
 
+pub fn build_upload_passwd_json(user: &str, pw: &str, state: u8, fail_reason: &str) -> String {
+    let json_data = json!({
+        "status": state,
+        "user": user,
+        "pw": pw,
+        "reason": fail_reason,
+    });
+    json_data.to_string()
+}
+
+pub fn build_upload_ip_jump_json(source_ip: &str, target_ip: &str, gateway: &str, agent_ip: &str, state: u8, fail_reason: &str) -> String {
+    let json_data = json!({
+        "source_ip": source_ip,
+        "target_ip": target_ip,
+        "gateway": gateway,
+        "agent_ip": agent_ip,
+        "status": state,
+        "reason": fail_reason,
+    });
+    json_data.to_string()
+}

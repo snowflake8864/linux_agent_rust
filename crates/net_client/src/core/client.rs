@@ -17,8 +17,9 @@ struct Data {
 
 pub struct NetClient {
     client: Client,
-    pub base_url: String,
+    pub base_url: Option<String>,
 }
+
 
 impl NetClient {
     // 初始化客户端（异步版本）
@@ -45,7 +46,7 @@ impl NetClient {
         })
     }
     */
-     pub fn new(base_url: String, disable_ssl: bool) -> Result<Self, String> {
+     pub fn new(base_url: Option<String>, disable_ssl: bool) -> Result<Self, String> {
         let mut client_builder = Client::builder()
             .timeout(Duration::from_secs(10)); // 设置请求超时时间
 
@@ -73,6 +74,7 @@ impl NetClient {
             base_url,
         })
     }
+
     
     // 异步版本的 POST 请求
     pub async fn post_data_async(
@@ -107,6 +109,9 @@ impl NetClient {
             }
             Err(e) => Err(format!("Failed to send POST request: {}", e)),
         }
+    }
+    pub fn get_base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
     }
 }
 

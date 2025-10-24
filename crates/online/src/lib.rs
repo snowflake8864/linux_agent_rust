@@ -92,7 +92,7 @@ impl BaseOnline {
 
         log_info!("Serialized JSON: {}", json_str);
 
-        let url = format!("{}/v1/auth", net_client.base_url);
+        let url = format!("{}/v1/auth", net_client.get_base_url().unwrap_or_default());
         println!("==url:{}", url);
         match net_client.post_data_async(&url, &json_str, Duration::from_secs(30), None).await {
             Ok(response) => {
@@ -131,8 +131,8 @@ impl StartOnline for BootManager {
 
             loop {
                 let base_url = self.get_base_url();
-                println!("0====================================================="); 
-                let mut net_client = match NetClient::new(base_url, true) {
+
+                let mut net_client = match NetClient::new(Some(base_url), true) {
                     Ok(client) => client,
                     Err(err) => {
                         eprintln!("创建 NetClient 失败: {}", err);
@@ -140,7 +140,6 @@ impl StartOnline for BootManager {
                     }
                 };
 
-                log_info!("1====================================================="); 
                 match BaseOnline::run(&mut net_client).await {
                     Ok(token) => {
                         if let Err(err) = token_tx.send(token.clone()).await {
@@ -156,7 +155,7 @@ impl StartOnline for BootManager {
                                     if let Some(json_data) = get_system_metrics() {
 
                                         // 发送到服务器
-                                        let url = format!("{}/v1/puthardwareinfo", net_client.base_url);
+                                        let url = format!("{}/v1/puthardwareinfo", net_client.get_base_url().unwrap_or_default());
                                         match net_client.post_data_async(
                                             &url,
                                             &json_data,
@@ -173,7 +172,7 @@ impl StartOnline for BootManager {
                                 result = host_is_offline_rx.recv() => {
                                     match result {
                                         Some(true) => {
-                                            println!("收到 host_is_offline 为 true 的信号，重新获取 token...");
+                                            log_info!("收到 host_is_offline 为 true 的信号，重新获取 token...");
                                             break;
                                         }
                                         Some(false) => {
