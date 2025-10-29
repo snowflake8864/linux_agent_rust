@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# 初始化环境变量
+if [[ ":$LD_LIBRARY_PATH:" != *:/opt/osec/* ]]; then
+    export LD_LIBRARY_PATH="/opt/osec/:$LD_LIBRARY_PATH"
+fi
+
+while true; do
+    # 检查MagicArmor_0进程
+    if ! ps -ef | grep -q "MagicArmor_0"; then
+        /opt/osec/MagicArmor_0 &
+        echo "[$(date)] MagicArmor_0 started"
+    fi
+
+    # 检查MagicArmor_cli进程
+    if ! ps -ef | grep -q "agent_manager"; then
+        /opt/osec/agent_manager &
+        echo "[$(date)] agent_manager started"
+    fi
+
+    sleep 10
+done
+

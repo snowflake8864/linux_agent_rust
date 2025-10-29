@@ -1,0 +1,14 @@
+[Unit]
+Description=agent_manager.service
+After=network.target auditd.service multi-user.target graphical.target
+
+[Service]
+Type=simple   
+ExecStart=/opt/osec/agent_manager
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target

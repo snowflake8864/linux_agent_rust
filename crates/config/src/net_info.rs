@@ -313,12 +313,12 @@ impl NetInfoConfig {
         writeln!(file, "[HOSTINFO]")?;
         writeln!(file, "DEV_UID={}", self.dev_uid)?;
         writeln!(file, "MACID={}", self.macid)?;
-        writeln!(file, "IPS={}", self.ips)?;
-        writeln!(file, "IFCFG={}", self.ifcfg)?;
-        writeln!(file, "OS={}", self.os)?;
-        writeln!(file, "MEMSIZE={}", self.memsize)?;
-        writeln!(file, "CPU={}", self.cpu)?;
-        writeln!(file, "HDSIZE={}", self.hdsize)?;
+        //writeln!(file, "IPS={}", self.ips)?;
+        //writeln!(file, "IFCFG={}", self.ifcfg)?;
+        //writeln!(file, "OS={}", self.os)?;
+        //writeln!(file, "MEMSIZE={}", self.memsize)?;
+        //writeln!(file, "CPU={}", self.cpu)?;
+        //writeln!(file, "HDSIZE={}", self.hdsize)?;
         writeln!(file, "AUTH={}", self.auth)?;
         writeln!(file, "HOSTNAME={}", self.host_name)?;
         Ok(())

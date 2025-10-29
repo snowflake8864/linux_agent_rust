@@ -39,7 +39,7 @@ impl IpJumpManager {
     async fn increment_tick(&self) -> u64 {
         let mut tick = self.tick_counter.write().await;
         *tick = tick.wrapping_add(1);
-        log_info!("TICK_COUNTER incremented to: {}", *tick);
+        //log_info!("TICK_COUNTER incremented to: {}", *tick);
         *tick
     }
 
@@ -48,7 +48,7 @@ impl IpJumpManager {
         let mut interval = interval(interval_duration);
         loop {
             interval.tick().await;
-            log_info!("正在执行定期清理...");
+            //log_info!("正在执行定期清理...");
             self.do_periodic_cleanup().await;
         }
     }
@@ -327,7 +327,7 @@ impl IpJumpManager {
         }
 
         let list = self.secondary_ips.read().await;
-        log_info!("Periodic cleanup completed, remaining secondary IPs: {:?}", *list);
+        //log_info!("Periodic cleanup completed, remaining secondary IPs: {:?}", *list);
     }
 
     /// 尝试删除系统上的 IP：优先用 prefix 删除，失败会尝试不带 prefix 的删除；返回 Ok 表示系统确实没有该地址（或删除成功）
@@ -414,8 +414,5 @@ impl IpJumpManager {
             }
         }
     }
-
-
-
 
 }

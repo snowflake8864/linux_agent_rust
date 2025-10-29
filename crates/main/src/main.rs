@@ -29,12 +29,11 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-
     // 初始化日志
     CustomLogger::init("/opt/osec/osec_backend.conf")
         .await
         .expect("无法初始化日志");
-    log_info!("程序启动");
+    log_info!("程序开始启动");
 
     // 卸载现有内核驱动
     let _ = unload_driver().ok();
