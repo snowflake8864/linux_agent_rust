@@ -143,4 +143,10 @@ macro_rules! log_error {
         log::log!(Error, $($arg)*);
     }};
 }
-
+#[macro_export]
+macro_rules! log_warn {
+    ($($arg:tt)*) => {{
+        use log::Level::Warn;
+        log::log!(Warn, $($arg)*);
+    }};
+}
