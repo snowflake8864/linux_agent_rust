@@ -1,11 +1,10 @@
 //crates/task/src/task_fetcher.rs
-use std::fs;
 use config::net_info::NETINFO_CONFIG;
+use std::{fs, io::Cursor, path::PathBuf,time::Duration};
 use std::pin::Pin;
 use std::future::Future;
 use serde_json::Value;
 use net_client::core::NetClient;
-use std::time::Duration;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use tokio::io::AsyncWriteExt; // 
@@ -25,10 +24,11 @@ use udisk::{list::SHARED_USB_LIST, device::UsbInfo,monitor::{get_all_local_usb_d
 use procinfo::{get_running_process_infos,build_process_list_json};
 use tokio::task;
 use serde_json::json;
+use tokio::net::UnixStream;
+use zip::ZipArchive;
 use snapman::{create_snapshot, restore_snapshot, list_snapshots, clean_snapshot, clean_all_snapshots};
 use rules_jump_mgr::{IpJumpManager, PasswordManager, IpJumpConfig, PutIpJumpInfo, PutPwJumpInfo};
 use tokio::process::Command;
-
 
 
 fn get_u32(map: &serde_json::Map<String, Value>, key: &str) -> Result<u32, String> {
@@ -125,6 +125,8 @@ impl TaskFetcher {
         PROCESS_PATTERN_RULES_MGR.lock().init();
         let mut api_interface = HashMap::new();
         api_interface.insert("closetask".to_string(), "v1/closetask".to_string());
+        api_interface.insert("update".to_string(), "v1/download".to_string());
+        api_interface.insert("uninstall".to_string(), "v1/uninstall".to_string());
         api_interface.insert("upload_process".to_string(), "v1/upload_process".to_string());
         api_interface.insert("download_white".to_string(), "v1/getprocwl".to_string());
         api_interface.insert("download_black".to_string(), "v1/getprocbl".to_string());
@@ -443,7 +445,10 @@ impl TaskFetcher {
                                 eprintln!("Unknown task ID: {}", task_id);
                             }
                         }
-                    } else {
+                    } else if parsed ["code"] == "401" {
+                         return Err("token 无效".to_string()); // 返回错误，通知主流程
+                    }
+                    else {
                         eprintln!("Invalid response code: {}", parsed["code"]);
                         log_info!("Invalid response code: {}", parsed["code"]);
                          return Err("无效响应码".to_string()); // 返回错误，通知主流程
@@ -451,12 +456,13 @@ impl TaskFetcher {
                 }
                 Err(err) => {
                     eprintln!("Error fetching task: {}", err);
-                    return Err("服务器离线或网络错误".to_string()); // 返回错误，通知主流程
+                    //return Err("服务器离线或网络错误".to_string()); // 返回错误，通知主流程
+                    log_info!("{}","服务器离线或网络错误".to_string()); // 返回错误，通知主流程
                 }
             }
 
             // 添加短暂休眠，避免频繁轮询
-            tokio::time::sleep(Duration::from_secs(20)).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
         }
     }
 
@@ -545,15 +551,77 @@ impl TaskFetcher {
         // 实际上传逻辑代码
         Ok(())
     }
+  pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
+        // 获取 update 信息
+        let download_url = self.api_interface.get("update")
+            .ok_or("URL for download update not found".to_string())?;
+        let url = format!("{}/{}", self.base_url, download_url);
+        log_info!("url:{}",url);
+        let token = self.get_token();
+        let token_owned = token.clone();
+        let token_str = token_owned.as_deref();
 
-    // 处理 TASK_UPDATE 任务
-    async fn task_update(&self, task_type: u64) -> Result<(), String> {
-        println!("Processing TASK_UPDATE...");
-        // 实际更新逻辑代码
+        let response = self.net_client
+            .post_data_async(&url, "", Duration::from_secs(10), token_str)
+            .await
+            .map_err(|e| format!("Error fetching update info: {}", e))?;
+
+        let parsed: serde_json::Value = serde_json::from_str(&response)
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+        if parsed["code"] != "000000" {
+            log_info!("Invalid response code: {}", parsed["code"].as_str().unwrap_or("unknown"));
+            return Err(format!("Invalid response code: {}", parsed["code"].as_str().unwrap_or("unknown")));
+        }
+
+        let data = parsed["data"].as_object().ok_or("Missing 'data' object in response")?;
+        let alias = data.get("alias").and_then(|v| v.as_str()).unwrap_or("update.zip");
+        let download_link = data.get("download").and_then(|v| v.as_str()).ok_or("Missing download url")?;
+
+        log_info!("🔽 开始下载更新包: {}", download_link);
+
+        let zip_bytes = self.net_client
+            .download_file_async(download_link, Duration::from_secs(60), token_str)
+            .await
+            .map_err(|e| format!("下载更新包失败: {}", e))?;
+
+        // 写入临时文件
+        let temp_dir = "/tmp/osec_update";
+        fs::create_dir_all(temp_dir).map_err(|e| e.to_string())?;
+        let zip_path = format!("{}/{}", temp_dir, alias);
+        fs::write(&zip_path, &zip_bytes).map_err(|e| e.to_string())?;
+
+        // 解压 zip
+        let reader = Cursor::new(&zip_bytes);
+        let mut archive = ZipArchive::new(reader).map_err(|e| e.to_string())?;
+        archive.extract(temp_dir).map_err(|e| e.to_string())?;
+
+        // 查找以 "osec-upgrade" 开头的脚本
+        let mut script_path: Option<PathBuf> = None;
+        for entry in fs::read_dir(temp_dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                if name.starts_with("osec-upgrade") && name.ends_with(".sh") {
+                    script_path = Some(path);
+                    break;
+                }
+            }
+        }
+
+        let script_path_ref = script_path.as_ref().ok_or_else(|| {
+            format!("未找到以 'osec-upgrade' 开头的脚本文件，目录: {}", temp_dir)
+        })?;
+        log_info!("✅ 找到升级脚本: {:?}", script_path_ref);
+
+        // 上报任务完成
+        self.report_task_completion(task_type).await?;
+        //此处发命令
+        if let Err(e) = send_command_to_agent("update").await {
+            log_info!("发送更新命令失败: {}", e);
+        }
         Ok(())
-    }
-
-    // 处理 TASK_UPLOAD_DIR 任务
+  }   
+  // 处理 TASK_UPLOAD_DIR 任务
     async fn task_upload_dir(&self, task_type: u64) -> Result<(), String> {
         println!("Processing TASK_UPLOAD_DIR...");
         // 上传目录的处理逻辑
@@ -1081,7 +1149,33 @@ impl TaskFetcher {
     // 处理 TASK_UNINSTALL 任务
     async fn task_uninstall(&self, task_type: u64) -> Result<(), String> {
         println!("Processing TASK_UNINSTALL...");
-        // 卸载任务处理
+
+        let download_url = self.api_interface.get("uninstall")
+            .ok_or("URL for download uninstall not found".to_string())?;
+        let url = format!("{}/{}", self.base_url, download_url);
+        log_info!("url:{}",url);
+        let token = self.get_token();
+        let token_owned = token.clone();
+        let token_str = token_owned.as_deref();
+
+        let response = self.net_client
+            .post_data_async(&url, "", Duration::from_secs(10), token_str)
+            .await
+            .map_err(|e| format!("Error fetching update info: {}", e))?;
+
+        let parsed: serde_json::Value = serde_json::from_str(&response)
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+        if parsed["code"] != "000000" {
+            log_info!("Invalid response code: {}", parsed["code"].as_str().unwrap_or("unknown"));
+            return Err(format!("Invalid response code: {}", parsed["code"].as_str().unwrap_or("unknown")));
+        }
+
+        // 上报任务完成
+        self.report_task_completion(task_type).await?;
+        //此处发命令
+        if let Err(e) = send_command_to_agent("uninstall").await {
+            log_info!("发送更新命令失败: {}", e);
+        }
         Ok(())
     }
 
@@ -1412,6 +1506,7 @@ impl TaskFetcher {
                 };
                 if parsed["code"] != "000000" {
                     let msg = parsed["msg"].as_str().unwrap_or("Unknown error");
+                    log_error!("API error: {}",msg);
                     return Err(format!("API error: {}", msg));
                 }
                 let data = parsed["data"].as_object().ok_or("Missing 'data' object in response")?;
@@ -1786,3 +1881,18 @@ pub fn build_upload_ip_jump_json(source_ip: &str, target_ip: &str, gateway: &str
     });
     json_data.to_string()
 }
+
+async fn send_command_to_agent(cmd: &str) -> Result<(), String> {
+    let socket_path = "/tmp/osec_agent.sock";
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(|e| format!("连接 agent_manager 失败: {}", e))?;
+
+    stream
+        .write_all(format!("{}\n", cmd).as_bytes())
+        .await
+        .map_err(|e| format!("发送命令失败: {}", e))?;
+
+    Ok(())
+}
+

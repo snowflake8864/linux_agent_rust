@@ -22,30 +22,6 @@ pub struct NetClient {
 
 
 impl NetClient {
-    // 初始化客户端（异步版本）
-    /*
-    pub fn new(base_url: String, disable_ssl: bool) -> Result<Self, String> {
-        let client_builder = Client::builder()
-            .timeout(Duration::from_secs(10)); // 设置请求超时时间
-
-        // 如果禁用 SSL 证书验证，则设置相应的选项
-        let client = if disable_ssl {
-            client_builder
-                .danger_accept_invalid_certs(true) // 禁用 SSL 证书验证
-                .build()
-                .map_err(|e| format!("Failed to create client with SSL disabled: {}", e))?
-        } else {
-            client_builder
-                .build()
-                .map_err(|e| format!("Failed to create client: {}", e))?
-        };
-
-        Ok(NetClient {
-                client,
-                base_url,
-        })
-    }
-    */
      pub fn new(base_url: Option<String>, disable_ssl: bool) -> Result<Self, String> {
         let mut client_builder = Client::builder()
             .timeout(Duration::from_secs(10)); // 设置请求超时时间
@@ -110,6 +86,47 @@ impl NetClient {
             Err(e) => Err(format!("Failed to send POST request: {}", e)),
         }
     }
+
+    /// 异步下载文件内容（返回字节数组）
+    pub async fn download_file_async(
+        &self,
+        url: &str,
+        timeout: Duration,
+        token: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        let mut request = self
+            .client
+            .get(url)
+            .timeout(timeout);
+
+        // 如果有 token，加入 Header
+        if let Some(token_str) = token {
+            request = request.header("Authorization", format!("{}", token_str));
+        }
+
+        // 发送请求
+        let response = request.send().await.map_err(|e| format!("请求失败: {}", e))?;
+
+        // 检查状态码
+        let status = response.status();
+        if !status.is_success() {
+            let err_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<无法读取错误信息>".to_string());
+            return Err(format!("下载失败 (HTTP {}): {}", status, err_text));
+        }
+
+        // 读取整个文件内容
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| format!("读取响应数据失败: {}", e))?;
+
+        Ok(bytes.to_vec())
+    }
+
+
     pub fn get_base_url(&self) -> Option<&str> {
         self.base_url.as_deref()
     }

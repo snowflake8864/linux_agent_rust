@@ -1,0 +1,44 @@
+#!/bin/bash
+#
+PROC_FILE="osec"
+
+start()
+{
+    /opt/agent/agentmonitor &
+}
+
+stop()
+{
+#    /opt/agent/MagicArmor_2
+   pkill -9 MagicArmor_0
+}
+
+status()
+{
+    run_status=$(ps -e|grep MagicArmor_0)
+    if [ "${run_status}X" == "X" ]; then
+        echo "osec is not running..."
+    else
+        echo "osec is running"
+    fi
+}
+
+case "$1" in
+start)
+    start
+    ;;
+stop)
+    stop
+    ;;
+restart)
+    stop
+    start
+    ;;
+status)
+    status
+    ;;
+*)
+    echo "usage: $0 start|stop|restart"
+    exit 0;
+esac
+
