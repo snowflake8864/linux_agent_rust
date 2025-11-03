@@ -1,7 +1,7 @@
 use serde::Serialize;
 use logging::{log_info, log_error};
 use serde_json;
-use crate::{AuditLogInfo,AuditProcess, EdrProcessLog, SysNetLog,OpenPortLog};
+use crate::{AuditLogInfo,AuditProcess, EdrProcessLog, SysNetLog,OpenPortLog,SelfProtectLogInfo};
 use process_mgr::get_md5_global;
 
 /*
@@ -293,3 +293,57 @@ pub fn build_open_port_json(logs: &[OpenPortLog], str_json: &mut String) -> Resu
         }
     }
 }
+
+pub fn build_self_protect_alert_log_json(log_info: &[SelfProtectLogInfo], str_json: &mut String) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct LogEntry {
+        level: u32,
+        time: u64,
+        #[serde(rename = "type")]
+        n_type: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        proc_dir: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        proc_hash: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        proc_param: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_dir: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_dir: Option<String>,
+    }
+
+    let entries: Vec<LogEntry> = log_info
+        .iter()
+        .map(|log| LogEntry {
+            level: log.n_level,
+            time: log.n_time,
+            n_type: log.n_type,
+            proc_dir: log.proc_dir.clone(),
+            proc_hash: log.proc_hash.clone(),
+            proc_param: log.proc_param.clone(),
+            file_dir: log.file_dir.clone(),
+            target_dir: log.target_dir.clone(),
+        })
+        .collect();
+
+    if entries.is_empty() {
+        log_error!("没有有效的日志条目可添加到 JSON。");
+        return Err("No valid log entries".to_string());
+    }
+
+    // 先序列化entries数组为字符串
+    let entries_str = serde_json::to_string(&entries)
+        .map_err(|e| format!("Entries序列化失败: {}", e))?;
+
+    // 构建包含字符串形式数组的JSON对象
+    let json_obj = serde_json::json!({
+        "alert": entries_str
+    });
+
+    *str_json = serde_json::to_string(&json_obj)
+        .map_err(|e| format!("JSON序列化失败: {}", e))?;
+
+    Ok(())
+}
+

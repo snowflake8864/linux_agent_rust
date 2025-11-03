@@ -19,6 +19,7 @@ use reporter::file_audit::FileAuditHandler;
 use reporter::process_audit::ProcessAuditHandler;
 use reporter::net_service_log::NetServiceLogHandler;
 use reporter::fake_port_audit::FakePortAuditHandler;
+use reporter::self_protect::SelfProtectAuditHandler;
 use hostinfo::net_app::handler::NetAppHandler;
 use docker::monitor::KernelDockerHandler;
 use zcopy_mgr::ZcopyMgr;
@@ -311,7 +312,8 @@ pub async fn register_user_event_handlers(
     let service_port_log_handler = Arc::new(NetServiceLogHandler::new(zcopy_mgr.clone(), boot_manager.clone()));
     let service_port_log_handler_in = service_port_log_handler.clone();
     let service_port_log_handler_out = service_port_log_handler.clone();
-    let fake_port_log_handler = FakePortAuditHandler::new(zcopy_mgr, boot_manager);
+    let fake_port_log_handler = FakePortAuditHandler::new(zcopy_mgr, boot_manager.clone());
+    let self_protect_handler = SelfProtectAuditHandler::new(boot_manager);
 
     let mut handler = event_handler.lock().await;
     handler
@@ -398,6 +400,19 @@ pub async fn register_user_event_handlers(
             let data = data.to_vec(); 
             Box::pin(async move {
                 handler.handle_kernel_docker_oper(&data, len).await
+            })
+        },
+    )
+    .await;
+
+    handler
+    .register_event_handler(
+        NLPolicyType::NL_POLICY_AV_SELF_PROTECTION_NOTIFY,
+        move |data, len| {
+            let handler = self_protect_handler.clone();
+            let data = data.to_vec(); 
+            Box::pin(async move {
+                handler.handle_self_protect_oper(&data, len).await
             })
         },
     )

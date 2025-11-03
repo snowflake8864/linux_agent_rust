@@ -3,12 +3,13 @@ use serde::Serialize;
 pub mod file_audit;
 pub mod process_audit;
 pub mod fake_port_audit;
+pub mod self_protect;
 pub mod netlink_msg;
 pub mod net_service_log; 
 pub mod log_worker;
 pub use log_worker::StartBashLog;
 pub mod build_json;
-pub use build_json::{build_alert_log_json,build_auto_process_list_json,build_batch_process_edr_json, build_open_port_json};
+pub use build_json::{build_alert_log_json,build_auto_process_list_json,build_batch_process_edr_json, build_open_port_json, build_self_protect_alert_log_json};
 
 use std::fs;
 use std::path::PathBuf;
@@ -122,3 +123,17 @@ pub struct OpenPortLog {
     pub redirect_ip: String,
     pub redirect_port: i32,
 }
+
+
+#[derive(Serialize,  Debug)]
+pub struct SelfProtectLogInfo {
+    pub file_dir: Option<String>,
+    pub proc_dir: Option<String>,
+    pub proc_hash: Option<String>,
+    pub proc_param: Option<String>,
+    pub target_dir: Option<String>,
+    pub n_type: u16,
+    pub n_level: u32,
+    pub n_time: u64,
+}
+
