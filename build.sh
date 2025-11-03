@@ -17,8 +17,8 @@ mkdir -p "$OUTPUT_DIR"
 cp target/x86_64-unknown-linux-musl/release/MagicArmor_0 package/opt/osec/x86_64-unknown-linux-musl/
 cp target/x86_64-unknown-linux-musl/release/agent_manager package/opt/osec/x86_64-unknown-linux-musl/
 # Uncomment for ARM if needed
-# cp target/aarch64-unknown-linux-musl/release/MagicArmor_0 package/opt/osec/aarch64-unknown-linux-musl/
-# cp target/aarch64-unknown-linux-musl/release/agent_manager package/opt/osec/aarch64-unknown-linux-musl/
+cp target/aarch64-unknown-linux-musl/release/MagicArmor_0 package/opt/osec/aarch64-unknown-linux-musl/
+cp target/aarch64-unknown-linux-musl/release/agent_manager package/opt/osec/aarch64-unknown-linux-musl/
 
 # Copy config and service files
 cp -f script/net_info.ini package/opt/osec/
@@ -272,16 +272,15 @@ fi
 PAYLOAD_LINE=\$(awk '/^__PAYLOAD_BELOW__/ {print NR + 1; exit}' "\$0")
 tail -n+\$PAYLOAD_LINE "\$0" | tar -xzf - -C /tmp || { echo "Extraction failed"; exit 1; }
 
-rm -f /tmp/opt/osec/agent_manager
-rm -f /tmp/opt/osec/agent_manager.service
-rm -rf "/tmp/opt/osec/\$BIN_DIR"
-
+# Backup current config
 if [ -f "\$INSTALL_DIR/net_info.ini" ]; then
     cp "\$INSTALL_DIR/net_info.ini" "\$INSTALL_DIR/net_info.ini.bak"
 fi
 
+# Copy ALL new files (including \$BIN_DIR)
 cp -rf /tmp/opt/osec/* "\$INSTALL_DIR/"
 
+# Restore config but update version
 if [ -f "\$INSTALL_DIR/net_info.ini.bak" ]; then
     mv "\$INSTALL_DIR/net_info.ini.bak" "\$INSTALL_DIR/net_info.ini"
 fi
@@ -291,20 +290,39 @@ if [ -f "\$INSTALL_DIR/net_info.ini" ]; then
     sed -i "/\\[SERVERINFO\\]/a VERSION=\$OSEC_VERSION" "\$INSTALL_DIR/net_info.ini"
 fi
 
-cp -f "\$INSTALL_DIR/\$BIN_DIR/MagicArmor_0" "\$INSTALL_DIR/MagicArmor_0"
-chmod +x "\$INSTALL_DIR/MagicArmor_0"
+# Deploy new MagicArmor_0 from architecture dir (MUST exist!)
+if [ -f "\$INSTALL_DIR/\$BIN_DIR/MagicArmor_0" ]; then
+    cp -f "\$INSTALL_DIR/\$BIN_DIR/MagicArmor_0" "\$INSTALL_DIR/MagicArmor_0"
+    chmod +x "\$INSTALL_DIR/MagicArmor_0"
+else
+    echo "ERROR: MagicArmor_0 not found in \$BIN_DIR!"
+    exit 1
+fi
+
+# NOW safe to remove architecture directories
+rm -rf "\$INSTALL_DIR/x86_64-unknown-linux-musl" "\$INSTALL_DIR/aarch64-unknown-linux-musl"
+
 
 if command -v systemctl >/dev/null 2>&1; then
     echo "Restarting osec via systemd..."
     cp -f "\$INSTALL_DIR/osec.service" /etc/systemd/system/osec.service
     chmod 644 /etc/systemd/system/osec.service
     systemctl daemon-reload
+    echo "Starting osec service..."
     systemctl enable osec --now
-    if ! systemctl is-active --quiet osec; then
-        echo "ERROR: osec failed to start after upgrade!"
-        journalctl -u osec -n 10 --no-pager
-        exit 1
-    fi
+# Wait for service to become active (up to 10 seconds)
+    for i in {1..10}; do
+      if systemctl is-active --quiet osec; then
+	echo "osec service started successfully."
+	break
+      fi
+    sleep 1
+   done
+   if ! systemctl is-active --quiet osec; then
+    echo "ERROR: osec failed to start after upgrade!"
+    journalctl -u osec -n 20 --no-pager
+    exit 1
+   fi
 else
     echo "systemd not found. Restarting osec via SysV init (osecservicecentos)..."
     if [ ! -f /etc/init.d/osecservicecentos ]; then

@@ -639,6 +639,7 @@ impl TaskFetcher {
 
 
         let url = format!("{}/{}", self.base_url, download_url);
+        log_info!("protect ====================={}",url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
 
@@ -672,6 +673,7 @@ impl TaskFetcher {
                 return Err(err);
             }
         }
+        self.report_task_completion(task_type).await?;
         // 下载目录策略的处理
         Ok(())
     }
@@ -702,6 +704,7 @@ impl TaskFetcher {
                     let conf = parsed["data"]["conf"]
                         .as_object()
                         .ok_or("Missing 'conf' object in response")?;
+                    log_info!("==============================conf:{:?}",conf);
                     self.update_config_from_json(conf)?;                   
 
                 } else {
@@ -718,6 +721,7 @@ impl TaskFetcher {
         }
 
 
+        self.report_task_completion(task_type).await?;
         // 下载配置的处理
         Ok(())
     }
@@ -1080,6 +1084,7 @@ impl TaskFetcher {
         };
         
         let url = format!("{}/{}", self.base_url, download_url);
+        log_info!("lesuo======={}",url);
         let token = self.get_token();
         let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
         match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
@@ -1112,7 +1117,7 @@ impl TaskFetcher {
             }
         }
 
-
+        self.report_task_completion(task_type).await?;
         Ok(())
     }
 
