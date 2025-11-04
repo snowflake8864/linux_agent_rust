@@ -1701,8 +1701,10 @@ dependencies = [
  "ipnet",
  "log",
  "logging",
+ "net_client",
  "regex",
  "serde",
+ "serde_json",
  "tokio",
 ]
 

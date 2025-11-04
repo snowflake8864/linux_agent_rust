@@ -79,7 +79,10 @@ impl NetClient {
                 let response_text = r.text().await.map_err(|e| format!("Failed to read response text: {}", e))?;
                 if status_code.is_success() {
                     Ok(response_text)
-                } else {
+                } else if status_code.is_client_error() {
+                    Ok(response_text)
+                } 
+                else {
                     Err(format!("POST request failed with status: {} - {}", status_code, response_text))
                 }
             }

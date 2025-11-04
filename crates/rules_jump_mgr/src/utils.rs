@@ -69,29 +69,110 @@ pub async fn ip_exists_on_iface(iface: &str, ip: &str) -> bool {
     }
 }
 
-/// 获取本机非回环 IPv4（优先 scope global），返回第一个合适 IP
 pub async fn get_local_ip() -> Option<String> {
+    let mut ips = Vec::new();
+
     if let Ok(out) = run_cmd_capture("ip", &["-o", "-4", "addr", "show", "scope", "global"]).await {
         let re = Regex::new(r"inet\s+(\d+\.\d+\.\d+\.\d+)/\d+").unwrap();
         for line in out.lines() {
             if let Some(cap) = re.captures(line) {
                 let ip = cap.get(1).unwrap().as_str();
                 if ip != "127.0.0.1" && !ip.starts_with("169.254.") {
-                    return Some(ip.to_string());
+                    ips.push(ip.to_string());
                 }
             }
         }
     }
-    // fallback: ip route get 1.1.1.1
-    if let Ok(out) = run_cmd_capture("ip", &["route", "get", "1.1.1.1"]).await {
-        let re = Regex::new(r"src\s+(\d+\.\d+\.\d+\.\d+)").unwrap();
-        if let Some(cap) = re.captures(&out) {
-            return Some(cap.get(1).unwrap().as_str().to_string());
+
+    if ips.is_empty() {
+        if let Ok(out) = run_cmd_capture("ip", &["route", "get", "1.1.1.1"]).await {
+            let re = Regex::new(r"src\s+(\d+\.\d+\.\d+\.\d+)").unwrap();
+            if let Some(cap) = re.captures(&out) {
+                let fallback_ip = cap.get(1).unwrap().as_str();
+                if fallback_ip != "127.0.0.1" && !fallback_ip.starts_with("169.254.") {
+                    ips.push(fallback_ip.to_string());
+                }
+            }
         }
     }
-    None
+
+    // 去重并返回第一个
+    ips.sort_unstable();
+    ips.dedup();
+    ips.into_iter().next()
 }
-/// 获取本机非回环 IPv4，排除指定 IP；若无结果，则 fallback 到默认路由出口 IP（即使等于 excluded）
+
+pub async fn get_local_ips_all() -> Option<String> {
+    let out4 = run_cmd_capture("ip", &["-o", "-4", "addr", "show"]).await.ok();
+    let out6 = run_cmd_capture("ip", &["-o", "-6", "addr", "show"]).await.ok();
+
+    let mut ips = Vec::new();
+
+    // 虚拟接口前缀
+    const BAD_IFACES: [&str; 8] = [
+        "lo", "docker", "veth", "br-", "cni", "flannel", "kube", "virbr",
+    ];
+
+    // 处理 IPv4
+    if let Some(out) = out4 {
+        for line in out.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 4 {
+                continue;
+            }
+
+            let iface = parts[1];
+            let cidr = parts[3];
+
+            // 过滤虚拟网卡
+            if BAD_IFACES.iter().any(|bad| iface.starts_with(bad)) {
+                continue;
+            }
+
+            if let Some((ip, _)) = cidr.split_once('/') {
+                ips.push(ip.to_string());
+            }
+        }
+    }
+
+    // 处理 IPv6
+    if let Some(out) = out6 {
+        for line in out.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 4 {
+                continue;
+            }
+
+            let iface = parts[1];
+            let cidr = parts[3];
+
+            // 过滤虚拟网卡
+            if BAD_IFACES.iter().any(|bad| iface.starts_with(bad)) {
+                continue;
+            }
+
+            if let Some((ip, _)) = cidr.split_once('/') {
+                // ✅ 排除 IPv6 无用地址
+                if ip == "::1" {
+                    continue;
+                }
+                if ip.starts_with("fe80:") {
+                    continue;
+                }
+                if ip.starts_with("ff") {
+                    continue;
+                }
+                ips.push(ip.to_string());
+            }
+        }
+    }
+
+    if ips.is_empty() {
+        None
+    } else {
+        Some(ips.join(","))
+    }
+}
 pub async fn get_local_ips_exclude(excluded_ip: &str) -> Vec<String> {
     let mut ips = Vec::new();
 
@@ -129,7 +210,7 @@ pub async fn get_local_ips_exclude(excluded_ip: &str) -> Vec<String> {
     ips.sort_unstable();
     ips.dedup();
     ips
-}/// 检查是否存在到 target_ip 的 ESTABLISHED TCP 连接（解析 /proc/net/tcp）
+}
 pub fn has_established_connection(target_ip: &str) -> bool {
     // /proc/net/tcp lines: local_address:port rem_address:port st ...
     if let Ok(content) = fs::read_to_string("/proc/net/tcp") {

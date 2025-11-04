@@ -6,6 +6,8 @@ use tokio::sync::RwLock;
 use std::sync::Arc;
 use logging::{log_info, log_error};
 use tokio::time::{interval, Duration};
+use net_client::core::NetClient;
+use serde_json::json;
 
 #[derive(Debug, Clone)]
 pub struct NetworkBackup {
@@ -23,37 +25,59 @@ pub struct IpJumpManager {
     secondary_ips: SharedSecondaryList,
     tick_counter: Arc<RwLock<u64>>,
     main_interface: String,
+    last_upload_failed: Arc<RwLock<bool>>, 
 }
 
 impl IpJumpManager {
-    /// 创建新的 IpJumpManager 实例，基于 server_ip 确定主接口，并返回 Arc 包装的共享实例
     pub fn new(main_interface: &str) -> Arc<Self> {
         Arc::new(IpJumpManager {
             secondary_ips: Arc::new(RwLock::new(Vec::new())),
             tick_counter: Arc::new(RwLock::new(0)),
             main_interface:main_interface.to_string(),
+            last_upload_failed: Arc::new(RwLock::new(false)),
         })
     }
 
-    /// 增加 tick 计数器
-    async fn increment_tick(&self) -> u64 {
-        let mut tick = self.tick_counter.write().await;
-        *tick = tick.wrapping_add(1);
-        //log_info!("TICK_COUNTER incremented to: {}", *tick);
-        *tick
-    }
+    async fn cleanup_old_secondary(&self, keep_ip: &str) {
+        let snapshot = {
+            let list = self.secondary_ips.read().await;
+            list.clone()
+        };
 
-    /// 启动定时清理任务
-    pub async fn start_periodic_cleanup(self: Arc<Self>, interval_duration: Duration) {
-        let mut interval = interval(interval_duration);
-        loop {
-            interval.tick().await;
-            //log_info!("正在执行定期清理...");
-            self.do_periodic_cleanup().await;
+        for entry in snapshot.iter() {
+            if entry.ip != keep_ip {
+                let iface = entry.interface.clone();
+                let ip = entry.ip.clone();
+                let prefix = entry.prefix_len;
+
+                log_info!(
+                    "cleanup_old_secondary: removing old secondary {} on {} (prefix {})",
+                    ip, iface, prefix
+                );
+
+                // 删除系统 IP
+                let _ = self.try_remove_ip_from_system(&iface, &ip, prefix).await;
+                // 删除内存记录
+                let mut list = self.secondary_ips.write().await;
+                list.retain(|x| x.ip != ip || x.interface != iface);
+            }
         }
     }
 
-    /// 获取主接口的主 IP
+    async fn increment_tick(&self) -> u64 {
+        let mut tick = self.tick_counter.write().await;
+        *tick = tick.wrapping_add(1);
+        *tick
+    }
+
+    pub async fn start_periodic_cleanup(self: Arc<Self>, base_url: &str, token: Option<String>, interval_duration: Duration) {
+        let mut interval = interval(interval_duration);
+        loop {
+            interval.tick().await;
+            self.do_periodic_cleanup(base_url,token.clone()).await;
+        }
+    }
+
     async fn get_primary_ip(&self, source_ip: &str) -> Result<(String, String), String> {
         let out = run_cmd_capture("ip", &["-o", "-4", "addr", "show", "dev", &self.main_interface]).await
             .map_err(|e| format!("ip addr show dev {} failed: {}", self.main_interface, e))?;
@@ -114,6 +138,9 @@ impl IpJumpManager {
             config.source_ip = source_ip.clone();
         }
 
+        // 在变更前清理旧 secondary
+        self.cleanup_old_secondary(&config.source_ip).await;
+
         // 2. 备份 interface info for source_ip
         log_info!("Backing up interface for IP: {}", config.source_ip);
         let backup = self.backup_interface(&config.source_ip).await.map_err(|e| {
@@ -131,6 +158,7 @@ impl IpJumpManager {
         log_info!("Removing source IP: {}/{} from {}", config.source_ip, src_prefix, backup.interface);
         if let Err(e) = self.run_ip_cmd(&["addr", "del", &format!("{}/{}", config.source_ip, src_prefix), "dev", &backup.interface]).await {
             log_error!("addr del failed: {}, attempt restore", e);
+            log_info!("addr del failed: {}, attempt restore", e);
             let _ = self.restore_backup(&backup).await;
             return Err(format!("addr del failed: {}", e));
         }
@@ -232,7 +260,6 @@ impl IpJumpManager {
         Ok(())
     }
 
-    /// 添加 secondary ip 记录并在系统中添加地址（如果不存在）
     pub async fn add_secondary_ip(&self, iface: &str, ip: &str, netmask: &str, prefix: u8, tick: u64) -> Result<(), String> {
         log_info!("Attempting to add secondary IP: {} on {}, tick: {}", ip, iface, tick);
         let mut list = self.secondary_ips.write().await;
@@ -264,7 +291,6 @@ impl IpJumpManager {
         log_info!("Added secondary IP: {} on {}, list len: {}", ip, iface, list.len());
         Ok(())
     }
-
     /// 查找与 gateway 同网段的接口名
     pub async fn find_iface_for_gateway(&self, gateway: &str) -> Option<String> {
         if let Ok(out) = run_cmd_capture("ip", &["-o", "-4", "addr", "show"]).await {
@@ -285,18 +311,12 @@ impl IpJumpManager {
         None
     }
 
-    /// 检查是否存在 ESTABLISHED 到 target_ip 的连接
     pub fn has_established_connection(&self, target_ip: &str) -> bool {
         crate::utils::has_established_connection(target_ip)
     }
 
-//===
-
-    pub async fn do_periodic_cleanup(&self) {
-        // tick 由定时任务增加一次
+    pub async fn do_periodic_cleanup(&self, base_url: &str, token: Option<String>) {
         let tick = self.increment_tick().await;
-
-        // 收集过期项 (interface, ip, prefix_len) 到一个临时列表
         let mut expired: Vec<(String, String, u8)> = Vec::new();
         {
             let list = self.secondary_ips.read().await;
@@ -307,39 +327,64 @@ impl IpJumpManager {
             }
         }
 
-        // 尝试删除系统上的 IP，每次删除成功才从内存中移除记录
+        let mut any_removed = false;
+
         for (iface, ip, prefix) in expired.iter() {
-            log_info!("Periodic cleanup: attempting to remove aged secondary IP {} on {} (prefix {})", ip, iface, prefix);
             match self.try_remove_ip_from_system(iface, ip, *prefix).await {
                 Ok(()) => {
-                    // 如果系统删除成功，从 secondary_ips 中移除
                     let mut list = self.secondary_ips.write().await;
-                    let before = list.len();
                     list.retain(|x| !(x.interface == *iface && x.ip == *ip));
-                    let after = list.len();
-                    log_info!("Removed aged IP {} on {} from system and list (before {}, after {})", ip, iface, before, after);
+                    any_removed = true;
                 }
                 Err(e) => {
                     log_error!("Failed to remove aged IP {} on {}: {}", ip, iface, e);
-                    // 不从内存删除记录，留给下次重试
                 }
             }
         }
 
-        let list = self.secondary_ips.read().await;
-        //log_info!("Periodic cleanup completed, remaining secondary IPs: {:?}", *list);
-    }
+        // 判断是否进入上传逻辑
+        let mut need_upload = any_removed;
+        {
+            let failed = self.last_upload_failed.read().await;
+            if *failed {
+                need_upload = true;
+            }
+        }
 
-    /// 尝试删除系统上的 IP：优先用 prefix 删除，失败会尝试不带 prefix 的删除；返回 Ok 表示系统确实没有该地址（或删除成功）
+        if need_upload {
+            if let Some(agent_ip) = get_local_ips_all().await {
+                match self.upload_ip_jump_periodic_result(base_url, token.clone(), &agent_ip).await {
+                    Ok(_) => {
+                        log_info!("Periodic IP jump result uploaded successfully: {}", agent_ip);
+                        let mut failed = self.last_upload_failed.write().await;
+                        *failed = false; // 清空失败标记
+                    }
+                    Err(e) => {
+                        log_error!("Failed to upload periodic IP jump result: {}, will retry next time", e);
+                        let mut failed = self.last_upload_failed.write().await;
+                        *failed = true; // 标记失败，下次重试
+                    }
+                }
+
+                // nmcli 持久化 primary IP
+                if self.has_nmcli().await {
+                    if let Ok(primary_ip) = self.get_primary_ip_of_main_interface().await {
+                        if let Err(e) = self.nmcli_update_primary_ip(&self.main_interface, &primary_ip).await {
+                            log_error!("Failed to persist primary IP using nmcli: {}", e);
+                        }
+                    }
+                }
+            } else {
+                log_error!("Cannot get local agent IP for periodic upload");
+            }
+        }
+    }
     async fn try_remove_ip_from_system(&self, iface: &str, ip: &str, prefix: u8) -> Result<(), String> {
-        // 1) 尝试精确带前缀删除
         let with_prefix = format!("{}/{}", ip, prefix);
         log_info!("try_remove_ip_from_system: running: ip addr del {} dev {}", with_prefix, iface);
         match run_cmd_capture("ip", &["addr", "del", &with_prefix, "dev", iface]).await {
             Ok(out) => {
-                // 即使 ip 命令有输出，也要再确认这个 IP 是否仍然在接口上
                 log_info!("ip addr del (with prefix) stdout: {}", out);
-                // 检查是否仍然存在
                 if !ip_exists_on_iface(iface, ip).await {
                     return Ok(());
                 } else {
@@ -348,11 +393,9 @@ impl IpJumpManager {
             }
             Err(err) => {
                 log_error!("ip addr del (with prefix) failed: {} (cmd stderr/stdout)", err);
-                // 继续尝试不带前缀
             }
         }
 
-        // 2) 兜底：尝试不带前缀删除（有时前缀不一致导致前一步无效）
         log_info!("try_remove_ip_from_system: trying fallback delete without prefix: ip addr del {} dev {}", ip, iface);
         match run_cmd_capture("ip", &["addr", "del", ip, "dev", iface]).await {
             Ok(out2) => {
@@ -368,11 +411,7 @@ impl IpJumpManager {
             }
         }
     }
-
-    /// 删除 secondary ip（从系统和列表） - 这个函数保留，但改为调用 try_remove_ip_from_system，
-    /// 如果成功则从列表中移除；如果失败则返回错误（不盲目移除列表）
     pub async fn remove_secondary_ip(&self, iface: &str, ip: &str) -> Result<(), String> {
-        // 查找 prefix（尽量从内存里找到）
         let prefix_opt = {
             let list = self.secondary_ips.read().await;
             list.iter().find(|x| x.interface == iface && x.ip == ip).map(|x| x.prefix_len)
@@ -380,7 +419,6 @@ impl IpJumpManager {
 
         if let Some(p) = prefix_opt {
             log_info!("remove_secondary_ip: found prefix {} for {} on {}", p, ip, iface);
-            // 使用 try_remove_ip_from_system 尝试删除系统上地址
             match self.try_remove_ip_from_system(iface, ip, p).await {
                 Ok(()) => {
                     // 成功则从内存中删除记录
@@ -395,11 +433,9 @@ impl IpJumpManager {
                 }
             }
         } else {
-            // 没有 prefix 信息，尝试不带 prefix 的删除
             log_info!("remove_secondary_ip: prefix not found for {} on {}, trying without prefix", ip, iface);
             match self.try_remove_ip_from_system(iface, ip, 0).await {
                 Ok(()) => {
-                    // 仍然尝试从内存移除所有匹配 ip/interface 的记录
                     let mut list = self.secondary_ips.write().await;
                     let before = list.len();
                     list.retain(|x| !(x.interface == iface && x.ip == ip));
@@ -414,5 +450,120 @@ impl IpJumpManager {
             }
         }
     }
+    async fn upload_ip_jump_periodic_result(
+        &self,
+        base_url: &str,
+        token: Option<String>,
+        agent_ip: &str,
+    ) -> Result<(), String> {
+        let token_str = token.as_ref().map(|s| s.as_str());
+        let url = format!("{}/v1/uploadIp", base_url);
+        let json_data = build_upload_agent_ip_json(agent_ip);
+        log_info!("Reporting putIpJump: {} => {}", url, json_data);
 
+        // 创建客户端，如果失败直接返回 Err
+        let net_client = NetClient::new(Some(base_url.to_string()), true)
+            .map_err(|e| format!("创建 NetClient 失败: {}", e))?;
+
+        // 发送请求，如果失败直接返回 Err
+        let response = net_client
+            .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
+            .await
+            .map_err(|err| {
+                log_info!("发送指标失败: {}", err);
+                eprintln!("发送指标失败: {}", err);
+                format!("发送指标失败: {}", err)
+            })?;
+
+        log_info!("服务器响应: {}", response);
+        Ok(())
+    }
+
+    pub async fn nmcli_update_primary_ip(&self, iface: &str, ip: &str) -> Result<(), String> {
+        // 1. 获取当前 IP 的 prefix
+        let out = run_cmd_capture("ip", &["-o", "-4", "addr", "show", "dev", iface]).await
+            .map_err(|e| format!("ip addr show failed: {}", e))?;
+
+        let mut prefix: Option<u8> = None;
+        let re = regex::Regex::new(r"^\d+:\s+[^:\s]+\s+inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)").unwrap();
+
+        for line in out.lines() {
+            if let Some(cap) = re.captures(line) {
+                let addr = cap.get(1).unwrap().as_str();
+                let pre: u8 = cap.get(2).unwrap().as_str().parse().unwrap_or(24);
+                if addr == ip && !line.contains("secondary") {
+                    prefix = Some(pre);
+                    break;
+                }
+            }
+        }
+
+        let prefix = match prefix {
+            Some(p) => p,
+            None => return Err(format!("Cannot find primary IP {} on interface {}", ip, iface)),
+        };
+
+        // 2. 获取当前 nmcli connection
+        let conn_out = run_cmd_capture("nmcli", &["-t", "-f", "NAME,DEVICE", "connection", "show"]).await
+            .map_err(|e| format!("nmcli connection show failed: {}", e))?;
+
+        let mut conn_name: Option<String> = None;
+        for line in conn_out.lines() {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() == 2 && parts[1] == iface {
+                conn_name = Some(parts[0].to_string());
+                break;
+            }
+        }
+
+        let conn_name = match conn_name {
+            Some(c) => c,
+            None => return Err(format!("No nmcli connection found for interface {}", iface)),
+        };
+
+        // 3. 修改 ipv4.addresses
+        let addr = format!("{}/{}", ip, prefix);
+        let status = run_cmd_status("nmcli", &["connection", "modify", &conn_name, "ipv4.addresses", &addr]).await;
+        status.map_err(|e| format!("nmcli modify ipv4.addresses failed: {}", e))?;
+
+        // 4. 确保 ipv4.method 是 manual
+        let status = run_cmd_status("nmcli", &["connection", "modify", &conn_name, "ipv4.method", "manual"]).await;
+        status.map_err(|e| format!("nmcli modify ipv4.method failed: {}", e))?;
+
+        // 5. 重启连接应用配置
+        let status = run_cmd_status("nmcli", &["connection", "up", &conn_name]).await;
+        status.map_err(|e| format!("nmcli connection up failed: {}", e))?;
+
+        log_info!("Primary IP {} on {} persisted via nmcli (connection: {})", ip, iface, conn_name);
+        Ok(())
+    }
+    pub async fn has_nmcli(&self) -> bool {
+        run_cmd_status("which", &["nmcli"]).await.is_ok()
+    }
+    pub async fn get_primary_ip_of_main_interface(&self) -> Result<String, String> {
+        let out = run_cmd_capture("ip", &["-o", "-4", "addr", "show", "dev", &self.main_interface]).await
+            .map_err(|e| format!("ip addr show failed: {}", e))?;
+
+        let re = regex::Regex::new(r"^\d+:\s+[^:\s]+\s+inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)").unwrap();
+
+        for line in out.lines() {
+            if let Some(cap) = re.captures(line) {
+                let addr = cap.get(1).unwrap().as_str();
+                if !line.contains("secondary") {
+                    // 找到 primary IP
+                    return Ok(addr.to_string());
+                }
+            }
+        }
+
+        Err(format!("No primary IP found on interface {}", self.main_interface))
+    }
 }
+
+pub fn build_upload_agent_ip_json(agent_ip: &str) -> String {
+    let json_data = json!({
+        "ip": agent_ip,
+    });
+    json_data.to_string()
+}
+
