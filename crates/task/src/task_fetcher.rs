@@ -1478,17 +1478,17 @@ impl TaskFetcher {
             reason: "".to_string(),
         };
         let mgr = PasswordManager::new();
-        let jump_result = mgr.do_pw_jump_async("zebra", new_password, &mut info).await;
+        let jump_result = mgr.do_pw_jump_async("", new_password, &mut info).await;
         match jump_result {
             Ok(_) => {
                 log_info!("pw jump success: {:?}", info);
-                info.user = "zebra".to_string(); // 补充 user 和 pw
+                //info.user = "zebra".to_string(); 
                 info.pw = new_password.to_string();
                 info.status = 1; // 成功状态
             },
             Err(e) => {
                 log_info!("pw jump fail: {:?}", e);
-                info.user = "zebra".to_string();
+                //info.user = "zebra".to_string();
                 info.pw = new_password.to_string();
                 info.status = 2; // 失败状态
                 info.reason = e.to_string(); // 记录失败原因

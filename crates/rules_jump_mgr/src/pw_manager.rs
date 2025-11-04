@@ -3,8 +3,6 @@ use crate::PutPwJumpInfo;
 use crate::utils::{run_cmd_capture, run_cmd_status};
 use logging::{log_info,log_error};
 
-/// 管理密码变更：备份原始 shadow 行 (getent shadow user),
-/// 使用 chpasswd 修改密码（需要 root），失败则用 usermod -p <hash> 恢复原始 hash。
 pub struct PasswordManager;
 
 impl PasswordManager {
@@ -42,31 +40,53 @@ impl PasswordManager {
         run_cmd_status("usermod", &["-p", hash, user]).await.map_err(|e| format!("usermod -p failed: {}", e))
     }
 
-    pub async fn do_pw_jump_async(&self, user: &str, newpw: &str, info: &mut PutPwJumpInfo) -> Result<(), String> {
-        log_info!("Starting pw jump for user {}", user);
+    pub async fn do_pw_jump_async(
+        &self,
+        user: &str,
+        newpw: &str,
+        info: &mut PutPwJumpInfo,
+    ) -> Result<(), String> {
+        let real_user = if user.trim().is_empty() {
+            if let Ok(u) = std::env::var("USER") {
+                u
+            } else {
+                let output = tokio::process::Command::new("whoami")
+                    .output()
+                    .await
+                    .map_err(|e| format!("failed to run whoami: {}", e))?;
+                let u = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if u.is_empty() {
+                    return Err("cannot determine current user".to_string());
+                }
+                u
+            }
+        } else {
+            user.to_string()
+        };
+
+        info.user = real_user.clone(); 
+        log_info!("Starting pw jump for user {}", real_user);
 
         // 1. 备份 shadow
-        let orig_hash_opt = self.backup_shadow(user).await.map_err(|e| {
+        let orig_hash_opt = self.backup_shadow(&real_user).await.map_err(|e| {
             log_error!("backup_shadow failed: {}", e);
             e
         })?;
 
-        log_info!("1--------Starting pw jump for user {}", user);
-        // 2. 尝试设置新密码
-        if let Err(e) = self.set_password_plain(user, newpw).await {
+        log_info!("1--------Starting pw jump for user {}", real_user);
+        if let Err(e) = self.set_password_plain(&real_user, newpw).await {
             log_error!("set_password_plain failed: {}", e);
-            // 回滚：尝试恢复原有 hash
             if let Some(h) = orig_hash_opt.as_deref() {
-                let _ = self.restore_shadow_hash(user, h).await;
+                let _ = self.restore_shadow_hash(&real_user, h).await;
             }
             info.status = 2;
             info.reason = format!("set_password failed: {}", e);
             return Err(info.reason.clone());
         }
 
-        log_info!("2--------Starting pw jump for user {}", user);
-        // 3. 可选：校验用户能否登录或其他检查（此处只填 info）
-        info.user = user.to_string();
+        log_info!("2--------Starting pw jump for user {}", real_user);
+
+        info.user = real_user;
         info.pw = newpw.to_string();
         info.status = 1;
         info.reason = "password changed".to_string();
