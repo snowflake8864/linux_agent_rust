@@ -159,10 +159,13 @@ impl TaskFetcher {
 
         let cfg = NETINFO_CONFIG.lock().unwrap(); // 这里使用 from_ini 解析配置
         let ip_jump_manager = IpJumpManager::new(&cfg.ifcfg.clone()); 
+        let base_url_owned = base_url.to_string();
+        let token_for_cleanup = token.clone();
+
         // Clone the Arc for the periodic cleanup task
         let manager_clone = Arc::clone(&ip_jump_manager.clone());
         tokio::spawn(async move {
-            manager_clone.start_periodic_cleanup(Duration::from_secs(60)).await;
+            manager_clone.start_periodic_cleanup(&base_url_owned, token_for_cleanup, Duration::from_secs(60)).await;
         });
         TaskFetcher {
               base_url: base_url.to_string(),
@@ -446,6 +449,7 @@ impl TaskFetcher {
                             }
                         }
                     } else if parsed ["code"] == "401" {
+                         log_info!("{}","token 无效".to_string()); // 返回错误，通知主流程
                          return Err("token 无效".to_string()); // 返回错误，通知主流程
                     }
                     else {
@@ -537,10 +541,13 @@ impl TaskFetcher {
                     &json_str,
                     Duration::from_secs(10),
                     token_str,
-                ).await {
-                    Ok(response) => {log_info!("服务器响应: {}", response)},
-                    Err(err) => eprintln!("发送指标失败: {}", err),
-                }
+                ).await{
+                Ok(response) => {log_info!("服务器响应: {}", response)},
+                Err(err) => {
+                    log_info!("发送指标失败: {}", err);
+                    eprintln!("发送指标失败: {}", err)
+                },
+            }
 
             }
             Err(e) => {
@@ -857,9 +864,12 @@ impl TaskFetcher {
             Err(e) => return Err(format!("Failed to serialize port data to JSON: {}", e)),
         };
         log_info!("准备上传的数据: {}", json_data);
-        match self.net_client.post_data_async(&url, &json_data, Duration::from_secs(10), token_str).await {
-            Ok(response) => log_info!("服务器响应: {}", response),
-            Err(err) => log_error!("发送指标失败: {}", err),
+        match self.net_client.post_data_async(&url, &json_data, Duration::from_secs(10), token_str).await{
+                Ok(response) => {log_info!("服务器响应: {}", response)},
+                Err(err) => {
+                    log_info!("发送指标失败: {}", err);
+                    eprintln!("发送指标失败: {}", err)
+                }
         }
         Ok(())
     }
@@ -1712,10 +1722,15 @@ impl TaskFetcher {
 
         log_info!("Reporting completion: {} => {}", url, json_data);
 
-        self.net_client
+        match self.net_client
             .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
-            .await?;
-
+            .await{
+                Ok(response) => {log_info!("服务器响应: {}", response)},
+                Err(err) => {
+                    log_info!("发送指标失败: {}", err);
+                    eprintln!("发送指标失败: {}", err)
+                }
+            }
         Ok(())
     }
     fn full_url(&self, key: &str) -> Result<String, String> {
@@ -1729,10 +1744,15 @@ impl TaskFetcher {
         let json_data = build_upload_backup_json(id, state, size, fail_reason);
         log_info!("Reporting upload_backup: {} => {}", url, json_data);
 
-        self.net_client
+        match self.net_client
             .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
-            .await?;
-
+            .await{
+                Ok(response) => {log_info!("服务器响应: {}", response)},
+                Err(err) => {
+                    log_info!("发送指标失败: {}", err);
+                    eprintln!("发送指标失败: {}", err)
+                }
+            }
         Ok(())
     }
     async fn upload_rollback(&self, id: &str, state: i32, fail_reason: &str) -> Result<(), String> {
@@ -1742,10 +1762,15 @@ impl TaskFetcher {
         let json_data = build_upload_rollback_json(id, state, fail_reason);
         log_info!("Reporting upload_rollback: {} => {}", url, json_data);
 
-        self.net_client
+        match self.net_client
             .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
-            .await?;
-
+            .await{
+                Ok(response) => {log_info!("服务器响应: {}", response)},
+                Err(err) => {
+                    log_info!("发送指标失败: {}", err);
+                    eprintln!("发送指标失败: {}", err)
+                },
+            }
         Ok(())
     }
 
@@ -1756,10 +1781,15 @@ impl TaskFetcher {
         let json_data = build_upload_passwd_json(user, pw, state,fail_reason);
         log_info!("Reporting putPwJump: {} => {}", url, json_data);
 
-        self.net_client
+        match self.net_client
             .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
-            .await?;
-
+            .await{
+                Ok(response) => {log_info!("服务器响应: {}", response)},
+                Err(err) => {
+                    log_info!("发送指标失败: {}", err);
+                    eprintln!("发送指标失败: {}", err)
+                },
+            }
         Ok(())
     }
 
@@ -1770,10 +1800,15 @@ impl TaskFetcher {
         let json_data = build_upload_ip_jump_json(source_ip, target_ip, gateway, agent_ip, state , fail_reason);
         log_info!("Reporting putIpJump: {} => {}", url, json_data);
 
-        self.net_client
+        match self.net_client
             .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
-            .await?;
-
+            .await{
+                Ok(response) => {log_info!("服务器响应: {}", response)},
+                Err(err) => {
+                    log_info!("发送指标失败: {}", err);
+                    eprintln!("发送指标失败: {}", err)
+                },
+            }
         Ok(())
     }
 }
