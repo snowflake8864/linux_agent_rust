@@ -5,8 +5,7 @@ use std::pin::Pin;
 use std::future::Future;
 use std::collections::HashSet;
 use tokio::time::{interval, Duration};
-use tokio::sync::mpsc;
-use logging::{log_info, log_error};
+use logging::{log_info, log_error, log_warn};
 use common::manager::boot::BootManager;
 use levenshtein::levenshtein;
 
@@ -17,13 +16,12 @@ pub trait LoadKernelDriver {
 impl LoadKernelDriver for BootManager {
     fn load_kernel_driver(&mut self) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
-//            let _ = unload_driver();
-
-            let mut interval = interval(Duration::from_secs(1));
-            let mut failed_drivers = HashSet::new();
-
             let kernel_version = get_kernel_version()?;
             log_info!("Current kernel version: {}", kernel_version);
+
+            if let Err(e) = cleanup_old_module_in_lib(&kernel_version) {
+                log_error!("Warning during cleanup: {}", e);
+            }
 
             let kernel_prefix = extract_kernel_prefix(&kernel_version)
                 .ok_or_else(|| "Failed to extract kernel major version".to_string())?;
@@ -45,6 +43,9 @@ impl LoadKernelDriver for BootManager {
                 return Err("No matching major version drivers found".into());
             }
 
+            let mut interval = interval(Duration::from_secs(1));
+            let mut failed_drivers = HashSet::new();
+
             loop {
                 if is_driver_loaded() {
                     log_info!("Driver already loaded, skipping");
@@ -55,14 +56,20 @@ impl LoadKernelDriver for BootManager {
                     }
                 }
 
-                match try_load_driver_with_cache(&mut failed_drivers).await {
+                match try_load_driver_with_cache(&kernel_version, &mut failed_drivers).await {
                     Ok(driver_name) => {
                         log_info!("Driver loaded successfully: {}", driver_name);
+                        if let Err(e) = cleanup_unused_drivers(&driver_name) {
+                            log_warn!("Failed to cleanup unused drivers: {}", e);
+                        }
                         return Ok(driver_name);
                     }
                     Err(e) => {
                         log_error!("Driver loading failed: {}", e);
-                        if failed_drivers.len() >= drivers.len() {
+                        let exact_driver_path = Path::new("/opt/osec/").join(format!("osec_base.ko-{}", kernel_version));
+                        if exact_driver_path.exists() && !failed_drivers.contains(&exact_driver_path) {
+                            failed_drivers.insert(exact_driver_path);
+                        } else if failed_drivers.len() >= drivers.len() {
                             log_error!("All compatible drivers failed, stopping retry");
                             return Err("All available drivers failed to load".into());
                         }
@@ -73,6 +80,35 @@ impl LoadKernelDriver for BootManager {
             }
         })
     }
+}
+
+fn cleanup_old_module_in_lib(kernel_version: &str) -> Result<(), String> {
+    let old_path = format!("/lib/modules/{}/kernel/drivers/osec_base.ko", kernel_version);
+    if Path::new(&old_path).exists() {
+        match fs::remove_file(&old_path) {
+            Ok(()) => log_info!("Cleaned up old module file: {}", old_path),
+            Err(e) => log_error!("Failed to remove old module file {}: {}", old_path, e),
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_unused_drivers(except_driver: &str) -> Result<(), String> {
+    let opt_dir = Path::new("/opt/osec/");
+    for entry in fs::read_dir(opt_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+            if name.starts_with("osec_base.ko-") && !name.ends_with(except_driver) {
+                if let Err(e) = fs::remove_file(&path) {
+                    log_warn!("Failed to remove unused driver {}: {}", path.display(), e);
+                } else {
+                    log_info!("Removed unused driver {}", path.display());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn has_any_driver() -> bool {
@@ -113,18 +149,12 @@ fn find_only_driver_in_opt_osec() -> Result<String, String> {
 }
 
 pub fn unload_driver() -> Result<(), String> {
-    let rmmod_status = Command::new("rmmod").arg("osec_base").status();
-    match rmmod_status {
-        Ok(status) if status.success() => {
-            log_info!("Successfully unloaded existing osec_base driver");
-            Ok(())
-        }
-        Ok(_) => {
-            log_info!("rmmod failed, maybe driver not loaded");
-            Ok(())
-        }
-        Err(e) => Err(format!("rmmod execution error: {}", e))
+    match Command::new("rmmod").arg("osec_base").status() {
+        Ok(status) if status.success() => log_info!("Successfully unloaded existing osec_base driver"),
+        Ok(_) => log_info!("rmmod failed, maybe driver not loaded"),
+        Err(e) => return Err(format!("rmmod execution error: {}", e)),
     }
+    Ok(())
 }
 
 fn get_kernel_version() -> Result<String, String> {
@@ -179,86 +209,137 @@ fn find_best_driver_excluding(kernel_version: &str, failed: &HashSet<PathBuf>) -
     best.map(|(p, _)| p).ok_or("No matching driver found".to_string())
 }
 
-fn copy_driver(src: &Path, dst: &Path) -> Result<(), String> {
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+fn setup_module_structure(src_path: &Path, kernel_version: &str) -> Result<(), String> {
+    let mod_dir = Path::new("/opt/osec/lib/modules").join(kernel_version);
+    fs::create_dir_all(&mod_dir).map_err(|e| e.to_string())?;
+
+    let dst_ko = mod_dir.join("osec_base.ko");
+    fs::copy(src_path, &dst_ko).map_err(|e| e.to_string())?;
+
+    fs::write(mod_dir.join("modules.order"), "").map_err(|e| e.to_string())?;
+    fs::write(mod_dir.join("modules.builtin"), "").map_err(|e| e.to_string())?;
+
+    let status = Command::new("depmod")
+        .arg("-b")
+        .arg("/opt/osec")
+        .arg("-a")
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        log_error!("depmod -b /opt/osec failed");
     }
-    fs::copy(src, dst).map_err(|e| e.to_string())?;
     Ok(())
 }
 
-fn load_driver(_path: &Path) -> Result<(), String> {
-    let depmod_status = Command::new("depmod").status().map_err(|e| e.to_string())?;
-    if !depmod_status.success() {
-        return Err(format!("depmod failed: {:?}", depmod_status));
-    }
-
-    let modprobe_status = Command::new("modprobe").arg("osec_base").status().map_err(|e| e.to_string())?;
-    if modprobe_status.success() {
-        Ok(())
+fn get_and_disable_selinux() -> Option<String> {
+    let getenforce_path = if Path::new("/usr/sbin/getenforce").exists() {
+        "/usr/sbin/getenforce"
+    } else if Path::new("/sbin/getenforce").exists() {
+        "/sbin/getenforce"
     } else {
-        Err(format!("modprobe failed: {:?}", modprobe_status))
+        log_info!("getenforce not found, assuming SELinux not present");
+        return None;
+    };
+
+    let output = Command::new(getenforce_path).output().ok()?;
+    let enforce_state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    log_info!("Current SELinux state: {}", enforce_state);
+
+    if enforce_state.eq_ignore_ascii_case("Enforcing") {
+        let setenforce_path = if Path::new("/usr/sbin/setenforce").exists() {
+            "/usr/sbin/setenforce"
+        } else if Path::new("/sbin/setenforce").exists() {
+            "/sbin/setenforce"
+        } else {
+            log_warn!("setenforce not found, cannot disable SELinux temporarily");
+            return Some(enforce_state);
+        };
+        let _ = Command::new(setenforce_path).arg("0").status();
+        log_info!("Temporarily disabled SELinux");
     }
+    Some(enforce_state)
 }
 
-fn cleanup_other_drivers(success_path: &Path, kernel_version: &str) -> Result<(), String> {
-    let success_file = success_path.file_name().and_then(|f| f.to_str()).ok_or("Invalid success path")?;
-    let opt_dir = Path::new("/opt/osec/");
+fn restore_selinux(state: Option<String>) {
+    let Some(st) = state else { return };
+    if !st.eq_ignore_ascii_case("Enforcing") { return; }
 
-    let lib_dir_str = format!("/lib/modules/{}/kernel/drivers/", kernel_version);
-    let lib_dir = Path::new(&lib_dir_str);
+    let setenforce_path = if Path::new("/usr/sbin/setenforce").exists() {
+        "/usr/sbin/setenforce"
+    } else if Path::new("/sbin/setenforce").exists() {
+        "/sbin/setenforce"
+    } else { return; };
 
-    if let Ok(entries) = fs::read_dir(opt_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                if name.starts_with("osec_base.ko-") && name != success_file {
-                    let _ = fs::remove_file(&path);
-                    log_info!("Removed unused driver file: {:?}", path);
-                }
-            }
-        }
-    }
-
-    if let Ok(entries) = fs::read_dir(lib_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                if name.starts_with("osec_base") && name != "osec_base.ko" {
-                    let _ = fs::remove_file(&path);
-                    log_info!("Cleaned unrelated files in target module dir: {:?}", path);
-                }
-            }
-        }
-    }
-
-    Ok(())
+    let _ = Command::new(setenforce_path).arg("1").status();
+    log_info!("Restored SELinux enforcing mode");
 }
-async fn try_load_driver_with_cache(failed_drivers: &mut HashSet<PathBuf>) -> Result<String, String> {
-    let kernel_version = get_kernel_version()?;
-    log_info!("Current kernel version: {}", kernel_version);
 
-    let driver_path = find_best_driver_excluding(&kernel_version, failed_drivers)?;
-    log_info!("Selected driver file: {:?}", driver_path);
+fn is_module_loaded(module_name: &str) -> bool {
+    if let Ok(content) = fs::read_to_string("/proc/modules") {
+        content.lines().any(|line| line.starts_with(module_name))
+    } else { false }
+}
 
-    let dst_path_str = format!("/lib/modules/{}/kernel/drivers/osec_base.ko", kernel_version);
-    let dst_path = Path::new(&dst_path_str);
+pub async fn try_load_driver_with_cache(
+    kernel_version: &str,
+    failed_drivers: &mut HashSet<PathBuf>,
+) -> Result<String, String> {
+    let original_selinux_state = get_and_disable_selinux();
 
-    if let Err(e) = copy_driver(&driver_path, dst_path)
-        .and_then(|_| load_driver(dst_path))
-        .and_then(|_| cleanup_other_drivers(&driver_path, &kernel_version))
-    {
-        log_error!("Driver loading failed: {}, marking as failed", e);
+    // 复制 /proc/kallsyms
+    let data_dir = Path::new("/opt/osec/Data");
+    let _ = fs::create_dir_all(data_dir);
+    let _ = fs::copy("/proc/kallsyms", data_dir.join("kallsyms"));
+
+    // 确保 uio 模块加载
+    if !is_module_loaded("uio") {
+        let _ = Command::new("modprobe").arg("uio").status();
+    }
+
+    // 选择驱动
+    let driver_path = {
+        let exact_driver = Path::new("/opt/osec/").join(format!("osec_base.ko-{}", kernel_version));
+        if exact_driver.exists() { exact_driver } 
+        else { find_best_driver_excluding(kernel_version, failed_drivers)? }
+    };
+
+    setup_module_structure(&driver_path, kernel_version)?;
+
+    // 尝试 modprobe
+    let _ = Command::new("modprobe").arg("osec_base").status();
+
+    if is_module_loaded("osec_base") {
+        restore_selinux(original_selinux_state);
+        return Ok(driver_path.file_name().and_then(|f| f.to_str()).unwrap_or("").trim_start_matches("osec_base.ko-").to_string());
+    }
+
+    // 尝试 modprobe -d /opt/osec
+    let _ = Command::new("modprobe").arg("-d").arg("/opt/osec").arg("osec_base").status();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    if is_module_loaded("osec_base") {
+        restore_selinux(original_selinux_state);
+        return Ok(driver_path.file_name().and_then(|f| f.to_str()).unwrap_or("").trim_start_matches("osec_base.ko-").to_string());
+    }
+
+    // 尝试 insmod
+    let ko_path = Path::new("/opt/osec/lib/modules").join(kernel_version).join("osec_base.ko");
+    if !ko_path.exists() {
+        restore_selinux(original_selinux_state);
+        return Err(format!("osec_base.ko not found at {}", ko_path.display()));
+    }
+
+    let output = Command::new("insmod").arg(&ko_path).output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        log_info!("insmod 成功加载 {}", ko_path.display());
+    } else {
+        let err = format!("insmod 失败: {}", String::from_utf8_lossy(&output.stderr));
         failed_drivers.insert(driver_path);
-        return Err(e);
+        restore_selinux(original_selinux_state);
+        return Err(err);
     }
 
-    let version_suffix = driver_path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("")
-        .trim_start_matches("osec_base.ko-")
-        .to_string();
-
-    Ok(version_suffix)
+    restore_selinux(original_selinux_state);
+    Ok(driver_path.file_name().and_then(|f| f.to_str()).unwrap_or("").trim_start_matches("osec_base.ko-").to_string())
 }
+

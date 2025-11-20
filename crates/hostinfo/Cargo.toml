@@ -7,7 +7,8 @@ resolver = "2"
 [dependencies]
 libc = "0.2"
 get_if_addrs = "0.5"
-md-5 = { path = "../md5" }
+#md-5 = { path = "../md5" }
+md-5 = "0.10"
 uuid = { version = "1", features = ["v4"] }  # 开启 v4 版本支持
 hex = "0.4"
 #hostname = "0.3"

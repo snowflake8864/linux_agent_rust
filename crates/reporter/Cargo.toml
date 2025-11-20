@@ -20,3 +20,5 @@ net_client = { path = "../net_client" }
 process_mgr = { path =  "../process_mgr" }
 config = { path = "../config"} 
 hostinfo = { path = "../hostinfo"}
+hex = "0.4"
+

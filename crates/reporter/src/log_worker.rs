@@ -37,7 +37,7 @@ impl StartBashLog for BootManager {
                     result = file_audit_log_rx.recv() => {
                         match result {
                             Some(log) => {
-                                log_info!("收到 FileAuditLogInfo: {:?}", log);
+                                //log_info!("收到 FileAuditLogInfo: {:?}", log);
                                 log_buffer.push(log);
                             }
                             None => {
@@ -58,7 +58,7 @@ impl StartBashLog for BootManager {
                                         Duration::from_secs(10),
                                         self.get_token().await.as_deref(),
                                     ).await {
-                                        Ok(response) => {log_info!("服务器响应: {}", response)},
+                                        Ok(response) => {/*log_info!("服务器响应: {}", response)*/},
                                         Err(err) => eprintln!("发送指标失败: {}", err),
                                     }
 
@@ -78,7 +78,7 @@ impl StartBashLog for BootManager {
                 let mut json_str = String::new();
                 match build_alert_log_json(&log_buffer, &mut json_str) {
                     Ok(()) => {
-                        log_info!("生成 JSON: {}", json_str);
+                        //log_info!("生成 JSON: {}", json_str);
                         match net_client.post_data_async(
                             &url,
                             &json_str,
@@ -86,7 +86,7 @@ impl StartBashLog for BootManager {
                             self.get_token().await.as_deref(),
                         ).await {
                             //Ok(response) => println!("服务器响应: {}", response),
-                            Ok(response) => {log_info!("服务器响应: {}", response)},
+                            Ok(response) => {/*log_info!("服务器响应: {}", response)*/},
                             Err(err) => eprintln!("发送指标失败: {}", err),
                         }
 

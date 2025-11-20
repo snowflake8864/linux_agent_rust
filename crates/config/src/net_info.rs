@@ -42,6 +42,8 @@ pub struct NetInfoConfig {
     pub syslog_inner_switch: bool,
     pub syslog_process_switch: bool,
     pub internet_switch: bool,
+    pub baseline_switch: bool,
+    pub baseline_time: u32,
     pub user_id: String,
     //=====host info
     pub dev_uid: String,
@@ -182,6 +184,9 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("SERVERINFO", "LOGSENT") {
             config.log_sent = value.parse().unwrap_or_default();
         }
+        if let Some(value) = ini.get("SERVERINFO", "CLI_SERVER_PORT") {
+            config.cli_port = value.parse().unwrap_or_default();
+        }
         if let Some(value) = ini.get("SERVERINFO", "MODULE_SWITCH") {
             config.module_switch = value.parse().unwrap_or_default();
         }
@@ -243,6 +248,13 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("SERVERINFO", "SYSLOG_PROCESS_SWITCH") {
             config.syslog_process_switch = matches!(value.trim(), "1");
         }
+        if let Some(value) = ini.get("SERVERINFO", "BASELINE_SWITCH") {
+            config.baseline_switch = matches!(value.trim(), "1");
+        }
+
+        if let Some(value) = ini.get("SERVERINFO", "BASELINE_TIME") {
+            config.baseline_time = value.parse().unwrap_or_default();
+        }
         if let Some(value) = ini.get("HOSTINFO", "DEV_UID") {
             config.dev_uid = value;
         }
@@ -291,6 +303,7 @@ impl NetInfoConfig {
         writeln!(file, "LOGIPPORT={}", self.log_ip_port.clone().unwrap_or_default())?;
         writeln!(file, "LOGPROTO={}", self.log_proto)?;
         writeln!(file, "LOGSENT={}", self.log_sent)?;
+        //writeln!(file, "CLI_SERVER_PORT={}", self.cli_port)?;
         writeln!(file, "MODULE_SWITCH={}", self.module_switch)?;
         writeln!(file, "OPEN_PORT_SWITCH={}", self.open_port_switch as u8)?;
         writeln!(file, "PROC_PROTECT={}", self.proc_protect as u8)?;
@@ -309,6 +322,8 @@ impl NetInfoConfig {
         writeln!(file, "SYSLOG_PROCESS_SWITCH={}", self.syslog_process_switch as u8)?;
         writeln!(file, "INTERNET_SWITCH={}", self.internet_switch as u8)?;
         writeln!(file, "OFFLINE_MODE={}", self.is_offline_mode as u8)?;
+        writeln!(file, "BASELINE_SWITCH={}", self.baseline_switch as u8)?;
+        writeln!(file, "BASELINE_TIME={}", self.baseline_time)?;
         writeln!(file, "VERSION={}", self.ver)?;
         writeln!(file, "[HOSTINFO]")?;
         writeln!(file, "DEV_UID={}", self.dev_uid)?;
@@ -326,7 +341,8 @@ impl NetInfoConfig {
 
     pub fn acquire_host_info(&mut self) -> io::Result<()> {
         log_info!("========dev_id:{}", self.dev_uid);
-        if self.dev_uid.is_empty() {
+        //if self.dev_uid.is_empty() 
+        {
             self.dev_uid = agent_uid::ensure_and_get_mgs_guid(&(self.app_path.clone() + "/.vedasystem"))
                 .unwrap_or_else(|_| "unknown".to_string());
         }
