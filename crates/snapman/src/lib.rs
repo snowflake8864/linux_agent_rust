@@ -1,5 +1,4 @@
 //crates/snapman/src/lib.rs
-//crates/snapman/src/lib.rs
 use chrono::{DateTime, Local};
 use tokio::process::Command;
 use std::error::Error;
@@ -301,7 +300,6 @@ pub async fn restore_snapshot(suffix: &str) -> Result<(), String> {
     Ok(())
 }
 
-// 工具函数: 解析大小字符串（例如 8G -> MB）
 fn parse_size(size: &str) -> Result<f64, String> {
     let size = size.trim().to_uppercase();
     if size.ends_with("G") {

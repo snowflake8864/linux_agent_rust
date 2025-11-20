@@ -4,7 +4,7 @@ members = [
     "crates/main",
     "crates/kernel_module",
     "crates/hostinfo",
-     "crates/md5",
+     #"crates/md5",
      "crates/common",
      "crates/net_client",
      "crates/online",
@@ -24,6 +24,7 @@ members = [
      "crates/snapman",
      "crates/rules_jump_mgr",
      "crates/agent_manager",
+  #"crates/agent_cli",
 ]
 
 [profile.dev]

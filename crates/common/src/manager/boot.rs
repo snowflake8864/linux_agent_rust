@@ -123,6 +123,16 @@ impl BootManager {
         let netinfocfg = NETINFO_CONFIG.lock().unwrap(); // 这里使用 from_ini 解析配置
         netinfocfg.server_ip_port.clone() // 返回克隆的值
     }
+
+
+    pub fn get_crontime(&self) -> u32 {
+        let netinfocfg = NETINFO_CONFIG.lock().unwrap(); 
+        netinfocfg.cron_time
+    }
+    pub fn get_baseline_info(&self) -> (bool,u32) {
+        let netinfocfg = NETINFO_CONFIG.lock().unwrap(); 
+        (netinfocfg.baseline_switch, netinfocfg.baseline_time)
+    }
     pub fn host_is_online(&self) -> bool {
         let core = self.inner.shared_core.load();
         core.is_online == true // 返回克隆的值

@@ -13,9 +13,9 @@ while true; do
     fi
 
     # 检查MagicArmor_cli进程
-    if ! ps -ef | grep -q "agent_manager"; then
-        /opt/osec/agent_manager &
-        echo "[$(date)] agent_manager started"
+    if ! ps -ef | grep -q "MagicArmorAgent"; then
+        /opt/osec/MagicArmorAgent &
+        echo "[$(date)] MagicArmorAgent started"
     fi
 
     sleep 10

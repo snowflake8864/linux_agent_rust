@@ -7,8 +7,7 @@ use std::ptr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use zcopy_mgr::{AvFileInfo, ZcopyMgr};
-use crate::{RulesType,AuditLogInfo}; // 从 lib.rs 导入
-                                         
+use crate::{RulesType,AuditLogInfo};
 use process_mgr::get_md5_global;
 // 定义 LogInfo
 #[derive(Clone)]
@@ -41,7 +40,7 @@ impl FileAuditHandler {
             ptr::read_unaligned(data.as_ptr() as *const NetlinkNetlog)
         };
 
-        log_info!("收到 NetlinkNetlog: {:?}", netlog);
+        //log_info!("收到 NetlinkNetlog: {:?}", netlog);
 
         if !self.zcopy_mgr.file_audit_succeed {
             return Err("ZcopyMgr file audit not initialized".to_string());
@@ -58,12 +57,13 @@ impl FileAuditHandler {
                     netlog.start_idx, netlog.end_idx
                 ));
             }
-
+/*
             log_info!(
                 "file audit, start_idx={}, end_idx={}",
                 netlog.start_idx,
                 netlog.end_idx
             );
+*/
             for idx in netlog.start_idx..netlog.end_idx {
                 if let Some(report) = self.zcopy_mgr.get_file_audit_data(idx as usize) {
                     reports.push(*report);
@@ -73,13 +73,14 @@ impl FileAuditHandler {
             }
         } else {
             // max_idx != 0，遍历 0 到 start_idx 和 end_idx 到 max_idx
+            /*
             log_info!(
                 "file audit, start_idx={}, end_idx={}, max_idx={}",
                 netlog.start_idx,
                 netlog.end_idx,
                 netlog.max_idx
             );
-
+*/
             // 0 到 start_idx
             for idx in 0..netlog.start_idx {
                 if let Some(report) = self.zcopy_mgr.get_file_audit_data(idx as usize) {
@@ -146,10 +147,10 @@ fn audit_file_oper_rename(&self, info: &AvFileInfo, level: u32, pos: u32) -> Res
         file_path: None,
         rename_dir: None,
         exception_process: Some(comm.to_string()),
-        md5: None,//Some("7490fea7c270d57b4a90add0e7bf7852".to_string()), // 假设 md5 稍后由 process_md5_mgr 更新
+        md5: None,//Some("7490fea7c270d57b4a90add0e7bf7852".to_string()), 
         n_type: info.log_type,
         n_level: level,
-        n_time: 1692760326, // 应替换为实际时间戳
+        n_time: 1692760326, 
         notice_remark: None,
         peripheral_name: None,
         peripheral_remark: None,

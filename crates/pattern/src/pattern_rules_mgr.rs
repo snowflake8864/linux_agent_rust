@@ -6,6 +6,7 @@ use std::fs::OpenOptions;
 use std::io::{Write, Error, ErrorKind};
 use serde::Deserialize;
 use serde_json::Value;
+use crate::GlobalTrustDir;
 
 
 // 枚举类型
@@ -25,13 +26,7 @@ enum PatternType {
     TamperProtectionType,
 }
 
-// 结构体定义
-#[derive(Clone, Debug)]
-pub struct GlobalTrusrDir {
-    pub dir: String,
-    pub typ: u8,
-    pub is_extend: u8,
-}
+
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct POLICY_EXIPOR_PROTECT {
@@ -84,13 +79,17 @@ pub struct PatternRulesMgr {
     pre_protect_dir_exclude_exe_patterns: String,
     pre_exiport_true_process: String,
     pre_protect_true_process: String,
-
+    default_global_trust_dirs: Vec<GlobalTrustDir>,
     load_pattern_rules_flag: bool,
     inited: bool,
 }
 
 impl PatternRulesMgr {
     pub fn new() -> Self {
+
+        let default_global_trust_dirs = vec![
+            GlobalTrustDir { dir: "/opt/osec/log".to_string(), typ: 0, is_extend: 0 },
+        ];
         PatternRulesMgr {
             const_file_patterns: String::new(),
             const_file_rules: String::new(),
@@ -118,6 +117,7 @@ impl PatternRulesMgr {
             pre_protect_dir_exclude_exe_patterns: String::new(),
             pre_exiport_true_process: String::new(),
             pre_protect_true_process: String::new(),
+            default_global_trust_dirs,
 
             load_pattern_rules_flag: false,
             inited: false,
@@ -198,6 +198,7 @@ impl PatternRulesMgr {
 
         Ok(result)
     }
+
     // 初始化
     pub fn init(&mut self) {
         if self.inited {
@@ -208,7 +209,7 @@ impl PatternRulesMgr {
         self.load_pattern_rules_flag = false;
         self.inited = true;
 
-        log_info!("PatternRulesMgr initialized.");
+        log_info!("==================================PatternRulesMgr initialized.");
     }
 
     // 检查文件是否存在
@@ -308,7 +309,7 @@ impl PatternRulesMgr {
     }
 
     // 设置全局信任目录
-    pub fn set_global_trust_dir(&mut self, dirs: Vec<GlobalTrusrDir>) {
+    pub fn set_global_trust_dir(&mut self, dirs: Vec<GlobalTrustDir>) {
         self.global_trust_dir_patterns.clear();
         self.global_trust_dir_rules.clear();
 
@@ -337,6 +338,7 @@ impl PatternRulesMgr {
 
         self.set_pattern_rules();
     }
+
 
     // 设置导出目录保护
 

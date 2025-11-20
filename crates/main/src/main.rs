@@ -14,11 +14,52 @@ use tokio::sync::Mutex;
 use config::net_info::NETINFO_CONFIG;
 use udisk::StartUsbService;
 use docker::StartDockerMonitor;
+use scopeguard; 
+use tokio::net::{UnixStream, UnixListener};
+use std::time::Duration;
+use std::io;
 
+const SINGLETON_SOCKET_PATH: &str = "/tmp/osec_backend_singleton.sock";
+
+async fn ensure_single_instance() -> io::Result<()> {
+    let path = std::path::Path::new(SINGLETON_SOCKET_PATH);
+
+    if path.exists() {
+        // 尝试连接该 socket，判断是否真有服务在运行
+        match tokio::time::timeout(
+            Duration::from_millis(100),
+            UnixStream::connect(SINGLETON_SOCKET_PATH)
+        ).await {
+            // 能连接上 → 真有实例在运行
+            Ok(Ok(_)) => {
+                eprintln!("【错误】osec_backend 已经在运行！另一个实例占用了单实例锁。");
+                std::process::exit(1);
+            }
+            // 连接失败 或 超时 → 残留文件，安全删除
+            Ok(Err(_)) | Err(_) => {
+                let _ = tokio::fs::remove_file(SINGLETON_SOCKET_PATH).await;
+            }
+        }
+    }
+
+    // 现在尝试绑定（此时路径应干净）
+    if let Err(e) = UnixListener::bind(SINGLETON_SOCKET_PATH) {
+        eprintln!("【错误】无法创建单实例锁文件 '{}': {}", SINGLETON_SOCKET_PATH, e);
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    // 忽略 SIGPIPE 信号
+    // ==================== 单实例锁 ====================
 
+    ensure_single_instance().await.unwrap();
+
+    scopeguard::defer! {
+        let _ = std::fs::remove_file(SINGLETON_SOCKET_PATH);
+    }
+    // 忽略 SIGPIPE 信号
     unsafe {
         let mut sa: sigaction = std::mem::zeroed();
         sa.sa_sigaction = SIG_IGN as usize;

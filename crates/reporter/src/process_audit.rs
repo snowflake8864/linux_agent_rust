@@ -145,7 +145,7 @@ impl ProcessAuditHandler {
         }
         
         if edr_logs.len() > 0 {
-//            log_info!("edr_logs{:?}", edr_logs);
+            //log_info!("edr_logs{:?}", edr_logs);
             let url = format!("{}/v1/putsyslog", net_client.get_base_url().unwrap_or_default());
             let mut json_str = String::new();
             match build_batch_process_edr_json(&edr_logs, &mut json_str) {
@@ -177,7 +177,12 @@ impl ProcessAuditHandler {
 fn file_exists(path: &str) -> bool {
     std::path::Path::new(path).exists()
 }
-
+fn bin_to_hex<T: AsRef<[u8]>>(data: T) -> String {
+    data.as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
 fn process_one(
     proc_info: &AvProcessInfo,
     processvec: &mut Vec<AuditProcess>,
@@ -195,19 +200,38 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
         Err(_) => return,
     };
     let cfg = NETINFO_CONFIG.lock().unwrap();
-    let parts: Vec<&str> = path_str.split(';').collect();
-    let p_dir = parts.get(0).unwrap_or(&"").to_string();
+    let mut parts: Vec<&str> = path_str.split(';').collect();
+    let mut p_dir = parts.get(0).unwrap_or(&"").to_string();
+
 
     //log_info!("proc_info: {:?}  p_dir: {:?}", proc_info, p_dir);
     if p_dir.is_empty() || !file_exists(&p_dir) {
         return;
     }
 
+    let is_docker = proc_info.is_docker_process();
+    if is_docker {
+        p_dir.push_str(";docker");
+        //log_info!("proc_info: {:?}  p_dir: {:?}", proc_info, p_dir);
+    }
+
+/*
     let hash = match get_md5_global(&p_dir) {
         Ok(h) => h,
         Err(_) => return,
     };
-    //log_info!("proc_info: {:?}  p_dir: {:?}  hash: {:?} ", proc_info, p_dir, hash);
+*/
+    let hash = if is_docker {
+        // 用结构体内置 md5（16 字节）转换成 hex 字符串
+        //hex::encode(proc_info.md5())
+        bin_to_hex(proc_info.md5())
+    } else {
+        match get_md5_global(&p_dir) {
+            Ok(h) => h,
+            Err(_) => return,
+        }
+    };
+    //log_info!("is docker= {}, proc_info: {:?}  p_dir: {:?}  hash: {:?} ",is_docker, proc_info, p_dir, hash);
     // 处理 AuditProcess
     if cfg.proc_switch {
         if proc_info.type_ == 1101 || proc_info.type_ == 1001 {
