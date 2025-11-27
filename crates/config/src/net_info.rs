@@ -57,7 +57,7 @@ pub struct NetInfoConfig {
     pub auth: String,
     pub host_name: String,
     pub mod_ver: String,
-    pub arch_type: String,
+    pub arch_type: u8,
     pub is_offline_mode: bool,
 }
 
@@ -209,18 +209,38 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("SERVERINFO", "SERVERIPPORT") {
             config.server_ip_port = value;
         }
+
+
         if let Some(value) = ini.get("SERVERINFO", "SERVER_IP") {
             config.server_ip = value;
-            // 在获取 server_ip 后，获取主接口
+
             if !config.server_ip.is_empty() {
-                config.ifcfg = Self::get_main_interface(&config.server_ip)
+                let ip_for_route = match Self::extract_ip(&config.server_ip) {
+                    Some(ip) => ip,
+                    None => {
+                        log_error!(
+                            "Failed to extract IP from server_ip: '{}', using raw value (may fail)",
+                            config.server_ip
+                        );
+                        config.server_ip.clone()
+                    }
+                };
+
+                config.ifcfg = Self::get_main_interface(&ip_for_route)
                     .unwrap_or_else(|e| {
-                        log_error!("Failed to get main interface for server_ip {}: {}, using default 'eth0'", config.server_ip, e);
+                        log_error!(
+                            "Failed to get main interface for IP '{}': {}, using default 'eth0'",
+                            ip_for_route,
+                            e
+                        );
                         "eth0".to_string()
                     });
+
                 log_info!("Main interface set to: {}", config.ifcfg);
             }
         }
+
+
         if let Some(value) = ini.get("SERVERINFO", "SERVER_PORT") {
             config.server_port = value.parse().unwrap_or_default();
         }
@@ -303,7 +323,7 @@ impl NetInfoConfig {
         writeln!(file, "LOGIPPORT={}", self.log_ip_port.clone().unwrap_or_default())?;
         writeln!(file, "LOGPROTO={}", self.log_proto)?;
         writeln!(file, "LOGSENT={}", self.log_sent)?;
-        //writeln!(file, "CLI_SERVER_PORT={}", self.cli_port)?;
+        writeln!(file, "CLI_SERVER_PORT={}", self.cli_port)?;
         writeln!(file, "MODULE_SWITCH={}", self.module_switch)?;
         writeln!(file, "OPEN_PORT_SWITCH={}", self.open_port_switch as u8)?;
         writeln!(file, "PROC_PROTECT={}", self.proc_protect as u8)?;
@@ -343,7 +363,7 @@ impl NetInfoConfig {
         log_info!("========dev_id:{}", self.dev_uid);
         //if self.dev_uid.is_empty() 
         {
-            self.dev_uid = agent_uid::ensure_and_get_mgs_guid(&(self.app_path.clone() + "/.vedasystem"))
+            self.dev_uid = agent_uid::ensure_and_get_mgs_guid(&("/etc/.vedasystem"))
                 .unwrap_or_else(|_| "unknown".to_string());
         }
         log_info!("=====dev_id:{}", self.dev_uid);
@@ -372,6 +392,32 @@ impl NetInfoConfig {
             self.ips = ip_mac::get_ip().unwrap_or("unknown".to_string());
         }
         Ok(())
+    }
+    fn extract_ip(input: &str) -> Option<String> {
+        use std::net::IpAddr;
+
+        // 1. 去掉协议头
+        let without_scheme = input
+            .strip_prefix("http://")
+            .or_else(|| input.strip_prefix("https://"))
+            .unwrap_or(input);
+
+        let host_part = if without_scheme.starts_with('[') {
+            // 找到第一个 ']'
+            if let Some(idx) = without_scheme.find(']') {
+                &without_scheme[1..idx] // 提取 ::1
+            } else {
+                without_scheme // 格式错误，但继续尝试
+            }
+        } else {
+            without_scheme.split(':').next().unwrap_or(without_scheme)
+        };
+
+        if host_part.parse::<IpAddr>().is_ok() {
+            Some(host_part.to_string())
+        } else {
+            None
+        }
     }
 }
 

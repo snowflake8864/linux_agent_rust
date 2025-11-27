@@ -45,17 +45,27 @@ impl LoadKernelDriver for BootManager {
 
             let mut interval = interval(Duration::from_secs(1));
             let mut failed_drivers = HashSet::new();
-
             loop {
                 if is_driver_loaded() {
-                    log_info!("Driver already loaded, skipping");
+                    /*
+                    if !Path::new("/opt/osec/lib").exists() {
+                        log_error!("/opt/osec/lib not found. Driver may be loaded from old system path.");
+                        log_error!("Please ensure the agent is deployed correctly under /opt/osec/");
+                        log_error!("Exiting to avoid conflicts.");
+                        std::process::exit(1);
+                    }
+                    */
+                    log_error!("Exiting to avoid conflicts,restart process");
+                    std::process::exit(1);
+                    /*
+                    //log_info!("Driver already loaded and /opt/osec/lib exists, skipping");
                     if let Ok(driver_name) = find_only_driver_in_opt_osec() {
                         return Ok(driver_name);
                     } else {
                         return Ok(String::new());
                     }
+                    */
                 }
-
                 match try_load_driver_with_cache(&kernel_version, &mut failed_drivers).await {
                     Ok(driver_name) => {
                         log_info!("Driver loaded successfully: {}", driver_name);
@@ -343,3 +353,7 @@ pub async fn try_load_driver_with_cache(
     Ok(driver_path.file_name().and_then(|f| f.to_str()).unwrap_or("").trim_start_matches("osec_base.ko-").to_string())
 }
 
+fn is_driver_loaded_from_system_path(kernel_version: &str) -> bool {
+    let system_ko_path = format!("/lib/modules/{}/kernel/drivers/osec_base.ko", kernel_version);
+    Path::new(&system_ko_path).exists()
+}
