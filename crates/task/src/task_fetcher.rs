@@ -15,6 +15,7 @@ use logging::{log_info,log_error};
 use common::manager::boot::BootManager;
 use crate::virtual_port_rule::VirtualPortRule;
 use crate::get_process_task::process_all_dirs;
+use crate::net_reach_rule::OutreachDetectRule;
 use pattern::{pattern_rules_mgr,process_pattern_rules_mgr::PROCESS_PATTERN_RULES_MGR, GlobalTrustDir};
 use tokio::sync::mpsc;
 use process_mgr::POLICY_MANAGER;
@@ -159,6 +160,7 @@ impl TaskFetcher {
         api_interface.insert("getRollbacks".to_string(), "v1/getRollbacks".to_string());
         api_interface.insert("uploadRollback".to_string(), "v1/uploadRollback".to_string());
         api_interface.insert("uploadBackup".to_string(), "v1/uploadBackup".to_string());
+        api_interface.insert("getOutreachDetect".to_string(), "v1/getOutreachDetect".to_string());
         let net_client = NetClient::new(
             Some(base_url.to_string()),
             true,
@@ -798,7 +800,6 @@ pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
     archive.extract(temp_dir).map_err(|e| e.to_string())?;
     log_info!("✅ 更新包已解压到: {}", temp_dir);
 
-    // ==================== 3. 查找 osec-installer*.sh 脚本（必须有） ====================
     let mut script_path: Option<PathBuf> = None;
     for entry in fs::read_dir(temp_dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -1663,16 +1664,46 @@ async fn task_update_uuid(&self, task_type: u64) -> Result<(), String> {
     self.report_task_completion(task_type).await
         .map_err(|e| e.to_string())?;
 
-    if fs::remove_file("/opt/osec/.vedasystem").is_ok() {
+    if fs::remove_file("/etc/.vedasystem").is_ok() {
         log_info!("[task_update_uuid] 已删除 .vedasystem");
     }
     std::process::exit(1)
-    //Ok(())
 }
 
 // 处理 TASK_OutreachDetect 任务
 async fn task_outreach_detect(&self, task_type: u64) -> Result<(), String> {
-    println!("Processing TASK_OutreachDetect...");
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
+    let download_url = match self.api_interface.get("getOutreachDetect") {
+        Some(url) => url,
+        None => return Err("URL for getOutreachDetect not found".to_string()),
+    };
+
+
+    let url = format!("{}/{}", self.base_url, download_url);
+    let token = self.get_token();
+    let token_str = token.as_ref().map(|s| s.as_str());
+
+    let response = self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await?;
+    let parsed: Value = serde_json::from_str(&response)
+        .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
+
+    if parsed["code"] != "000000" {
+        return Err(format!("Invalid response code: {}", parsed["code"]));
+    }
+
+    let data = parsed["data"].as_object().ok_or("Missing 'data' object in response")?;
+    let rules: Vec<OutreachDetectRule> = data["list"]
+        .as_array()
+        .ok_or("Missing 'data' array in response")?
+        .iter()
+        .map(|item| {
+            serde_json::from_value(item.clone())
+                .map_err(|e| format!("Failed to parse VirtualPortRule: {}", e))
+        })
+    .collect::<Result<Vec<OutreachDetectRule>, _>>()?;
+    log_info!("rules:{:?}",rules);
     // 外围探测任务处理
     Ok(())
 }
@@ -2257,9 +2288,23 @@ async fn is_process_running(name: &str) -> bool {
 }
 
 pub async fn stop_agent() -> Result<(), String> {
-    log_info!("[upgrade] 开始停止 agent_manager / MagicArmorAgent 服务");
+    log_info!("[upgrade] 开始停止 agent_manager / MagicArmorAgent / osec_cli 服务");
 
-    // 1. 先尝试优雅停止服务（优先级：systemctl > service > 直接杀进程）
+    async fn service_exists(name: &str) -> bool {
+        Command::new("systemctl")
+            .args(["status", name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    async fn process_running(name: &str) -> bool {
+        is_process_running(name).await
+    }
+
     let has_systemctl = Command::new("which")
         .arg("systemctl")
         .stdout(Stdio::null())
@@ -2268,7 +2313,9 @@ pub async fn stop_agent() -> Result<(), String> {
         .map(|s| s.success())
         .unwrap_or(false);
 
-    if has_systemctl {
+    let mut stopped_any = false;
+
+    if has_systemctl && service_exists("agent_manager").await {
         log_info!("[upgrade] 使用 systemctl stop agent_manager");
         let _ = Command::new("systemctl")
             .args(["stop", "agent_manager"])
@@ -2276,37 +2323,46 @@ pub async fn stop_agent() -> Result<(), String> {
             .stderr(Stdio::null())
             .status()
             .await;
-    } else {
-        let has_service = Command::new("which")
-            .arg("service")
-            .stdout(Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false);
-
-        if has_service {
-            log_info!("[upgrade] 使用 service 命令停止 agent_manager");
-            let _ = Command::new("service")
-                .args(["agent_manager", "stop"])
-                .stdout(Stdio::null())
-                .status()
-                .await;
-        }
+        stopped_any = true;
+    } else if process_running("agent_manager").await {
+        log_info!("[upgrade] 强制终止 agent_manager 进程");
+        let _ = Command::new("pkill").args(["-9", "agent_manager"]).status().await;
+        stopped_any = true;
     }
 
-    // 2. 强制杀掉残留进程（MagicArmorAgent 可能被 agent_manager 以外的方式启动）
+    if has_systemctl && service_exists("osec_cli").await {
+        log_info!("[upgrade] 使用 systemctl stop osec_cli");
+        let _ = Command::new("systemctl")
+            .args(["stop", "osec_cli"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        stopped_any = true;
+    } else if process_running("osec_cli").await {
+        log_info!("[upgrade] 强制终止 osec_cli 进程");
+        let _ = Command::new("pkill").args(["-9", "osec_cli"]).status().await;
+        stopped_any = true;
+    }
+
     log_info!("[upgrade] 强制杀死 MagicArmorAgent 进程");
     for _ in 0..3 {
         let _ = Command::new("pkill").args(["-9", "MagicArmorAgent"]).status().await;
         let _ = Command::new("killall").args(["-9", "MagicArmorAgent"]).status().await;
         sleep(Duration::from_millis(200)).await;
     }
+    stopped_any = true;
 
-    // 3. 等待进程真正退出（关键！避免 Text file busy）
-    log_info!("[upgrade] 等待 MagicArmorAgent 完全退出（最多 {} 秒）...", MAX_WAIT_SECONDS);
+    log_info!(
+        "[upgrade] 等待相关进程完全退出（最多 {} 秒）...",
+        MAX_WAIT_SECONDS
+    );
+
     let wait_ok = timeout(Duration::from_secs(MAX_WAIT_SECONDS), async {
-        while is_process_running("MagicArmorAgent").await {
+        while process_running("MagicArmorAgent").await
+            || process_running("agent_manager").await
+            || process_running("osec_cli").await
+        {
             sleep(Duration::from_millis(POLL_INTERVAL_MILLIS)).await;
         }
     })
@@ -2314,21 +2370,26 @@ pub async fn stop_agent() -> Result<(), String> {
         .is_ok();
 
     if wait_ok {
-        log_info!("[upgrade] MagicArmorAgent 已完全停止");
+        log_info!("[upgrade] 所有相关进程已完全停止");
     } else {
-        log_info!("[upgrade] ⚠️ 警告：MagicArmorAgent 在 {} 秒内未完全退出，继续替换（有一定风险）", MAX_WAIT_SECONDS);
-        // 最后再强杀一次
+        log_info!("[upgrade] ⚠️ 警告：部分进程未在 {} 秒内退出，继续操作（有风险）", MAX_WAIT_SECONDS);
         let _ = Command::new("pkill").args(["-9", "MagicArmorAgent"]).status().await;
+        let _ = Command::new("pkill").args(["-9", "agent_manager"]).status().await;
+        let _ = Command::new("pkill").args(["-9", "osec_cli"]).status().await;
         sleep(Duration::from_secs(1)).await;
+    }
+
+    if !stopped_any {
+        log_info!("[upgrade] 无需停止：没有运行中的 agent_manager / osec_cli / MagicArmorAgent");
     }
 
     Ok(())
 }
 
-/// 通用启动 agent_manager 服务（兼容无 systemctl 环境）
 pub async fn start_agent() -> Result<(), String> {
     log_info!("[upgrade] 启动 agent_manager 服务");
 
+    // ---------- 检查 systemctl 是否存在 ----------
     let has_systemctl = Command::new("which")
         .arg("systemctl")
         .stdout(Stdio::null())
@@ -2338,6 +2399,49 @@ pub async fn start_agent() -> Result<(), String> {
         .unwrap_or(false);
 
     if has_systemctl {
+        // ---------- 检查 agent_manager.service 是否已安装 ----------
+        let service_installed = Command::new("systemctl")
+            .args(["status", "agent_manager.service"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        // ---------- service 未安装 → 自动安装并 enable ----------
+        if !service_installed {
+            let src = Path::new("/opt/osec/agent_manager.service");
+            let dst = Path::new("/etc/systemd/system/agent_manager.service");
+
+            if src.exists() {
+                log_info!("[upgrade] 未找到 agent_manager.service，正在安装...");
+
+                if let Err(e) = tokio::fs::copy(src, dst).await {
+                    return Err(format!("复制 service 文件失败: {}", e));
+                }
+
+                // daemon-reload
+                let _ = Command::new("systemctl")
+                    .args(["daemon-reload"])
+                    .status()
+                    .await;
+
+                // ★ 必须 enable，让服务随系统启动 ★
+                let _ = Command::new("systemctl")
+                    .args(["enable", "agent_manager"])
+                    .status()
+                    .await;
+
+                log_info!("[upgrade] agent_manager.service 安装并 enable 完成");
+            } else {
+                log_info!(
+                    "[upgrade] ⚠️ /opt/osec/agent_manager.service 不存在，无法自动安装 service 文件"
+                );
+            }
+        }
+
+        // ---------- 启动 agent_manager ----------
         log_info!("[upgrade] 使用 systemctl start agent_manager");
         let status = Command::new("systemctl")
             .args(["start", "agent_manager"])
@@ -2350,7 +2454,9 @@ pub async fn start_agent() -> Result<(), String> {
         } else {
             log_info!("[upgrade] ⚠️ systemctl start 返回非零，但新进程可能已被拉起");
         }
-    } else {
+    } 
+    else {
+        // ---------- service 命令 ----------
         let has_service = Command::new("which")
             .arg("service")
             .stdout(Stdio::null())
@@ -2366,15 +2472,15 @@ pub async fn start_agent() -> Result<(), String> {
                 .status()
                 .await;
         } else {
-            // 极端情况：直接后台启动二进制（某些精简系统）
+            // ---------- fallback：直接后台启动 MagicArmorAgent ----------
             log_info!("[upgrade] 无服务管理器，直接后台启动 MagicArmorAgent");
             let _ = Command::new("/opt/osec/MagicArmorAgent")
-                .arg("--daemon")  // 假设你的 agent 支持这个参数，或直接 &
+                .arg("--daemon")
                 .spawn();
         }
     }
 
-    // 简单等一秒让进程起来
+    // ---------- 等待 MagicArmorAgent 出现 ----------
     tokio::time::sleep(Duration::from_millis(800)).await;
     if is_process_running("MagicArmorAgent").await {
         log_info!("[upgrade] MagicArmorAgent 已成功运行");
@@ -2385,14 +2491,12 @@ pub async fn start_agent() -> Result<(), String> {
     Ok(())
 }
 
-/// 严格按照当前编译架构替换 MagicArmorAgent 二进制（超详细日志版）
 pub async fn replace_binary_with_arch_check(temp_dir: &str) -> Result<(), String> {
     let target_dir = "/opt/osec";
     let binary_name = "MagicArmorAgent";
 
     log_info!("[upgrade] 开始替换二进制，临时目录: {}", temp_dir);
 
-    // 1. 判断当前架构
     let current_arch = if cfg!(target_arch = "x86_64") {
         "x86_64"
     } else if cfg!(target_arch = "aarch64") {
@@ -2403,15 +2507,12 @@ pub async fn replace_binary_with_arch_check(temp_dir: &str) -> Result<(), String
     };
     log_info!("[upgrade] 当前系统架构: {}", current_arch);
 
-    // 2. 期望的文件名
     let expected_filename = format!("{}.{}", binary_name, current_arch);
     let src_path = Path::new(temp_dir).join(&expected_filename);
 
     log_info!("[upgrade] 期望的新二进制文件: {}", src_path.display());
 
-    // 3. 检查文件是否存在
     if !src_path.exists() {
-        // 打印临时目录所有文件，方便排查包错了还是架构错了
         let mut actual_files = Vec::new();
         if let Ok(entries) = fs::read_dir(temp_dir) {
             for entry in entries.flatten() {
@@ -2436,12 +2537,11 @@ pub async fn replace_binary_with_arch_check(temp_dir: &str) -> Result<(), String
 
     log_info!("✅ 找到匹配的新二进制: {}", src_path.display());
 
-    // 4. 确保目标目录存在
     log_info!("[upgrade] 确保目标目录存在: {}", target_dir);
     fs::create_dir_all(target_dir)
         .map_err(|e| format!("创建目标目录 {} 失败: {}", target_dir, e))?;
 
-    // 5. 备份旧版本
+    // 备份旧版本
     let target_path = format!("{}/{}", target_dir, binary_name);
     let backup_path = format!("{}/{}.bak", target_dir, binary_name);
 
@@ -2455,19 +2555,18 @@ pub async fn replace_binary_with_arch_check(temp_dir: &str) -> Result<(), String
         log_info!("[upgrade] 未发现旧版本，跳过备份");
     }
 
-    // 6. 复制新版本
+    //  复制新版本
     log_info!("[upgrade] 正在复制新二进制 → {}", target_path);
     let copied_bytes = fs::copy(&src_path, &target_path)
         .map_err(|e| format!("复制二进制失败: {}", e))?;
     log_info!("✅ 复制完成，大小: {} bytes", copied_bytes);
 
-    // 7. 设置可执行权限
+    // 设置可执行权限
     log_info!("[upgrade] 设置可执行权限 755");
     fs::set_permissions(&target_path, Permissions::from_mode(0o755))
         .map_err(|e| format!("设置执行权限失败: {}", e))?;
     log_info!("✅ 权限设置完成");
 
-    // 8. 清理临时文件（可选，但推荐）
     let _ = fs::remove_file(&src_path);
     log_info!("🧹 已删除临时文件: {}", src_path.display());
 

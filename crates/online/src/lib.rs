@@ -41,7 +41,8 @@ pub struct BaseOnline {
     pub auth: String,
     pub userid: String,
     pub host_name: String,
-    //pub mod_ver: String,
+    pub mod_ver: String,
+    pub arch_type: u8,
 }
 fn get_os_start_time() -> String {
     if let Ok(content) = fs::read_to_string("/proc/uptime") {
@@ -56,11 +57,20 @@ fn get_os_start_time() -> String {
     // fallback
     Utc::now().timestamp().to_string()
 }
+fn get_cpu_arch_type() -> u8 {
+    match std::env::consts::ARCH {
+        "x86_64" => 1,   // amd64
+        "aarch64" => 2,  // arm64
+        "mips64" => 3,   // mips64
+        _ => 0,          // 未知架构，可设为 0 或其他默认值
+    }
+}
 impl BaseOnline {
     pub fn new() -> Self {
         let cfg = NETINFO_CONFIG.lock().unwrap(); // 这里使用 from_ini 解析配置
         let asstarttime = Utc::now().timestamp().to_string();       // 程序启动时间
         let osstarttime = get_os_start_time();                      // 系统启动时间
+        let arch_type = get_cpu_arch_type();
         BaseOnline {
             uid: cfg.dev_uid.clone(),
             macid: cfg.macid.clone(),
@@ -80,7 +90,8 @@ impl BaseOnline {
             //osstarttime:"1731309829".to_string(),
             asstarttime,
             osstarttime,
-            //mod_ver: cfg.mod_ver.clone(),
+            mod_ver: cfg.mod_ver.clone(),
+            arch_type,            
         }
     }
 

@@ -479,6 +479,33 @@ async fn handle_console(
                 log_info!("No client selected");
             }
         }
+        ["rkill"] => {
+            let (client_id_opt, uid) = {
+                let guard = clients.lock().await;
+                let current_id = *current.lock().await;
+                if let Some(id) = current_id {
+                    if let Some(client) = guard.get(&id) {
+                        (Some(id), client.uid.clone().unwrap_or_default())
+                    } else { (None, String::new()) }
+                } else { (None, String::new()) }
+            };
+            if let Some(id) = client_id_opt {
+                let cmd_str = format!("uid:{} rkill", uid);
+                let writer_opt = { clients.lock().await.get(&id).map(|ci| ci.writer.clone()) };
+                if let Some(writer) = writer_opt {
+                    let mut wlock = writer.lock().await;
+                    if wlock.write_all(cmd_str.as_bytes()).await.is_err() {
+                        clients.lock().await.remove(&id);
+                        log_info!("Client {} disconnected during rkill command", id);
+                    } else {
+                        let _ = wlock.flush().await;
+                        log_info!("Sent rkill command to {}", uid);
+                    }
+                }
+            } else {
+                log_info!("No client selected");
+            }
+        }
         ["exit"] => {
             if current.lock().await.is_none() {
                 std::process::exit(0);
@@ -486,6 +513,7 @@ async fn handle_console(
                 log_info!("Cannot exit: client is selected. Use 'select' to deselect.");
             }
         }
+
         ["help"] => print_help(),
         _ => {
             let (client_id_opt, uid) = {

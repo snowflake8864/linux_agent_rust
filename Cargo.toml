@@ -23,7 +23,7 @@ members = [
      "crates/docker",
      "crates/snapman",
      "crates/rules_jump_mgr",
-     "crates/agent_manager",
+     #"crates/agent_manager",
   #"crates/agent_cli",
 ]
 

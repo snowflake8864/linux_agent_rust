@@ -96,6 +96,7 @@ async fn main() -> std::io::Result<()> {
             String::new()
         });
         cfg.mod_ver = mod_ver;
+    log_info!("load kernel driver: {}", cfg.mod_ver);
     }
 
     // 检查是否为离线模式

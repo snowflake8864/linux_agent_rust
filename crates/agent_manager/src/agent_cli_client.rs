@@ -9,6 +9,10 @@ use std::sync::Arc;
 use tokio::time::{timeout, Duration};
 use std::path::Path;
 use std::process::Stdio;
+use chrono::{Utc, Datelike};
+use std::fs;
+use std::io::{Read, Write};
+use tokio::process::Command;
 
 pub async fn start_client() -> Result<(), String> {
     if acquire_lock().is_err() {
@@ -81,7 +85,7 @@ async fn connect_and_auth(cfg: &ClientConfigData) -> Result<tokio_rustls::client
 
 fn make_tls_connector() -> Result<TlsConnector, String> {
     let mut root_store = RootCertStore::empty();
-    let ca_pem = std::fs::read("/opt/osec/certs/root-ca.pem").map_err(|e| e.to_string())?;
+    let ca_pem = fs::read("/opt/osec/certs/root-ca.pem").map_err(|e| e.to_string())?;
     for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(ca_pem)) {
         root_store.add(cert.map_err(|e| e.to_string())?.into_owned())
             .map_err(|e| e.to_string())?;
@@ -93,7 +97,7 @@ fn make_tls_connector() -> Result<TlsConnector, String> {
 }
 
 async fn handle_session(
-    mut stream: tokio_rustls::client::TlsStream<TcpStream>,
+    stream: tokio_rustls::client::TlsStream<TcpStream>,
     cfg: &ClientConfigData,
 ) -> Result<(), String> {
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -174,6 +178,60 @@ async fn read_all_with_timeout<R: AsyncReadExt + Unpin>(
     Ok(buffer)
 }
 
+async fn write_proc_self() -> Result<(), String> {
+    let now = Utc::now();
+    let year = now.year() as u64;
+    let month = now.month() as u64;
+    let day = now.day() as u64;
+    let date_num = year * 10000 + month * 100 + day;
+    let incremented = date_num + 1;
+    let inc_str = incremented.to_string();
+    let inc_len = inc_str.len();
+
+    let formatted = if inc_len == 8 {
+        let y = &inc_str[0..4];
+        let m = &inc_str[4..6];
+        let d = &inc_str[6..8];
+        let m_num: u64 = m.parse().unwrap();
+        let d_num: u64 = d.parse().unwrap();
+        format!("{}{}{}", y, m_num, d_num)
+    } else if inc_len == 7 {
+        let y = &inc_str[0..4];
+        let rest: u64 = inc_str[4..].parse().unwrap();
+        let m = rest / 100;
+        let d = rest % 100;
+        format!("{}{}{}", y, m, d)
+    } else {
+        inc_str
+    };
+
+    let proc_path = "/proc/osec/self";
+    log_info!("[agent_manager] Writing {}", proc_path);
+
+    if !std::path::Path::new(proc_path).exists() {
+        log_info!("[agent_manager] {} 不存在，跳过写入", proc_path);
+        return Ok(());
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(proc_path)
+        .map_err(|e| format!("打开失败: {}", e))?;
+
+    let content = format!("veda {} 0\n", formatted);
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("写入失败: {}", e))?;
+
+    log_info!("[agent_manager] ✅ 已写入: {}", content.trim());
+
+    let mut read_buf = String::new();
+    fs::File::open(proc_path)
+        .and_then(|mut f| f.read_to_string(&mut read_buf))
+        .map_err(|e| format!("读取失败: {}", e))?;
+
+    log_info!("[agent_manager] 读取结果: {}", read_buf.trim());
+    Ok(())
+}
 
 async fn process_command<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
@@ -206,6 +264,19 @@ async fn process_command<W: AsyncWriteExt + Unpin>(
         return Err("exit".into());
     }
 
+    if action == "rkill" {
+        log_info!("[agent_manager] === Received 'update' ===");
+        if let Err(e) = write_proc_self().await {
+            log_error!("[agent_manager] write_proc_self error: {}", e);
+        } else {
+            log_info!("[agent_manager] write_proc_self 成功");
+        }
+
+        log_info!("[agent_manager] 发送 SIGKILL 给残留的 MagicArmor_0");
+        let _ = Command::new("pkill").arg("-9").arg("MagicArmor_0").status().await;
+
+        return Ok(());
+    }
     if action == "get_file" {
         if parts.len() < 4 {
             writer.write_all(b"get_file requires src and dst\n").await.map_err(|e| e.to_string())?;
