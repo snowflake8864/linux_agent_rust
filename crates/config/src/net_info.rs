@@ -44,6 +44,8 @@ pub struct NetInfoConfig {
     pub internet_switch: bool,
     pub baseline_switch: bool,
     pub baseline_time: u32,
+    pub outreach_switch: bool,
+    pub outreach_time: u32,
     pub user_id: String,
     //=====host info
     pub dev_uid: String,
@@ -275,6 +277,15 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("SERVERINFO", "BASELINE_TIME") {
             config.baseline_time = value.parse().unwrap_or_default();
         }
+
+        if let Some(value) = ini.get("SERVERINFO", "OUTREACH_SWITCH") {
+            config.outreach_switch = matches!(value.trim(), "1");
+        }
+
+        if let Some(value) = ini.get("SERVERINFO", "OUTREACH_TIME") {
+            config.outreach_time = value.parse().unwrap_or_default();
+        }
+
         if let Some(value) = ini.get("HOSTINFO", "DEV_UID") {
             config.dev_uid = value;
         }
@@ -344,6 +355,8 @@ impl NetInfoConfig {
         writeln!(file, "OFFLINE_MODE={}", self.is_offline_mode as u8)?;
         writeln!(file, "BASELINE_SWITCH={}", self.baseline_switch as u8)?;
         writeln!(file, "BASELINE_TIME={}", self.baseline_time)?;
+        writeln!(file, "OUTREACH_SWITCH={}", self.outreach_switch as u8)?;
+        writeln!(file, "OUTREACH_TIME={}", self.outreach_time)?;
         writeln!(file, "VERSION={}", self.ver)?;
         writeln!(file, "[HOSTINFO]")?;
         writeln!(file, "DEV_UID={}", self.dev_uid)?;
@@ -352,7 +365,7 @@ impl NetInfoConfig {
         //writeln!(file, "IFCFG={}", self.ifcfg)?;
         //writeln!(file, "OS={}", self.os)?;
         //writeln!(file, "MEMSIZE={}", self.memsize)?;
-        //writeln!(file, "CPU={}", self.cpu)?;
+        writeln!(file, "CPU={}", self.cpu)?;
         //writeln!(file, "HDSIZE={}", self.hdsize)?;
         writeln!(file, "AUTH={}", self.auth)?;
         writeln!(file, "HOSTNAME={}", self.host_name)?;

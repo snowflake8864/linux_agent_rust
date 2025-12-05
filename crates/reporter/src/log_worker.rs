@@ -73,7 +73,7 @@ impl StartBashLog for BootManager {
                 }
             }
 
-            // 处理剩余日志
+            // 处理剩余告警
             if !log_buffer.is_empty() {
                 let mut json_str = String::new();
                 match build_alert_log_json(&log_buffer, &mut json_str) {
@@ -98,7 +98,7 @@ impl StartBashLog for BootManager {
                 }
             }
 
-            Ok("后台日志任务正常退出".to_string())
+            Ok("后台告警任务正常退出".to_string())
         })
     }
 }

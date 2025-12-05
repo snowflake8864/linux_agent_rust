@@ -11,46 +11,41 @@ mod agent_cli_server;
 use logging::{log_info, log_error, CustomLogger};
 use manager::{run_agent_manager, AgentCommand};
 
-use scopeguard; 
+use std::fs;
+use std::path::Path;
 
-const SINGLETON_SOCKET_PATH: &str = "/tmp/agent_manager_singleton.sock";
+const PID_FILE: &str = "/var/run/agent_manager.pid";
 
-async fn ensure_single_instance_async() -> io::Result<()> {
-    use tokio::net::UnixStream;
-    use std::time::Duration;
+fn pid_is_running(pid: u32) -> bool {
+    Path::new(&format!("/proc/{}", pid)).exists()
+}
 
-    if std::path::Path::new(SINGLETON_SOCKET_PATH).exists() {
-        // 尝试连接，带超时
-        match tokio::time::timeout(
-            Duration::from_millis(100),
-            UnixStream::connect(SINGLETON_SOCKET_PATH)
-        ).await {
-            Ok(Ok(_)) => {
-                eprintln!("【错误】osec_backend 已经在运行！另一个实例占用了单实例锁。");
-                std::process::exit(1);
-            }
-            Ok(Err(_)) | Err(_) => {
-                let _ = tokio::fs::remove_file(SINGLETON_SOCKET_PATH).await;
+fn ensure_single_instance() {
+    if Path::new(PID_FILE).exists() {
+        if let Ok(content) = fs::read_to_string(PID_FILE) {
+            if let Ok(old_pid) = content.trim().parse::<u32>() {
+
+                if pid_is_running(old_pid) {
+                    eprintln!("❌ osec_backend 已在运行 (PID={})！", old_pid);
+                    std::process::exit(1);
+                }
             }
         }
     }
 
-    if let Err(e) = tokio::net::UnixListener::bind(SINGLETON_SOCKET_PATH) {
-        eprintln!("【错误】无法绑定单实例 socket: {}", e);
-        std::process::exit(1);
+    // 3. 写入当前 pid
+    let current_pid = std::process::id();
+    if let Err(e) = fs::write(PID_FILE, current_pid.to_string()) {
+        eprintln!("⚠ 无法写入 PID 文件: {}", e);
     }
 
-    Ok(())
+    println!("✔ 单实例检查通过，当前 PID={}", current_pid);
 }
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     // ==================== 单实例锁 ====================
-    ensure_single_instance_async().await.unwrap();
-
-
-    scopeguard::defer! {
-        let _ = std::fs::remove_file(SINGLETON_SOCKET_PATH);
-    }
+    ensure_single_instance();
 
     let args: Vec<String> = std::env::args().collect();
 

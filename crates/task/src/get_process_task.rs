@@ -83,7 +83,6 @@ pub async fn process_all_dirs(
             Ok(response) => log_info!("服务器响应: {}", response),
             Err(err) => log_error!("发送指标失败: {}", err),
         }
-
     }
 
     Ok(())

@@ -7,58 +7,50 @@ use kernel_module::{LoadKernelDriver, unload_driver};
 use common::manager::boot::BootManager;
 use reporter::{AuditLogInfo, StartBashLog};
 use tokio::sync::mpsc;
-use logging::{log_info, CustomLogger, log_error};
+use logging::{log_info, CustomLogger, log_error, log_warn};
 use netlink::netlink::NlSockInfo;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use config::net_info::NETINFO_CONFIG;
 use udisk::StartUsbService;
 use docker::StartDockerMonitor;
-use scopeguard; 
-use tokio::net::{UnixStream, UnixListener};
-use std::time::Duration;
-use std::io;
+use std::fs;
+use std::path::Path;
 
-const SINGLETON_SOCKET_PATH: &str = "/tmp/osec_backend_singleton.sock";
+const PID_FILE: &str = "/var/run/osec_backend.pid";
 
-async fn ensure_single_instance() -> io::Result<()> {
-    let path = std::path::Path::new(SINGLETON_SOCKET_PATH);
+fn pid_is_running(pid: u32) -> bool {
+    Path::new(&format!("/proc/{}", pid)).exists()
+}
 
-    if path.exists() {
-        // 尝试连接该 socket，判断是否真有服务在运行
-        match tokio::time::timeout(
-            Duration::from_millis(100),
-            UnixStream::connect(SINGLETON_SOCKET_PATH)
-        ).await {
-            // 能连接上 → 真有实例在运行
-            Ok(Ok(_)) => {
-                eprintln!("【错误】osec_backend 已经在运行！另一个实例占用了单实例锁。");
-                std::process::exit(1);
-            }
-            // 连接失败 或 超时 → 残留文件，安全删除
-            Ok(Err(_)) | Err(_) => {
-                let _ = tokio::fs::remove_file(SINGLETON_SOCKET_PATH).await;
+fn ensure_single_instance() {
+    if Path::new(PID_FILE).exists() {
+        if let Ok(content) = fs::read_to_string(PID_FILE) {
+            if let Ok(old_pid) = content.trim().parse::<u32>() {
+
+                if pid_is_running(old_pid) {
+                    eprintln!("❌ osec_backend 已在运行 (PID={})！", old_pid);
+                    std::process::exit(1);
+                }
             }
         }
     }
 
-    // 现在尝试绑定（此时路径应干净）
-    if let Err(e) = UnixListener::bind(SINGLETON_SOCKET_PATH) {
-        eprintln!("【错误】无法创建单实例锁文件 '{}': {}", SINGLETON_SOCKET_PATH, e);
-        std::process::exit(1);
+    let current_pid = std::process::id();
+    if let Err(e) = fs::write(PID_FILE, current_pid.to_string()) {
+        eprintln!("⚠ 无法写入 PID 文件: {}", e);
     }
 
-    Ok(())
+    println!("✔ 单实例检查通过，当前 PID={}", current_pid);
 }
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    // ==================== 单实例锁 ====================
-
-    ensure_single_instance().await.unwrap();
-
-    scopeguard::defer! {
-        let _ = std::fs::remove_file(SINGLETON_SOCKET_PATH);
-    }
+    ensure_single_instance(); 
+    // 初始化日志
+    CustomLogger::init("/opt/osec/osec_backend.conf")
+        .await
+        .expect("无法初始化日志");
     // 忽略 SIGPIPE 信号
     unsafe {
         let mut sa: sigaction = std::mem::zeroed();
@@ -69,11 +61,6 @@ async fn main() -> std::io::Result<()> {
             panic!("sigaction failed to set SIGPIPE to ignore");
         }
     }
-
-    // 初始化日志
-    CustomLogger::init("/opt/osec/osec_backend.conf")
-        .await
-        .expect("无法初始化日志");
     log_info!("程序开始启动");
 
     // 卸载现有内核驱动

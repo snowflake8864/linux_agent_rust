@@ -56,7 +56,6 @@ pub async fn create_snapshot(name: &str, size: &str) -> Result<String, String> {
     // 获取卷组名
     let vg = get_vg_name().await.map_err(|e| e.to_string())?;
     let lvs = list_lvs().await.map_err(|e| e.to_string())?;
-
     let mut created_any = false;
     let mut created_size = String::new();
 
@@ -68,6 +67,13 @@ pub async fn create_snapshot(name: &str, size: &str) -> Result<String, String> {
 
         let snap_name = format!("{}_snap_{}", lv.name, name);
 
+        /*
+        let lvs_cmd_str = format!(
+            "lvs --noheadings -o lv_size {}/{}",
+            lv.vg, lv.name
+        );
+        log_info!("🔍 调试命令（获取 LV 大小）: {}", lvs_cmd_str);
+        */
         // 通过 lvs 获取原 LV 的大小
         let size_output = Command::new("lvs")
             .arg("--noheadings")
@@ -153,10 +159,12 @@ async fn check_free_space(vg: &str, required_size: &str) -> Result<(), String> {
 
     Err(format!("未找到卷组 {}", vg))
 }
-
+/*
 /// 解析 LVM 输出的大小字符串（如 "36.12g" -> 36）
 fn parse_size_to_gb(size_str: &str) -> Result<u64, String> {
+    log_info!("1==={}",size_str);
     let s = size_str.trim().to_lowercase();
+    log_info!("333==={}",s);
     if s.ends_with('g') {
         let num = s.trim_end_matches('g').parse::<f64>().map_err(|_| "解析失败")?;
         Ok(num.ceil() as u64)
@@ -170,7 +178,36 @@ fn parse_size_to_gb(size_str: &str) -> Result<u64, String> {
         Err(format!("无法解析大小: {}", size_str))
     }
 }
+*/
+fn parse_size_to_gb(size_str: &str) -> Result<u64, String> {
+    // 移除开头的非数值字符（如 <, <=, [, ( 等）
+    let cleaned: String = size_str
+        .trim()
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit() && *c != '.')
+        .collect();
 
+    if cleaned.is_empty() {
+        return Err(format!("清理后大小为空: {}", size_str));
+    }
+
+    let s = cleaned.to_lowercase();
+    if s.ends_with('g') {
+        let num_str = s.trim_end_matches('g');
+        let num = num_str.parse::<f64>().map_err(|_| format!("无法解析 GB 数值: '{}'", num_str))?;
+        Ok(num.ceil() as u64)
+    } else if s.ends_with('m') {
+        let num_str = s.trim_end_matches('m');
+        let num = num_str.parse::<f64>().map_err(|_| format!("无法解析 MB 数值: '{}'", num_str))?;
+        Ok(((num / 1024.0).ceil()) as u64)
+    } else if s.ends_with('t') {
+        let num_str = s.trim_end_matches('t');
+        let num = num_str.parse::<f64>().map_err(|_| format!("无法解析 TB 数值: '{}'", num_str))?;
+        Ok((num * 1024.0).ceil() as u64)
+    } else {
+        Err(format!("无法解析大小（未知单位）: '{}'", size_str))
+    }
+}
 
 pub async fn list_snapshots() -> Result<(), Box<dyn std::error::Error>> {
 

@@ -7,13 +7,14 @@ fi
 
 while true; do
     # 检查MagicArmor_0进程
-    if ! ps -ef | grep -q "MagicArmor_0"; then
+    if ! pgrep -f "MagicArmor_0" > /dev/null; then
+
         /opt/osec/MagicArmor_0 &
         echo "[$(date)] MagicArmor_0 started"
     fi
 
     # 检查MagicArmor_cli进程
-    if ! ps -ef | grep -q "MagicArmorAgent"; then
+    if ! pgrep -f "MagicArmorAgent" > /dev/null; then
         /opt/osec/MagicArmorAgent &
         echo "[$(date)] MagicArmorAgent started"
     fi
