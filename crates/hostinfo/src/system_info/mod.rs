@@ -26,7 +26,6 @@ impl SystemInfo {
 
     /// 获取内核版本
     pub fn get_kernel_version() -> Result<String, Error> {
-        // 读取 /proc/sys/kernel/osrelease 代替 uname()
         let release = fs::read_to_string("/proc/sys/kernel/osrelease")?;
         Ok(release.trim().to_string())
     }
@@ -64,23 +63,21 @@ impl SystemInfo {
         Ok(format!("{} GB", total_size_gb))
     }
 
-    /// 获取内存总大小（以 GB 为单位）
     pub fn get_memory_size() -> Result<String, Error> {
         let meminfo = fs::read_to_string("/proc/meminfo")?;
         for line in meminfo.lines() {
             if line.starts_with("MemTotal:") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if let Some(kb_str) = parts.get(1) {
-                    if let Ok(kb) = kb_str.parse::<u64>() {
-                        let gb = kb / 1024 / 1024;
-                        return Ok(format!("{}G", gb));
+                    if let Ok(kb) = kb_str.parse::<f64>() {
+                        let gb = kb / 1024.0 / 1024.0; // kB → MB → GB
+                        return Ok(format!("{:.1}G", gb));
                     }
                 }
             }
         }
         Err(io::Error::new(io::ErrorKind::NotFound, "Memory size not found"))
     }
-
     /// 获取 CPU 核心数
     pub fn get_cpu_cores() -> Result<String, Error> {
         let output = Command::new("nproc").output()?;

@@ -9,4 +9,4 @@ pub mod net_reach_rule;
 pub use virtual_port_rule::{VirtualPortRule, deserialize_port_range, deserialize_dest_port};
 pub use task_fetcher::TaskService;
 pub use timer_task::TimerTask;
-pub use net_reach_rule::OutreachDetectRule;
+pub use net_reach_rule::{OutreachDetectRule,run_outreach_detection,update_global_outreach_rules,build_outreach_detect_list_json};

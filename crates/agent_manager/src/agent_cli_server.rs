@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 use std::collections::HashMap;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
-use logging::log_info;
+use logging::{log_info, log_plain,log_mod};
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use rustls::{ServerConfig, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer}};
 use rustls_pemfile;
@@ -36,6 +36,7 @@ pub async fn start_server(port: u16) -> Result<(), Box<dyn std::error::Error + S
     let acceptor = TlsAcceptor::from(tls_cfg);
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
     log_info!("Server listening on 0.0.0.0:{}", port);
+    log_mod!("agent_server","Server listening on 0.0.0.0:{}", port);
 
     let clients: ClientsState = Arc::new(Mutex::new(HashMap::new()));
     let current: CurrentState = Arc::new(Mutex::new(None));
@@ -320,6 +321,7 @@ async fn handle_console(
         .collect();
 
     // 解析历史命令 !!
+
     let cmd_to_run = if clean_cmd == "!!" {
         if let Some(ref hist) = history {
             let hist_guard = hist.lock().await;
@@ -335,10 +337,28 @@ async fn handle_console(
             print_prompt(&current, &clients).await;
             return;
         }
+    } else if clean_cmd.starts_with('!') {
+        if let Ok(idx) = clean_cmd[1..].parse::<usize>() {
+            if let Some(ref hist) = history {
+                let hist_guard = hist.lock().await;
+                if idx > 0 && idx <= hist_guard.len() {
+                    hist_guard[idx - 1].clone()
+                } else {
+                    log_info!("History index out of range: {}", idx);
+                    print_prompt(&current, &clients).await;
+                    return;
+                }
+            } else {
+                log_info!("No history available");
+                print_prompt(&current, &clients).await;
+                return;
+            }
+        } else {
+            clean_cmd.clone()
+        }
     } else {
         clean_cmd.clone()
     };
-
     // 保存历史：存解析后的真实命令
     if let Some(ref hist) = history {
         let mut hist_guard = hist.lock().await;
@@ -620,17 +640,34 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerConfig>,
 }
 
 fn print_help() {
-    log_info!("=== Agent CLI Server Commands ===");
-    log_info!(" set uid <id> - Show/set UID for client id (does not switch session)");
-    log_info!(" set uid <id> <uid> - Manually set client UID (does not switch session)");
-    log_info!(" select <id|uid> - Select current client (alias: use)");
-    log_info!(" list - List all connected clients");
-    log_info!(" send_file <src> <dst> - Send file to current client");
-    log_info!(" get_file <src> <dst> - Request file from current client");
-    log_info!(" history - Show command history");
-    log_info!(" help - Show help");
-    log_info!(" exit - Exit (only if no client selected)");
-    log_info!(" <cmd> - Send command to selected client");
+    log_plain!("=== Agent CLI Server Commands ===");
+    log_plain!("");
+    log_plain!("Client Management:");
+    log_plain!("  list                            - List all connected clients");
+    log_plain!("  select <id> | <uid>             - Switch to a specific client (alias: use)");
+    log_plain!("  set uid <id>                    - Show or confirm UID of a client (does not switch)");
+    log_plain!("  set uid <id> <uid>              - Manually assign a UID to a client");
+    log_plain!("");
+    log_plain!("File Transfer:");
+    log_plain!("  send_file <local_path> <remote_path> - Upload a file to the selected client");
+    log_plain!("  get_file <remote_path> <local_path>  - Download a file from the selected client");
+    log_plain!("");
+    log_plain!("Remote Commands:");
+    log_plain!("  <any shell command>             - Execute command on the selected client");
+    log_plain!("  rkill                           - Send a remote kill signal (e.g., terminate agent)");
+    log_plain!("");
+    log_plain!("History & Navigation:");
+    log_plain!("  history                         - Show command history (last {} entries)", HISTORY_SIZE);
+    log_plain!("  !!                              - Re-execute the last non-history command");
+    log_plain!("");
+    log_plain!("Miscellaneous:");
+    log_plain!("  help                            - Show this help message");
+    log_plain!("  exit                            - Exit server (only allowed when no client is selected)");
+    log_plain!("");
+    log_plain!("Notes:");
+    log_plain!("- You must 'select' a client before sending commands or transferring files.");
+    log_plain!("- The '!!' command skips other history-related commands (like '!!' itself).");
+    log_plain!("- File paths with spaces must be handled by the underlying shell on the client side.");
 }
 
 async fn print_prompt(current: &CurrentState, clients: &ClientsState) {

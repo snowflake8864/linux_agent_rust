@@ -2,6 +2,8 @@ use reqwest::{Client, Response, Proxy};
 use std::time::Duration;
 use serde::{Deserialize};
 use std::env;
+use tokio::net::lookup_host;
+use url::Url;
 
 #[derive(Deserialize)]
 struct ResponseData {
@@ -19,7 +21,16 @@ pub struct NetClient {
     client: Client,
     pub base_url: Option<String>,
 }
-
+#[derive(Debug)]
+pub struct GetDataWithIpResponse {
+    pub body: String,          // HTTP 返回内容
+    pub domain_ips: Vec<String>, // URL 域名对应 IP 列表
+}
+#[derive(Debug)]
+pub struct PostDataWithIpResponse {
+    pub body: String,          // POST 返回内容
+    pub domain_ips: Vec<String>, // 域名解析的 IP 列表
+}
 
 impl NetClient {
      pub fn new(base_url: Option<String>, disable_ssl: bool) -> Result<Self, String> {
@@ -90,6 +101,84 @@ impl NetClient {
         }
     }
 
+   pub async fn get_data_async(
+        &self,
+        url: &str,
+        timeout: Duration,
+        token: Option<&str>,
+    ) -> Result<String, String> {
+        let mut req = self.client.get(url)
+            .header("Accept", "application/json")
+            .timeout(timeout);
+
+        if let Some(t) = token {
+            req = req.header("Authorization", format!("{}", t));
+        }
+
+        let resp = req.send().await;
+        match resp {
+            Ok(r) => {
+                let status = r.status();
+                let text = r.text().await
+                    .map_err(|e| format!("Failed to read response: {}", e))?;
+                if status.is_success() {
+                    Ok(text)
+                } else {
+                    Err(format!("GET failed {}: {}", status, text))
+                }
+            }
+            Err(e) => Err(format!("Request failed: {}", e)),
+        }
+   }
+   pub async fn get_data_with_ip_async(
+       &self,
+       url: &str,
+       timeout: Duration,
+       token: Option<&str>,
+   ) -> Result<GetDataWithIpResponse, String> {
+
+       let parsed = Url::parse(url)
+           .map_err(|e| format!("URL 解析失败: {}", e))?;
+
+       let domain = parsed.host_str()
+           .ok_or_else(|| "URL 中没有域名".to_string())?;
+
+       let port = parsed.port().unwrap_or(80);
+       let host_port = format!("{}:{}", domain, port);
+
+       let domain_ips: Vec<String> = lookup_host(host_port)
+           .await
+           .map_err(|e| format!("DNS 解析失败: {}", e))?
+           .map(|addr| addr.ip().to_string())
+           .collect();
+
+       let mut req = self.client.get(url)
+           .header("Accept", "application/json")
+           .timeout(timeout);
+
+       if let Some(t) = token {
+           req = req.header("Authorization", format!("{}", t));
+       }
+
+       let resp = req.send().await;
+       match resp {
+           Ok(r) => {
+               let status = r.status();
+               let text = r.text().await
+                   .map_err(|e| format!("Failed to read response: {}", e))?;
+
+               if status.is_success() {
+                   Ok(GetDataWithIpResponse {
+                       body: text,
+                       domain_ips,
+                   })
+               } else {
+                   Err(format!("GET failed {}: {}", status, text))
+               }
+           }
+           Err(e) => Err(format!("Request failed: {}", e)),
+       }
+   }
     /// 异步下载文件内容（返回字节数组）
     pub async fn download_file_async(
         &self,
@@ -129,7 +218,63 @@ impl NetClient {
         Ok(bytes.to_vec())
     }
 
+pub async fn post_data_with_ip_async(
+        &self,
+        url: &str,
+        json_data: &str,
+        timeout: Duration,
+        token: Option<&str>,
+    ) -> Result<PostDataWithIpResponse, String> {
 
+        // ----------- 新增：获取域名对应 IP -----------------
+        let parsed = Url::parse(url)
+            .map_err(|e| format!("URL 解析失败: {}", e))?;
+
+        let domain = parsed.host_str()
+            .ok_or_else(|| "URL 中没有域名".to_string())?;
+
+        let port = parsed.port().unwrap_or(80);
+        let host_port = format!("{}:{}", domain, port);
+
+        let domain_ips: Vec<String> = lookup_host(host_port)
+            .await
+            .map_err(|e| format!("DNS 解析失败: {}", e))?
+            .map(|addr| addr.ip().to_string())
+            .collect();
+        // ----------------------------------------------------
+
+        // ---------------- 原本的 POST 请求逻辑 ----------------
+        let mut request = self.client
+            .post(url)
+            .timeout(timeout)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .body(json_data.to_string());
+
+        if let Some(token_str) = token {
+            request = request.header("Authorization", token_str);
+        }
+
+        let resp = request.send().await;
+        match resp {
+            Ok(r) => {
+                let status = r.status();
+                let text = r.text()
+                    .await
+                    .map_err(|e| format!("Failed to read response: {}", e))?;
+
+                if status.is_success() || status.is_client_error() {
+                    Ok(PostDataWithIpResponse {
+                        body: text,
+                        domain_ips,
+                    })
+                } else {
+                    Err(format!("POST failed {}: {}", status, text))
+                }
+            }
+            Err(e) => Err(format!("Request failed: {}", e)),
+        }
+    }
     pub fn get_base_url(&self) -> Option<&str> {
         self.base_url.as_deref()
     }

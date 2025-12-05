@@ -68,13 +68,14 @@ impl ProcessAuditHandler {
                     netlog.start_idx, netlog.end_idx
                 ));
             }
-            /*
+           /* 
             log_info!(
                 "file audit, start_idx={}, end_idx={}",
                 netlog.start_idx,
                 netlog.end_idx
             );
             */
+            
             iterate(netlog.start_idx, netlog.end_idx);
         } else {
             /*
@@ -204,12 +205,12 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
     let mut p_dir = parts.get(0).unwrap_or(&"").to_string();
 
 
+    let is_docker = proc_info.is_docker_process();
     //log_info!("proc_info: {:?}  p_dir: {:?}", proc_info, p_dir);
-    if p_dir.is_empty() || !file_exists(&p_dir) {
+    if  !is_docker && (p_dir.is_empty() || !file_exists(&p_dir)) {
         return;
     }
 
-    let is_docker = proc_info.is_docker_process();
     if is_docker {
         p_dir.push_str(";docker");
         //log_info!("proc_info: {:?}  p_dir: {:?}", proc_info, p_dir);
@@ -273,7 +274,7 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
     }
 
     // 处理 EdrProcessLog
-    if cfg.syslog_process_switch {
+     if !is_docker &&cfg.syslog_process_switch {
         let mut pp_dir = String::new();
         let mut pp_hash = String::new();
 

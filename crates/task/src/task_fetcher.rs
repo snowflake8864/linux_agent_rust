@@ -15,7 +15,7 @@ use logging::{log_info,log_error};
 use common::manager::boot::BootManager;
 use crate::virtual_port_rule::VirtualPortRule;
 use crate::get_process_task::process_all_dirs;
-use crate::net_reach_rule::OutreachDetectRule;
+use crate::net_reach_rule::{OutreachDetectRule,update_global_outreach_rules};
 use pattern::{pattern_rules_mgr,process_pattern_rules_mgr::PROCESS_PATTERN_RULES_MGR, GlobalTrustDir};
 use tokio::sync::mpsc;
 use process_mgr::POLICY_MANAGER;
@@ -471,7 +471,8 @@ fn update_config_from_json(&mut self, conf: &serde_json::Map<String, Value>) -> 
     try_update!(bool syslog_dns_switch,     "syslog_dns_switch");
     try_update!(bool internet_switch,       "internet_switch");
     try_update!(bool syslog_process_switch,"syslog_process_switch");
-
+    try_update!(u32 outreach_time,          "outreach_time");
+    try_update!(bool outreach_switch,       "outreach_switch");
     if conf.contains_key("logipport") {
         new_cfg.log_ip_port = conf["logipport"]
             .as_str()
@@ -1703,8 +1704,8 @@ async fn task_outreach_detect(&self, task_type: u64) -> Result<(), String> {
                 .map_err(|e| format!("Failed to parse VirtualPortRule: {}", e))
         })
     .collect::<Result<Vec<OutreachDetectRule>, _>>()?;
-    log_info!("rules:{:?}",rules);
-    // 外围探测任务处理
+    update_global_outreach_rules(rules);
+    //log_info!("rules:{:?}",rules);
     Ok(())
 }
 
