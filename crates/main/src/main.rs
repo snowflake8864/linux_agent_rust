@@ -83,7 +83,7 @@ async fn main() -> std::io::Result<()> {
             String::new()
         });
         cfg.mod_ver = mod_ver;
-    log_info!("load kernel driver: {}", cfg.mod_ver);
+       log_info!("load kernel driver: {}", cfg.mod_ver);
     }
 
     // 检查是否为离线模式
@@ -107,11 +107,11 @@ async fn main() -> std::io::Result<()> {
         log_error!("Netlink socket 未创建，跳过 send_data_to_kernel");
     }
 
-
+/*
     // 初始化信号处理
-    let mut sigint = unix_signal(SignalKind::interrupt())?;
-    let mut sigterm = unix_signal(SignalKind::terminate())?;
-
+    let sigint = unix_signal(SignalKind::interrupt())?;
+    let  sigterm = unix_signal(SignalKind::terminate())?;
+*/
     // 启动异步任务
     let start_services_handle = tokio::spawn({
         let mut init = init.clone();

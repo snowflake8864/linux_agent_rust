@@ -11,11 +11,12 @@ use std::net::Ipv4Addr;
 use tokio::io::AsyncWriteExt; // 
 use std::sync::{Arc, Mutex};
 use tokio::fs::OpenOptions;
-use logging::{log_info,log_error};
+use logging::{log_info,log_error,log_warn};
 use common::manager::boot::BootManager;
 use crate::virtual_port_rule::VirtualPortRule;
 use crate::get_process_task::process_all_dirs;
 use crate::net_reach_rule::{OutreachDetectRule,update_global_outreach_rules};
+use crate::scan_directory_task::{DirectionScanRule,scan_single_dir};
 use pattern::{pattern_rules_mgr,process_pattern_rules_mgr::PROCESS_PATTERN_RULES_MGR, GlobalTrustDir};
 use tokio::sync::mpsc;
 use process_mgr::POLICY_MANAGER;
@@ -28,7 +29,7 @@ use tokio::task;
 use serde_json::json;
 use tokio::net::UnixStream;
 use zip::ZipArchive;
-use snapman::{create_snapshot, restore_snapshot, list_snapshots, clean_snapshot, clean_all_snapshots};
+use snapman::{create_snapshot, restore_snapshot};
 use rules_jump_mgr::{IpJumpManager, PasswordManager, IpJumpConfig, PutIpJumpInfo, PutPwJumpInfo};
 use chrono::{Utc, Datelike};
 use std::io::{Read, Write};
@@ -135,6 +136,8 @@ impl TaskFetcher {
         let mut api_interface = HashMap::new();
         api_interface.insert("closetask".to_string(), "v1/closetask".to_string());
         api_interface.insert("update".to_string(), "v1/download".to_string());
+        api_interface.insert("getdirinfo".to_string(), "v1/getdirinfo".to_string());
+        api_interface.insert("putdir".to_string(), "v1/putdir".to_string());
         api_interface.insert("uninstall".to_string(), "v1/uninstall".to_string());
         api_interface.insert("upload_process".to_string(), "v1/upload_process".to_string());
         api_interface.insert("download_white".to_string(), "v1/getprocwl".to_string());
@@ -707,6 +710,9 @@ async fn handle_task(&mut self, task_type: TaskTypeEnum) -> Result<(), String> {
 // 处理 TASK_UPLOAD_PROCESS 任务
 async fn task_upload_process(&self, task_type: u64) -> Result<(), String> {
 
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     let upload_url = match self.api_interface.get("upload_process") {
         Some(url) => url,
         None => return Err("URL for upload_gloabal_process not found".to_string()),
@@ -749,14 +755,15 @@ async fn task_upload_process(&self, task_type: u64) -> Result<(), String> {
             log_error!("构建 JSON 失败: {}", e);
         }
     }
-    self.report_task_completion(task_type).await?;
-    // 实际上传逻辑代码
     Ok(())
 }
 
 
 pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
-    // ==================== 1. 下载更新信息 ====================
+
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     let download_url = self.api_interface.get("update")
         .ok_or("URL for download update not found".to_string())?;
     let url = format!("{}/{}", self.base_url, download_url);
@@ -829,10 +836,7 @@ pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
 
     log_info!("✅ 找到升级脚本: {:?}", script_path_ref);
 
-    // ==================== 4. 先上报一次任务完成（兼容历史逻辑） ====================
-    self.report_task_completion(task_type).await?;
 
-    // ==================== 5. 判断是否需要热升级主程序 ====================
     let binary_name = "MagicArmorAgent";
     let (current_arch, need_hot_upgrade) = if cfg!(target_arch = "x86_64") {
         ("x86_64", Path::new(temp_dir).join(format!("{}.x86_64", binary_name)).exists())
@@ -868,21 +872,113 @@ pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
         log_info!("✅ 已发送 update 命令给 agent");
     }
 
-
     log_info!("🚀 task_update 任务执行完毕");
-    Ok(())
-}  
-// 处理 TASK_UPLOAD_DIR 任务
-async fn task_upload_dir(&self, task_type: u64) -> Result<(), String> {
-    println!("Processing TASK_UPLOAD_DIR...");
-    // 上传目录的处理逻辑
     Ok(())
 }
 
+async fn task_upload_dir(&self, task_type: u64) -> Result<(), String> {
+    const MAX_FILES: usize = 1000;
+
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
+    let download_url = match self.api_interface.get("getdirinfo") {
+        Some(url) => url,
+        None => return Err("未找到 getdirinfo 策略的 URL".to_string()),
+    };
+    let url = format!("{}/{}", self.base_url, download_url);
+    let token = self.get_token();
+    let token_str = token.as_ref().map(|s| s.as_str());
+
+    let response = match self.net_client
+        .post_data_async(&url, "", Duration::from_secs(10), token_str)
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            eprintln!("获取 getdirinfo 策略失败: {}", err);
+            return Err(err);
+        }
+    };
+
+    let parsed: Value = match serde_json::from_str(&response) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("解析 getdirinfo 响应失败: {}", e);
+            return Err("解析 getdirinfo 响应失败".to_string());
+        }
+    };
+
+    if parsed["code"] != "000000" {
+        eprintln!("警告: getdirinfo 返回 code != 000000: {}", parsed["code"]);
+    }
+
+    let rules: Vec<DirectionScanRule> = parsed["data"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+               .filter_map(|v| serde_json::from_value(v.clone()).ok())
+               .collect()
+        })
+        .unwrap_or_default();
+
+    //log_info!("收到 {} 条目录监控策略，开始扫描", rules.len());
+
+    let mut all_files = Vec::new();
+
+    for rule in &rules {
+        if all_files.len() >= MAX_FILES {
+            log_warn!("已达到最大上报条数 {} 条，停止扫描后续目录", MAX_FILES);
+            break;
+        }
+
+        match scan_single_dir(&rule.dir, rule.pid).await {
+            Ok(mut files) => {
+                let remaining = MAX_FILES - all_files.len();
+                if files.len() > remaining {
+                    log_warn!("目录 {} 文件过多，仅取前 {} 条上报", rule.dir, remaining);
+                    files.truncate(remaining);
+                }
+                let count = files.len();
+                all_files.append(&mut files);
+                log_info!("扫描 {} → {} 条记录 (累计 {} 条", rule.dir, count, all_files.len());
+            }
+            Err(e) => log_warn!("扫描目录 {} 失败: {}", rule.dir, e),
+        }
+    }
+
+    let files_json_str = serde_json::to_string(&all_files)
+        .map_err(|e| format!("序列化文件列表失败: {e}"))?;
+
+    let payload = json!({
+        "dir": files_json_str   
+    });
+    let body = payload.to_string();
+
+    let upload_url = self.full_url("putdir")?;
+
+ //   log_info!("上传目录信息 → {}", upload_url);
+
+    let resp = self
+        .net_client
+        .post_data_async(&upload_url, &body, Duration::from_secs(120), token_str)
+        .await
+        .map_err(|e| format!("上传目录信息失败: {e}"))?;
+/*
+    log_info!(
+        "目录扫描上传完成，共 {} 条记录（上限 {} 条），服务器返回: {}",
+        all_files.len(),
+        MAX_FILES,
+        resp.trim()
+    );
+*/
+    Ok(())
+}
 
 // 处理 TASK_DOWN_DIR_POLICY 任务
 async fn task_down_dir_policy(&self, task_type: u64) -> Result<(), String> {
-    // 获取 download_white 的 URL
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
     let download_url = match self.api_interface.get("getdirpolicy") {
         Some(url) => url,
         None => return Err("URL for download_white not found".to_string()),
@@ -924,13 +1020,14 @@ async fn task_down_dir_policy(&self, task_type: u64) -> Result<(), String> {
             return Err(err);
         }
     }
-    self.report_task_completion(task_type).await?;
-    // 下载目录策略的处理
     Ok(())
 }
 
 
 async fn task_down_conf(&mut self, task_type: u64) -> Result<(), String> {
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     let download_url = match self.api_interface.get("getconf") {
         Some(url) => url,
         None => return Err("URL for download_white not found".to_string()),
@@ -972,13 +1069,15 @@ async fn task_down_conf(&mut self, task_type: u64) -> Result<(), String> {
     }
 
 
-    self.report_task_completion(task_type).await?;
-    // 下载配置的处理
     Ok(())
 }
 
 // 处理 TASK_DOWN_BLACK 任务
 async fn task_down_black(&self, task_type: u64) -> Result<(), String> {
+
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     // 获取 download_white 的 URL
     let download_url = match self.api_interface.get("download_black") {
         Some(url) => url,
@@ -1034,6 +1133,10 @@ async fn task_down_black(&self, task_type: u64) -> Result<(), String> {
 
 
 pub async fn task_down_white(&self, task_type: u64) -> Result<(), String> {
+
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     // 获取 download_white 的 URL
     let download_url = match self.api_interface.get("download_white") {
         Some(url) => url,
@@ -1093,6 +1196,9 @@ async fn task_down_file_tt(&self, task_type: u64) -> Result<(), String> {
 async fn task_upload_port(&self, task_type: u64) -> Result<(), String> {
     //println!("Processing TASK_UPLOAD_PORT...");
 
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     let upload_url = match self.api_interface.get("upserviceport") {
         Some(url) => url,
         None => return Err("URL for upload_gloabal_process not found".to_string()),
@@ -1119,6 +1225,10 @@ async fn task_upload_port(&self, task_type: u64) -> Result<(), String> {
 }
 
 pub async fn task_down_virtual_port(&self, task_type: u64) -> Result<(), String> {
+
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     let download_url = match self.api_interface.get("getvirtualport") {
         Some(url) => url,
         None => return Err("URL for getvirtualport not found".to_string()),
@@ -1220,6 +1330,10 @@ pub async fn task_down_virtual_port(&self, task_type: u64) -> Result<(), String>
 
 
 async fn task_down_netblock_policy(&self, task_type: u64) -> Result<(), String> {
+
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     let download_url = match self.api_interface.get("getPlugging") {
         Some(url) => url,
         None => return Err("未找到 netblock 策略的 URL".to_string()),
@@ -1276,6 +1390,10 @@ async fn task_down_netblock_policy(&self, task_type: u64) -> Result<(), String> 
 }
 
 async fn task_down_black_ip_policy(&self, task_type: u64) -> Result<(), String> {
+
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     let download_url = match self.api_interface.get("getipblacklist") {
         Some(url) => url,
         None => return Err("未找到 black IP 策略的 URL".to_string()),
@@ -1331,6 +1449,10 @@ async fn task_down_black_ip_policy(&self, task_type: u64) -> Result<(), String> 
     update_and_write_policies(policies).await
 }
 async fn task_down_extort(&self, task_type: u64) -> Result<(), String> {
+
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     // 获取 download_white 的 URL
     let download_url = match self.api_interface.get("getprotect") {
         Some(url) => url,
@@ -1371,7 +1493,6 @@ async fn task_down_extort(&self, task_type: u64) -> Result<(), String> {
         }
     }
 
-    self.report_task_completion(task_type).await?;
     Ok(())
 }
 
@@ -1409,6 +1530,8 @@ async fn task_upload_process_black_module(&self, task_type: u64) -> Result<(), S
 async fn task_uninstall(&self, task_type: u64) -> Result<(), String> {
     println!("Processing TASK_UNINSTALL...");
 
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
     let download_url = self.api_interface.get("uninstall")
         .ok_or("URL for download uninstall not found".to_string())?;
     let url = format!("{}/{}", self.base_url, download_url);
@@ -1429,9 +1552,6 @@ async fn task_uninstall(&self, task_type: u64) -> Result<(), String> {
         return Err(format!("Invalid response code: {}", parsed["code"].as_str().unwrap_or("unknown")));
     }
 
-    // 上报任务完成
-    self.report_task_completion(task_type).await?;
-    //此处发命令
     if let Err(e) = send_command_to_agent("uninstall").await {
         log_info!("发送更新命令失败: {}", e);
     }
@@ -1439,6 +1559,9 @@ async fn task_uninstall(&self, task_type: u64) -> Result<(), String> {
 }
 
 async fn task_get_white_peripherals(&self, task_type: u64) -> Result<(), String> {
+
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
 
     let download_url = match self.api_interface.get("getwhiteperipherals") {
         Some(url) => url,
@@ -1493,6 +1616,8 @@ async fn task_get_white_peripherals(&self, task_type: u64) -> Result<(), String>
 // 处理 TASK_getblackperipherals 任务
 async fn task_get_black_peripherals(&self, task_type: u64) -> Result<(), String> {
 
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
     // 获取 download_white 的 URL
     let download_url = match self.api_interface.get("getblackperipherals") {
         Some(url) => url,
@@ -1544,6 +1669,9 @@ async fn task_get_black_peripherals(&self, task_type: u64) -> Result<(), String>
 }
 async fn task_usb_upload(&self, task_type: u64) -> Result<(), String> {
 
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     let upload_url = match self.api_interface.get("addperipherals") {
         Some(url) => url,
         None => return Err("URL for upload_gloabal_process not found".to_string()),
@@ -1594,6 +1722,10 @@ async fn task_upload_sample(&self, task_type: u64) -> Result<(), String> {
 
 // 处理 TASK_GLOBAL_PROC 任务
 async fn task_global_proc(&self, task_type: u64) -> Result<(), String> {
+
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     let upload_url = match self.api_interface.get("upload_gloabal_process") {
         Some(url) => url,
         None => return Err("URL for upload_gloabal_process not found".to_string()),
@@ -1614,6 +1746,9 @@ async fn task_global_proc(&self, task_type: u64) -> Result<(), String> {
 }
 
 async fn task_global_dir(&self,task_type: u64) -> Result<(), String> {
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     let download_url = match self.api_interface.get("gettrustdir") {
         Some(url) => url,
         None => return Err("URL for download_white not found".to_string()),
@@ -1710,6 +1845,10 @@ async fn task_outreach_detect(&self, task_type: u64) -> Result<(), String> {
 }
 
 async fn task_down_pwjump(&self, task_type: u64) -> Result<(), String> {
+
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     let download_url = match self.api_interface.get("getPwJump") {
         Some(url) => url,
         None => return Err("URL for getPwJump not found".to_string()),
@@ -1776,13 +1915,14 @@ async fn task_down_pwjump(&self, task_type: u64) -> Result<(), String> {
         }
     }
     self.upload_passwd_result(&info.user, &info.pw, info.status, &info.reason).await?;
-    self.report_task_completion(task_type).await
-        .map_err(|e| e.to_string())?;
 
     Ok(())
 }
 
 async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     let download_url = match self.api_interface.get("getIpJump") {
         Some(url) => url,
         None => return Err("URL for getIpJump not found".to_string()),
@@ -1861,12 +2001,13 @@ async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
             return Err(err);
         }
     }
-    self.report_task_completion(task_type).await?;
     Ok(())
 }
 
 
 async fn task_get_system_backups(&self, task_type: u64) -> Result<(), String> {
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
 
     let download_url = match self.api_interface.get("getBackups") {
         Some(url) => url,
@@ -1890,7 +2031,7 @@ async fn task_get_system_backups(&self, task_type: u64) -> Result<(), String> {
                 if let Some(arr) = parsed["data"].as_array() {
                     for obj in arr {
                         if let Some(id) = obj["id"].as_str() {
-                            match snapman::create_snapshot(id, "").await {  // 添加 .await
+                            match create_snapshot(id, "").await {  // 添加 .await
                                 Ok(size) => {
                                     log_info!("✅ 快照创建成功: {}", id);
                                     // 成功上报
@@ -1922,6 +2063,9 @@ async fn task_get_system_backups(&self, task_type: u64) -> Result<(), String> {
     Ok(())
 }
 async fn task_system_rollback(&self, task_type: u64) -> Result<(), String> {
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
     let download_url = match self.api_interface.get("getRollbacks") {
         Some(url) => url,
         None => return Err("URL for getRollbacks not found".to_string()),
@@ -1951,7 +2095,7 @@ async fn task_system_rollback(&self, task_type: u64) -> Result<(), String> {
     if let Some(arr) = parsed["data"].as_array() {
         for obj in arr {
             if let Some(id) = obj["id"].as_str() {
-                match snapman::restore_snapshot(id).await {
+                match restore_snapshot(id).await {
                     Ok(_) => {
                         log_info!("✅ 系统恢复成功: {}", id);
                         has_success = true;
@@ -1970,7 +2114,6 @@ async fn task_system_rollback(&self, task_type: u64) -> Result<(), String> {
         }
     }
 
-    self.report_task_completion(task_type).await?;
 
     if has_success {
         self.reboot_system().await?;
@@ -2219,60 +2362,47 @@ async fn send_command_to_agent(cmd: &str) -> Result<(), String> {
 
     Ok(())
 }
+
 async fn write_proc_self() -> Result<(), String> {
     let now = Utc::now();
-    let year = now.year() as u64;
-    let month = now.month() as u64;
-    let day = now.day() as u64;
-    let date_num = year * 10000 + month * 100 + day;
-    let incremented = date_num + 1;
-    let inc_str = incremented.to_string();
-    let inc_len = inc_str.len();
 
-    let formatted = if inc_len == 8 {
-        let y = &inc_str[0..4];
-        let m = &inc_str[4..6];
-        let d = &inc_str[6..8];
-        let m_num: u64 = m.parse().unwrap();
-        let d_num: u64 = d.parse().unwrap();
-        format!("{}{}{}", y, m_num, d_num)
-    } else if inc_len == 7 {
-        let y = &inc_str[0..4];
-        let rest: u64 = inc_str[4..].parse().unwrap();
-        let m = rest / 100;
-        let d = rest % 100;
-        format!("{}{}{}", y, m, d)
-    } else {
-        inc_str
-    };
+    let year  = now.year() as u64;
+    let month = now.month() as u64;
+    let day   = now.day() as u64;
+
+    let concatenated = format!("{}{}{}", year, month, day);
+    let num = concatenated.parse::<u64>()
+        .map_err(|e| format!("日期拼接解析失败: {}", e))?;
+
+    let final_value = num + 1;
+    let formatted = final_value.to_string();
 
     let proc_path = "/proc/osec/self";
-    //log_info!("[agent_manager] Writing {}", proc_path);
 
-    if !std::path::Path::new(proc_path).exists() {
+    log_info!("[agent_manager] Writing {}", proc_path);
+
+    if !Path::new(proc_path).exists() {
         log_info!("[agent_manager] {} 不存在，跳过写入", proc_path);
         return Ok(());
     }
 
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .open(proc_path)
-        .map_err(|e| format!("打开失败: {}", e))?;
-
     let content = format!("veda {} 0\n", formatted);
-    file.write_all(content.as_bytes())
+
+    // 直接用 fs::write，更简洁
+    fs::write(proc_path, content.as_bytes())
         .map_err(|e| format!("写入失败: {}", e))?;
 
-    //log_info!("[agent_manager] ✅ 已写入: {}", content.trim());
+    log_info!("[agent_manager] 已写入: {}", content.trim());
 
-    let mut read_buf = String::new();
-    fs::File::open(proc_path)
-        .and_then(|mut f| f.read_to_string(&mut read_buf))
+    // 验证读取
+    let read_back = fs::read_to_string(proc_path)
         .map_err(|e| format!("读取失败: {}", e))?;
 
-    log_info!("[agent_manager] 读取结果: {}", read_buf.trim());
+    log_info!("[task_fetcher] 读取结果: {}", read_back.trim());
+
     Ok(())
 }
+
 const MAX_WAIT_SECONDS: u64 = 15;
 const POLL_INTERVAL_MILLIS: u64 = 300;
 
@@ -2577,3 +2707,6 @@ pub async fn replace_binary_with_arch_check(temp_dir: &str) -> Result<(), String
 
     Ok(())
 }
+
+
+

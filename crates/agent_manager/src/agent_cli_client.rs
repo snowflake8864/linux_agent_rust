@@ -7,12 +7,126 @@ use tokio_rustls::TlsConnector;
 use rustls::{ClientConfig, RootCertStore};
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
-use std::path::Path;
 use std::process::Stdio;
 use chrono::{Utc, Datelike};
-use std::fs;
-use std::io::{Read, Write};
+use std::{
+    fs::{self, File},
+    io::{self, Read,Write},
+    path::{Path, PathBuf},
+};
 use tokio::process::Command;
+use uname::uname;
+async fn make_zip(src_dir: &Path, dst_zip: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs;
+    use walkdir::WalkDir;
+    use zip::write::FileOptions;
+    use zip::ZipWriter;
+
+    let file = fs::File::create(dst_zip)?;
+    let mut zip = ZipWriter::new(file);
+
+    let options = FileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .unix_permissions(0o755);
+
+    let top_name = src_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("invalid dir name")?
+        .to_string();
+
+    zip.add_directory(&top_name, options)?;
+
+    for entry in WalkDir::new(src_dir).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let relative = path.strip_prefix(src_dir).unwrap();
+        let zip_path = Path::new(&top_name).join(relative);
+
+        if path.is_dir() {
+            if !relative.as_os_str().is_empty() {
+                zip.add_directory(zip_path.to_string_lossy(), options)?;
+            }
+        } else {
+            zip.start_file(zip_path.to_string_lossy(), options)?;
+            let mut f = fs::File::open(path)?;
+            std::io::copy(&mut f, &mut zip)?;
+        }
+    }
+
+    zip.finish()?.flush()?;
+    Ok(())
+}
+pub async fn get_kernel_src<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+) -> Result<(), String> {
+    use tokio::fs;
+    use walkdir::WalkDir;
+
+    let info = uname().map_err(|e| format!("uname failed: {e}"))?;
+    let kver = info.release.as_str();
+
+    let real_src_dir = PathBuf::from(format!("/usr/src/kernels/{kver}"));
+    if !real_src_dir.exists() {
+        return Err(format!("kernel source not found: {real_src_dir:?}"));
+    }
+
+    let zip_path = PathBuf::from(format!("{kver}.zip"));
+    if zip_path.exists() {
+        let _ = fs::remove_file(&zip_path).await;
+    }
+
+    log_info!("[agent_manager] 正在打包完整内核源码（压缩模式） → {zip_path}", zip_path = zip_path.display());
+
+    let file = std::fs::File::create(&zip_path).map_err(|e| format!("create zip failed: {e}"))?;
+    let mut zip = zip::ZipWriter::new(file);
+
+    let options = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o755);
+
+    zip.add_directory(kver, options).map_err(|e| format!("add top dir failed: {e}"))?;
+    let build_prefix = format!("{kver}/build");
+    zip.add_directory(&build_prefix, options).map_err(|e| format!("add build dir failed: {e}"))?;
+
+    for entry in WalkDir::new(&real_src_dir).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let relative = path.strip_prefix(&real_src_dir).unwrap();
+
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+
+        let zip_path = Path::new(&build_prefix).join(relative);
+
+        if path.is_dir() {
+            zip.add_directory(zip_path.to_string_lossy(), options)
+                .map_err(|e| format!("add dir failed: {e}"))?;
+        } else {
+            zip.start_file(zip_path.to_string_lossy(), options)
+                .map_err(|e| format!("start file failed: {e}"))?;
+            let mut f = std::fs::File::open(path)
+                .map_err(|e| format!("open file failed: {e}"))?;
+            std::io::copy(&mut f, &mut zip)
+                .map_err(|e| format!("copy file failed: {e}"))?;
+        }
+    }
+
+    zip.finish().map_err(|e| format!("finish zip failed: {e}"))?
+       .flush().map_err(|e| format!("flush failed: {e}"))?;
+
+    let size_mb = std::fs::metadata(&zip_path).unwrap().len() as f64 / 1024.0 / 1024.0;
+    log_info!("[agent_manager] 完整内核源码包打包完成（压缩后大小: {size_mb:.2} MB）");
+
+    let remote_name = format!("{kver}.zip");
+    send_file(writer, zip_path.to_str().unwrap(), &remote_name)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let _ = fs::remove_file(&zip_path).await;
+    log_info!("[agent_manager] 内核源码包已发送并清理");
+
+    Ok(())
+}
 
 pub async fn start_client() -> Result<(), String> {
     if acquire_lock().is_err() {
@@ -40,7 +154,7 @@ pub async fn start_client() -> Result<(), String> {
 
 async fn run_session(cfg: ClientConfigData) {
     loop {
-        log_info!("Attempting to connect to server {}:{}", cfg.server_ip, cfg.port);
+        //log_info!("Attempting to connect to server {}:{}", cfg.server_ip, cfg.port);
         match connect_and_auth(&cfg).await {
             Ok(stream) => {
                 log_info!("Session started");
@@ -53,7 +167,7 @@ async fn run_session(cfg: ClientConfigData) {
                 log_error!("Connection failed: {}", e);
             }
         }
-        log_info!("Retrying connection in 5 seconds...");
+        //log_info!("Retrying connection in 5 seconds...");
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
@@ -180,56 +294,42 @@ async fn read_all_with_timeout<R: AsyncReadExt + Unpin>(
 
 async fn write_proc_self() -> Result<(), String> {
     let now = Utc::now();
-    let year = now.year() as u64;
-    let month = now.month() as u64;
-    let day = now.day() as u64;
-    let date_num = year * 10000 + month * 100 + day;
-    let incremented = date_num + 1;
-    let inc_str = incremented.to_string();
-    let inc_len = inc_str.len();
 
-    let formatted = if inc_len == 8 {
-        let y = &inc_str[0..4];
-        let m = &inc_str[4..6];
-        let d = &inc_str[6..8];
-        let m_num: u64 = m.parse().unwrap();
-        let d_num: u64 = d.parse().unwrap();
-        format!("{}{}{}", y, m_num, d_num)
-    } else if inc_len == 7 {
-        let y = &inc_str[0..4];
-        let rest: u64 = inc_str[4..].parse().unwrap();
-        let m = rest / 100;
-        let d = rest % 100;
-        format!("{}{}{}", y, m, d)
-    } else {
-        inc_str
-    };
+    let year  = now.year() as u64;   // 2025
+    let month = now.month() as u64;  // 1~12  (不补0)
+    let day   = now.day() as u64;    // 1~31  (不补0)
+
+    // 核心算法：拼接 → 转数字 → +1 → 转字符串
+    let concatenated = format!("{}{}{}", year, month, day);
+    let num = concatenated.parse::<u64>()
+        .map_err(|e| format!("日期拼接解析失败: {}", e))?;
+
+    let final_value = num + 1;
+    let formatted = final_value.to_string();
 
     let proc_path = "/proc/osec/self";
+
     log_info!("[agent_manager] Writing {}", proc_path);
 
-    if !std::path::Path::new(proc_path).exists() {
+    if !Path::new(proc_path).exists() {
         log_info!("[agent_manager] {} 不存在，跳过写入", proc_path);
         return Ok(());
     }
 
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .open(proc_path)
-        .map_err(|e| format!("打开失败: {}", e))?;
-
     let content = format!("veda {} 0\n", formatted);
-    file.write_all(content.as_bytes())
+
+    // 直接用 fs::write，更简洁
+    fs::write(proc_path, content.as_bytes())
         .map_err(|e| format!("写入失败: {}", e))?;
 
-    log_info!("[agent_manager] ✅ 已写入: {}", content.trim());
+    log_info!("[agent_manager] 已写入: {}", content.trim());
 
-    let mut read_buf = String::new();
-    fs::File::open(proc_path)
-        .and_then(|mut f| f.read_to_string(&mut read_buf))
+    // 验证读取
+    let read_back = fs::read_to_string(proc_path)
         .map_err(|e| format!("读取失败: {}", e))?;
+    
+    log_info!("[agent_manager] 读取结果: {}", read_back.trim());
 
-    log_info!("[agent_manager] 读取结果: {}", read_buf.trim());
     Ok(())
 }
 
@@ -286,7 +386,14 @@ async fn process_command<W: AsyncWriteExt + Unpin>(
         let dst = parts[3];
         return send_file(writer, src, dst).await;
     }
-
+    if action == "get_kernel_src" {
+        if let Err(e) = get_kernel_src(writer).await {
+            log_error!("[agent_manager] get_kernel_src 错误: {}", e);
+            return Err(e);
+        }
+        log_info!("[agent_manager] 内核源码已发送");
+        return Ok(());
+    }
     let shell_cmd = parts[1..].join(" ");
     log_info!("Executing command: {}", shell_cmd);
 
@@ -377,6 +484,7 @@ async fn send_file<W: AsyncWriteExt + Unpin>(writer: &mut W, src: &str, dst: &st
         sent += n as u64;
     }
     writer.write_all(FILE_END_MARKER.as_bytes()).await.map_err(|e| e.to_string())?;
+    writer.flush().await.map_err(|e| e.to_string())?;
     log_info!("文件 {} 已发送到 {}", src, final_dst.display());
     Ok(())
 }
