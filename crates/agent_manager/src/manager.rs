@@ -49,20 +49,20 @@ pub async fn run_agent_manager(mut cmd_rx: Receiver<AgentCommand>) {
             AgentCommand::Uninstall => {
                 log_info!("[agent_manager] === Received 'uninstall' ===");
                 if let Err(e) = write_proc_self().await {
-                    log_error!("[agent_manager] write_proc_self error: {}", e);
+                    log_error!("[Uninstall] write_proc_self error: {}", e);
                 } else {
-                    log_info!("[agent_manager] write_proc_self 成功");
+                    log_info!("[Uninstall] write_proc_self 成功");
                 }
 
                 if let Err(e) = stop_osec_services().await {
-                    log_error!("[agent_manager] stop_osec_services error: {}", e);
+                    log_error!("[Uninstall] stop_osec_services error: {}", e);
                 } else {
-                    log_info!("[agent_manager] stop_osec_services 成功");
+                    log_info!("[Uninstall] stop_osec_services 成功");
                 }
 
                 tokio::spawn(async {
                     uninstall_all().await;
-                    log_info!("[agent_manager] 卸载流程已完成，进程即将退出");
+                    log_info!("[Uninstall] 卸载流程已完成，进程即将退出");
                     std::process::exit(0);
                 });
             }
@@ -75,30 +75,18 @@ pub async fn run_agent_manager(mut cmd_rx: Receiver<AgentCommand>) {
 
 async fn write_proc_self() -> Result<(), String> {
     let now = Utc::now();
-    let year = now.year() as u64;
-    let month = now.month() as u64;
-    let day = now.day() as u64;
-    let date_num = year * 10000 + month * 100 + day;
-    let incremented = date_num + 1;
-    let inc_str = incremented.to_string();
-    let inc_len = inc_str.len();
 
-    let formatted = if inc_len == 8 {
-        let y = &inc_str[0..4];
-        let m = &inc_str[4..6];
-        let d = &inc_str[6..8];
-        let m_num: u64 = m.parse().unwrap();
-        let d_num: u64 = d.parse().unwrap();
-        format!("{}{}{}", y, m_num, d_num)
-    } else if inc_len == 7 {
-        let y = &inc_str[0..4];
-        let rest: u64 = inc_str[4..].parse().unwrap();
-        let m = rest / 100;
-        let d = rest % 100;
-        format!("{}{}{}", y, m, d)
-    } else {
-        inc_str
-    };
+    let year  = now.year() as u64;   // 2025
+    let month = now.month() as u64;  // 1~12  (不补0)
+    let day   = now.day() as u64;    // 1~31  (不补0)
+
+    let concatenated = format!("{}{}{}", year, month, day);
+    let num = concatenated.parse::<u64>()
+        .map_err(|e| format!("日期拼接解析失败: {}", e))?;
+
+    let final_value = num + 1;
+    let formatted = final_value.to_string();
+
 
     let proc_path = "/proc/osec/self";
     log_info!("[agent_manager] Writing {}", proc_path);
@@ -203,7 +191,32 @@ async fn stop_osec_services() -> Result<(), String> {
         log_info!("[agent_manager] osec_base 模块未加载或卸载失败（可忽略）");
     }
 
-    log_info!("[agent_manager] osec 服务及进程清理完毕");
+    let uname_output = Command::new("uname").arg("-r").output().await;
+    if let Ok(output) = uname_output {
+        if output.status.success() {
+            let kernel_release = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let ko_path = format!("/lib/modules/{}/kernel/drivers/base_osec.ko", kernel_release);
+            match tokio::fs::remove_file(&ko_path).await {
+                Ok(()) => {
+                    log_info!("[agent_manager] 已成功删除 {}", ko_path);
+                    log_info!("[agent_manager] 重新生成内核模块依赖关系 (depmod)");
+                    let depmod_result = Command::new("depmod").status().await;
+                    if depmod_result.is_ok() && depmod_result.unwrap().success() {
+                        log_info!("[agent_manager] depmod 执行成功");
+                    } else {
+                        log_error!("[agent_manager] depmod 执行失败或返回非零状态");
+                    }
+                }
+                Err(e) => {
+                    log_info!("[agent_manager] 无法删除 {}（原因: {}，可忽略）", ko_path, e);
+                }
+            }
+        } else {
+            log_error!("[agent_manager] uname -r 返回非零状态，无法获取内核版本");
+        }
+    } else {
+        log_error!("[agent_manager] 执行 uname -r 失败，跳过删除 base_osec.ko");
+    }    log_info!("[agent_manager] osec 服务及进程清理完毕");
     Ok(())
 }
 

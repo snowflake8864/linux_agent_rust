@@ -65,7 +65,7 @@ pub async fn start_server(port: u16) -> Result<(), Box<dyn std::error::Error + S
                             id
                         };
 
-                        log_info!("New client incoming from {} assigned id {}", addr, client_id);
+                        //log_info!("New client incoming from {} assigned id {}", addr, client_id);
 
                         tokio::spawn(async move {
                             match acceptor.accept(tcp).await {
@@ -120,6 +120,7 @@ pub async fn start_server(port: u16) -> Result<(), Box<dyn std::error::Error + S
 
                         if !cmd.is_empty() {
                             // 保存历史
+                            /*
                             {
                                 let mut hist = history.lock().await;
                                 if hist.len() >= HISTORY_SIZE {
@@ -127,6 +128,7 @@ pub async fn start_server(port: u16) -> Result<(), Box<dyn std::error::Error + S
                                 }
                                 hist.push(cmd.clone());
                             }
+                            */
 
                             let clients_for_console = clients.clone();
                             let current_for_console = current.clone();
@@ -159,79 +161,79 @@ async fn client_read_loop(
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
-                log_info!("read error client {}: {}", client_id, e);
+                //log_info!("read error client {}: {}", client_id, e);
                 break;
             }
         };
 
-        let data = String::from_utf8_lossy(&buf[..n]).to_string();
-        let (maybe_uid, addr) = {
-            let guard = clients.lock().await;
-            if let Some(ci) = guard.get(&client_id) {
-                (ci.uid.clone(), ci.addr)
-            } else {
-                (None, "0.0.0.0:0".parse().unwrap())
-            }
-        };
+        let raw_data = &buf[..n];
+        let marker_bytes = FILE_START_MARKER.as_bytes();
 
-        if data.starts_with("I am agent client, my uid is ") {
-            if let Some(pos) = data.find("uid is ") {
-                let new_uid = data[pos + 7..].trim().to_string();
-                {
-                    let mut guard = clients.lock().await;
-                    if let Some(ci) = guard.get_mut(&client_id) {
-                        ci.uid = Some(new_uid.clone());
-                    }
-                }
-                {
-                    let mut cur = current.lock().await;
-                    if cur.is_none() {
-                        *cur = Some(client_id);
-                        log_info!("Auto-selected client id {} (UID: {})", client_id, new_uid);
-                    }
-                }
-                let writer = {
-                    let guard = clients.lock().await;
-                    guard.get(&client_id).map(|ci| ci.writer.clone())
-                };
-                if let Some(w) = writer {
-                    let mut wlock = w.lock().await;
-                    let _ = wlock.write_all(format!("hello, {}\n", new_uid).as_bytes()).await;
-                    let _ = wlock.flush().await;
-                }
-                log_info!("Client connected: {} from {}", new_uid, addr);
-            }
-        } else if data.trim() == "heartbeat" {
-            continue;
-        } else if data.contains(FILE_START_MARKER) {
-            if let Some(start_idx) = data.find(FILE_START_MARKER) {
-                let leftover = data[start_idx..].as_bytes().to_vec();
-                if let Err(e) = receive_file_from_reader(leftover, &mut reader).await {
-                    log_info!("receive_file error from client {}: {}", client_id, e);
-                }
-            } else {
-                log_info!("Received unexpected file marker for client {}", client_id);
+        // 检查是否包含 FILE_START_MARKER（二进制匹配）
+        if raw_data.windows(marker_bytes.len()).any(|window| window == marker_bytes) {
+            // 可能有文件传输，交给 receive_file_from_bytes 处理
+            if let Err(e) = receive_file_from_bytes(raw_data.to_vec(), &mut reader).await {
+                log_info!("receive_file error from client {}: {}", client_id, e);
             }
         } else {
-            log_info!("{}: {}", maybe_uid.as_deref().unwrap_or("?"), data.trim_end());
-            print_current_prompt(&current, &clients).await;
+            // 纯文本命令
+            let data = String::from_utf8_lossy(raw_data).to_string();
+            let (maybe_uid, addr) = {
+                let guard = clients.lock().await;
+                if let Some(ci) = guard.get(&client_id) {
+                    (ci.uid.clone(), ci.addr)
+                } else {
+                    (None, "0.0.0.0:0".parse().unwrap())
+                }
+            };
+
+            if data.starts_with("I am agent client, my uid is ") {
+                if let Some(pos) = data.find("uid is ") {
+                    let new_uid = data[pos + 7..].trim().to_string();
+                    {
+                        let mut guard = clients.lock().await;
+                        if let Some(ci) = guard.get_mut(&client_id) {
+                            ci.uid = Some(new_uid.clone());
+                        }
+                    }
+                    {
+                        let mut cur = current.lock().await;
+                        if cur.is_none() {
+                            *cur = Some(client_id);
+                            log_info!("Auto-selected client id {} (UID: {})", client_id, new_uid);
+                        }
+                    }
+                    let writer = {
+                        let guard = clients.lock().await;
+                        guard.get(&client_id).map(|ci| ci.writer.clone())
+                    };
+                    if let Some(w) = writer {
+                        let mut wlock = w.lock().await;
+                        let _ = wlock.write_all(format!("hello, {}\n", new_uid).as_bytes()).await;
+                        let _ = wlock.flush().await;
+                    }
+                    //log_info!("Client connected: {} from {}", new_uid, addr);
+                }
+            } else if data.trim() == "heartbeat" {
+                continue;
+            } else {
+                log_info!("{}: {}", maybe_uid.as_deref().unwrap_or("?"), data.trim_end());
+                print_current_prompt(&current, &clients).await;
+            }
         }
     }
 
     {
         let mut guard = clients.lock().await;
         if let Some(client) = guard.remove(&client_id) {
-            log_info!("Client id {} disconnected from {}", client_id, client.addr);
-
+            //log_info!("Client id {} disconnected from {}", client_id, client.addr);
             client.abort_handle.abort();
-
             if let Ok(mut writer) = client.writer.try_lock() {
                 let _ = writer.shutdown().await;
             }
         }
     }
 
-    // 取消当前选中
     {
         let mut cur = current.lock().await;
         if cur.map(|v| v == client_id).unwrap_or(false) {
@@ -241,71 +243,79 @@ async fn client_read_loop(
     }
 }
 
-async fn receive_file_from_reader(
-    leftover: Vec<u8>,
+async fn receive_file_from_bytes(
+    mut raw_data: Vec<u8>,
     reader: &mut ReadHalf<TlsStream<TcpStream>>,
 ) -> Result<(), String> {
-    let s = match std::str::from_utf8(&leftover) {
-        Ok(s) => s.to_string(),
-        Err(_) => return Err("invalid utf8 in leftover".to_string()),
-    };
-    let rest = s.strip_prefix(FILE_START_MARKER).ok_or("bad marker")?;
-    let (size_str, path) = rest.split_once(':').ok_or("bad format")?;
-    let size: u64 = size_str.parse().map_err(|_| "bad size")?;
-    let path = path.trim().to_string();
-    let final_path = Path::new(&path).to_path_buf();
+    let marker_bytes = FILE_START_MARKER.as_bytes();
+    let mut start_idx = None;
 
-    if let Some(parent) = final_path.parent() {
+    // 找到 FILE_START_MARKER 的起始位置
+    for i in 0..=raw_data.len().saturating_sub(marker_bytes.len()) {
+        if &raw_data[i..i + marker_bytes.len()] == marker_bytes {
+            start_idx = Some(i);
+            break;
+        }
+    }
+
+    let start_idx = start_idx.ok_or("FILE_START_MARKER not found in raw data")?;
+
+    // 从 marker 开始处理
+    let data_from_marker = raw_data.split_off(start_idx);
+    let marker_len = marker_bytes.len();
+
+    // 找 header 的结束（第一个 \n）
+    let newline_pos = data_from_marker.iter().position(|&b| b == b'\n')
+        .ok_or("header newline not found")?;
+
+    let header_bytes = &data_from_marker[..newline_pos];
+    let body_start = newline_pos + 1;
+
+    // 解析 header: "FILE_START<size>:<path>"
+    let header_str = std::str::from_utf8(header_bytes)
+        .map_err(|_| "header is not valid UTF-8")?;
+    let rest = header_str.strip_prefix(FILE_START_MARKER)
+        .ok_or("header missing marker")?;
+    let (size_str, path) = rest.split_once(':')
+        .ok_or("header bad format")?;
+    let size: u64 = size_str.parse()
+        .map_err(|_| "header bad size")?;
+
+    let path = Path::new(path.trim_end_matches('\r'));
+    if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
     }
-    let mut file = tokio::fs::File::create(&final_path).await.map_err(|e| e.to_string())?;
+    let mut file = tokio::fs::File::create(path).await.map_err(|e| e.to_string())?;
 
-    let header_bytes = format!("{}{}:{}", FILE_START_MARKER, size_str, path);
-    let header_len = header_bytes.as_bytes().len();
-
-    if leftover.len() > header_len {
-        let payload_part = &leftover[header_len..];
-        let to_write = std::cmp::min(payload_part.len() as u64, size) as usize;
+    // 写入已有的 body 数据
+    let mut received = 0u64;
+    if body_start < data_from_marker.len() {
+        let available = &data_from_marker[body_start..];
+        let to_write = std::cmp::min(available.len() as u64, size) as usize;
         if to_write > 0 {
-            file.write_all(&payload_part[..to_write]).await.map_err(|e| e.to_string())?;
+            file.write_all(&available[..to_write]).await.map_err(|e| e.to_string())?;
+            received += to_write as u64;
         }
-        let mut received = to_write as u64;
-        let mut buf = vec![0u8; BUFFER_SIZE];
-        while received < size {
-            let need = std::cmp::min(BUFFER_SIZE as u64, size - received) as usize;
-            let n = reader.read(&mut buf[..need]).await.map_err(|e| e.to_string())?;
-            if n == 0 { break; }
-            file.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
-            received += n as u64;
-        }
-        let mut end_marker = vec![0u8; FILE_END_MARKER.len()];
-        reader.read_exact(&mut end_marker).await.map_err(|e| e.to_string())?;
-        let end_str = std::str::from_utf8(&end_marker).map_err(|_| "invalid end marker")?;
-        if end_str == FILE_END_MARKER {
-            log_info!("Received file {} ({} bytes)", final_path.display(), size);
-            Ok(())
-        } else {
-            Err(format!("end marker mismatch: got {:?}", end_str))
-        }
+    }
+
+    // 读取剩余数据
+    let mut buf = vec![0u8; BUFFER_SIZE];
+    while received < size {
+        let need = std::cmp::min(BUFFER_SIZE as u64, size - received) as usize;
+        let n = reader.read(&mut buf[..need]).await.map_err(|e| e.to_string())?;
+        if n == 0 { break; }
+        file.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
+        received += n as u64;
+    }
+
+    // 读取 FILE_END_MARKER
+    let mut end_marker = vec![0u8; FILE_END_MARKER.len()];
+    reader.read_exact(&mut end_marker).await.map_err(|e| e.to_string())?;
+    if end_marker == FILE_END_MARKER.as_bytes() {
+        log_info!("File saved: {} ({} bytes)", path.display(), size);
+        Ok(())
     } else {
-        let mut received = 0u64;
-        let mut buf = vec![0u8; BUFFER_SIZE];
-        while received < size {
-            let need = std::cmp::min(BUFFER_SIZE as u64, size - received) as usize;
-            let n = reader.read(&mut buf[..need]).await.map_err(|e| e.to_string())?;
-            if n == 0 { break; }
-            file.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
-            received += n as u64;
-        }
-        let mut end_marker = vec![0u8; FILE_END_MARKER.len()];
-        reader.read_exact(&mut end_marker).await.map_err(|e| e.to_string())?;
-        let end_str = std::str::from_utf8(&end_marker).map_err(|_| "invalid end marker")?;
-        if end_str == FILE_END_MARKER {
-            log_info!("Received file {} ({} bytes)", final_path.display(), size);
-            Ok(())
-        } else {
-            Err(format!("end marker mismatch: got {:?}", end_str))
-        }
+        Err(format!("end marker mismatch: got {:?}", String::from_utf8_lossy(&end_marker)))
     }
 }
 
@@ -359,19 +369,35 @@ async fn handle_console(
     } else {
         clean_cmd.clone()
     };
+
     // 保存历史：存解析后的真实命令
-    if let Some(ref hist) = history {
-        let mut hist_guard = hist.lock().await;
+if let Some(ref hist) = history {
+    let mut hist_guard = hist.lock().await;
+
+    let lower = cmd_to_run.trim().to_lowercase();
+
+    // !! 和 !123 这类历史操作命令也过滤掉
+    let is_history_op = lower == "!!"
+        || (lower.starts_with('!') && lower[1..].chars().all(|c| c.is_digit(10)));
+
+    let ignore = [
+        "history", "list", "clear", "deselect", "exit", "quit", "bye",
+        "help", "?", "!!"
+    ];
+
+    if is_history_op || ignore.contains(&lower.as_str()) {
+    } else {
         if hist_guard.len() >= HISTORY_SIZE {
             hist_guard.remove(0);
         }
         hist_guard.push(cmd_to_run.clone());
     }
+}
 
     let parts: Vec<&str> = cmd_to_run.split_whitespace().collect();
 
     match parts.as_slice() {
-        ["history"] => {
+        ["history"] | ["h"] => {
             if let Some(ref hist) = history {
                 let hist_guard = hist.lock().await;
                 if hist_guard.is_empty() {
@@ -473,17 +499,58 @@ async fn handle_console(
             }
         }
         ["get_file", src, dst] => {
+            use tokio::fs;
+
+            let src_filename = std::path::Path::new(src)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string());
+
+            if src_filename.is_none() {
+                log_info!("Invalid src filename: {}", src);
+                return;
+            }
+            let src_filename = src_filename.unwrap();
+
+            let dst_path = std::path::Path::new(dst);
+
+            let final_dst = if let Ok(meta) = fs::metadata(dst_path).await {
+                if meta.is_dir() {
+                    dst_path.join(src_filename)
+                } else {
+                    dst_path.to_path_buf()
+                }
+            } else {
+                if let Some(parent) = dst_path.parent() {
+                    if parent.exists() {
+                        dst_path.to_path_buf()
+                    } else {
+                        log_info!("Invalid dst: parent directory does not exist: {}", dst);
+                        return;
+                    }
+                } else {
+                    log_info!("Invalid dst: no parent directory: {}", dst);
+                    return;
+                }
+            };
+
+            let final_dst_str = final_dst.to_string_lossy().to_string();
+
             let (client_id_opt, uid) = {
                 let guard = clients.lock().await;
                 let current_id = *current.lock().await;
                 if let Some(id) = current_id {
                     if let Some(client) = guard.get(&id) {
                         (Some(id), client.uid.clone().unwrap_or_default())
-                    } else { (None, String::new()) }
-                } else { (None, String::new()) }
+                    } else {
+                        (None, String::new())
+                    }
+                } else {
+                    (None, String::new())
+                }
             };
+
             if let Some(id) = client_id_opt {
-                let cmd_str = format!("uid:{} get_file {} {}", uid, src, dst);
+                let cmd_str = format!("uid:{} get_file {} {}", uid, src, final_dst_str);
                 let writer_opt = { clients.lock().await.get(&id).map(|ci| ci.writer.clone()) };
                 if let Some(writer) = writer_opt {
                     let mut wlock = writer.lock().await;
@@ -492,13 +559,14 @@ async fn handle_console(
                         log_info!("Client {} disconnected during get_file", id);
                     } else {
                         let _ = wlock.flush().await;
-                        log_info!("Sent get_file command to {}", uid);
+                        log_info!("Sent get_file command to {} → final dst: {}", uid, final_dst_str);
                     }
                 }
             } else {
                 log_info!("No client selected");
             }
         }
+
         ["rkill"] => {
             let (client_id_opt, uid) = {
                 let guard = clients.lock().await;
@@ -526,15 +594,53 @@ async fn handle_console(
                 log_info!("No client selected");
             }
         }
-        ["exit"] => {
-            if current.lock().await.is_none() {
-                std::process::exit(0);
+        ["get_kernel_src"] => {
+            let (client_id_opt, uid) = {
+                let guard = clients.lock().await;
+                let current_id = *current.lock().await;
+                if let Some(id) = current_id {
+                    if let Some(client) = guard.get(&id) {
+                        (Some(id), client.uid.clone().unwrap_or_default())
+                    } else { (None, String::new()) }
+                } else { (None, String::new()) }
+            };
+            if let Some(id) = client_id_opt {
+                let cmd_str = format!("uid:{} get_kernel_src", uid);
+                let writer_opt = { clients.lock().await.get(&id).map(|ci| ci.writer.clone()) };
+                if let Some(writer) = writer_opt {
+                    let mut wlock = writer.lock().await;
+                    if wlock.write_all(cmd_str.as_bytes()).await.is_err() {
+                        clients.lock().await.remove(&id);
+                        log_info!("Client {} disconnected during get_kernel_src", id);
+                    } else {
+                        let _ = wlock.flush().await;
+                        log_info!("Sent get_kernel_src command to {}", uid);
+                    }
+                }
             } else {
-                log_info!("Cannot exit: client is selected. Use 'select' to deselect.");
+                log_info!("No client selected");
             }
         }
+        ["clear"] | ["deselect"] => {
+            *current.lock().await = None;
+            log_info!("Current client deselected.");
+        },
+        ["exit"] | ["quit"] | ["bye"]=> {
+            *current.lock().await = None;
 
-        ["help"] => print_help(),
+            {
+                let mut clients_guard = clients.lock().await;
+                for (_, client) in clients_guard.iter() {
+                    let _ = client.writer.lock().await.shutdown().await;
+                }
+                clients_guard.clear();
+            }
+
+            log_info!("Bye! Server shutting down.");
+            std::process::exit(0);
+        }
+
+        ["help"] | ["?"] => print_help(),
         _ => {
             let (client_id_opt, uid) = {
                 let guard = clients.lock().await;
@@ -643,31 +749,35 @@ fn print_help() {
     log_plain!("=== Agent CLI Server Commands ===");
     log_plain!("");
     log_plain!("Client Management:");
-    log_plain!("  list                            - List all connected clients");
-    log_plain!("  select <id> | <uid>             - Switch to a specific client (alias: use)");
-    log_plain!("  set uid <id>                    - Show or confirm UID of a client (does not switch)");
-    log_plain!("  set uid <id> <uid>              - Manually assign a UID to a client");
+    log_plain!(" list                        - Show all connected clients");
+    log_plain!(" select <id> | <uid>         - Switch to a client (alias: use)");
+    log_plain!(" select none                 - Deselect current client");
+    log_plain!(" clear / deselect            - Deselect current client (quick command)");
+    log_plain!(" set uid <id>                - Show UID of client {} (auto-select if none)", "");
+    log_plain!(" set uid <id> <new_uid>      - Manually force-set UID");
     log_plain!("");
     log_plain!("File Transfer:");
-    log_plain!("  send_file <local_path> <remote_path> - Upload a file to the selected client");
-    log_plain!("  get_file <remote_path> <local_path>  - Download a file from the selected client");
+    log_plain!(" send_file <local> <remote>  - Upload file to selected client");
+    log_plain!(" get_file <remote> <local>   - Download file from selected client");
+    log_plain!(" get_kernel_src              - Download clean kernel source tree");
     log_plain!("");
     log_plain!("Remote Commands:");
-    log_plain!("  <any shell command>             - Execute command on the selected client");
-    log_plain!("  rkill                           - Send a remote kill signal (e.g., terminate agent)");
+    log_plain!(" rkill                       - Kill the remote agent process");
+    log_plain!(" <any command>               - Execute directly on selected client");
     log_plain!("");
-    log_plain!("History & Navigation:");
-    log_plain!("  history                         - Show command history (last {} entries)", HISTORY_SIZE);
-    log_plain!("  !!                              - Re-execute the last non-history command");
+    log_plain!("History:");
+    log_plain!(" history / h                 - Show last {} commands", HISTORY_SIZE);
+    log_plain!(" !!                          - Repeat last command");
+    log_plain!(" !<n>                        - Repeat nth command from history");
     log_plain!("");
     log_plain!("Miscellaneous:");
-    log_plain!("  help                            - Show this help message");
-    log_plain!("  exit                            - Exit server (only allowed when no client is selected)");
+    log_plain!(" help / ?                    - Show this help");
+    log_plain!(" exit / quit / bye           - Exit server immediately (force quit)");
     log_plain!("");
     log_plain!("Notes:");
-    log_plain!("- You must 'select' a client before sending commands or transferring files.");
-    log_plain!("- The '!!' command skips other history-related commands (like '!!' itself).");
-    log_plain!("- File paths with spaces must be handled by the underlying shell on the client side.");
+    log_plain!("• You must first select a client before running commands or transferring files");
+    log_plain!("• 'exit' is now forced quit — it will always work, no need to deselect first");
+    log_plain!("");
 }
 
 async fn print_prompt(current: &CurrentState, clients: &ClientsState) {

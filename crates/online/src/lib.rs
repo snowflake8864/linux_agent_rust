@@ -76,6 +76,7 @@ impl BaseOnline {
             macid: cfg.macid.clone(),
             ip: cfg.ips.clone(),
             ver: cfg.ver.clone(),
+            //ver: "3.0.1_R3_B4".to_string(), //c++ to rust
             type_: 1,
             os: cfg.os.clone(),
             memsize: cfg.memsize.clone(),
