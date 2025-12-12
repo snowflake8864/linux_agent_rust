@@ -46,6 +46,8 @@ pub struct NetInfoConfig {
     pub baseline_time: u32,
     pub outreach_switch: bool,
     pub outreach_time: u32,
+    pub hardware_switch: bool,
+    pub hardware_time:u32,
     pub user_id: String,
     //=====host info
     pub dev_uid: String,
@@ -270,6 +272,15 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("SERVERINFO", "SYSLOG_PROCESS_SWITCH") {
             config.syslog_process_switch = matches!(value.trim(), "1");
         }
+
+        if let Some(value) = ini.get("SERVERINFO", "HARDWARE_SWITCH") {
+            config.hardware_switch = matches!(value.trim(), "1");
+        }
+
+        if let Some(value) = ini.get("SERVERINFO", "HARDWARE_TIME") {
+            config.hardware_time = value.parse().unwrap_or_default();
+        }
+
         if let Some(value) = ini.get("SERVERINFO", "BASELINE_SWITCH") {
             config.baseline_switch = matches!(value.trim(), "1");
         }
@@ -355,6 +366,8 @@ impl NetInfoConfig {
         writeln!(file, "OFFLINE_MODE={}", self.is_offline_mode as u8)?;
         writeln!(file, "BASELINE_SWITCH={}", self.baseline_switch as u8)?;
         writeln!(file, "BASELINE_TIME={}", self.baseline_time)?;
+        writeln!(file, "HARDWARE_SWITCH={}", self.hardware_switch as u8)?;
+        writeln!(file, "HARDWARE_TIME={}", self.hardware_time)?;
         writeln!(file, "OUTREACH_SWITCH={}", self.outreach_switch as u8)?;
         writeln!(file, "OUTREACH_TIME={}", self.outreach_time)?;
         writeln!(file, "VERSION={}", self.ver)?;

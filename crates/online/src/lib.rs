@@ -4,7 +4,7 @@ use serde::{Serialize, Deserialize};
 use std::pin::Pin;
 use common::manager::boot::BootManager;
 use std::future::Future;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, Interval};
 use tokio::sync::mpsc;
 use std::fs;
 use chrono::Utc;
@@ -139,7 +139,6 @@ pub trait StartOnline {
 impl StartOnline for BootManager {
     fn start_services(&mut self, token_tx: mpsc::Sender<String>, mut host_is_offline_rx: mpsc::Receiver<bool>) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
-            let mut interval = interval(Duration::from_secs(30));
 
             loop {
                 let base_url = self.get_base_url();
@@ -152,6 +151,7 @@ impl StartOnline for BootManager {
                     }
                 };
 
+                //let mut local_interval = interval(Duration::from_secs(30));
                 match BaseOnline::run(&mut net_client).await {
                     Ok(token) => {
                         if let Err(err) = token_tx.send(token.clone()).await {
@@ -161,9 +161,51 @@ impl StartOnline for BootManager {
                         self.set_token(token.clone()).await;
                         log_info!("Token 已成功发送！");
                         log_info!("开始监听 host_is_offline 信号和系统资源...");
+
+                        async fn upload_once(net_client: &mut NetClient, token: &String) {
+                            if let Some(json_data) = get_system_metrics() {
+                                let url = format!("{}/v1/puthardwareinfo",
+                                    net_client.get_base_url().unwrap_or_default());
+
+                                match net_client.post_data_async(
+                                    &url,
+                                    &json_data,
+                                    Duration::from_secs(180),
+                                    Some(token)
+                                ).await {
+                                    Ok(resp) => log_info!("hardware upload response: {}", resp),
+                                    Err(err) => eprintln!("发送指标失败: {}", err),
+                                }
+                            } else {
+                                eprintln!("获取系统指标失败");
+                            }
+                        }
+                        let mut hardware_interval: Option<Interval> = None;
+                        let mut hardware_enabled = false;
                         loop {
+
+                            let (switch, time_secs) = self.get_hardware_info();
+                            if switch && time_secs > 0 {
+                                if !hardware_enabled || hardware_interval.is_none() {
+                                    log_info!("启用 hardware 拉取，间隔: {} 秒", time_secs);
+                                    hardware_interval = Some(interval(Duration::from_secs(time_secs as u64)));
+                                    hardware_enabled = true;
+                                    upload_once(&mut net_client, &token).await;
+                                }
+                            } else if hardware_enabled {
+                                log_info!("停用 hardware 拉取");
+                                hardware_interval = None;
+                                hardware_enabled = false;
+                            }
+
                             tokio::select! {
-                                _ = interval.tick() => {
+                                _ = async {
+                                    if let Some(ref mut bi) = hardware_interval {
+                                        bi.tick().await
+                                    } else {
+                                        std::future::pending().await
+                                    }
+                                }, if hardware_interval.is_some() => {
                                     if let Some(json_data) = get_system_metrics() {
 
                                         // 发送到服务器
@@ -174,13 +216,14 @@ impl StartOnline for BootManager {
                                             Duration::from_secs(180),
                                             Some(&token)
                                         ).await {
-                                            Ok(response) => {},
+                                            Ok(response) => {/*log_info!("hardware upload response:{}",response)*/},
                                             Err(err) => eprintln!("发送指标失败: {}", err),
                                         }
                                     } else {
                                         eprintln!("获取系统指标失败");
                                     }
                                 }
+
                                 result = host_is_offline_rx.recv() => {
                                     match result {
                                         Some(true) => {
@@ -188,10 +231,10 @@ impl StartOnline for BootManager {
                                             break;
                                         }
                                         Some(false) => {
-                                            println!("收到 host_is_offline 为 false 的信号，继续监听...");
+                                            log_info!("收到 host_is_offline 为 false 的信号，继续监听...");
                                         }
                                         None => {
-                                            println!("host_is_offline_rx 信号通道已关闭，退出任务。");
+                                            log_info!("host_is_offline_rx 信号通道已关闭，退出任务。");
                                             return Ok("后台任务已启动.".to_string());
                                         }
                                     }
