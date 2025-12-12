@@ -451,17 +451,14 @@ fn update_config_from_json(&mut self, conf: &serde_json::Map<String, Value>) -> 
     }
 
     try_update!(u32 cron_time,          "crontime");
-    try_update!(u32 baseline_time,      "baseline_time");
     try_update!(u32 log_proto,          "logproto");
     try_update!(u32 log_sent,           "logsent");
     try_update!(u32 cli_port,           "debug_switch");
     try_update!(u32 module_switch,      "module_switch");
-
     try_update!(bool extortion_protect,     "extortion_protect");
     try_update!(bool extortion_switch,      "extortion_switch");
     try_update!(bool file_protect,          "file_protect");
     try_update!(bool file_switch,           "file_switch");
-    try_update!(bool baseline_switch,       "baseline_switch");
     try_update!(bool self_protect_switch,   "self_protect_switch");
     try_update!(bool open_port_switch,      "open_port_switch");
     try_update!(bool dynamic_switch,        "dynamic_switch");
@@ -476,6 +473,12 @@ fn update_config_from_json(&mut self, conf: &serde_json::Map<String, Value>) -> 
     try_update!(bool syslog_process_switch,"syslog_process_switch");
     try_update!(u32 outreach_time,          "outreach_time");
     try_update!(bool outreach_switch,       "outreach_switch");
+    try_update!(bool baseline_switch,       "baseline_switch");
+    try_update!(u32 baseline_time,      "baseline_time");
+    try_update!(bool hardware_switch,       "hardware_switch");
+    try_update!(u32 hardware_time,      "hardware_time");
+
+
     if conf.contains_key("logipport") {
         new_cfg.log_ip_port = conf["logipport"]
             .as_str()

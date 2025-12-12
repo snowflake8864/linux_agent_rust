@@ -134,6 +134,11 @@ impl BootManager {
         (netinfocfg.baseline_switch, netinfocfg.baseline_time)
     }
 
+    pub fn get_hardware_info(&self) -> (bool,u32) {
+        let netinfocfg = NETINFO_CONFIG.lock().unwrap(); 
+        (netinfocfg.hardware_switch, netinfocfg.hardware_time)
+    }
+
     pub fn get_outreach_info(&self) -> (bool,u32) {
         let netinfocfg = NETINFO_CONFIG.lock().unwrap(); 
         (netinfocfg.outreach_switch, netinfocfg.outreach_time)
