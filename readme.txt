@@ -99,3 +99,7 @@ cross build --target mips64el-unknown-linux-gnuabi64 :ml-citation{ref="4" data="
 
 
 此方法可隔离主机环境差异，自动处理工具链依赖。
+
+
+sudo apt update
+sudo apt install gcc-mipsel-linux-gnu g++-mipsel-linux-gnu

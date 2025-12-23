@@ -9,13 +9,13 @@ while true; do
     # 检查MagicArmor_0进程
     if ! pgrep -f "MagicArmor_0" > /dev/null; then
 
-        /opt/osec/MagicArmor_0 &
+        /opt/osec/MagicArmor_0 >/dev/null 2>&1 &
         echo "[$(date)] MagicArmor_0 started"
     fi
 
     # 检查MagicArmor_cli进程
     if ! pgrep -f "MagicArmorAgent" > /dev/null; then
-        /opt/osec/MagicArmorAgent &
+        /opt/osec/MagicArmorAgent >/dev/null 2>&1 &
         echo "[$(date)] MagicArmorAgent started"
     fi
 

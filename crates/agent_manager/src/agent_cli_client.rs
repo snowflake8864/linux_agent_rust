@@ -2,7 +2,7 @@
 use crate::common::*;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, AsyncBufReadExt};
-use logging::{log_info, log_error};
+use logging::{log_info, log_error,log_warn};
 use tokio_rustls::TlsConnector;
 use rustls::{ClientConfig, RootCertStore};
 use std::sync::Arc;
@@ -16,11 +16,13 @@ use std::{
 };
 use tokio::process::Command;
 use uname::uname;
+use walkdir::WalkDir;
+use zip::write::FileOptions;
+use zip::ZipWriter;
+
+
 async fn make_zip(src_dir: &Path, dst_zip: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use std::fs;
-    use walkdir::WalkDir;
-    use zip::write::FileOptions;
-    use zip::ZipWriter;
 
     let file = fs::File::create(dst_zip)?;
     let mut zip = ZipWriter::new(file);
@@ -56,6 +58,7 @@ async fn make_zip(src_dir: &Path, dst_zip: &Path) -> Result<(), Box<dyn std::err
     zip.finish()?.flush()?;
     Ok(())
 }
+/*
 pub async fn get_kernel_src<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
 ) -> Result<(), String> {
@@ -127,6 +130,87 @@ pub async fn get_kernel_src<W: AsyncWriteExt + Unpin>(
 
     Ok(())
 }
+*/
+pub async fn get_kernel_src<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut W,
+) -> Result<(), String> {
+
+    let info = uname().map_err(|e| format!("uname failed: {e}"))?;
+    let kver = info.release.as_str();
+
+    let modules_root = PathBuf::from("/lib/modules");
+    let modules_dir = modules_root.join(kver);
+
+    if !modules_dir.exists() {
+        return Err(format!(
+            "kernel modules directory not found: {:?}",
+            modules_dir
+        ));
+    }
+
+    let zip_name = format!("{kver}.zip");
+    let zip_path = modules_root.join(&zip_name); 
+
+    if zip_path.exists() {
+        fs::remove_file(&zip_path)
+            .map_err(|e| format!("remove old zip failed: {e}"))?;
+    }
+
+    log_info!(
+        "[agent_manager] 在 /lib/modules 下打包 {} → {}",
+        kver,
+        zip_name
+    );
+
+    let status = Command::new("zip")
+        .current_dir(&modules_root)
+        .arg("-r")
+        .arg(&zip_name)
+        .arg(kver)
+        // --- 排除模块 ---
+        .arg("-x").arg("*.ko")
+        .arg("-x").arg("*.ko.*")
+        // --- 排除无用大文件 ---
+        .arg("-x").arg("*/vmlinuz")
+        .arg("-x").arg("*/System.map")
+        .arg("-x").arg("*/.vmlinuz.hmac")
+        .arg("-x").arg("*/symvers.gz")
+        // --- 排除运行时目录 ---
+        .arg("-x").arg("*/vdso/*")
+        .arg("-x").arg("*/dtb/*")
+        .arg("-x").arg("*/updates/*")
+        .arg("-x").arg("*/weak-updates/*")
+        .arg("-x").arg("*/source/*")
+        .arg("-x").arg("*/extra/*")
+        .status()
+        .await
+        .map_err(|e| format!("failed to exec zip: {e}"))?;
+
+
+
+    if !status.success() {
+        return Err(format!("zip command failed with status: {status}"));
+    }
+
+    log_info!("[agent_manager] 打包完成，开始发送");
+
+    send_file(
+        writer,
+        zip_path
+            .to_str()
+            .ok_or("invalid zip path")?,
+        &zip_name,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let _ = fs::remove_file(&zip_path);
+
+    log_info!("[agent_manager] 内核包已发送并清理");
+
+    Ok(())
+}
+
 
 pub async fn start_client() -> Result<(), String> {
     if acquire_lock().is_err() {
