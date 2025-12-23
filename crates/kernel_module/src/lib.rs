@@ -19,6 +19,18 @@ impl LoadKernelDriver for BootManager {
             let kernel_version = get_kernel_version()?;
             log_info!("Current kernel version: {}", kernel_version);
 
+            if is_running_in_container() {
+                log_warn!("Detected container environment, skip kernel module loading");
+
+                if is_driver_loaded() {
+                    log_info!("osec_base already loaded on host kernel");
+                    return Ok(String::new());
+                } else {
+                    log_warn!("osec_base not loaded, but container cannot load kernel module");
+                    return Ok(String::new());
+                }
+            }
+
             if let Err(e) = cleanup_old_module_in_lib(&kernel_version) {
                 log_error!("Warning during cleanup: {}", e);
             }
@@ -294,6 +306,13 @@ pub async fn try_load_driver_with_cache(
     kernel_version: &str,
     failed_drivers: &mut HashSet<PathBuf>,
 ) -> Result<String, String> {
+    if is_running_in_container() {
+        return Err("Kernel module loading disabled in container".into());
+    }
+
+    if !has_modprobe() {
+        return Err("modprobe not found on system".into());
+    }
     let original_selinux_state = get_and_disable_selinux();
 
     // 复制 /proc/kallsyms
@@ -357,3 +376,27 @@ fn is_driver_loaded_from_system_path(kernel_version: &str) -> bool {
     let system_ko_path = format!("/lib/modules/{}/kernel/drivers/osec_base.ko", kernel_version);
     Path::new(&system_ko_path).exists()
 }
+
+fn is_running_in_container() -> bool {
+    // Docker / containerd / k8s 都能命中
+    if let Ok(cgroup) = fs::read_to_string("/proc/1/cgroup") {
+        return cgroup.contains("docker")
+            || cgroup.contains("kubepods")
+            || cgroup.contains("containerd");
+    }
+    false
+}
+
+fn has_modprobe() -> bool {
+    Path::new("/sbin/modprobe").exists()
+        || Path::new("/bin/modprobe").exists()
+        || Path::new("/usr/sbin/modprobe").exists()
+}
+
+fn can_load_kernel_module() -> bool {
+    if is_running_in_container() {
+        return false;
+    }
+    has_modprobe()
+}
+

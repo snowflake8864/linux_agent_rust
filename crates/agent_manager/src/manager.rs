@@ -173,6 +173,7 @@ async fn stop_osec_services() -> Result<(), String> {
     } else if has_service {
         log_info!("[agent_manager] 使用 service 停止 osec");
         let _ = Command::new("service").args(["osec", "stop"]).status().await;
+        let _ = Command::new("pkill").arg("-9").arg("osecmonitor").status().await;
 
         if tokio::fs::remove_file("/etc/init.d/osecservicecentos").await.is_ok() {
             log_info!("[agent_manager] 已删除 /etc/init.d/osecservicecentos");

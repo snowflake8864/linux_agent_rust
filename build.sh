@@ -9,7 +9,7 @@ INSTALLER_NAME="${OUTPUT_DIR}/osec-installer-${VERSION}.sh"
 
 # Clean up
 rm -rf package/opt/osec "$OUTPUT_DIR"
-mkdir -p package/opt/osec/{x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,certs}
+mkdir -p package/opt/osec/{x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,mips64el-unknown-linux-gnuabi64,certs}
 mkdir -p package/opt/osec/log
 mkdir -p "$OUTPUT_DIR"
 
@@ -18,6 +18,8 @@ cp target/x86_64-unknown-linux-musl/release/MagicArmor_0 package/opt/osec/x86_64
 cp target/x86_64-unknown-linux-musl/release/MagicArmorAgent package/opt/osec/x86_64-unknown-linux-musl/
 cp target/aarch64-unknown-linux-musl/release/MagicArmor_0 package/opt/osec/aarch64-unknown-linux-musl/
 cp target/aarch64-unknown-linux-musl/release/MagicArmorAgent package/opt/osec/aarch64-unknown-linux-musl/
+cp target/mips64el-unknown-linux-gnuabi64/release/MagicArmor_0 package/opt/osec/mips64el-unknown-linux-gnuabi64/
+#cp target/mips64el-unknown-linux-gnuabi64/release/MagicArmorAgent package/opt/osec/mips64el-unknown-linux-gnuabi64/
 cp certs/root-ca.pem package/opt/osec/certs/
 
 # Copy config and service files
@@ -100,6 +102,7 @@ ARCH=\$(uname -m)
 case \$ARCH in
     x86_64|amd64) BIN_DIR="x86_64-unknown-linux-musl" ;;
     aarch64|arm64) BIN_DIR="aarch64-unknown-linux-musl" ;;
+    mips64) BIN_DIR="mips64el-unknown-linux-gnuabi64" ;;
     *) echo "Unsupported architecture: \$ARCH"; exit 1 ;;
 esac
 echo "Detected architecture: \$ARCH"
@@ -306,6 +309,7 @@ fi
 
 # Cleanup architecture dirs
 rm -rf "\$INSTALL_DIR/x86_64-unknown-linux-musl" "\$INSTALL_DIR/aarch64-unknown-linux-musl"
+rm -rf "\$INSTALL_DIR/mips64el-unknown-linux-gnuabi64" "\$INSTALL_DIR/mips64el-unknown-linux-gnuabi64"
 
 if [[ "\$MODE" == "install" ]]; then
     echo "✅ Installation completed!"

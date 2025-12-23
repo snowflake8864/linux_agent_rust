@@ -83,7 +83,8 @@ async fn main() -> std::io::Result<()> {
             String::new()
         });
         cfg.mod_ver = mod_ver;
-       log_info!("load kernel driver: {}", cfg.mod_ver);
+        log_info!("load kernel driver: {}", cfg.mod_ver);
+        let _ = cfg.to_ini(&format!("{}/net_info.ini", cfg.app_path));
     }
 
     // 检查是否为离线模式

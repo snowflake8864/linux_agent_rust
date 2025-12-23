@@ -4,13 +4,15 @@ PROC_FILE="osec"
 
 start()
 {
-    /opt/agent/agentmonitor &
+    /opt/osec/osecmonitor &
 }
 
 stop()
 {
 #    /opt/agent/MagicArmor_2
    pkill -9 MagicArmor_0
+   pkill -9 MagicArmorAgent
+   pkill -9 osecmonitor
 }
 
 status()
