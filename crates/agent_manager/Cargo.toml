@@ -6,22 +6,36 @@ edition = "2021"
 [[bin]]
 name = "MagicArmorAgent"
 path = "src/main.rs"
+
+[features]
+# 默认开启 agent-cli（仅在 x86_64 / aarch64 有效，靠 cfg 控制）
+default = ["agent-cli"]
+
+# 显式控制 CLI 功能
+agent-cli = [
+  "dep:tokio-rustls",
+  "dep:rustls",
+  "dep:rustls-pemfile",
+  "dep:webpki-roots",
+  "dep:rustls-native-certs"
+]
+
 [dependencies]
 tokio = { version = "1.37", features = ["full"] }
-#tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = "0.4"
 logging = { path = "../logging" }
 log = "0.4"
-
-rustls-native-certs = "0.7"   
-tokio-rustls = "0.26"
-rustls = "0.23"
-rustls-pemfile = "2"
-webpki-roots = "0.26"
 fs2 = "0.4"
 tempfile = "3"
-zip = "0.6" 
+zip = "0.6"
 walkdir = "2.5"
 uname = "0.1"
+
+# --- TLS / CLI 依赖必须标记为 optional ---
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+rustls-native-certs = { version = "0.7", optional = true }

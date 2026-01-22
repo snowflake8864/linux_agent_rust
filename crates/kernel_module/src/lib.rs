@@ -94,6 +94,8 @@ impl LoadKernelDriver for BootManager {
                         } else if failed_drivers.len() >= drivers.len() {
                             log_error!("All compatible drivers failed, stopping retry");
                             return Err("All available drivers failed to load".into());
+                        } else if failed_drivers.contains(&exact_driver_path) {
+                            return Err("best driver failed to load".into());
                         }
                     }
                 }

@@ -9,6 +9,7 @@ use hostinfo::net_app::parser_netstat::update_netstat_info;
 use hostinfo::net_app::parser_dnat::update_dnat_info;
 use hostinfo::net_app::parser_docker::update_docker_info;
 use hostinfo::net_app::model::write_business_ports_to_proc;
+use config::net_info::NETINFO_CONFIG;
 use crate::baseline_task::{process_baselines_from_client};
 use crate::run_outreach_detection;
 use crate::net_reach_rule::build_outreach_detect_list_json;
@@ -60,7 +61,6 @@ impl TimerTask for BootManager {
                     outreach_interval = None;
                     outreach_enabled = false;
                 }
-
                 tokio::select! {
                     _ = local_interval.tick() => {
                         update_netstat_info();

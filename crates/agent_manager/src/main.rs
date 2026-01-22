@@ -5,7 +5,11 @@ use tokio::sync::mpsc;
 mod unix_socket_server;
 mod manager;
 mod common;
+
+#[cfg(feature = "agent-cli")]
 mod agent_cli_client;
+
+#[cfg(feature = "agent-cli")]
 mod agent_cli_server;
 
 use logging::{log_info, log_error, CustomLogger};
@@ -24,7 +28,6 @@ fn ensure_single_instance() {
     if Path::new(PID_FILE).exists() {
         if let Ok(content) = fs::read_to_string(PID_FILE) {
             if let Ok(old_pid) = content.trim().parse::<u32>() {
-
                 if pid_is_running(old_pid) {
                     eprintln!("❌ osec_backend 已在运行 (PID={})！", old_pid);
                     std::process::exit(1);
@@ -33,7 +36,6 @@ fn ensure_single_instance() {
         }
     }
 
-    // 3. 写入当前 pid
     let current_pid = std::process::id();
     if let Err(e) = fs::write(PID_FILE, current_pid.to_string()) {
         eprintln!("⚠ 无法写入 PID 文件: {}", e);
@@ -44,11 +46,9 @@ fn ensure_single_instance() {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    // ==================== 单实例锁 ====================
     ensure_single_instance();
 
     let args: Vec<String> = std::env::args().collect();
-
     let mode = if args.len() < 2 {
         "client".to_string()
     } else {
@@ -72,11 +72,12 @@ async fn main() -> io::Result<()> {
         "/tmp/osec_agent.sock",
         cmd_tx.clone(),
     ));
+
+    #[cfg(feature = "agent-cli")]
     match mode.as_str() {
         "server" => {
             log_info!("启动 Agent 服务器模式 (后台运行)");
             let port = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10448);
-            // 关键：spawn 出去，不要 .await！
             tokio::spawn(async move {
                 if let Err(e) = agent_cli_server::start_server(port).await {
                     log_error!("Agent server 崩溃: {}", e);
@@ -85,7 +86,6 @@ async fn main() -> io::Result<()> {
         }
         "client" => {
             log_info!("启动 Agent 客户端模式 (后台运行)");
-            // 同样 spawn 出去
             tokio::spawn(async move {
                 if let Err(e) = agent_cli_client::start_client().await {
                     log_error!("Agent client 崩溃: {}", e);
@@ -94,7 +94,13 @@ async fn main() -> io::Result<()> {
         }
         _ => {
             log_info!("无效模式");
-            return Ok(());
+        }
+    }
+
+    #[cfg(not(feature = "agent-cli"))]
+    {
+        if mode == "server" || mode == "client" {
+            log_info!("⚠ agent-cli 功能已禁用，client/server 模式被忽略");
         }
     }
 
