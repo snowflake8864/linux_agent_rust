@@ -1,13 +1,32 @@
-//src/ip_manager.rs
+// src/ip_manager.rs
 use crate::{IpJumpConfig, PutIpJumpInfo, SecondaryIPInfo};
 use ipnet::Ipv4Net;
 use crate::utils::*;
 use tokio::sync::RwLock;
 use std::sync::Arc;
-use logging::{log_info, log_error};
+use logging::{log_info, log_error, log_warn};
 use tokio::time::{interval, Duration};
 use net_client::core::NetClient;
-use serde_json::json;
+use serde_json::{json, Value};
+use tokio::sync::watch;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::Path;
+use tokio::fs;
+use regex::Regex;
+
+
+// ===== 全局通道 =====
+static IP_JUMP_INSTRUCTION_TX: OnceLock<watch::Sender<Option<IpJumpInstruction>>> = OnceLock::new();
+static IP_JUMP_DAEMON_STARTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Debug)]
+struct IpJumpInstruction {
+    source_ip: String,
+    target_ip: String,
+    gateway: String,
+    active_time: u32,
+}
 
 #[derive(Debug, Clone)]
 pub struct NetworkBackup {
@@ -25,7 +44,7 @@ pub struct IpJumpManager {
     secondary_ips: SharedSecondaryList,
     tick_counter: Arc<RwLock<u64>>,
     main_interface: String,
-    last_upload_failed: Arc<RwLock<bool>>, 
+    last_upload_failed: Arc<RwLock<bool>>,
 }
 
 impl IpJumpManager {
@@ -33,9 +52,344 @@ impl IpJumpManager {
         Arc::new(IpJumpManager {
             secondary_ips: Arc::new(RwLock::new(Vec::new())),
             tick_counter: Arc::new(RwLock::new(0)),
-            main_interface:main_interface.to_string(),
+            main_interface: main_interface.to_string(),
             last_upload_failed: Arc::new(RwLock::new(false)),
         })
+    }
+
+    pub fn send_instruction(
+        &self,
+        source_ip: String,
+        target_ip: String,
+        gateway: String,
+        active_time: u32,
+    ) -> Result<(), String> {
+        if let Some(tx) = IP_JUMP_INSTRUCTION_TX.get() {
+            let instr = IpJumpInstruction {
+                source_ip,
+                target_ip,
+                gateway,
+                active_time,
+            };
+            tx.send(Some(instr)).map_err(|_| "Failed to send instruction".to_string())?;
+            Ok(())
+        } else {
+            Err("IP Jump daemon not initialized".to_string())
+        }
+    }
+
+    pub async fn start_ip_jump_daemon(
+        self: Arc<Self>,
+        base_url: String,
+        token: Option<String>,
+    ) {
+        if IP_JUMP_DAEMON_STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_err() {
+            return;
+        }
+
+        let (tx, mut rx) = watch::channel(None::<IpJumpInstruction>);
+        IP_JUMP_INSTRUCTION_TX.set(tx).unwrap();
+
+        let upload_url = format!("{}/v1/putIpJump", base_url);
+        let get_url = format!("{}/v1/getIpJump", base_url);
+        let token_for_req = token.clone();
+        let base_url_for_req = base_url.clone();
+        log_info!("IP Jump daemon starting, fetching initial configuration...");
+/*
+        let mut need_wait = false;
+        match self.fetch_latest_instruction(&get_url, &token_for_req, &base_url_for_req).await {
+            Ok(Some(instr)) => {
+                log_info!("Initial instruction fetched: active_time={}", instr.active_time);
+                self.execute_instruction(&instr, &upload_url, &token_for_req, &base_url_for_req).await;
+
+                if instr.active_time > 0 {
+                    self.run_periodic_loop(
+                        instr,
+                        &get_url,
+                        &upload_url,
+                        &token_for_req,
+                        &base_url_for_req,
+                        &mut rx,
+                    ).await;
+                }
+            }
+            Ok(None) => {
+                log_info!("Initial instruction is empty, waiting for external trigger.");
+                need_wait = true;
+            }
+            Err(e) => {
+                log_error!("Failed to fetch initial instruction: {}", e);
+                need_wait = true;
+            }
+        }
+*/
+        let mut need_wait = true;
+        loop {
+            if need_wait {
+                let _ = rx.changed().await;
+                need_wait = false;
+            }
+
+            let instr_opt = rx.borrow().clone();
+            let Some(instr) = instr_opt else {
+                let _ = rx.changed().await;
+                continue;
+            };
+
+            self.execute_instruction(&instr, &upload_url, &token_for_req, &base_url_for_req).await;
+
+            log_info!("IP Jump daemon received instruction: active_time={}", instr.active_time);
+            if instr.active_time > 0 {
+                self.run_periodic_loop(
+                    instr,
+                    &get_url,
+                    &upload_url,
+                    &token_for_req,
+                    &base_url_for_req,
+                    &mut rx,
+                ).await;
+                need_wait = true;
+                continue;
+            }
+
+            let _ = rx.changed().await;
+        }
+    }
+
+
+    async fn execute_instruction(
+        &self,
+        instr: &IpJumpInstruction,
+        upload_url: &str,
+        token: &Option<String>,
+        base_url: &str,
+    ) {
+        let mut info = PutIpJumpInfo {
+            source_ip: "".to_string(),
+            target_ip: "".to_string(),
+            gateway: "".to_string(),
+            agent_ip: "".to_string(),
+            status: 0,
+            reason: "".to_string(),
+        };
+
+        let mut jump_success = false;
+        if !instr.source_ip.is_empty() || !instr.target_ip.is_empty() {
+            let config = IpJumpConfig {
+                source_ip: instr.source_ip.clone(),
+                target_ip: instr.target_ip.clone(),
+                gateway: instr.gateway.clone(),
+            };
+            match self.do_ip_jump_async(config, &mut info).await {
+                Ok(_) => {
+                    log_info!("IP jump success: {:?}", info);
+                    info.status = 1;
+                    jump_success = true; 
+                }
+                Err(e) => {
+                    log_error!("IP jump failed: {:?}", e);
+                    info.status = 2;
+                    info.reason = e.to_string();
+                }
+            }
+        }
+
+        let _ = self.upload_result_direct(upload_url, &info, token, base_url).await;
+
+        if jump_success {
+            let gw = if instr.gateway.is_empty() {
+                None
+            } else {
+                Some(instr.gateway.as_str())
+            };
+
+            if self.is_netplan_system().await {
+                if let Ok(primary_ip) = self.get_primary_ip_of_main_interface().await {
+                    if let Err(e) = self.netplan_update_primary_ip(
+                        &self.main_interface,
+                        &instr.source_ip,
+                        &primary_ip,
+                        gw,
+                    ).await {
+                        log_error!("netplan persist ip failed: {}", e);
+                    }
+                }
+            } else if self.has_nmcli().await {
+                if let Ok(primary_ip) = self.get_primary_ip_of_main_interface().await {
+                    if let Err(e) = self.nmcli_update_primary_ip(
+                        &self.main_interface,
+                        &primary_ip,
+                        gw,
+                    ).await {
+                        log_error!("nmcli persist ip failed: {}", e);
+                    }
+                }
+            }
+
+            if let Some(mut agent_ip) = get_local_ips_all().await {
+                if !instr.target_ip.is_empty() {
+                    let target_ip_no_prefix = strip_ip_prefix(&instr.target_ip);
+                    if !ip_list_contains(&agent_ip, target_ip_no_prefix) {
+                        if agent_ip.is_empty() {
+                            agent_ip = target_ip_no_prefix.to_string();
+                        } else {
+                            agent_ip = format!("{},{}", agent_ip, target_ip_no_prefix);
+                        }
+                    }
+                }
+                match self.upload_ip_jump_periodic_result(base_url, token.clone(), &agent_ip).await {
+                    Ok(_) => {
+                        log_info!("Periodic IP jump result uploaded successfully: {}", agent_ip);
+                    }
+                    Err(e) => {
+                        log_error!("Failed to upload periodic IP jump result: {}, will retry next time", e);
+                    }
+                }
+
+
+            }
+        }
+    }
+    async fn run_periodic_loop(
+        &self,
+        initial_instr: IpJumpInstruction,
+        get_url: &str,
+        upload_url: &str,
+        token: &Option<String>,
+        base_url: &str,
+        rx: &mut watch::Receiver<Option<IpJumpInstruction>>,
+    ) {
+        let mut current_active_time = initial_instr.active_time;
+        let mut interval = tokio::time::interval(Duration::from_secs(current_active_time as u64));
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    match self.fetch_latest_instruction(get_url, token, base_url).await {
+                        Ok(Some(latest_instr)) => {
+                            self.execute_instruction(&latest_instr, upload_url, token, base_url).await;
+
+                            if latest_instr.active_time == 0 {
+                                log_info!("Periodic task received active_time=0, stopping interval.");
+                                break;
+                            }
+
+                            if latest_instr.active_time != current_active_time {
+                                log_info!("Active time changed to {}, restarting interval", latest_instr.active_time);
+                                current_active_time = latest_instr.active_time;
+                                interval = tokio::time::interval(Duration::from_secs(current_active_time as u64));
+                            }
+                        }
+                        Ok(None) => {
+                            log_warn!("Received empty instruction in periodic mode, skipping.");
+                        }
+                        Err(e) => {
+                            log_error!("Failed to fetch latest instruction: {}", e);
+                            break;
+                        }
+                    }
+                },
+                _ = rx.changed() => {
+                    log_info!("New instruction received during periodic mode, breaking to handle it.");
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn fetch_latest_instruction(
+        &self,
+        url: &str,
+        token: &Option<String>,
+        base_url: &str,
+    ) -> Result<Option<IpJumpInstruction>, String> {
+        let client = NetClient::new(Some(base_url.to_string()), true)
+            .map_err(|e| e.to_string())?;
+        let token_str = token.as_deref();
+        let resp = client
+            .post_data_async(url, "", Duration::from_secs(10), token_str)
+            .await
+            .map_err(|e| e.to_string())?;
+        let parsed: Value = serde_json::from_str(&resp)
+            .map_err(|e| e.to_string())?;
+
+        if parsed["code"] != "000000" {
+            return Err("API error".to_string());
+        }
+
+        if let Some(data) = parsed["data"].as_object() {
+            let gateway = data
+                .get("gateway")
+                .and_then(|v: &Value| v.as_str())
+                .unwrap_or("");
+            let source_ip = data
+                .get("source_ip")
+                .and_then(|v: &Value| v.as_str())
+                .unwrap_or("");
+            let target_ip = data
+                .get("target_ip")
+                .and_then(|v: &Value| v.as_str())
+                .unwrap_or("");
+            let active_time = data
+                .get("active_time")
+                .and_then(|v: &Value| v.as_u64())
+                .unwrap_or(0) as u32;
+
+            if source_ip.is_empty() && target_ip.is_empty() {
+                return Ok(None);
+            }
+
+            Ok(Some(IpJumpInstruction {
+                source_ip: source_ip.to_string(),
+                target_ip: target_ip.to_string(),
+                gateway: gateway.to_string(),
+                active_time,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn upload_result_direct(
+        &self,
+        url: &str,
+        info: &PutIpJumpInfo,
+        token: &Option<String>,
+        base_url: &str,
+    ) -> Result<(), String> {
+        let json_body = self.build_upload_ip_jump_json(
+            &info.source_ip,
+            &info.target_ip,
+            &info.gateway,
+            &info.agent_ip,
+            info.status,
+            &info.reason,
+        );
+        let client = NetClient::new(Some(base_url.to_string()), true)
+            .map_err(|e| e.to_string())?;
+        let _ = client
+            .post_data_async(url, &json_body, Duration::from_secs(10), token.as_deref())
+            .await;
+        Ok(())
+    }
+
+    fn build_upload_ip_jump_json(
+        &self,
+        source_ip: &str,
+        target_ip: &str,
+        gateway: &str,
+        agent_ip: &str,
+        state: u8,
+        fail_reason: &str,
+    ) -> String {
+        json!({
+            "source_ip": source_ip,
+            "target_ip": target_ip,
+            "gateway": gateway,
+            "agent_ip": agent_ip,
+            "status": state,
+            "reason": fail_reason,
+        }).to_string()
     }
 
     async fn cleanup_old_secondary(&self, keep_ip: &str) {
@@ -55,9 +409,7 @@ impl IpJumpManager {
                     ip, iface, prefix
                 );
 
-                // 删除系统 IP
                 let _ = self.try_remove_ip_from_system(&iface, &ip, prefix).await;
-                // 删除内存记录
                 let mut list = self.secondary_ips.write().await;
                 list.retain(|x| x.ip != ip || x.interface != iface);
             }
@@ -74,7 +426,7 @@ impl IpJumpManager {
         let mut interval = interval(interval_duration);
         loop {
             interval.tick().await;
-            self.do_periodic_cleanup(base_url,token.clone()).await;
+            self.do_periodic_cleanup(base_url, token.clone()).await;
         }
     }
 
@@ -109,7 +461,7 @@ impl IpJumpManager {
         if source_ip_found {
             if is_source_ip_secondary {
                 if let Some(primary) = primary_ip {
-                    log_info!("Source IP {} is secondary, using primary IP {} on {}", source_ip, primary, self.main_interface);
+                    //log_info!("Source IP {} is secondary, using primary IP {} on {}", source_ip, primary, self.main_interface);
                     return Ok((primary, self.main_interface.clone()));
                 }
             } else {
@@ -127,58 +479,48 @@ impl IpJumpManager {
         }
     }
 
-    /// 执行 IP jump，包含：备份、删除 source ip、添加 target ip、记录 secondary、设置网关
     pub async fn do_ip_jump_async(&self, mut config: IpJumpConfig, info: &mut PutIpJumpInfo) -> Result<(), String> {
-        log_info!("Starting IP jump: {} -> {} (gw={})", config.source_ip, config.target_ip, config.gateway);
+        //log_info!("Starting IP jump: {} -> {} (gw={})", config.source_ip, config.target_ip, config.gateway);
 
-        // 1. 检查 source_ip 是否是次要 IP 或不存在，如果是，则替换为主 IP
         let (source_ip, _interface) = self.get_primary_ip(&config.source_ip).await?;
         if source_ip != config.source_ip {
             log_info!("Adjusted source_ip from {} to primary IP {}", config.source_ip, source_ip);
             config.source_ip = source_ip.clone();
         }
 
-        // 在变更前清理旧 secondary
         self.cleanup_old_secondary(&config.source_ip).await;
 
-        // 2. 备份 interface info for source_ip
-        log_info!("Backing up interface for IP: {}", config.source_ip);
+        //log_info!("Backing up interface for IP: {}", config.source_ip);
         let backup = self.backup_interface(&config.source_ip).await.map_err(|e| {
             log_error!("backup_interface failed: {}", e);
             e
         })?;
-        log_info!("Backup created: {:?}", backup);
+        //log_info!("Backup created: {:?}", backup);
 
-        // 3. parse prefixes
         let src_prefix = netmask_to_prefix(&backup.netmask).map_err(|e| e.to_string())?;
         let (target_ip, target_prefix) = parse_cidr(&config.target_ip).map_err(|e| e.to_string())?;
-        log_info!("Source prefix: {}, Target IP: {}, Target prefix: {}", src_prefix, target_ip, target_prefix);
+        //log_info!("Source prefix: {}, Target IP: {}, Target prefix: {}", src_prefix, target_ip, target_prefix);
 
-        // 4. remove source ip from device
-        log_info!("Removing source IP: {}/{} from {}", config.source_ip, src_prefix, backup.interface);
+        //log_info!("Removing source IP: {}/{} from {}", config.source_ip, src_prefix, backup.interface);
         if let Err(e) = self.run_ip_cmd(&["addr", "del", &format!("{}/{}", config.source_ip, src_prefix), "dev", &backup.interface]).await {
             log_error!("addr del failed: {}, attempt restore", e);
-            log_info!("addr del failed: {}, attempt restore", e);
             let _ = self.restore_backup(&backup).await;
             return Err(format!("addr del failed: {}", e));
         }
 
-        // 5. add target ip
-        log_info!("Adding target IP: {}/{} to {}", target_ip, target_prefix, backup.interface);
+        //log_info!("Adding target IP: {}/{} to {}", target_ip, target_prefix, backup.interface);
         if let Err(e) = self.run_ip_cmd(&["addr", "add", &format!("{}/{}", target_ip, target_prefix), "dev", &backup.interface]).await {
             log_error!("addr add failed: {}, restoring", e);
             let _ = self.restore_backup(&backup).await;
             return Err(format!("addr add failed: {}", e));
         }
 
-        // 6. add secondary ip record for original source ip
         let tick = self.increment_tick().await;
-        log_info!("Adding secondary IP: {} on {}", config.source_ip, backup.interface);
+        //log_info!("Adding secondary IP: {} on {}", config.source_ip, backup.interface);
         if let Err(e) = self.add_secondary_ip(&backup.interface, &config.source_ip, &backup.netmask, src_prefix, tick).await {
             log_error!("add_secondary_ip warning: {}", e);
         }
 
-        // 7. set gateway if provided
         if !config.gateway.trim().is_empty() {
             log_info!("Setting gateway: {} on {}", config.gateway, backup.interface);
             if let Err(e) = self.set_gateway(&config.gateway, &backup.interface).await {
@@ -188,7 +530,6 @@ impl IpJumpManager {
             }
         }
 
-        // fill info
         info.source_ip = config.source_ip.clone();
         info.target_ip = config.target_ip.clone();
         info.gateway = config.gateway.clone();
@@ -201,7 +542,6 @@ impl IpJumpManager {
         Ok(())
     }
 
-    /// 根据某个 IP 找到绑定该 IP 的 interface、netmask 并返回备份信息
     pub async fn backup_interface(&self, ip: &str) -> Result<NetworkBackup, String> {
         let out = run_cmd_capture("ip", &["-o", "-4", "addr", "show"]).await
             .map_err(|e| format!("ip addr show failed: {}", e))?;
@@ -226,7 +566,6 @@ impl IpJumpManager {
         Err(format!("interface for ip {} not found", ip))
     }
 
-    /// 获取默认网关 ip
     pub async fn get_default_gateway(&self) -> Result<String, String> {
         let out = run_cmd_capture("ip", &["route", "show", "default"]).await.map_err(|e| e)?;
         for line in out.lines() {
@@ -238,19 +577,16 @@ impl IpJumpManager {
         Err("no default gateway".to_string())
     }
 
-    /// 通用 ip 子命令封装
     pub async fn run_ip_cmd(&self, args: &[&str]) -> Result<(), String> {
         run_cmd_status("ip", args).await.map_err(|e| e)
     }
 
-    /// 指定网关 + dev
     pub async fn set_gateway(&self, gateway: &str, iface: &str) -> Result<(), String> {
         let _ = run_cmd_status("ip", &["route", "del", "default", "dev", iface]).await;
         run_cmd_status("ip", &["route", "add", "default", "via", gateway, "dev", iface]).await
             .map_err(|e| format!("set_gateway failed: {}", e))
     }
 
-    /// 恢复备份
     pub async fn restore_backup(&self, backup: &NetworkBackup) -> Result<(), String> {
         let prefix = netmask_to_prefix(&backup.netmask).map_err(|e| e.to_string())?;
         let _ = self.run_ip_cmd(&["addr", "add", &format!("{}/{}", backup.ip, prefix), "dev", &backup.interface]).await;
@@ -264,14 +600,12 @@ impl IpJumpManager {
         log_info!("Attempting to add secondary IP: {} on {}, tick: {}", ip, iface, tick);
         let mut list = self.secondary_ips.write().await;
 
-        // 检查是否已存在相同的 IP 和接口
         if let Some(e) = list.iter_mut().find(|x| x.interface == iface && x.ip == ip) {
-            e.added_tick = tick; // 更新 tick
+            e.added_tick = tick;
             log_info!("Updated existing secondary IP: {} on {}", ip, iface);
             return Ok(());
         }
 
-        // 添加新的 secondary IP 记录
         list.push(SecondaryIPInfo {
             interface: iface.to_string(),
             ip: ip.to_string(),
@@ -280,7 +614,6 @@ impl IpJumpManager {
             added_tick: tick,
         });
 
-        // 如果系统上没有这个 IP，则添加到接口
         if !ip_exists_on_iface(iface, ip).await {
             self.run_ip_cmd(&["addr", "add", &format!("{}/{}", ip, prefix), "dev", iface])
                 .await
@@ -291,7 +624,7 @@ impl IpJumpManager {
         log_info!("Added secondary IP: {} on {}, list len: {}", ip, iface, list.len());
         Ok(())
     }
-    /// 查找与 gateway 同网段的接口名
+
     pub async fn find_iface_for_gateway(&self, gateway: &str) -> Option<String> {
         if let Ok(out) = run_cmd_capture("ip", &["-o", "-4", "addr", "show"]).await {
             for line in out.lines() {
@@ -342,7 +675,6 @@ impl IpJumpManager {
             }
         }
 
-        // 判断是否进入上传逻辑
         let mut need_upload = any_removed;
         {
             let failed = self.last_upload_failed.read().await;
@@ -357,16 +689,15 @@ impl IpJumpManager {
                     Ok(_) => {
                         log_info!("Periodic IP jump result uploaded successfully: {}", agent_ip);
                         let mut failed = self.last_upload_failed.write().await;
-                        *failed = false; // 清空失败标记
+                        *failed = false;
                     }
                     Err(e) => {
                         log_error!("Failed to upload periodic IP jump result: {}, will retry next time", e);
                         let mut failed = self.last_upload_failed.write().await;
-                        *failed = true; // 标记失败，下次重试
+                        *failed = true;
                     }
                 }
-
-                // nmcli 持久化 primary IP
+/*
                 if self.has_nmcli().await {
                     if let Ok(primary_ip) = self.get_primary_ip_of_main_interface().await {
                         if let Err(e) = self.nmcli_update_primary_ip(&self.main_interface, &primary_ip).await {
@@ -374,17 +705,19 @@ impl IpJumpManager {
                         }
                     }
                 }
+*/
             } else {
                 log_error!("Cannot get local agent IP for periodic upload");
             }
         }
     }
+/*
     async fn try_remove_ip_from_system(&self, iface: &str, ip: &str, prefix: u8) -> Result<(), String> {
         let with_prefix = format!("{}/{}", ip, prefix);
-        log_info!("try_remove_ip_from_system: running: ip addr del {} dev {}", with_prefix, iface);
+        //log_info!("try_remove_ip_from_system: running: ip addr del {} dev {}", with_prefix, iface);
         match run_cmd_capture("ip", &["addr", "del", &with_prefix, "dev", iface]).await {
             Ok(out) => {
-                log_info!("ip addr del (with prefix) stdout: {}", out);
+                //log_info!("ip addr del (with prefix) stdout: {}", out);
                 if !ip_exists_on_iface(iface, ip).await {
                     return Ok(());
                 } else {
@@ -411,6 +744,61 @@ impl IpJumpManager {
             }
         }
     }
+*/
+    async fn try_remove_ip_from_system(
+        &self,
+        iface: &str,
+        ip: &str,
+        prefix: u8,
+    ) -> Result<(), String> {
+        let with_prefix = format!("{}/{}", ip, prefix);
+
+        if !ip_exists_on_iface(iface, ip).await {
+            log_info!(
+                "try_remove_ip_from_system: {} not present on {}, treat as success",
+                ip,
+                iface
+            );
+            return Ok(());
+        }
+
+        match run_cmd_capture("ip", &["addr", "del", &with_prefix, "dev", iface]).await {
+            Ok(_) => {
+                if !ip_exists_on_iface(iface, ip).await {
+                    return Ok(());
+                }
+                log_warn!(
+                    "ip addr del {} succeeded but IP still exists on {}",
+                    with_prefix,
+                    iface
+                );
+            }
+            Err(e) => {
+                log_warn!(
+                    "ip addr del {} failed: {}, will try fallback",
+                    with_prefix,
+                    e
+                );
+            }
+        }
+
+        match run_cmd_capture("ip", &["addr", "del", ip, "dev", iface]).await {
+            Ok(_) => {
+                if !ip_exists_on_iface(iface, ip).await {
+                    return Ok(());
+                }
+                Err(format!(
+                        "fallback delete executed but IP still present: {} on {}",
+                        ip, iface
+                ))
+            }
+            Err(e) => Err(format!(
+                    "both delete attempts failed or ineffective: {}",
+                    e
+            )),
+        }
+    }
+
     pub async fn remove_secondary_ip(&self, iface: &str, ip: &str) -> Result<(), String> {
         let prefix_opt = {
             let list = self.secondary_ips.read().await;
@@ -421,7 +809,6 @@ impl IpJumpManager {
             log_info!("remove_secondary_ip: found prefix {} for {} on {}", p, ip, iface);
             match self.try_remove_ip_from_system(iface, ip, p).await {
                 Ok(()) => {
-                    // 成功则从内存中删除记录
                     let mut list = self.secondary_ips.write().await;
                     list.retain(|x| !(x.interface == iface && x.ip == ip));
                     log_info!("Removed secondary IP {} on {} from both system and list", ip, iface);
@@ -450,6 +837,7 @@ impl IpJumpManager {
             }
         }
     }
+
     async fn upload_ip_jump_periodic_result(
         &self,
         base_url: &str,
@@ -458,14 +846,12 @@ impl IpJumpManager {
     ) -> Result<(), String> {
         let token_str = token.as_ref().map(|s| s.as_str());
         let url = format!("{}/v1/uploadIp", base_url);
-        let json_data = build_upload_agent_ip_json(agent_ip);
-        log_info!("Reporting putIpJump: {} => {}", url, json_data);
+        let json_data = self.build_upload_agent_ip_json(agent_ip);
+        log_info!("Reporting uploadIp: {} => {}", url, json_data);
 
-        // 创建客户端，如果失败直接返回 Err
         let net_client = NetClient::new(Some(base_url.to_string()), true)
             .map_err(|e| format!("创建 NetClient 失败: {}", e))?;
 
-        // 发送请求，如果失败直接返回 Err
         let response = net_client
             .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
             .await
@@ -479,8 +865,8 @@ impl IpJumpManager {
         Ok(())
     }
 
+    /*
     pub async fn nmcli_update_primary_ip(&self, iface: &str, ip: &str) -> Result<(), String> {
-        // 1. 获取当前 IP 的 prefix
         let out = run_cmd_capture("ip", &["-o", "-4", "addr", "show", "dev", iface]).await
             .map_err(|e| format!("ip addr show failed: {}", e))?;
 
@@ -503,7 +889,6 @@ impl IpJumpManager {
             None => return Err(format!("Cannot find primary IP {} on interface {}", ip, iface)),
         };
 
-        // 2. 获取当前 nmcli connection
         let conn_out = run_cmd_capture("nmcli", &["-t", "-f", "NAME,DEVICE", "connection", "show"]).await
             .map_err(|e| format!("nmcli connection show failed: {}", e))?;
 
@@ -521,25 +906,298 @@ impl IpJumpManager {
             None => return Err(format!("No nmcli connection found for interface {}", iface)),
         };
 
-        // 3. 修改 ipv4.addresses
         let addr = format!("{}/{}", ip, prefix);
-        let status = run_cmd_status("nmcli", &["connection", "modify", &conn_name, "ipv4.addresses", &addr]).await;
-        status.map_err(|e| format!("nmcli modify ipv4.addresses failed: {}", e))?;
-
-        // 4. 确保 ipv4.method 是 manual
-        let status = run_cmd_status("nmcli", &["connection", "modify", &conn_name, "ipv4.method", "manual"]).await;
-        status.map_err(|e| format!("nmcli modify ipv4.method failed: {}", e))?;
-
-        // 5. 重启连接应用配置
-        let status = run_cmd_status("nmcli", &["connection", "up", &conn_name]).await;
-        status.map_err(|e| format!("nmcli connection up failed: {}", e))?;
+        run_cmd_status("nmcli", &["connection", "modify", &conn_name, "ipv4.addresses", &addr]).await
+            .map_err(|e| format!("nmcli modify ipv4.addresses failed: {}", e))?;
+        run_cmd_status("nmcli", &["connection", "modify", &conn_name, "ipv4.method", "manual"]).await
+            .map_err(|e| format!("nmcli modify ipv4.method failed: {}", e))?;
+        run_cmd_status("nmcli", &["connection", "up", &conn_name]).await
+            .map_err(|e| format!("nmcli connection up failed: {}", e))?;
 
         log_info!("Primary IP {} on {} persisted via nmcli (connection: {})", ip, iface, conn_name);
+        Ok(())
+    }
+    */
+    pub async fn nmcli_update_primary_ip(
+        &self,
+        iface: &str,
+        ip: &str,
+        gateway: Option<&str>,
+    ) -> Result<(), String> {
+        let out = run_cmd_capture("ip", &["-o", "-4", "addr", "show", "dev", iface]).await
+            .map_err(|e| format!("ip addr show failed: {}", e))?;
+
+        let mut prefix: Option<u8> = None;
+        let re = regex::Regex::new(r"^\d+:\s+[^:\s]+\s+inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)").unwrap();
+
+        for line in out.lines() {
+            if let Some(cap) = re.captures(line) {
+                let addr = cap.get(1).unwrap().as_str();
+                let pre: u8 = cap.get(2).unwrap().as_str().parse().unwrap_or(24);
+                if addr == ip && !line.contains("secondary") {
+                    prefix = Some(pre);
+                    break;
+                }
+            }
+        }
+
+        let prefix = prefix.ok_or_else(|| format!("Cannot find primary IP {} on interface {}", ip, iface))?;
+
+        let conn_out = run_cmd_capture(
+            "nmcli",
+            &["-t", "-f", "NAME,DEVICE", "connection", "show"],
+        )
+            .await
+            .map_err(|e| format!("nmcli connection show failed: {}", e))?;
+
+        let mut conn_name: Option<String> = None;
+        for line in conn_out.lines() {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() == 2 && parts[1] == iface {
+                conn_name = Some(parts[0].to_string());
+                break;
+            }
+        }
+
+        let conn_name =
+            conn_name.ok_or_else(|| format!("No nmcli connection found for interface {}", iface))?;
+
+        let addr = format!("{}/{}", ip, prefix);
+
+        run_cmd_status(
+            "nmcli",
+            &["connection", "modify", &conn_name, "ipv4.addresses", &addr],
+        )
+            .await
+            .map_err(|e| format!("nmcli modify ipv4.addresses failed: {}", e))?;
+
+        run_cmd_status(
+            "nmcli",
+            &["connection", "modify", &conn_name, "ipv4.method", "manual"],
+        )
+            .await
+            .map_err(|e| format!("nmcli modify ipv4.method failed: {}", e))?;
+
+        if let Some(gw) = gateway {
+            run_cmd_status(
+                "nmcli",
+                &["connection", "modify", &conn_name, "ipv4.gateway", gw],
+            )
+                .await
+                .map_err(|e| format!("nmcli modify ipv4.gateway failed: {}", e))?;
+        }
+
+        log_info!(
+            "Primary IP {} on {} persisted via nmcli (connection: {}, gateway: {:?})",
+            ip,
+            iface,
+            conn_name,
+            gateway
+        );
+
         Ok(())
     }
     pub async fn has_nmcli(&self) -> bool {
         run_cmd_status("which", &["nmcli"]).await.is_ok()
     }
+
+    pub async fn is_netplan_system(&self) -> bool {
+        let dir = Path::new("/etc/netplan");
+        if !dir.is_dir() {
+            return false;
+        }
+
+        match fs::read_dir(dir).await {
+            Ok(mut rd) => {
+                while let Ok(Some(ent)) = rd.next_entry().await {
+                    let p = ent.path();
+                    if let Some(ext) = p.extension() {
+                        if ext == "yaml" || ext == "yml" {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+
+pub async fn netplan_update_primary_ip(
+    &self,
+    iface: &str,
+    source_ip: &str,
+    primary_ip: &str,
+    gw: Option<&str>,
+) -> Result<(), String> {
+    use regex::Regex;
+    use std::net::Ipv4Addr;
+    use std::path::Path;
+    use tokio::fs;
+
+    fn same_subnet(a: Ipv4Addr, b: Ipv4Addr, prefix: u8) -> bool {
+        if prefix == 0 {
+            return false;
+        }
+        let mask = u32::MAX << (32 - prefix);
+        (u32::from(a) & mask) == (u32::from(b) & mask)
+    }
+
+    let source_v4: Ipv4Addr = source_ip
+        .parse()
+        .map_err(|_| format!("invalid source_ip {}", source_ip))?;
+    let primary_v4: Ipv4Addr = primary_ip
+        .parse()
+        .map_err(|_| format!("invalid primary_ip {}", primary_ip))?;
+
+    let netplan_dir = Path::new("/etc/netplan");
+    if !netplan_dir.is_dir() {
+        return Err("not a netplan system".into());
+    }
+
+    let mut target_file = None;
+    let mut rd = fs::read_dir(netplan_dir)
+        .await
+        .map_err(|e| format!("read /etc/netplan failed: {}", e))?;
+
+    while let Some(ent) = rd.next_entry().await.map_err(|e| e.to_string())? {
+        let path = ent.path();
+        if !path
+            .extension()
+            .map(|s| s == "yaml" || s == "yml")
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let content = fs::read_to_string(&path)
+            .await
+            .map_err(|e| format!("read {:?} failed: {}", path, e))?;
+
+        if content.contains(&format!("{}:", iface)) {
+            target_file = Some(path);
+            break;
+        }
+    }
+
+    let file = target_file.ok_or_else(|| {
+        format!("no netplan yaml contains interface {}", iface)
+    })?;
+
+    let mut content = fs::read_to_string(&file)
+        .await
+        .map_err(|e| format!("read {:?} failed: {}", file, e))?;
+
+    let addr_re =
+        Regex::new(r"addresses:\s*\[([^\]]*)\]").unwrap();
+
+    let caps = addr_re
+        .captures(&content)
+        .ok_or_else(|| "addresses field not found".to_string())?;
+
+    let raw_list = caps.get(1).unwrap().as_str();
+
+    #[derive(Clone)]
+    enum AddrEntry {
+        V4 { ip: Ipv4Addr, prefix: u8 },
+        Other(String), 
+    }
+
+    let mut entries: Vec<AddrEntry> = Vec::new();
+    let mut chosen_idx: Option<usize> = None;
+
+    for item in raw_list.split(',') {
+        let item = item.trim();
+
+        if let Some((ip_str, pre_str)) = item.split_once('/') {
+            if let Ok(v4) = ip_str.parse::<Ipv4Addr>() {
+                let prefix: u8 = pre_str.parse().unwrap_or(24);
+                let idx = entries.len();
+
+                entries.push(AddrEntry::V4 {
+                    ip: v4,
+                    prefix,
+                });
+
+                if v4 == source_v4 {
+                    chosen_idx = Some(idx);
+                }
+                else if chosen_idx.is_none()
+                    && same_subnet(v4, source_v4, prefix)
+                {
+                    chosen_idx = Some(idx);
+                }
+
+                continue;
+            }
+        }
+
+        entries.push(AddrEntry::Other(item.to_string()));
+    }
+
+    match chosen_idx {
+        Some(i) => {
+            if let AddrEntry::V4 { prefix, .. } = entries[i] {
+                entries[i] = AddrEntry::V4 {
+                    ip: primary_v4,
+                    prefix,
+                };
+            }
+        }
+        None => {
+            // 没有任何 IPv4，直接 append
+            entries.push(AddrEntry::V4 {
+                ip: primary_v4,
+                prefix: 24,
+            });
+        }
+    }
+
+    let new_addr_list = entries
+        .iter()
+        .map(|e| match e {
+            AddrEntry::V4 { ip, prefix } => {
+                format!("{}/{}", ip, prefix)
+            }
+            AddrEntry::Other(s) => s.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let new_addr_line = format!("addresses: [{}]", new_addr_list);
+    content = addr_re
+        .replace(&content, new_addr_line)
+        .to_string();
+
+    if let Some(gw) = gw {
+        let gw_re =
+            Regex::new(r"(?m)^\s*gateway4:\s*.+$").unwrap();
+        if gw_re.is_match(&content) {
+            content = gw_re
+                .replace(&content, format!("      gateway4: {}", gw))
+                .to_string();
+        }
+    }
+
+    fs::write(&file, content)
+        .await
+        .map_err(|e| format!("write {:?} failed: {}", file, e))?;
+
+    run_cmd_status("netplan", &["apply"])
+        .await
+        .map_err(|e| format!("netplan apply failed: {}", e))?;
+
+    log_info!(
+        "netplan persisted iface={} source={} -> primary={}",
+        iface,
+        source_ip,
+        primary_ip
+    );
+
+    Ok(())
+}
+
     pub async fn get_primary_ip_of_main_interface(&self) -> Result<String, String> {
         let out = run_cmd_capture("ip", &["-o", "-4", "addr", "show", "dev", &self.main_interface]).await
             .map_err(|e| format!("ip addr show failed: {}", e))?;
@@ -550,7 +1208,6 @@ impl IpJumpManager {
             if let Some(cap) = re.captures(line) {
                 let addr = cap.get(1).unwrap().as_str();
                 if !line.contains("secondary") {
-                    // 找到 primary IP
                     return Ok(addr.to_string());
                 }
             }
@@ -558,12 +1215,21 @@ impl IpJumpManager {
 
         Err(format!("No primary IP found on interface {}", self.main_interface))
     }
-}
 
-pub fn build_upload_agent_ip_json(agent_ip: &str) -> String {
-    let json_data = json!({
-        "ip": agent_ip,
-    });
-    json_data.to_string()
+    fn build_upload_agent_ip_json(&self, agent_ip: &str) -> String {
+        json!({ "ip": agent_ip }).to_string()
+    }
+}
+fn ip_list_contains(ip_list: &str, ip: &str) -> bool {
+    ip_list
+        .split(',')
+        .map(|s| s.trim())
+        .any(|item| item == ip)
+}
+fn strip_ip_prefix(ip: &str) -> &str {
+    match ip.find('/') {
+        Some(pos) => &ip[..pos],
+        None => ip,
+    }
 }
 

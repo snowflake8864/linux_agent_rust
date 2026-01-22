@@ -152,7 +152,6 @@ pub async fn get_local_ips_all() -> Option<String> {
             }
 
             if let Some((ip, _)) = cidr.split_once('/') {
-                // ✅ 排除 IPv6 无用地址
                 if ip == "::1" {
                     continue;
                 }

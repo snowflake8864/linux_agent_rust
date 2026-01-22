@@ -336,7 +336,7 @@ async fn handle_session(
                     } else if trimmed == "heartbeat" {
                         // Ignore
                     } else {
-                        log_info!("Unknown message: {:?}", trimmed);
+                        //log_info!("Unknown message: {:?}", trimmed);
                     }
                 }
             }

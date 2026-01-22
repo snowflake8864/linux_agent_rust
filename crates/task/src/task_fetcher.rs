@@ -38,6 +38,10 @@ use std::process::Stdio;
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+static AUTO_IP_JUMP_DAEMON_RUNNING: AtomicBool = AtomicBool::new(false);
 
 
 
@@ -184,6 +188,15 @@ impl TaskFetcher {
         tokio::spawn(async move {
             manager_clone.start_periodic_cleanup(&base_url_owned, token_for_cleanup, Duration::from_secs(60)).await;
         });
+
+        let base_url_for_jump = base_url.to_string();
+        let token_for_jump = token.clone();
+
+        let ip_jump_manager_for_daemon = Arc::clone(&ip_jump_manager);
+        tokio::spawn(async move {
+            ip_jump_manager_for_daemon.start_ip_jump_daemon(base_url_for_jump, token_for_jump).await;
+        });
+
         TaskFetcher {
             base_url: base_url.to_string(),
             token,
@@ -896,13 +909,13 @@ async fn task_upload_dir(&self, task_type: u64) -> Result<(), String> {
     let response = match self.net_client
         .post_data_async(&url, "", Duration::from_secs(10), token_str)
         .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            eprintln!("获取 getdirinfo 策略失败: {}", err);
-            return Err(err);
-        }
-    };
+        {
+            Ok(response) => response,
+            Err(err) => {
+                eprintln!("获取 getdirinfo 策略失败: {}", err);
+                return Err(err);
+            }
+        };
 
     let parsed: Value = match serde_json::from_str(&response) {
         Ok(parsed) => parsed,
@@ -920,10 +933,10 @@ async fn task_upload_dir(&self, task_type: u64) -> Result<(), String> {
         .as_array()
         .map(|arr| {
             arr.iter()
-               .filter_map(|v| serde_json::from_value(v.clone()).ok())
-               .collect()
+                .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                .collect()
         })
-        .unwrap_or_default();
+    .unwrap_or_default();
 
     //log_info!("收到 {} 条目录监控策略，开始扫描", rules.len());
 
@@ -960,21 +973,21 @@ async fn task_upload_dir(&self, task_type: u64) -> Result<(), String> {
 
     let upload_url = self.full_url("putdir")?;
 
- //   log_info!("上传目录信息 → {}", upload_url);
+    //   log_info!("上传目录信息 → {}", upload_url);
 
     let resp = self
         .net_client
         .post_data_async(&upload_url, &body, Duration::from_secs(120), token_str)
         .await
         .map_err(|e| format!("上传目录信息失败: {e}"))?;
-/*
-    log_info!(
-        "目录扫描上传完成，共 {} 条记录（上限 {} 条），服务器返回: {}",
-        all_files.len(),
-        MAX_FILES,
-        resp.trim()
-    );
-*/
+    /*
+       log_info!(
+       "目录扫描上传完成，共 {} 条记录（上限 {} 条），服务器返回: {}",
+       all_files.len(),
+       MAX_FILES,
+       resp.trim()
+       );
+       */
     Ok(())
 }
 
@@ -1312,15 +1325,15 @@ pub async fn task_down_virtual_port(&self, task_type: u64) -> Result<(), String>
             } else {
                 0
             },
-                addr_type,
-                );
+            addr_type,
+            );
 
         log_info!("{}", rule_str);
 
         file.write_all(rule_str.as_bytes())
             .await
             .map_err(|e| format!("Failed to write rule: {}", e))?;
-    }
+        }
 
     file.flush()
         .await
@@ -1921,7 +1934,95 @@ async fn task_down_pwjump(&self, task_type: u64) -> Result<(), String> {
 
     Ok(())
 }
+/*
+   async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
+   self.report_task_completion(task_type).await
+   .map_err(|e| e.to_string())?;
 
+   let download_url = match self.api_interface.get("getIpJump") {
+   Some(url) => url,
+   None => return Err("URL for getIpJump not found".to_string()),
+   };
+   let url = format!("{}/{}", self.base_url, download_url);
+   log_info!("url: {}", url);
+   let token = self.get_token();
+   let token_str = token.as_ref().map(|s| s.as_str());
+   match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+   Ok(response) => {
+   let parsed: Value = match serde_json::from_str(&response) {
+   Ok(parsed) => parsed,
+   Err(e) => {
+   log_error!("Failed to parse response: {}", e);
+   return Err("Failed to parse response.".to_string());
+   }
+   };
+   if parsed["code"] != "000000" {
+   let msg = parsed["msg"].as_str().unwrap_or("Unknown error");
+   log_error!("API error: {}",msg);
+   return Err(format!("API error: {}", msg));
+   }
+   let data = parsed["data"].as_object().ok_or("Missing 'data' object in response")?;
+   log_info!("data: {:?}", data);
+   let gateway = data.get("gateway").and_then(|v| v.as_str()).unwrap_or("");
+   let source_ip = data.get("source_ip").and_then(|v| v.as_str()).unwrap_or("");
+   let target_ip = data.get("target_ip").and_then(|v| v.as_str()).unwrap_or("");
+   let mode = data.get("mode").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+   let allow_size = data.get("allow_size").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+   let aging_time = data.get("aging_time").and_then(|v| v.as_u64()).unwrap_or(300) as u32;
+   let active_time = data.get("active_time").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+   log_info!(
+   "IP Jump Task: source_ip={}, target_ip={}, gateway={}, mode={}, allow_size={}, aging_time={},active_time={}",
+   source_ip, target_ip, gateway, mode, allow_size, aging_time,active_time
+   );
+   if source_ip.is_empty() && target_ip.is_empty() {
+   log_info!("Both source_ip and target_ip are empty; skipping IP jump.");
+   self.report_task_completion(task_type).await?;
+   return Ok(());
+   }
+
+   let config = IpJumpConfig {
+   source_ip: source_ip.to_string(),
+   target_ip: target_ip.to_string(),
+   gateway: gateway.to_string(),
+   };
+   let mut info = PutIpJumpInfo {
+   source_ip: "".to_string(),
+   target_ip: "".to_string(),
+   gateway: "".to_string(),
+   agent_ip: "".to_string(),
+   status: 0,
+   reason: "".to_string(),
+   };
+   let jump_result = self.ip_jump_manager.do_ip_jump_async(config, &mut info).await;
+   match jump_result {
+   Ok(_) => {
+   log_info!("ip jump success: {:?}", info);
+   info.status = 1;
+   }
+   Err(e) => {
+   log_error!("ip jump fail: {:?}", e);
+   info.status = 2;
+   info.reason = e.to_string();
+   }
+   }
+self.upload_ip_jump_result(
+    &info.source_ip,
+    &info.target_ip,
+    &info.gateway,
+    &info.agent_ip,
+    info.status as u8,
+    &info.reason,
+).await?;
+}
+Err(err) => {
+    log_error!("Error fetching task: {}", err);
+    return Err(err);
+}
+}
+Ok(())
+    }
+*/
+/*
 async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
     self.report_task_completion(task_type).await
         .map_err(|e| e.to_string())?;
@@ -1945,7 +2046,7 @@ async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
             };
             if parsed["code"] != "000000" {
                 let msg = parsed["msg"].as_str().unwrap_or("Unknown error");
-                log_error!("API error: {}",msg);
+                log_error!("API error: {}", msg);
                 return Err(format!("API error: {}", msg));
             }
             let data = parsed["data"].as_object().ok_or("Missing 'data' object in response")?;
@@ -1956,15 +2057,17 @@ async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
             let mode = data.get("mode").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
             let allow_size = data.get("allow_size").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let aging_time = data.get("aging_time").and_then(|v| v.as_u64()).unwrap_or(300) as u32;
+            let active_time = data.get("active_time").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             log_info!(
-                "IP Jump Task: source_ip={}, target_ip={}, gateway={}, mode={}, allow_size={}, aging_time={}",
-                source_ip, target_ip, gateway, mode, allow_size, aging_time
+                "IP Jump Task: source_ip={}, target_ip={}, gateway={}, mode={}, allow_size={}, aging_time={}, active_time={}",
+                source_ip, target_ip, gateway, mode, allow_size, aging_time, active_time
             );
             if source_ip.is_empty() && target_ip.is_empty() {
                 log_info!("Both source_ip and target_ip are empty; skipping IP jump.");
                 self.report_task_completion(task_type).await?;
                 return Ok(());
             }
+
             let config = IpJumpConfig {
                 source_ip: source_ip.to_string(),
                 target_ip: target_ip.to_string(),
@@ -1998,12 +2101,172 @@ async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
                 info.status as u8,
                 &info.reason,
             ).await?;
+
+            if active_time > 0 {
+                if AUTO_IP_JUMP_DAEMON_RUNNING.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                    log_info!("Spawning auto IP Jump daemon with interval: {}s", active_time);
+
+                    let base_url = self.base_url.clone();
+                    let token = self.get_token();
+                    let ip_jump_manager = self.ip_jump_manager.clone();
+                    let api_interface = self.api_interface.clone();
+                    let upload_url = format!("{}/{}", base_url, api_interface.get("putIpJump").cloned().unwrap_or_else(|| "v1/putIpJump".to_string()));
+
+                    tokio::spawn(async move {
+                        let mut current_interval = active_time;
+                        loop {
+                            sleep(Duration::from_secs(current_interval as u64)).await;
+
+                            let download_url = api_interface.get("getIpJump")
+                                .cloned()
+                                .unwrap_or_else(|| "v1/getIpJump".to_string());
+                            let url = format!("{}/{}", base_url, download_url);
+                            let token_str = token.as_deref();
+
+                            let client = match NetClient::new(Some(base_url.clone()), true) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    log_error!("Auto IP Jump: create NetClient failed: {}", e);
+                                    continue;
+                                }
+                            };
+
+                            match client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+                                Ok(response) => {
+                                    if let Ok(parsed) = serde_json::from_str::<Value>(&response) {
+                                        if parsed["code"] == "000000" {
+                                            if let Some(data) = parsed["data"].as_object() {
+                                                let gateway = data.get("gateway").and_then(|v| v.as_str()).unwrap_or("");
+                                                let source_ip = data.get("source_ip").and_then(|v| v.as_str()).unwrap_or("");
+                                                let target_ip = data.get("target_ip").and_then(|v| v.as_str()).unwrap_or("");
+                                                let new_active_time = data.get("active_time").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+
+                                                current_interval = new_active_time;
+
+                                                let mut info = PutIpJumpInfo {
+                                                    source_ip: "".to_string(),
+                                                    target_ip: "".to_string(),
+                                                    gateway: "".to_string(),
+                                                    agent_ip: "".to_string(),
+                                                    status: 0,
+                                                    reason: "".to_string(),
+                                                };
+
+                                                if !source_ip.is_empty() || !target_ip.is_empty() {
+                                                    let config = IpJumpConfig {
+                                                        source_ip: source_ip.to_string(),
+                                                        target_ip: target_ip.to_string(),
+                                                        gateway: gateway.to_string(),
+                                                    };
+                                                    match ip_jump_manager.do_ip_jump_async(config, &mut info).await {
+                                                        Ok(_) => {
+                                                            log_info!("Auto IP jump success");
+                                                            info.status = 1;
+                                                        }
+                                                        Err(e) => {
+                                                            log_error!("Auto IP jump fail: {:?}", e);
+                                                            info.status = 2;
+                                                            info.reason = e.to_string();
+                                                        }
+                                                    }
+                                                }
+
+                                                let json_body = build_upload_ip_jump_json(
+                                                    &info.source_ip,
+                                                    &info.target_ip,
+                                                    &info.gateway,
+                                                    &info.agent_ip,
+                                                    info.status as u8,
+                                                    &info.reason,
+                                                );
+                                                let _ = client.post_data_async(
+                                                    &upload_url,
+                                                    &json_body,
+                                                    Duration::from_secs(10),
+                                                    token_str,
+                                                ).await;
+
+                                                if new_active_time == 0 {
+                                                    log_info!("Auto IP Jump daemon stopped by server");
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log_error!("Auto IP Jump request failed: {}", e);
+                                }
+                            }
+                        }
+                        AUTO_IP_JUMP_DAEMON_RUNNING.store(false, Ordering::SeqCst);
+                    });
+                }
+            }
         }
         Err(err) => {
             log_error!("Error fetching task: {}", err);
             return Err(err);
         }
     }
+    Ok(())
+}
+*/
+async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
+    self.report_task_completion(task_type).await?;
+
+    let download_url = self.api_interface.get("getIpJump")
+        .cloned()
+        .unwrap_or_else(|| "v1/getIpJump".to_string());
+    let url = format!("{}/{}", self.base_url, download_url);
+    log_info!("url: {}", url);
+
+    let token = self.get_token();
+    let token_str = token.as_deref();
+
+    let response = self.net_client
+        .post_data_async(&url, "", Duration::from_secs(10), token_str)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let parsed: Value = serde_json::from_str(&response)
+        .map_err(|e| {
+            log_error!("Failed to parse response: {}", e);
+            "Failed to parse response.".to_string()
+        })?;
+
+    if parsed["code"] != "000000" {
+        let msg = parsed["msg"].as_str().unwrap_or("Unknown error");
+        log_error!("API error: {}", msg);
+        return Err(format!("API error: {}", msg));
+    }
+
+    let data = parsed["data"].as_object().ok_or("Missing 'data' object in response")?;
+    log_info!(" {:?}", data);
+
+    let gateway = data.get("gateway").and_then(|v| v.as_str()).unwrap_or("");
+    let source_ip = data.get("source_ip").and_then(|v| v.as_str()).unwrap_or("");
+    let target_ip = data.get("target_ip").and_then(|v| v.as_str()).unwrap_or("");
+    let active_time = data.get("active_time").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+
+    log_info!(
+        "IP Jump Task: source_ip={}, target_ip={}, gateway={}, active_time={}",
+        source_ip, target_ip, gateway, active_time
+    );
+
+    if source_ip.is_empty() && target_ip.is_empty() {
+        log_info!("Both source_ip and target_ip are empty; skipping IP jump.");
+        self.report_task_completion(task_type).await?;
+        return Ok(());
+    }
+
+    self.ip_jump_manager.send_instruction(
+        source_ip.to_string(),
+        target_ip.to_string(),
+        gateway.to_string(),
+        active_time,
+    )?;
+
     Ok(())
 }
 
@@ -2340,7 +2603,7 @@ pub fn build_upload_passwd_json(user: &str, pw: &str, state: u8, fail_reason: &s
     json_data.to_string()
 }
 
-pub fn build_upload_ip_jump_json(source_ip: &str, target_ip: &str, gateway: &str, agent_ip: &str, state: u8, fail_reason: &str) -> String {
+fn build_upload_ip_jump_json(source_ip: &str, target_ip: &str, gateway: &str, agent_ip: &str, state: u8, fail_reason: &str) -> String {
     let json_data = json!({
         "source_ip": source_ip,
         "target_ip": target_ip,
