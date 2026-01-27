@@ -76,6 +76,8 @@ pub struct UsbMonitor {
     shared_list: SharedBlackWhiteList,
     seen_devices: Arc<std::sync::Mutex<Vec<String>>>,
     usb_audit_log_tx: mpsc::Sender<AuditLogInfo>,
+    hotplug_signal_tx: Option<mpsc::Sender<bool>>,
+    device_info_cache: Arc<Mutex<HashMap<(u8, u8), (String, String)>>>,
 }
 
 impl UsbMonitor {
@@ -84,6 +86,22 @@ impl UsbMonitor {
             shared_list,
             seen_devices: Arc::new(std::sync::Mutex::new(Vec::new())),
             usb_audit_log_tx,
+            hotplug_signal_tx: None,
+            device_info_cache: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    pub fn new_with_signal(
+        shared_list: SharedBlackWhiteList, 
+        usb_audit_log_tx: mpsc::Sender<AuditLogInfo>,
+        hotplug_signal_tx: mpsc::Sender<bool>
+    ) -> Result<Self, rusb::Error> {
+        Ok(UsbMonitor {
+            shared_list,
+            seen_devices: Arc::new(std::sync::Mutex::new(Vec::new())),
+            usb_audit_log_tx,
+            hotplug_signal_tx: Some(hotplug_signal_tx),
+            device_info_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -93,7 +111,8 @@ impl UsbMonitor {
             shared_list: self.shared_list,
             seen_devices: self.seen_devices,
             usb_audit_log_tx: self.usb_audit_log_tx,
-
+            hotplug_signal_tx: self.hotplug_signal_tx.clone(),
+            device_info_cache: self.device_info_cache.clone(),
         };
 
         let _registration = HotplugBuilder::new()
@@ -112,14 +131,19 @@ struct HotplugCallback {
     shared_list: SharedBlackWhiteList,
     seen_devices: Arc<std::sync::Mutex<Vec<String>>>,
     usb_audit_log_tx: mpsc::Sender<AuditLogInfo>,
+    hotplug_signal_tx: Option<mpsc::Sender<bool>>,
+    device_info_cache: Arc<Mutex<HashMap<(u8, u8), (String, String)>>>,
 }
 
 impl rusb::Hotplug<Context> for HotplugCallback {
     fn device_arrived(&mut self, device: Device<Context>) {
+        log::info!("USB 设备插入事件触发");
+        
         let cfg = NETINFO_CONFIG.lock().unwrap();
-         if !cfg.usb_switch {
-             return;
-         }
+        if !cfg.usb_switch {
+            log::debug!("USB 监控开关已关闭，跳过后续处理");
+            return;
+        }
         let usb_protect = cfg.usb_protect;
         let desc = match device.device_descriptor() {
             Ok(d) => d,
@@ -128,6 +152,7 @@ impl rusb::Hotplug<Context> for HotplugCallback {
                 return;
             }
         };
+
 
         let is_storage = is_usb_storage(&device, &desc);
         log::info!(
@@ -173,10 +198,16 @@ impl rusb::Hotplug<Context> for HotplugCallback {
             });
          let eid = crate::utils::generate_eid(&vendor_str, &product_str, &serial);
 
+        // 缓存设备信息，用于拔出时上报
+        {
+            let mut cache = self.device_info_cache.lock().unwrap();
+            cache.insert((device.bus_number(), device.address()), (eid.clone(), name.clone()));
+        }
 
         {
             let mut seen = self.seen_devices.lock().unwrap();
-            if !seen.contains(&eid) {
+            let is_new_device = !seen.contains(&eid);
+            if is_new_device {
                 seen.push(eid.clone());
                 log::debug!("新 USB 存储设备: eid={}, name={}", eid, name);
             }
@@ -194,8 +225,11 @@ impl rusb::Hotplug<Context> for HotplugCallback {
                     exception_process: None,
                     md5: None,
                     n_type: 9004,
-                    n_level: 3,
-                    n_time: 1692760326, // 应替换为实际时间戳
+                    n_level: 2,
+                    n_time: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(), // 
                     notice_remark: None,
                     peripheral_name: Some(name.to_string()), 
                     peripheral_remark: Some(name.to_string()),
@@ -206,6 +240,7 @@ impl rusb::Hotplug<Context> for HotplugCallback {
 
                 if usb_protect {
                     log.n_type = 9006;
+                    log.n_level = 3;
                     if disable_usb_device(&device).is_ok() {
                         log::error!("已阻止 USB 设备: {} (eid={})", name, eid);
                     } else {
@@ -239,8 +274,11 @@ impl rusb::Hotplug<Context> for HotplugCallback {
                     exception_process: None,
                     md5: None,
                     n_type: 9003,
-                    n_level: 3,
-                    n_time: 1692760326, 
+                    n_level: 2,
+                    n_time: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(), 
                     notice_remark: None,
                     peripheral_name: Some(name.to_string()), 
                     peripheral_remark: Some(name.to_string()),
@@ -251,6 +289,7 @@ impl rusb::Hotplug<Context> for HotplugCallback {
 
                 if usb_protect {
                     log.n_type = 9005;
+                    log.n_level = 3;
                     if disable_usb_device(&device).is_ok() {
                         log::error!("已阻止 USB 设备: {} (eid={})", name, eid);
                     } else {
@@ -278,26 +317,89 @@ impl rusb::Hotplug<Context> for HotplugCallback {
 
             },
         }
+        if let Some(ref tx) = self.hotplug_signal_tx {
+            let _ = tx.try_send(true);
+            log::info!("[USB-HOTPLUG] 已尝试发送插入信号");
+        }
+
     }
 
     fn device_left(&mut self, device: Device<Context>) {
-        let desc = match device.device_descriptor() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        let vid = desc.vendor_id();
-        let pid = desc.product_id();
-        let vendor_str = format!("{:04x}", vid);
-        let product_str = format!("{:04x}", pid);
-        let serial = device
-            .open()
-            .and_then(|h| h.read_serial_number_string_ascii(&desc))
-            .unwrap_or_default();
+        log::info!("USB 设备拔出事件触发");
 
-        let eid = crate::utils::generate_eid(&vendor_str, &product_str, &serial);
-        let mut seen = self.seen_devices.lock().unwrap();
-        seen.retain(|e| e != &eid);
-        log::debug!("USB 设备拔出: eid={}", eid);
+        let cfg = NETINFO_CONFIG.lock().unwrap();
+        if !cfg.usb_switch {
+            log::debug!("USB 监控开关已关闭，跳过拔出处理");
+            return;
+        }
+        let usb_protect = cfg.usb_protect;
+        drop(cfg);
+
+        if let Some(ref tx) = self.hotplug_signal_tx {
+            match tx.try_send(true) {
+                Ok(_) => log::info!("[USB-HOTPLUG] 热插拔信号已发送 (拔出)"),
+                Err(e) => log::error!("[USB-HOTPLUG] 发送信号失败 (拔出): {:?}", e),
+            }
+        }
+
+        // 获取拔出设备的信息并上报
+        let bus = device.bus_number();
+        let addr = device.address();
+        let device_info = {
+            let mut cache = self.device_info_cache.lock().unwrap();
+            cache.remove(&(bus, addr))
+        };
+
+        if let Some((eid, name)) = device_info {
+            // 从已见设备列表中移除
+            {
+                let mut seen = self.seen_devices.lock().unwrap();
+                seen.retain(|e| e != &eid);
+            }
+
+            let status = self.shared_list.lock().unwrap().get_device_list_status(&eid);
+            
+            match status {
+                DeviceListStatus::InWhitelist => {
+                    log::info!("已允许 USB 设备拔出: {} (eid={})", name, eid);
+                }
+                DeviceListStatus::InBlacklist | DeviceListStatus::NotInAnyList => {
+                    log::info!("上报 USB 设备拔出: name={}, eid={}, status={:?}", name, eid, status);
+                    
+                    let log = AuditLogInfo {
+                        file_path: None,
+                        rename_dir: None,
+                        exception_process: None,
+                        md5: None,
+                        n_type: if usb_protect { 9007 } else { 9008 },
+                        n_level: if usb_protect { 3 } else { 2 },
+                        n_time: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        notice_remark: None,
+                        peripheral_name: Some(name.clone()),
+                        peripheral_remark: Some(name),
+                        peripheral_eid: Some(eid),
+                        p_param: None,
+                    };
+
+                    let tx = self.usb_audit_log_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        match tx.try_send(log) {
+                            Ok(()) => {
+                                log_info!("[USB-MONITOR] 拔出审计日志已安全发送");
+                            }
+                            Err(e) => {
+                                log_error!("[USB-MONITOR] 拔出审计日志发送失败: {:?}", e);
+                            }
+                        }
+                    });
+                }
+            }
+        } else {
+            log_debug!("拔出设备不在缓存中 (可能不是存储设备或监控开启前插入)");
+        }
     }
 }
 
@@ -501,17 +603,23 @@ pub async fn upload_usb_info(
 
 
 pub trait StartUsbService {
-    fn start_usb_services(&mut self, usb_audit_log_tx: mpsc::Sender<AuditLogInfo>
+    fn start_usb_services(&mut self, usb_audit_log_tx: mpsc::Sender<AuditLogInfo>, hotplug_signal_tx: mpsc::Sender<bool>
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
 }
+
+pub trait StartUsbHotplugHandler {
+    fn start_usb_hotplug_handler(&mut self, hotplug_signal_rx: mpsc::Receiver<bool>
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
+}
+
 impl StartUsbService for BootManager {
     fn start_usb_services(
-        &mut self, usb_audit_log_tx: mpsc::Sender<AuditLogInfo>
+        &mut self, usb_audit_log_tx: mpsc::Sender<AuditLogInfo>, hotplug_signal_tx: mpsc::Sender<bool>
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
             let base_url = self.get_base_url();
             let net_client = match NetClient::new(Some(base_url), true) {
-                Ok(client) => client,
+                Ok(client) => Arc::new(client),
                 Err(err) => {
                     eprintln!("创建 NetClient 失败: {}", err);
                     return Err("创建 NetClient 失败".to_string());
@@ -521,26 +629,54 @@ impl StartUsbService for BootManager {
 
             let current_devices = get_all_local_usb_devices();
             loop {
-
                 if let Some(_) = self.get_token().await {
                     let devices = current_devices.clone();
                     upload_usb_info(&devices, &net_client, &url, self).await;
                     break;
                 } else {
-                    //log_error!("token 尚未准备好，等待中...");
                     sleep(Duration::from_secs(2)).await;
                 }
             }
-
-            let monitor = UsbMonitor::new(SHARED_USB_LIST.clone(), usb_audit_log_tx)
+            
+            let monitor = UsbMonitor::new_with_signal(SHARED_USB_LIST.clone(), usb_audit_log_tx, hotplug_signal_tx)
                 .map_err(|e| format!("创建监控器失败: {:?}", e))?;
-
-            tokio::spawn(async move {
+            
+            tokio::task::spawn_blocking(move || {
                 if let Err(e) = monitor.run() {
                     log::error!("USB 监控运行失败: {:?}", e);
                 }
             });
+
             Ok("USB服务正常退出".to_string())
+        })
+    }
+}
+
+impl StartUsbHotplugHandler for BootManager {
+    fn start_usb_hotplug_handler(
+        &mut self, mut hotplug_signal_rx: mpsc::Receiver<bool>
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        Box::pin(async move {
+            let base_url = self.get_base_url();
+            let net_client = match NetClient::new(Some(base_url), true) {
+                Ok(client) => Arc::new(client),
+                Err(err) => {
+                    eprintln!("创建 NetClient 失败: {}", err);
+                    return Err("创建 NetClient 失败".to_string());
+                }
+            };
+            let url = format!("{}/v1/addperipherals", net_client.get_base_url().unwrap_or_default());
+            let boot_mgr_clone = self.clone();
+            
+            tokio::spawn(async move {
+                while let Some(_) = hotplug_signal_rx.recv().await {
+                    log_info!("[USB-HOTPLUG-HANDLER] 收到USB热插拔信号,重新获取并上传设备列表");
+                    let devices = get_all_local_usb_devices();
+                    upload_usb_info(&devices, &net_client, &url, &boot_mgr_clone).await;
+                }
+            });
+
+            Ok("USB热插拔处理服务正常退出".to_string())
         })
     }
 }

@@ -100,7 +100,7 @@ async fn detect_valid_command() -> Result<(String, usize), String> {
                 log_info!("Detected valid command [{}]: {}", i, cmd);
                 return Ok((cmd.to_string(), i));
             }
-            Ok(_) => log_debug!("Command [{}] returned no output: {}", i, cmd),
+            Ok(_) => {/*log_debug!("Command [{}] returned no output: {}", i, cmd);*/},
             Err(e) => log_debug!("Command [{}] failed: {}", i, e),
         }
     }
