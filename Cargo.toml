@@ -10,7 +10,7 @@ members = [
      "crates/online",
      "crates/task",
      "crates/netlink",
-     "crates/kernel_event",
+     #"crates/kernel_event",
      "crates/system_metrics",
      "crates/logging",
      "crates/pattern",
@@ -19,12 +19,11 @@ members = [
      "crates/process_mgr",
      "crates/procinfo",
      "crates/netblock",
-     "crates/udisk",
-     "crates/docker",
+     #"crates/udisk",
+     #"crates/docker",
      "crates/snapman",
      "crates/rules_jump_mgr",
      "crates/agent_manager",
-  #"crates/agent_cli",
 ]
 
 [profile.dev]
@@ -70,6 +69,12 @@ incremental = false
 debug-assertions = false
 overflow-checks = false
 rpath = false
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+opt-level = 2  # 稍微降低优化级别增加稳定性
+lto = false   # 禁用LTO避免mips64链接问题
 
 [workspace.dependencies]
 tracing = "0.1"

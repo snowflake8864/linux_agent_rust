@@ -30,7 +30,7 @@ rustup default nightly
 rustup target add mips64-unknown-linux-muslabi64 --toolchain nightly
 cargo +nightly build --release --target mips64-unknown-linux-muslabi64
 
-
+rustup default stable
 # x86_64
 cargo zigbuild --target x86_64-unknown-linux-musl --release
 
@@ -38,7 +38,9 @@ cargo zigbuild --target x86_64-unknown-linux-musl --release
 cargo zigbuild --target aarch64-unknown-linux-musl --release
 
 # mips64el
-cargo +nightly build -Z build-std=std,panic_abort --target mips64el-unknown-linux-gnuabi64 --release --no-default-features
+cargo +nightly zigbuild -Z build-std=std,panic_abort --target mips64el-unknown-linux-gnuabi64 --release --no-default-features
+cargo +nightly zigbuild -Z build-std=std,panic_abort --target mips64el-unknown-linux-muslabi64 --release --no-default-features
+
 
 # loongarch64
 cargo zigbuild --target loongarch64-unknown-linux-musl --release --no-default-features

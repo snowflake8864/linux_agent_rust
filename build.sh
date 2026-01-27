@@ -26,9 +26,11 @@ cp target/aarch64-unknown-linux-musl/release/MagicArmorAgent package/opt/osec/aa
 
 # mips64el (no MagicArmorAgent)
 cp target/mips64el-unknown-linux-gnuabi64/release/MagicArmor_0 package/opt/osec/mips64el-unknown-linux-gnuabi64/
+cp target/mips64el-unknown-linux-gnuabi64/release/MagicArmorAgent package/opt/osec/mips64el-unknown-linux-gnuabi64/
 
 # loongarch64 (no MagicArmorAgent)
 cp target/loongarch64-unknown-linux-musl/release/MagicArmor_0 package/opt/osec/loongarch64-unknown-linux-musl/
+cp target/loongarch64-unknown-linux-musl/release/MagicArmorAgent package/opt/osec/loongarch64-unknown-linux-musl/
 
 # ====== 3. Copy architecture-specific kernel modules ======
 echo "Copying kernel modules..."

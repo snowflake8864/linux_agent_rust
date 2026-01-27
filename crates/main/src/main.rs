@@ -12,7 +12,7 @@ use netlink::netlink::NlSockInfo;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use config::net_info::NETINFO_CONFIG;
-use udisk::StartUsbService;
+use udisk::{StartUsbService, StartUsbHotplugHandler};
 use docker::StartDockerMonitor;
 use std::fs;
 use std::path::Path;
@@ -113,6 +113,7 @@ async fn main() -> std::io::Result<()> {
     let sigint = unix_signal(SignalKind::interrupt())?;
     let  sigterm = unix_signal(SignalKind::terminate())?;
 */
+    
     // 启动异步任务
     let start_services_handle = tokio::spawn({
         let mut init = init.clone();
@@ -198,14 +199,29 @@ async fn main() -> std::io::Result<()> {
         logging::log_error!("无法创建 socket，跳过内核事件处理");
     }
 
+    // 创建USB热插拔信号通道
+    let (usb_hotplug_tx, usb_hotplug_rx) = mpsc::channel::<bool>(100);
+
     let usb_monitor_handle = tokio::spawn({
         let mut init = init.clone();
         let tx = file_audit_log_tx.clone();
         async move {
-            init.start_usb_services(tx)
+            init.start_usb_services(tx, usb_hotplug_tx)
                 .await
                 .map_err(|e| {
                     logging::log_error!("start_usb_services 失败: {}", e);
+                    std::io::Error::new(std::io::ErrorKind::Other, e)
+                })
+        }
+    });
+
+    let usb_hotplug_handler_handle = tokio::spawn({
+        let mut init = init.clone();
+        async move {
+            init.start_usb_hotplug_handler(usb_hotplug_rx)
+                .await
+                .map_err(|e| {
+                    logging::log_error!("start_usb_hotplug_handler 失败: {}", e);
                     std::io::Error::new(std::io::ErrorKind::Other, e)
                 })
         }
