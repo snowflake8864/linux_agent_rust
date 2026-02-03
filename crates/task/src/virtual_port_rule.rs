@@ -1,23 +1,42 @@
 // crates/task/src/virtual_port_rule.rs
 
 use serde::{Deserialize, Deserializer};
+use serde::de;
 use std::str::FromStr;
 
 // 自定义反序列化函数，解析 "1000-2000" 格式的 source_port
+
 pub fn deserialize_port_range<'de, D>(deserializer: D) -> Result<(u16, u16), D::Error>
 where
     D: Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
     let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 2 {
-        return Err(serde::de::Error::custom("Invalid source_port format, expected 'start-end'"));
-    }
-    let start = u16::from_str(parts[0]).map_err(|_| serde::de::Error::custom("Invalid start_port"))?;
-    let end = u16::from_str(parts[1]).map_err(|_| serde::de::Error::custom("Invalid end_port"))?;
-    if start > end {
-        return Err(serde::de::Error::custom("start_port must be less than or equal to end_port"));
-    }
+
+    let parse_port = |p: &str| {
+        u16::from_str(p).map_err(|_| de::Error::custom(format!("Invalid port: {}", p)))
+    };
+
+    let (start, end) = match parts.len() {
+        1 => {
+            let port = parse_port(parts[0])?;
+            (port, port)
+        }
+        2 => {
+            let start = parse_port(parts[0])?;
+            let end = parse_port(parts[1])?;
+            if start > end {
+                return Err(de::Error::custom("start_port must be <= end_port"));
+            }
+            (start, end)
+        }
+        _ => {
+            return Err(de::Error::custom(
+                "Invalid port format, expected 'port' or 'start-end'",
+            ));
+        }
+    };
+
     Ok((start, end))
 }
 
