@@ -29,6 +29,7 @@ logging = { path = "../logging" }
 log = "0.4"
 fs2 = "0.4"
 tempfile = "3"
+rustix = "0.38"
 zip = "0.6"
 walkdir = "2.5"
 uname = "0.1"

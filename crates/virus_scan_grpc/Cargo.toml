@@ -1,0 +1,27 @@
+[package]
+name = "virus_scan_grpc"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+tonic-build = "0.14"
+tonic-prost-build = "0.14"
+
+[dependencies]
+tonic = "0.14"
+prost = "0.14"
+tonic-prost = "0.14"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+process_mgr = { path = "../process_mgr" }
+net_client = { path = "../net_client" }
+common = { path = "../common" }
+logging = { path = "../logging" }
+config = { path = "../config" }
+chrono = { version = "0.4" }
+uuid = { version = "1" }
+log = "0.4"
+clamav-client = "2.2.0"
