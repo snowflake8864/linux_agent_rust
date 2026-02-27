@@ -6,7 +6,7 @@ use tonic::transport::Server;
 use logging::{log_error, log_info,log_warn};
 use common::manager::boot::BootManager;
 use net_client::core::NetClient;
-use crate::clamav_scanner::ClamAVScanner;
+use crate::clamav_scanner::{ClamAVConnectionPool, ClamAVConnection};
 
 pub trait StartVirusScanGrpcService {
     fn start_virus_scan_grpc_service(
@@ -27,7 +27,7 @@ impl StartVirusScanGrpcService for BootManager {
         &mut self,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
-            let (virus_scan_enabled, virus_scan_dev_mode, virus_scan_grpc_addr, virus_scan_dev_grpc_addr, clamav_enabled, clamav_host, clamav_port, clamav_timeout_secs) = {
+            let (virus_scan_enabled, virus_scan_dev_mode, virus_scan_grpc_addr, virus_scan_dev_grpc_addr, clamav_enabled, clamav_host, clamav_port, clamav_timeout_secs, clamav_pool_size) = {
                 let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
                 (
                     cfg.virus_scan_enabled,
@@ -38,6 +38,7 @@ impl StartVirusScanGrpcService for BootManager {
                     cfg.clamav_host.clone(),
                     cfg.clamav_port,
                     cfg.clamav_timeout_secs,
+                    cfg.clamav_pool_size,
                 )
             };
             
@@ -53,12 +54,21 @@ impl StartVirusScanGrpcService for BootManager {
             
             // 检查 ClamAV 是否启用
             let scanner = if clamav_enabled {
-                // 自动检测连接类型：优先 TCP，失败则尝试 Unix Socket
                 let timeout = Duration::from_secs(clamav_timeout_secs);
-                match ClamAVScanner::auto_connect(clamav_host.clone(), Some(clamav_port), timeout).await {
-                    Ok(s) => {
-                        log_info!("ClamAV 连接成功");
-                        Some(Arc::new(s))
+                
+                // 自动检测连接类型
+                let connection = if clamav_host.starts_with('/') || clamav_host.contains(".sock") {
+                    ClamAVConnection::Unix { socket_path: clamav_host.clone() }
+                } else {
+                    ClamAVConnection::Tcp { host: clamav_host.clone(), port: clamav_port }
+                };
+                
+                let pool = Arc::new(ClamAVConnectionPool::new(connection, timeout, clamav_pool_size));
+                
+                match pool.ping().await {
+                    Ok(_) => {
+                        log_info!("ClamAV 连接池创建成功，大小={}", clamav_pool_size);
+                        Some(pool)
                     }
                     Err(e) => {
                         log_warn!("ClamAV 连接失败: {}，病毒扫描功能不可用", e);
