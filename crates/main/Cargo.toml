@@ -36,6 +36,10 @@ netlink = { path = "../netlink" }
 udisk = { path = "../udisk"}
 kernel_module = { path = "../kernel_module" }
 docker = { path = "../docker"}
+virus_scan_grpc = { path = "../virus_scan_grpc" }
+net_client = { path = "../net_client" }
+tonic = "0.14"
+prost = "0.14"
 #[CKlibm]
 #libc ="/home/zebra/workspace/rustprj/linux_agent_rust_v10/lib/libc.so.6"
 #libm ="/home/zebra/workspace/rustprj/linux_agent_rust_v10/lib/libm.so.6"
