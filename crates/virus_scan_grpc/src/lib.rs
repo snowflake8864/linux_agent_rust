@@ -9,7 +9,7 @@ pub mod grpc_service;
 pub mod service;
 pub mod vuln_service;
 
-pub use clamav_scanner::{ClamAVScanner, ClamAVConfig, ScanResult};
+pub use clamav_scanner::{ClamAVConnectionPool, ClamAVConfig, ScanResult};
 pub use scan_task_mgr::ScanTaskManager;
 pub use grpc_service::VirusScanGrpcService;
 pub use vuln_service::VulnScanGrpcService;

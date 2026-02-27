@@ -72,6 +72,7 @@ pub struct NetInfoConfig {
     pub clamav_host: String,
     pub clamav_port: u16,
     pub clamav_timeout_secs: u64,
+    pub clamav_pool_size: usize,
 }
 
 enum NetRule<'a> {
@@ -371,6 +372,11 @@ impl NetInfoConfig {
         } else {
             config.clamav_timeout_secs = 60;
         }
+        if let Some(value) = ini.get("VIRUS_SCAN", "CLAMAV_POOL_SIZE") {
+            config.clamav_pool_size = value.parse().unwrap_or(10);
+        } else {
+            config.clamav_pool_size = 10;
+        }
 
         config
     }
@@ -459,6 +465,7 @@ impl NetInfoConfig {
         writeln!(file, "CLAMAV_HOST={}", self.clamav_host)?;
         writeln!(file, "CLAMAV_PORT={}", self.clamav_port)?;
         writeln!(file, "CLAMAV_TIMEOUT={}", self.clamav_timeout_secs)?;
+        writeln!(file, "CLAMAV_POOL_SIZE={}", self.clamav_pool_size)?;
         Ok(())
     }
 

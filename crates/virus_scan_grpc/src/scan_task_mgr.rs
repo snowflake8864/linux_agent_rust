@@ -1,5 +1,5 @@
 use crate::proto::{ScanProgress, VirusAlert, ScanCompleted, ServerMessage, FileScanResult};
-use crate::clamav_scanner::{ClamAVScanner, ScanResult};
+use crate::clamav_scanner::{ClamAVConnectionPool, ScanResult};
 use chrono::Utc;
 use common::manager::boot::BootManager;
 use logging::{log_error, log_info};
@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::fs;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -19,6 +19,12 @@ const SCAN_STATE_IDLE: u8 = 0;
 const SCAN_STATE_RUNNING: u8 = 1;
 const SCAN_STATE_STOPPED: u8 = 2;
 const SCAN_STATE_COMPLETED: u8 = 3;
+
+enum ScanAction {
+    Virus(String),
+    Clean,
+    Error(String),
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct VirusScanAlert {
@@ -80,10 +86,11 @@ pub struct ScanTaskManager {
     tasks: Arc<Mutex<HashMap<String, ScanTask>>>,
     net_client: Arc<net_client::core::NetClient>,
     server_b_url: String,
-    clamav_scanner: Option<Arc<ClamAVScanner>>,
+    clamav_scanner: Option<Arc<ClamAVConnectionPool>>,
     virus_tx: mpsc::Sender<VirusScanAlert>,
     virus_rx: Arc<Mutex<mpsc::Receiver<VirusScanAlert>>>,
     boot_manager: Option<BootManager>,
+    scan_semaphore: Arc<Semaphore>,
 }
 
 impl ScanTask {
@@ -126,10 +133,12 @@ impl ScanTaskManager {
     pub fn new(
         net_client: Arc<net_client::core::NetClient>,
         server_b_url: String,
-        clamav_scanner: Option<Arc<ClamAVScanner>>,
+        clamav_scanner: Option<Arc<ClamAVConnectionPool>>,
         boot_manager: Option<BootManager>,
     ) -> Self {
         let (virus_tx, virus_rx) = mpsc::channel(1024);
+        let concurrency = config::net_info::NETINFO_CONFIG.lock().unwrap().clamav_pool_size;
+        log_info!("扫描并发数设置为: {}", concurrency);
         Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             net_client,
@@ -138,6 +147,7 @@ impl ScanTaskManager {
             virus_tx,
             virus_rx: Arc::new(Mutex::new(virus_rx)),
             boot_manager,
+            scan_semaphore: Arc::new(Semaphore::new(concurrency)),
         }
     }
 
@@ -162,7 +172,7 @@ impl ScanTaskManager {
         let mut json_str = String::new();
         match build_virus_alert_json(&alerts, &mut json_str) {
             Ok(()) => {
-                log_info!("病毒告警上报内容: {}", json_str);
+                //log_info!("病毒告警上报内容: {}", json_str);
                 let token = async {
                     match &self.boot_manager {
                         Some(m) => m.get_token().await,
@@ -269,7 +279,7 @@ impl ScanTaskManager {
         task: &ScanTask,
         total_scanned: &mut u32,
     ) {
-        let mut entries = match fs::read_dir(dir_path).await {
+        let entries = match fs::read_dir(dir_path).await {
             Ok(e) => e,
             Err(e) => {
                 log_error!("打开目录失败: {} - {}", dir_path.display(), e);
@@ -277,7 +287,18 @@ impl ScanTaskManager {
             }
         };
 
+        let mut all_entries = Vec::new();
+        let mut entries = entries;
         while let Some(entry) = entries.next_entry().await.ok().flatten() {
+            all_entries.push(entry);
+        }
+
+        let semaphore = Arc::clone(&self.scan_semaphore);
+        
+        let mut handles = Vec::new();
+        let mut dirs_to_scan = Vec::new();
+
+        for entry in all_entries {
             if task.state.load(Ordering::Relaxed) != SCAN_STATE_RUNNING {
                 break;
             }
@@ -293,56 +314,107 @@ impl ScanTaskManager {
 
             match entry.file_type().await {
                 Ok(ft) if ft.is_dir() => {
-                    Box::pin(self.scan_directory_recursive(&entry.path(), excludes, scan_id, task, total_scanned)).await;
+                    dirs_to_scan.push(entry.path());
                 }
                 Ok(ft) if ft.is_file() => {
-                    let scan_start = std::time::Instant::now();
-                    if let Some(scanner) = &self.clamav_scanner {
-                        match scanner.scan_file(&file_path).await {
-                            Ok(ScanResult::Virus { name }) => {
-                                log_info!("[SCAN] {} -> VIRUS ({})", file_path, name);
-                                self.send_virus_alert(scan_id, &file_path, &name, task).await;
-                                self.send_file_scan_result(scan_id, &file_path, "VIRUS", Some(&name), None, scan_start.elapsed().as_millis() as i64, task).await;
+                    let scanner = self.clamav_scanner.clone();
+                    let scan_id_inner = scan_id.to_string();
+                    let file_path_clone = file_path.clone();
+                    let semaphore_clone = semaphore.clone();
+                    
+                    handles.push(tokio::spawn(async move {
+                        let _permit = semaphore_clone.acquire().await.unwrap();
+                        let scan_start = std::time::Instant::now();
+                        
+                        if let Some(scanner) = &scanner {
+                            match scanner.scan_file(&file_path_clone).await {
+                                Ok(ScanResult::Virus { name }) => {
+                                    log_info!("[SCAN] {} -> VIRUS ({})", file_path_clone, name);
+                                    (ScanAction::Virus(name), file_path_clone, scan_start.elapsed().as_millis() as i64)
+                                }
+                                Ok(ScanResult::Clean) => {
+                                    (ScanAction::Clean, file_path_clone, scan_start.elapsed().as_millis() as i64)
+                                }
+                                Ok(ScanResult::Error { message }) => {
+                                    log_error!("[SCAN] {} -> ERROR: {}", file_path_clone, message);
+                                    (ScanAction::Error(message), file_path_clone, scan_start.elapsed().as_millis() as i64)
+                                }
+                                Err(e) => {
+                                    log_error!("[SCAN] {} -> ERROR: {}", file_path_clone, e);
+                                    (ScanAction::Error(e), file_path_clone, scan_start.elapsed().as_millis() as i64)
+                                }
                             }
-                            Ok(ScanResult::Clean) => {
-                                log_info!("[SCAN] {} -> OK", file_path);
-                                self.send_file_scan_result(scan_id, &file_path, "OK", None, None, scan_start.elapsed().as_millis() as i64, task).await;
-                            }
-                            Ok(ScanResult::Error { message }) => {
-                                log_error!("[SCAN] {} -> ERROR: {}", file_path, message);
-                                self.send_file_scan_result(scan_id, &file_path, "ERROR", None, Some(&message), scan_start.elapsed().as_millis() as i64, task).await;
-                            }
-                            Err(e) => {
-                                log_error!("[SCAN] {} -> ERROR: {}", file_path, e);
-                                self.send_file_scan_result(scan_id, &file_path, "ERROR", None, Some(&e), scan_start.elapsed().as_millis() as i64, task).await;
-                            }
+                        } else {
+                            log_error!("[SCAN] {} -> ERROR: ClamAV 不可用", file_path_clone);
+                            (ScanAction::Error("ClamAV 不可用".to_string()), file_path_clone, scan_start.elapsed().as_millis() as i64)
                         }
-                    } else {
-                        log_error!("[SCAN] {} -> ERROR: ClamAV 不可用", file_path);
-                        self.send_file_scan_result(scan_id, &file_path, "ERROR", None, Some("ClamAV 不可用"), scan_start.elapsed().as_millis() as i64, task).await;
-                    }
-
-                    *total_scanned += 1;
-
-                    if *total_scanned % 10 == 0 {
-                        let progress = ScanProgress {
-                            scan_id: scan_id.to_string(),
-                            scanned: *total_scanned as i32,
-                            total: 0,
-                            viruses_found: task.viruses.load(Ordering::Relaxed) as i32,
-                            current_path: file_path.clone(),
-                        };
-                        let _ = task.tx.send(Ok(ServerMessage {
-                            event: Some(crate::proto::server_message::Event::Progress(progress)),
-                        })).await;
-                    }
+                    }));
                 }
                 _ => {}
             }
         }
+
+        for handle in handles {
+            if task.state.load(Ordering::Relaxed) != SCAN_STATE_RUNNING {
+                break;
+            }
+            
+            if let Ok((action, file_path, elapsed)) = handle.await {
+                *total_scanned += 1;
+                
+                match action {
+                    ScanAction::Virus(name) => {
+                        self.send_virus_alert(scan_id, &file_path, &name, task).await;
+                        self.send_file_scan_result(scan_id, &file_path, "VIRUS", Some(&name), None, elapsed, task).await;
+                    }
+                    ScanAction::Clean => {
+                        self.send_file_scan_result(scan_id, &file_path, "OK", None, None, elapsed, task).await;
+                    }
+                    ScanAction::Error(msg) => {
+                        self.send_file_scan_result(scan_id, &file_path, "ERROR", None, Some(&msg), elapsed, task).await;
+                    }
+                }
+
+                if *total_scanned % 10 == 0 {
+                    let progress = ScanProgress {
+                        scan_id: scan_id.to_string(),
+                        scanned: *total_scanned as i32,
+                        total: 0,
+                        viruses_found: task.viruses.load(Ordering::Relaxed) as i32,
+                        current_path: file_path.clone(),
+                    };
+                    let _ = task.tx.send(Ok(ServerMessage {
+                        event: Some(crate::proto::server_message::Event::Progress(progress)),
+                    })).await;
+                }
+            }
+        }
+
+        for dir_path in dirs_to_scan {
+            if task.state.load(Ordering::Relaxed) != SCAN_STATE_RUNNING {
+                break;
+            }
+            Box::pin(self.scan_directory_recursive(&dir_path, excludes, scan_id, task, total_scanned)).await;
+        }
     }
 
-    /// 发送病毒告警 (ClamAV 模式)
+    /// 根据病毒名判断威胁级别
+    fn determine_threat_level(&self, virus_name: &str) -> String {
+        let name_lower = virus_name.to_lowercase();
+        
+        if name_lower.contains("ransomware") || name_lower.contains("crypto") {
+            "CRITICAL".to_string()
+        } else if name_lower.contains("trojan") || name_lower.contains("backdoor") {
+            "HIGH".to_string()
+        } else if name_lower.contains("adware") || name_lower.contains("pup") {
+            "MEDIUM".to_string()
+        } else if name_lower.contains("test") || name_lower.contains("eicar") {
+            "LOW".to_string()  // 测试文件
+        } else {
+            "HIGH".to_string()  // 默认高危
+        }
+    }
+
     async fn send_virus_alert(
         &self,
         scan_id: &str,
@@ -358,7 +430,7 @@ impl ScanTaskManager {
             scan_id: scan_id.to_string(),
             file_path: file_path.to_string(),
             virus_name: virus_name.to_string(),
-            md5: "".to_string(),  // ClamAV 模式不计算 MD5
+            md5: "".to_string(),
             threat_level,
             detected_at: Utc::now().timestamp_millis(),
             file_size: "".to_string(),
@@ -379,7 +451,6 @@ impl ScanTaskManager {
         log_info!("[gRPC] 上报病毒告警: {} - {}", file_path, virus_name);
     }
 
-    /// 发送单个文件扫描结果
     async fn send_file_scan_result(
         &self,
         scan_id: &str,
@@ -404,24 +475,7 @@ impl ScanTaskManager {
             event: Some(crate::proto::server_message::Event::FileScanResult(result)),
         })).await;
 
-        log_info!("[gRPC] 上报文件结果: {} -> {} ({}ms)", file_path, status, scan_time_ms);
-    }
-
-    /// 根据病毒名判断威胁级别
-    fn determine_threat_level(&self, virus_name: &str) -> String {
-        let name_lower = virus_name.to_lowercase();
-        
-        if name_lower.contains("ransomware") || name_lower.contains("crypto") {
-            "CRITICAL".to_string()
-        } else if name_lower.contains("trojan") || name_lower.contains("backdoor") {
-            "HIGH".to_string()
-        } else if name_lower.contains("adware") || name_lower.contains("pup") {
-            "MEDIUM".to_string()
-        } else if name_lower.contains("test") || name_lower.contains("eicar") {
-            "LOW".to_string()  // 测试文件
-        } else {
-            "HIGH".to_string()  // 默认高危
-        }
+        //log_info!("[gRPC] 上报文件结果: {} -> {} ({}ms)", file_path, status, scan_time_ms);
     }
 }
 
@@ -435,6 +489,7 @@ impl Clone for ScanTaskManager {
             virus_tx: self.virus_tx.clone(),
             virus_rx: Arc::clone(&self.virus_rx),
             boot_manager: self.boot_manager.clone(),
+            scan_semaphore: Arc::new(Semaphore::new(10)),
         }
     }
 }
