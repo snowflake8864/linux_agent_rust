@@ -27,7 +27,7 @@ impl StartVirusScanGrpcService for BootManager {
         &mut self,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
-            let (virus_scan_enabled, virus_scan_dev_mode, virus_scan_grpc_addr, virus_scan_dev_grpc_addr, clamav_enabled, clamav_host, clamav_port, clamav_timeout_secs, clamav_pool_size) = {
+            let (virus_scan_enabled, virus_scan_dev_mode, virus_scan_grpc_addr, virus_scan_dev_grpc_addr, clamav_enabled, clamav_host, clamav_port, clamav_timeout_secs, clamav_pool_size, clamav_connection_type, clamav_socket_path) = {
                 let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
                 (
                     cfg.virus_scan_enabled,
@@ -39,6 +39,8 @@ impl StartVirusScanGrpcService for BootManager {
                     cfg.clamav_port,
                     cfg.clamav_timeout_secs,
                     cfg.clamav_pool_size,
+                    cfg.clamav_connection_type.clone(),
+                    cfg.clamav_socket_path.clone(),
                 )
             };
             
@@ -56,11 +58,15 @@ impl StartVirusScanGrpcService for BootManager {
             let scanner = if clamav_enabled {
                 let timeout = Duration::from_secs(clamav_timeout_secs);
                 
-                // 自动检测连接类型
-                let connection = if clamav_host.starts_with('/') || clamav_host.contains(".sock") {
-                    ClamAVConnection::Unix { socket_path: clamav_host.clone() }
-                } else {
-                    ClamAVConnection::Tcp { host: clamav_host.clone(), port: clamav_port }
+                let connection = match clamav_connection_type.to_lowercase().as_str() {
+                    "unix" | "socket" => {
+                        log_info!("ClamAV: 使用 Unix socket 连接, path={}", clamav_socket_path);
+                        ClamAVConnection::Unix { socket_path: clamav_socket_path.clone() }
+                    }
+                    _ => {
+                        log_info!("ClamAV: 使用 TCP socket 连接, host={}, port={}", clamav_host, clamav_port);
+                        ClamAVConnection::Tcp { host: clamav_host.clone(), port: clamav_port }
+                    }
                 };
                 
                 let pool = Arc::new(ClamAVConnectionPool::new(connection, timeout, clamav_pool_size));

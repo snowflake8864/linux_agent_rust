@@ -44,7 +44,7 @@ impl ClamAVConnectionPool {
 
     pub async fn scan_file(&self, path: &str) -> Result<ScanResult, String> {
         let permits = self.semaphore.available_permits();
-        log_info!("ClamAV: 获取连接，并发数={}, 路径={}", self.pool_size - permits, path);
+        //log_info!("ClamAV: 获取连接，并发数={}, 路径={}", self.pool_size - permits, path);
         let _permit = self.semaphore.acquire().await.map_err(|e| format!("Semaphore error: {}", e))?;
         
         let path_owned = path.to_string();
@@ -85,7 +85,7 @@ impl ClamAVConnectionPool {
                         .map_err(|_| "Unix connect timeout")?
                         .map_err(|e| format!("Unix socket connect failed: {}", e))?;
                     
-                    stream.write_all(b"INSTREAM\0").await.map_err(|e| format!("Write failed: {}", e))?;
+                    stream.write_all(b"zINSTREAM\0").await.map_err(|e| format!("Write failed: {}", e))?;
                     
                     let file_data = timeout(timeout_duration, tokio::fs::read(&path_owned)).await
                         .map_err(|_| "File read timeout")?
@@ -109,7 +109,7 @@ impl ClamAVConnectionPool {
         }.await;
 
         let permits = self.semaphore.available_permits();
-        log_info!("ClamAV: 释放连接，并发数={}", self.pool_size - permits);
+        //log_info!("ClamAV: 释放连接，并发数={}", self.pool_size - permits);
 
         match response {
             Ok(resp) => {

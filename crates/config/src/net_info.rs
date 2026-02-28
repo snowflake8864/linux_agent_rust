@@ -73,6 +73,8 @@ pub struct NetInfoConfig {
     pub clamav_port: u16,
     pub clamav_timeout_secs: u64,
     pub clamav_pool_size: usize,
+    pub clamav_connection_type: String,
+    pub clamav_socket_path: String,
 }
 
 enum NetRule<'a> {
@@ -378,6 +380,13 @@ impl NetInfoConfig {
             config.clamav_pool_size = 10;
         }
 
+        config.clamav_connection_type = ini
+            .get("VIRUS_SCAN", "CLAMAV_CONNECTION_TYPE")
+            .unwrap_or_else(|| "tcp".to_string());
+        config.clamav_socket_path = ini
+            .get("VIRUS_SCAN", "CLAMAV_SOCKET_PATH")
+            .unwrap_or_else(|| "/opt/clamav/var/run/clamd.sock".to_string());
+
         config
     }
 
@@ -466,6 +475,15 @@ impl NetInfoConfig {
         writeln!(file, "CLAMAV_PORT={}", self.clamav_port)?;
         writeln!(file, "CLAMAV_TIMEOUT={}", self.clamav_timeout_secs)?;
         writeln!(file, "CLAMAV_POOL_SIZE={}", self.clamav_pool_size)?;
+        writeln!(
+            file,
+            "CLAMAV_CONNECTION_TYPE={}",
+            self.clamav_connection_type
+        )?;
+        writeln!(file, "CLAMAV_SOCKET_PATH={}", self.clamav_socket_path)?;
+        if self.clamav_socket_path.is_empty() {
+            writeln!(file, "CLAMAV_SOCKET_PATH=/opt/clamav/var/run/clamd.sock")?;
+        }
         Ok(())
     }
 
