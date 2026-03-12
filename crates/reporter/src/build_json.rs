@@ -347,3 +347,24 @@ pub fn build_self_protect_alert_log_json(log_info: &[SelfProtectLogInfo], str_js
     Ok(())
 }
 
+/// 构建SSH登录日志JSON
+pub fn build_ssh_login_json(logs: &[crate::SyslogSshLog], str_json: &mut String) -> Result<(), String> {
+    if logs.is_empty() {
+        return Err("No valid SSH login log entries".to_string());
+    }
+
+    // 序列化日志数组
+    let logs_str = serde_json::to_string(logs)
+        .map_err(|e| format!("序列化SSH登录日志数组失败: {}", e))?;
+
+    // 构造最终JSON对象，与build_batch_syslog_net_json保持一致格式
+    let root_obj = serde_json::json!({
+        "list": logs_str
+    });
+
+    *str_json = serde_json::to_string(&root_obj)
+        .map_err(|e| format!("最终JSON序列化失败: {}", e))?;
+
+    Ok(())
+}
+

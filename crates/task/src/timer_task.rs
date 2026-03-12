@@ -13,6 +13,7 @@ use config::net_info::NETINFO_CONFIG;
 use crate::baseline_task::{process_baselines_from_client};
 use crate::run_outreach_detection;
 use crate::net_reach_rule::build_outreach_detect_list_json;
+use crate::ssh_login_task::SshLoginCollector;
 pub trait TimerTask {
     fn start_timer_task(&mut self) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
 }
@@ -28,6 +29,8 @@ impl TimerTask for BootManager {
                 });
             }
         };
+        // Create SSH login collector once — state (offsets + dedup) must persist across ticks
+        let ssh_login_collector = SshLoginCollector::new();
         Box::pin(async move {
             let mut local_interval = interval(Duration::from_secs(30));
             let mut baseline_interval: Option<Interval> = None;
@@ -61,12 +64,29 @@ impl TimerTask for BootManager {
                     outreach_interval = None;
                     outreach_enabled = false;
                 }
+
+                // SSH登录日志采集开关
+                let ssh_login_switch = self.get_ssh_login_info();
+                if ssh_login_switch {
+                    // 每分钟检查一次
+                    if local_interval.period().as_secs() != 60 {
+                        local_interval = interval(Duration::from_secs(60));
+                        log_info!("启用 SSH 登录日志采集，间隔: 60 秒");
+                    }
+                }
+
                 tokio::select! {
                     _ = local_interval.tick() => {
                         update_netstat_info();
                         update_dnat_info();
                         update_docker_info();
                         write_business_ports_to_proc();
+                        
+                        // SSH登录日志采集
+                        if ssh_login_switch {
+                            let token = self.get_token().await;
+                            ssh_login_collector.collect_and_report(&shared_net_client, token.as_deref()).await;
+                        }
                     }
 
                     _ = async {

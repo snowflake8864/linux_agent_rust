@@ -484,6 +484,7 @@ fn update_config_from_json(&mut self, conf: &serde_json::Map<String, Value>) -> 
     try_update!(bool syslog_dns_switch,     "syslog_dns_switch");
     try_update!(bool internet_switch,       "internet_switch");
     try_update!(bool syslog_process_switch,"syslog_process_switch");
+    try_update!(bool syslog_login_switch,   "syslog_login_switch");
     try_update!(u32 outreach_time,          "outreach_time");
     try_update!(bool outreach_switch,       "outreach_switch");
     try_update!(bool baseline_switch,       "baseline_switch");

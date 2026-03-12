@@ -144,6 +144,12 @@ impl BootManager {
         (netinfocfg.outreach_switch, netinfocfg.outreach_time)
         //(netinfocfg.outreach_switch, 60)
     }
+
+    pub fn get_ssh_login_info(&self) -> bool {
+        let netinfocfg = NETINFO_CONFIG.lock().unwrap();
+        netinfocfg.syslog_login_switch
+    }
+
     pub fn host_is_online(&self) -> bool {
         let core = self.inner.shared_core.load();
         core.is_online == true // 返回克隆的值
