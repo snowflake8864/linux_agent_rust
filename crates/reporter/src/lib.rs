@@ -125,7 +125,7 @@ pub struct OpenPortLog {
 }
 
 
-#[derive(Serialize,  Debug)]
+#[derive(Serialize, Debug)]
 pub struct SelfProtectLogInfo {
     pub file_dir: Option<String>,
     pub proc_dir: Option<String>,
@@ -135,5 +135,17 @@ pub struct SelfProtectLogInfo {
     pub n_type: u16,
     pub n_level: u32,
     pub n_time: u64,
+}
+
+/// SSH登录日志结构
+#[derive(Serialize, Debug, Clone)]
+pub struct SyslogSshLog {
+    pub ip: String,
+    pub username: String,
+    #[serde(rename = "type")]
+    pub login_type: String,
+    pub status: i32,
+    pub log_type: i32,
+    pub time: i64,
 }
 
