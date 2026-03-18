@@ -118,10 +118,16 @@ impl StartVirusScanGrpcService for BootManager {
             Server::builder()
                 .add_service(crate::proto::virus_scan_service_server::VirusScanServiceServer::new(grpc_service))
                 // ============================================================
-                // 漏洞扫描服务 (如需关闭，注释掉下面几行)
+                // 漏洞扫描服务 (接收外部推送的漏洞数据)
                 // ============================================================
                 .add_service(crate::proto::vuln_scan_service_server::VulnScanServiceServer::new(
                     crate::VulnScanGrpcService::new(self.clone(), vuln_base_url),
+                ))
+                // ============================================================
+                // Lynis 系统漏洞扫描服务 (触发 Lynis 执行并返回结果)
+                // ============================================================
+                .add_service(crate::proto::lynis_scan_service_server::LynisScanServiceServer::new(
+                    crate::LynisScanGrpcService::new(),
                 ))
                 // ============================================================
                 .serve(addr)
