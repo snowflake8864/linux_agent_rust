@@ -38,7 +38,7 @@ pub struct SecondaryIPInfo {
     pub ip: String,
     pub netmask: String,
     pub prefix_len: u8,
-    pub added_tick: u64,
+    pub added_time: std::time::Instant,
 }
 pub use ip_manager::IpJumpManager;
 pub use pw_manager::PasswordManager;

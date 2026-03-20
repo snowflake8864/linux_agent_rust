@@ -2249,10 +2249,11 @@ async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
     let source_ip = data.get("source_ip").and_then(|v| v.as_str()).unwrap_or("");
     let target_ip = data.get("target_ip").and_then(|v| v.as_str()).unwrap_or("");
     let active_time = data.get("active_time").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let aging_time = data.get("aging_time").and_then(|v| v.as_u64()).unwrap_or(2) as u32;  // 默认 2 分钟
 
     log_info!(
-        "IP Jump Task: source_ip={}, target_ip={}, gateway={}, active_time={}",
-        source_ip, target_ip, gateway, active_time
+        "IP Jump Task: source_ip={}, target_ip={}, gateway={}, active_time={}, aging_time={}",
+        source_ip, target_ip, gateway, active_time, aging_time
     );
 
     if source_ip.is_empty() && target_ip.is_empty() {
@@ -2266,6 +2267,7 @@ async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
         target_ip.to_string(),
         gateway.to_string(),
         active_time,
+        aging_time,
     )?;
 
     Ok(())
