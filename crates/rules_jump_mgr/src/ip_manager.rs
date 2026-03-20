@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::Path;
 use tokio::fs;
-use regex::Regex;
+use std::time::Instant;
 
 
 // ===== 全局通道 =====
@@ -26,6 +26,7 @@ struct IpJumpInstruction {
     target_ip: String,
     gateway: String,
     active_time: u32,
+    aging_time: u32,  // 单位：分钟
 }
 
 #[derive(Debug, Clone)]
@@ -36,24 +37,34 @@ pub struct NetworkBackup {
     pub interface: String,
 }
 
-const AGING_TICKS: u64 = 2;
+// 默认老化时间 2 分钟（服务端未返回时使用）
+const DEFAULT_AGING_TIME_SECS: u64 = 120;
 
 type SharedSecondaryList = Arc<RwLock<Vec<SecondaryIPInfo>>>;
 
+// 待持久化信息
+#[derive(Debug, Clone)]
+struct PendingPersistInfo {
+    old_ip: String,  // 跳变前的主IP，用于定位 netplan 配置中的条目
+    gateway: Option<String>,
+}
+
 pub struct IpJumpManager {
     secondary_ips: SharedSecondaryList,
-    tick_counter: Arc<RwLock<u64>>,
     main_interface: String,
     last_upload_failed: Arc<RwLock<bool>>,
+    aging_time_secs: Arc<RwLock<u64>>,
+    pending_persist: Arc<RwLock<Option<PendingPersistInfo>>>,
 }
 
 impl IpJumpManager {
     pub fn new(main_interface: &str) -> Arc<Self> {
         Arc::new(IpJumpManager {
             secondary_ips: Arc::new(RwLock::new(Vec::new())),
-            tick_counter: Arc::new(RwLock::new(0)),
             main_interface: main_interface.to_string(),
             last_upload_failed: Arc::new(RwLock::new(false)),
+            aging_time_secs: Arc::new(RwLock::new(DEFAULT_AGING_TIME_SECS)),
+            pending_persist: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -63,6 +74,7 @@ impl IpJumpManager {
         target_ip: String,
         gateway: String,
         active_time: u32,
+        aging_time: u32,
     ) -> Result<(), String> {
         if let Some(tx) = IP_JUMP_INSTRUCTION_TX.get() {
             let instr = IpJumpInstruction {
@@ -70,6 +82,7 @@ impl IpJumpManager {
                 target_ip,
                 gateway,
                 active_time,
+                aging_time,
             };
             tx.send(Some(instr)).map_err(|_| "Failed to send instruction".to_string())?;
             Ok(())
@@ -164,6 +177,20 @@ impl IpJumpManager {
         token: &Option<String>,
         base_url: &str,
     ) {
+        // 更新 aging_time 配置（分钟转秒）
+        if instr.aging_time > 0 {
+            let new_aging_secs = instr.aging_time as u64 * 60;
+            let mut aging = self.aging_time_secs.write().await;
+            if *aging != new_aging_secs {
+                log_info!(
+                    "[IP-JUMP] aging_time 更新: {} 分钟 ({} 秒) -> {} 分钟 ({} 秒)",
+                    *aging / 60, *aging,
+                    instr.aging_time, new_aging_secs
+                );
+                *aging = new_aging_secs;
+            }
+        }
+        
         let mut info = PutIpJumpInfo {
             source_ip: "".to_string(),
             target_ip: "".to_string(),
@@ -203,27 +230,20 @@ impl IpJumpManager {
                 Some(instr.gateway.as_str())
             };
 
-            if self.is_netplan_system().await {
-                if let Ok(primary_ip) = self.get_primary_ip_of_main_interface().await {
-                    if let Err(e) = self.netplan_update_primary_ip(
-                        &self.main_interface,
-                        &instr.source_ip,
-                        &primary_ip,
-                        gw,
-                    ).await {
-                        log_error!("netplan persist ip failed: {}", e);
-                    }
-                }
-            } else if self.has_nmcli().await {
-                if let Ok(primary_ip) = self.get_primary_ip_of_main_interface().await {
-                    if let Err(e) = self.nmcli_update_primary_ip(
-                        &self.main_interface,
-                        &primary_ip,
-                        gw,
-                    ).await {
-                        log_error!("nmcli persist ip failed: {}", e);
-                    }
-                }
+            // 检查是否有 secondary IP，如果有则延后持久化
+            let has_secondary = {
+                let list = self.secondary_ips.read().await;
+                !list.is_empty()
+            };
+
+            if has_secondary {
+                log_info!("[IP-JUMP] 有 {} 个 secondary IP 存在，延后持久化直到老化清理完成", 
+                    self.secondary_ips.read().await.len());
+                // 保存持久化所需信息，供后续使用
+                self.save_pending_persist_info(&instr.source_ip, gw).await;
+            } else {
+                // 没有 secondary IP，立即持久化
+                self.do_persist_ip(&instr.source_ip, gw).await;
             }
 
             if let Some(mut agent_ip) = get_local_ips_all().await {
@@ -250,6 +270,50 @@ impl IpJumpManager {
             }
         }
     }
+
+    /// 保存待持久化信息
+    /// old_ip: 跳变前的主IP，用于定位 netplan 配置中的条目
+    async fn save_pending_persist_info(&self, old_ip: &str, gateway: Option<&str>) {
+        let info = PendingPersistInfo {
+            old_ip: old_ip.to_string(),
+            gateway: gateway.map(|s| s.to_string()),
+        };
+        let mut pending = self.pending_persist.write().await;
+        *pending = Some(info);
+        log_info!("[IP-JUMP] 保存待持久化信息: old_ip={}, gateway={:?}", old_ip, gateway);
+    }
+
+    /// 执行持久化
+    /// old_ip: 跳变前的主IP，用于定位 netplan 配置中的条目
+    async fn do_persist_ip(&self, old_ip: &str, gateway: Option<&str>) {
+        if self.is_netplan_system().await {
+            if let Ok(new_primary_ip) = self.get_primary_ip_of_main_interface().await {
+                if let Err(e) = self.netplan_update_primary_ip(
+                    &self.main_interface,
+                    old_ip,
+                    &new_primary_ip,
+                    gateway,
+                ).await {
+                    log_error!("netplan persist ip failed: {}", e);
+                } else {
+                    log_info!("[IP-JUMP] netplan 持久化成功: {}", new_primary_ip);
+                }
+            }
+        } else if self.has_nmcli().await {
+            if let Ok(new_primary_ip) = self.get_primary_ip_of_main_interface().await {
+                if let Err(e) = self.nmcli_update_primary_ip(
+                    &self.main_interface,
+                    &new_primary_ip,
+                    gateway,
+                ).await {
+                    log_error!("nmcli persist ip failed: {}", e);
+                } else {
+                    log_info!("[IP-JUMP] nmcli 持久化成功: {}", new_primary_ip);
+                }
+            }
+        }
+    }
+
     async fn run_periodic_loop(
         &self,
         initial_instr: IpJumpInstruction,
@@ -260,37 +324,57 @@ impl IpJumpManager {
         rx: &mut watch::Receiver<Option<IpJumpInstruction>>,
     ) {
         let mut current_active_time = initial_instr.active_time;
+        log_info!("[IP-JUMP-DEBUG] 进入周期循环, 初始 active_time={} 秒", current_active_time);
+        
         let mut interval = tokio::time::interval(Duration::from_secs(current_active_time as u64));
+        let mut loop_count: u64 = 0;
+        let start_time = std::time::Instant::now();
 
         loop {
+            let tick_start = std::time::Instant::now();
             tokio::select! {
                 _ = interval.tick() => {
+                    loop_count += 1;
+                    let elapsed_since_start = start_time.elapsed().as_secs();
+                    let elapsed_since_tick = tick_start.elapsed().as_millis();
+                    log_info!(
+                        "[IP-JUMP-DEBUG] tick #{}: 距启动 {} 秒, tick耗时 {} ms, 当前周期 {} 秒",
+                        loop_count, elapsed_since_start, elapsed_since_tick, current_active_time
+                    );
+                    
                     match self.fetch_latest_instruction(get_url, token, base_url).await {
                         Ok(Some(latest_instr)) => {
+                            log_info!(
+                                "[IP-JUMP-DEBUG] 获取到指令: active_time={}, source_ip={}, target_ip={}",
+                                latest_instr.active_time, latest_instr.source_ip, latest_instr.target_ip
+                            );
                             self.execute_instruction(&latest_instr, upload_url, token, base_url).await;
 
                             if latest_instr.active_time == 0 {
-                                log_info!("Periodic task received active_time=0, stopping interval.");
+                                log_info!("[IP-JUMP-DEBUG] Periodic task received active_time=0, stopping interval.");
                                 break;
                             }
 
                             if latest_instr.active_time != current_active_time {
-                                log_info!("Active time changed to {}, restarting interval", latest_instr.active_time);
+                                log_info!(
+                                    "[IP-JUMP-DEBUG] active_time 变化: {} -> {} 秒, 重建 interval",
+                                    current_active_time, latest_instr.active_time
+                                );
                                 current_active_time = latest_instr.active_time;
                                 interval = tokio::time::interval(Duration::from_secs(current_active_time as u64));
                             }
                         }
                         Ok(None) => {
-                            log_warn!("Received empty instruction in periodic mode, skipping.");
+                            log_warn!("[IP-JUMP-DEBUG] Received empty instruction in periodic mode, skipping.");
                         }
                         Err(e) => {
-                            log_error!("Failed to fetch latest instruction: {}", e);
+                            log_error!("[IP-JUMP-DEBUG] Failed to fetch latest instruction: {}", e);
                             break;
                         }
                     }
                 },
                 _ = rx.changed() => {
-                    log_info!("New instruction received during periodic mode, breaking to handle it.");
+                    log_info!("[IP-JUMP-DEBUG] New instruction received during periodic mode, breaking to handle it.");
                     break;
                 }
             }
@@ -334,6 +418,10 @@ impl IpJumpManager {
                 .get("active_time")
                 .and_then(|v: &Value| v.as_u64())
                 .unwrap_or(0) as u32;
+            let aging_time = data
+                .get("aging_time")
+                .and_then(|v: &Value| v.as_u64())
+                .unwrap_or(2) as u32;  // 默认 2 分钟
 
             if source_ip.is_empty() && target_ip.is_empty() {
                 return Ok(None);
@@ -344,6 +432,7 @@ impl IpJumpManager {
                 target_ip: target_ip.to_string(),
                 gateway: gateway.to_string(),
                 active_time,
+                aging_time,
             }))
         } else {
             Ok(None)
@@ -390,36 +479,6 @@ impl IpJumpManager {
             "status": state,
             "reason": fail_reason,
         }).to_string()
-    }
-
-    async fn cleanup_old_secondary(&self, keep_ip: &str) {
-        let snapshot = {
-            let list = self.secondary_ips.read().await;
-            list.clone()
-        };
-
-        for entry in snapshot.iter() {
-            if entry.ip != keep_ip {
-                let iface = entry.interface.clone();
-                let ip = entry.ip.clone();
-                let prefix = entry.prefix_len;
-
-                log_info!(
-                    "cleanup_old_secondary: removing old secondary {} on {} (prefix {})",
-                    ip, iface, prefix
-                );
-
-                let _ = self.try_remove_ip_from_system(&iface, &ip, prefix).await;
-                let mut list = self.secondary_ips.write().await;
-                list.retain(|x| x.ip != ip || x.interface != iface);
-            }
-        }
-    }
-
-    async fn increment_tick(&self) -> u64 {
-        let mut tick = self.tick_counter.write().await;
-        *tick = tick.wrapping_add(1);
-        *tick
     }
 
     pub async fn start_periodic_cleanup(self: Arc<Self>, base_url: &str, token: Option<String>, interval_duration: Duration) {
@@ -488,7 +547,8 @@ impl IpJumpManager {
             config.source_ip = source_ip.clone();
         }
 
-        self.cleanup_old_secondary(&config.source_ip).await;
+        // 不再调用 cleanup_old_secondary，让老化时间控制 secondary IP 的删除
+        // self.cleanup_old_secondary(&config.source_ip).await;
 
         //log_info!("Backing up interface for IP: {}", config.source_ip);
         let backup = self.backup_interface(&config.source_ip).await.map_err(|e| {
@@ -501,13 +561,13 @@ impl IpJumpManager {
         let (target_ip, target_prefix) = parse_cidr(&config.target_ip).map_err(|e| e.to_string())?;
         //log_info!("Source prefix: {}, Target IP: {}, Target prefix: {}", src_prefix, target_ip, target_prefix);
 
-        //log_info!("Removing source IP: {}/{} from {}", config.source_ip, src_prefix, backup.interface);
-        if let Err(e) = self.run_ip_cmd(&["addr", "del", &format!("{}/{}", config.source_ip, src_prefix), "dev", &backup.interface]).await {
-            log_error!("addr del failed: {}, attempt restore", e);
-            let _ = self.restore_backup(&backup).await;
-            return Err(format!("addr del failed: {}", e));
-        }
-
+        // 重要：确保 target_ip 成为唯一的主IP
+        // 步骤：
+        // 1. 添加 target_ip → 变成 secondary
+        // 2. 临时移除所有老的 secondary IP（避免它们提升为主IP）
+        // 3. 删除 source_ip → target_ip 自动提升为主IP
+        // 4. 把老的 secondary IP 加回系统
+        
         //log_info!("Adding target IP: {}/{} to {}", target_ip, target_prefix, backup.interface);
         if let Err(e) = self.run_ip_cmd(&["addr", "add", &format!("{}/{}", target_ip, target_prefix), "dev", &backup.interface]).await {
             log_error!("addr add failed: {}, restoring", e);
@@ -515,10 +575,26 @@ impl IpJumpManager {
             return Err(format!("addr add failed: {}", e));
         }
 
-        let tick = self.increment_tick().await;
-        //log_info!("Adding secondary IP: {} on {}", config.source_ip, backup.interface);
-        if let Err(e) = self.add_secondary_ip(&backup.interface, &config.source_ip, &backup.netmask, src_prefix, tick).await {
-            log_error!("add_secondary_ip warning: {}", e);
+        // 临时移除所有老的 secondary IP（保留在列表中，只从系统移除）
+        let old_secondaries = self.temporarily_remove_old_secondaries(&backup.interface, &target_ip).await;
+
+        //log_info!("Removing source IP: {}/{} from {}", config.source_ip, src_prefix, backup.interface);
+        if let Err(e) = self.run_ip_cmd(&["addr", "del", &format!("{}/{}", config.source_ip, src_prefix), "dev", &backup.interface]).await {
+            log_error!("addr del failed: {}, attempt restore", e);
+            // 恢复老的 secondary IP
+            self.restore_temp_secondaries(&old_secondaries).await;
+            let _ = self.restore_backup(&backup).await;
+            return Err(format!("addr del failed: {}", e));
+        }
+
+        // 恢复老的 secondary IP
+        self.restore_temp_secondaries(&old_secondaries).await;
+
+        log_info!("[IP-JUMP] 将老IP {} 作为 secondary 加回系统", config.source_ip);
+        if let Err(e) = self.add_secondary_ip(&backup.interface, &config.source_ip, &backup.netmask, src_prefix).await {
+            log_error!("add_secondary_ip failed: {}", e);
+        } else {
+            log_info!("[IP-JUMP] add_secondary_ip 成功: {} on {}", config.source_ip, backup.interface);
         }
 
         if !config.gateway.trim().is_empty() {
@@ -596,33 +672,111 @@ impl IpJumpManager {
         Ok(())
     }
 
-    pub async fn add_secondary_ip(&self, iface: &str, ip: &str, netmask: &str, prefix: u8, tick: u64) -> Result<(), String> {
-        log_info!("Attempting to add secondary IP: {} on {}, tick: {}", ip, iface, tick);
+    pub async fn add_secondary_ip(&self, iface: &str, ip: &str, netmask: &str, prefix: u8) -> Result<(), String> {
+        log_info!("Attempting to add secondary IP: {} on {}", ip, iface);
+        
+        const MAX_SECONDARY_IPS: usize = 3;
+        
         let mut list = self.secondary_ips.write().await;
 
+        // 如果已存在，更新时间并返回
         if let Some(e) = list.iter_mut().find(|x| x.interface == iface && x.ip == ip) {
-            e.added_tick = tick;
+            e.added_time = Instant::now();
             log_info!("Updated existing secondary IP: {} on {}", ip, iface);
             return Ok(());
         }
 
+        // 如果数量已达上限，移除最老的 secondary IP
+        if list.len() >= MAX_SECONDARY_IPS {
+            if let Some(oldest) = list.first() {
+                let old_iface = oldest.interface.clone();
+                let old_ip = oldest.ip.clone();
+                let old_prefix = oldest.prefix_len;
+                
+                log_info!(
+                    "Secondary IP list full ({}), removing oldest: {} on {}",
+                    MAX_SECONDARY_IPS, old_ip, old_iface
+                );
+                
+                // 从系统中移除
+                if ip_exists_on_iface(&old_iface, &old_ip).await {
+                    let _ = self.run_ip_cmd(&["addr", "del", &format!("{}/{}", old_ip, old_prefix), "dev", &old_iface]).await;
+                    log_info!("Removed old secondary IP from system: {} on {}", old_ip, old_iface);
+                }
+                
+                // 从列表中移除
+                list.remove(0);
+            }
+        }
+
+        // 添加新的 secondary IP
         list.push(SecondaryIPInfo {
             interface: iface.to_string(),
             ip: ip.to_string(),
             netmask: netmask.to_string(),
             prefix_len: prefix,
-            added_tick: tick,
+            added_time: Instant::now(),
         });
 
+        // 添加到系统
         if !ip_exists_on_iface(iface, ip).await {
-            self.run_ip_cmd(&["addr", "add", &format!("{}/{}", ip, prefix), "dev", iface])
+            self.run_ip_cmd(&["addr", "add", &format!("{}/{}", ip, prefix), "dev", iface, "secondary"])
                 .await
                 .map_err(|e| format!("failed to add secondary ip to system: {}", e))?;
-            log_info!("Added IP to system: {} on {}", ip, iface);
+            log_info!("Added secondary IP to system: {} on {}", ip, iface);
         }
 
         log_info!("Added secondary IP: {} on {}, list len: {}", ip, iface, list.len());
         Ok(())
+    }
+
+    /// 临时移除所有老的 secondary IP（保留在列表中，只从系统移除）
+    /// 返回被移除的 IP 列表，用于后续恢复
+    async fn temporarily_remove_old_secondaries(&self, iface: &str, exclude_ip: &str) -> Vec<(String, String, u8)> {
+        let snapshot = {
+            let list = self.secondary_ips.read().await;
+            list.clone()
+        };
+        
+        let mut removed: Vec<(String, String, u8)> = Vec::new();
+        
+        for info in snapshot.iter() {
+            // 只移除同接口的、不是 exclude_ip 的 secondary IP
+            if info.interface == iface && info.ip != exclude_ip {
+                if ip_exists_on_iface(&info.interface, &info.ip).await {
+                    log_info!(
+                        "[IP-JUMP] 临时移除 secondary IP: {} on {}",
+                        info.ip, info.interface
+                    );
+                    if self.run_ip_cmd(&[
+                        "addr", "del",
+                        &format!("{}/{}", info.ip, info.prefix_len),
+                        "dev", &info.interface
+                    ]).await.is_ok() {
+                        removed.push((info.interface.clone(), info.ip.clone(), info.prefix_len));
+                    }
+                }
+            }
+        }
+        
+        log_info!("[IP-JUMP] 临时移除了 {} 个 secondary IP", removed.len());
+        removed
+    }
+
+    /// 恢复临时移除的 secondary IP
+    async fn restore_temp_secondaries(&self, secondaries: &[(String, String, u8)]) {
+        for (iface, ip, prefix) in secondaries {
+            log_info!(
+                "[IP-JUMP] 恢复 secondary IP: {} on {}",
+                ip, iface
+            );
+            let _ = self.run_ip_cmd(&[
+                "addr", "add",
+                &format!("{}/{}", ip, prefix),
+                "dev", iface,
+                "secondary"
+            ]).await;
+        }
     }
 
     pub async fn find_iface_for_gateway(&self, gateway: &str) -> Option<String> {
@@ -649,12 +803,18 @@ impl IpJumpManager {
     }
 
     pub async fn do_periodic_cleanup(&self, base_url: &str, token: Option<String>) {
-        let tick = self.increment_tick().await;
+        let aging_secs = *self.aging_time_secs.read().await;
+        let now = Instant::now();
         let mut expired: Vec<(String, String, u8)> = Vec::new();
         {
             let list = self.secondary_ips.read().await;
             for info in list.iter() {
-                if tick.saturating_sub(info.added_tick) >= AGING_TICKS {
+                let elapsed = now.duration_since(info.added_time).as_secs();
+                if elapsed >= aging_secs {
+                    log_info!(
+                        "Secondary IP {} on {} aged out: {}s >= {}s",
+                        info.ip, info.interface, elapsed, aging_secs
+                    );
                     expired.push((info.interface.clone(), info.ip.clone(), info.prefix_len));
                 }
             }
@@ -697,17 +857,21 @@ impl IpJumpManager {
                         *failed = true;
                     }
                 }
-/*
-                if self.has_nmcli().await {
-                    if let Ok(primary_ip) = self.get_primary_ip_of_main_interface().await {
-                        if let Err(e) = self.nmcli_update_primary_ip(&self.main_interface, &primary_ip).await {
-                            log_error!("Failed to persist primary IP using nmcli: {}", e);
-                        }
-                    }
-                }
-*/
             } else {
                 log_error!("Cannot get local agent IP for periodic upload");
+            }
+        }
+
+        // 检查是否所有 secondary IP 都已清理，如果是则执行延后的持久化
+        {
+            let list = self.secondary_ips.read().await;
+            if list.is_empty() {
+                drop(list); // 释放锁
+                let pending = self.pending_persist.write().await.take();
+                if let Some(info) = pending {
+                    log_info!("[IP-JUMP] 所有 secondary IP 已清理，执行延后的持久化");
+                    self.do_persist_ip(&info.old_ip, info.gateway.as_deref()).await;
+                }
             }
         }
     }
