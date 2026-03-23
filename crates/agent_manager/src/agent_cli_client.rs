@@ -248,7 +248,7 @@ async fn run_session(cfg: ClientConfigData) {
                 }
             }
             Err(e) => {
-                log_error!("Connection failed: {}", e);
+                {/*log_error!("Connection failed: {}", e)*/};
             }
         }
         //log_info!("Retrying connection in 5 seconds...");
