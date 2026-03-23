@@ -145,7 +145,7 @@ impl NetInfoConfig {
         }
 
         config.ver = ini.get("SERVERINFO", "VERSION")
-            .unwrap_or_else(|| "3.0.1_T9".to_string());
+            .unwrap_or_else(|| "3.0.1_R4_B1".to_string());
 
         if let Some(user_id) = ini.get("SERVERINFO", "USER_ID") {
             config.user_id = user_id;

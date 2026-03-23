@@ -2810,7 +2810,14 @@ pub async fn start_agent() -> Result<(), String> {
         // ---------- service 未安装 → 自动安装并 enable ----------
         if !service_installed {
             let src = Path::new("/opt/osec/agent_manager.service");
-            let dst = Path::new("/etc/systemd/system/agent_manager.service");
+            let unit_dir = if std::path::Path::new("/usr/lib/systemd/system").exists() {
+                "/usr/lib/systemd/system"
+            } else if std::path::Path::new("/lib/systemd/system").exists() {
+                "/lib/systemd/system"
+            } else {
+                "/etc/systemd/system"
+            };
+            let dst = Path::new(unit_dir).join("agent_manager.service");
 
             if src.exists() {
                 log_info!("[upgrade] 未找到 agent_manager.service，正在安装...");

@@ -12,6 +12,36 @@ use logging::{log_info, log_error};
 const MAX_WAIT_SECONDS: u64 = 30;
 const POLL_INTERVAL_MILLIS: u64 = 500;
 
+fn get_systemd_unit_dir() -> &'static str {
+    if std::path::Path::new("/usr/lib/systemd/system").exists() {
+        "/usr/lib/systemd/system"
+    } else if std::path::Path::new("/lib/systemd/system").exists() {
+        "/lib/systemd/system"
+    } else {
+        "/etc/systemd/system"
+    }
+}
+
+async fn cleanup_all_service_files(service_name: &str) {
+    let dirs = ["/usr/lib/systemd/system", "/lib/systemd/system", "/etc/systemd/system"];
+    for dir in dirs {
+        let path = format!("{}/{}", dir, service_name);
+        if tokio::fs::remove_file(&path).await.is_ok() {
+            log_info!("[agent_manager] 已清理 {}", path);
+        }
+    }
+}
+
+fn cleanup_all_service_files_sync(service_name: &str) {
+    let dirs = ["/usr/lib/systemd/system", "/lib/systemd/system", "/etc/systemd/system"];
+    for dir in dirs {
+        let path = format!("{}/{}", dir, service_name);
+        if fs::remove_file(&path).is_ok() {
+            log_info!("[agent_manager] 已清理 {}", path);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentCommand {
     Update,
@@ -162,13 +192,7 @@ async fn stop_osec_services() -> Result<(), String> {
         log_info!("[agent_manager] 使用 systemctl 停止 osec");
         let _ = Command::new("systemctl").args(["stop", "osec"]).status().await;
         let _ = Command::new("systemctl").args(["disable", "osec"]).status().await;
-
-        if tokio::fs::remove_file("/etc/systemd/system/osec.service").await.is_ok() {
-            log_info!("[agent_manager] 已删除 /etc/systemd/system/osec.service");
-        } else {
-            log_info!("[agent_manager] 未找到或删除失败 /etc/systemd/system/osec.service");
-        }
-
+        cleanup_all_service_files("osec.service").await;
         let _ = Command::new("systemctl").arg("daemon-reload").status().await;
     } else if has_service {
         log_info!("[agent_manager] 使用 service 停止 osec");
@@ -293,10 +317,7 @@ async fn uninstall_all() {
     if has_systemctl {
         let _ = Command::new("systemctl").args(["stop", "osec"]).status().await;
         let _ = Command::new("systemctl").args(["disable", "osec"]).status().await;
-
-        if fs::remove_file("/etc/systemd/system/osec.service").is_ok() {
-            log_info!("[agent_manager] 已删除 osec.service");
-        }
+        cleanup_all_service_files_sync("osec.service");
         let _ = Command::new("systemctl").args(["daemon-reload"]).status().await;
     } else if has_service {
         let _ = Command::new("service").args(["osec", "stop"]).status().await;
@@ -308,9 +329,7 @@ async fn uninstall_all() {
     // 停止 agent_manager 自身服务
     if has_systemctl {
         let _ = Command::new("systemctl").args(["disable", "agent_manager"]).status().await;
-        if fs::remove_file("/etc/systemd/system/agent_manager.service").is_ok() {
-            log_info!("[agent_manager] 已删除 agent_manager.service");
-        }
+        cleanup_all_service_files_sync("agent_manager.service");
         let _ = Command::new("systemctl").args(["daemon-reload"]).status().await;
     } else if has_service {
         let _ = fs::remove_file("/etc/init.d/agent_manager");
