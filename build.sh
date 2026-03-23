@@ -3,7 +3,7 @@ set -e
 
 echo "Start packaging osec..."
 
-VERSION="3.0.1_R8_B1"
+VERSION="3.0.1_R4_B2"
 OUTPUT_DIR="output"
 INSTALLER_NAME="${OUTPUT_DIR}/osec-installer-${VERSION}.sh"
 
@@ -60,6 +60,20 @@ sed -i "/\[SERVERINFO\]/a VERSION=$VERSION" "$NET_INFO_FILE"
 cat > "package/install_or_upgrade.sh" << EOF
 #!/bin/bash
 set -e
+
+UNIT_DIR=""
+detect_unit_dir() {
+    for d in /usr/lib/systemd/system /lib/systemd/system /etc/systemd/system; do
+        if [ -d "\$d" ]; then
+            UNIT_DIR="\$d"
+            return 0
+        fi
+    done
+    mkdir -p /lib/systemd/system
+    UNIT_DIR="/lib/systemd/system"
+}
+
+detect_unit_dir
 
 MODE="install"
 if [[ "\$1" == "--upgrade" ]]; then
@@ -245,9 +259,12 @@ if command -v systemctl >/dev/null 2>&1; then
     echo "Setting up services with systemd..."
     if [[ "\$MODE" == "install" ]]; then
         systemctl stop osec agent_manager 2>/dev/null || true
-        cp -f "\$INSTALL_DIR/osec.service" /etc/systemd/system/osec.service
-        cp -f "\$INSTALL_DIR/agent_manager.service" /etc/systemd/system/agent_manager.service
-        chmod 644 /etc/systemd/system/osec.service /etc/systemd/system/agent_manager.service
+        for d in /usr/lib/systemd/system /lib/systemd/system /etc/systemd/system; do
+            rm -f "\$d/osec.service" "\$d/agent_manager.service" 2>/dev/null || true
+        done
+        cp -f "\$INSTALL_DIR/osec.service" "\$UNIT_DIR/osec.service"
+        cp -f "\$INSTALL_DIR/agent_manager.service" "\$UNIT_DIR/agent_manager.service"
+        chmod 644 "\$UNIT_DIR/osec.service" "\$UNIT_DIR/agent_manager.service"
         systemctl daemon-reload
         systemctl enable osec 
         systemctl enable agent_manager
@@ -267,8 +284,11 @@ if command -v systemctl >/dev/null 2>&1; then
         fi
         echo "osec and agent_manager services started successfully."
     else
-        cp -f "\$INSTALL_DIR/osec.service" /etc/systemd/system/osec.service
-        chmod 644 /etc/systemd/system/osec.service
+        for d in /usr/lib/systemd/system /lib/systemd/system /etc/systemd/system; do
+            rm -f "\$d/osec.service" 2>/dev/null || true
+        done
+        cp -f "\$INSTALL_DIR/osec.service" "\$UNIT_DIR/osec.service"
+        chmod 644 "\$UNIT_DIR/osec.service"
         systemctl daemon-reload
         systemctl enable osec
         systemctl start osec
