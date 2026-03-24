@@ -67,6 +67,12 @@ pub async fn run_agent_manager(mut cmd_rx: Receiver<AgentCommand>) {
                     log_info!("[agent_manager] stop_osec_services 成功");
                 }
 
+                if let Err(e) = uninstall_osec_packages().await {
+                    log_error!("[agent_manager] 卸载旧 osec 包失败: {}", e);
+                } else {
+                    log_info!("[agent_manager] 旧 osec 包卸载完成（如有）");
+                }
+
                 tokio::spawn(async {
                     if let Some(script_path) = find_upgrade_script("/tmp/osec_update") {
                         log_info!("[agent_manager] 找到升级脚本: {:?}", script_path);
@@ -242,6 +248,71 @@ async fn stop_osec_services() -> Result<(), String> {
     } else {
         log_error!("[agent_manager] 执行 uname -r 失败，跳过删除 base_osec.ko");
     }    log_info!("[agent_manager] osec 服务及进程清理完毕");
+    Ok(())
+}
+
+async fn uninstall_osec_packages() -> Result<(), String> {
+    log_info!("[agent_manager] 开始卸载系统中已安装的 osec RPM/DEB 包（如存在）...");
+
+    // 1. 处理 RPM 包
+    let has_rpm = Command::new("which")
+        .arg("rpm")
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if has_rpm {
+        let output = Command::new("rpm").arg("-qa").output().await
+            .map_err(|e| format!("执行 'rpm -qa' 失败: {}", e))?;
+
+        if output.status.success() {
+            if let Ok(list) = String::from_utf8(output.stdout) {
+                for line in list.lines() {
+                    let pkg = line.trim();
+                    if pkg.starts_with("osec-") {
+                        log_info!("[agent_manager] 卸载 RPM 包: {}", pkg);
+                        let _ = Command::new("rpm").args(["-e", pkg]).status().await;
+                    }
+                }
+            }
+        } else {
+            log_error!("[agent_manager] 'rpm -qa' 返回非零状态，跳过 RPM 卸载");
+        }
+    }
+
+    // 2. 处理 DEB 包
+    let has_dpkg = Command::new("which")
+        .arg("dpkg")
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if has_dpkg {
+        let output = Command::new("dpkg").args(["-l"]).output().await
+            .map_err(|e| format!("执行 'dpkg -l' 失败: {}", e))?;
+
+        if output.status.success() {
+            if let Ok(list) = String::from_utf8(output.stdout) {
+                for line in list.lines() {
+                    // 形如: "ii  osec-3.0.1-50.x86_64  ..."
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("ii  osec-") {
+                        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            let pkg = parts[1];
+                            log_info!("[agent_manager] 卸载 DEB 包: {}", pkg);
+                            let _ = Command::new("dpkg").args(["-P", pkg]).status().await;
+                        }
+                    }
+                }
+            }
+        } else {
+            log_error!("[agent_manager] 'dpkg -l' 返回非零状态，跳过 DEB 卸载");
+        }
+    }
+
     Ok(())
 }
 
