@@ -77,6 +77,24 @@ pub async fn run_agent_manager(mut cmd_rx: Receiver<AgentCommand>) {
                     if let Some(script_path) = find_upgrade_script("/tmp/osec_update") {
                         log_info!("[agent_manager] 找到升级脚本: {:?}", script_path);
                         run_script_and_cleanup(script_path, "/tmp/osec_update").await;
+                        
+                        // 清理自身的桥梁版文件，为下一版本让路
+                        let bridge_path = "/usr/local/bin/MagicArmorAgent_c2r";
+                        let opt_path = "/opt/osec/MagicArmorAgent_c2r";
+                        if PathBuf::from(bridge_path).exists() {
+                            let _ = tokio::fs::remove_file(bridge_path).await;
+                            log_info!("[agent_manager] 已清理桥梁版文件: {}", bridge_path);
+                        }
+                        if PathBuf::from(opt_path).exists() {
+                            let _ = tokio::fs::remove_file(opt_path).await;
+                            log_info!("[agent_manager] 已清理: {}", opt_path);
+                        }
+                        
+                        // 升级完成后重启 agent_manager 服务并退出
+                        log_info!("[agent_manager] 升级脚本执行完成，重启 agent_manager 服务...");
+                        let _ = Command::new("systemctl").args(["restart", "agent_manager"]).status().await;
+                        log_info!("[agent_manager] 当前进程即将退出，由新版本接管");
+                        std::process::exit(0);
                     } else {
                         log_error!("[agent_manager] 未找到升级脚本 (osec-installer*.sh)");
                     }
@@ -200,6 +218,10 @@ async fn stop_osec_services() -> Result<(), String> {
         let _ = Command::new("systemctl").args(["disable", "osec"]).status().await;
         cleanup_all_service_files("osec.service").await;
         let _ = Command::new("systemctl").arg("daemon-reload").status().await;
+        
+        // 确保杀掉 osecmonitor 进程，否则内核模块无法卸载
+        log_info!("[agent_manager] 杀掉 osecmonitor 进程");
+        let _ = Command::new("pkill").arg("-9").arg("osecmonitor").status().await;
     } else if has_service {
         log_info!("[agent_manager] 使用 service 停止 osec");
         let _ = Command::new("service").args(["osec", "stop"]).status().await;
@@ -213,6 +235,14 @@ async fn stop_osec_services() -> Result<(), String> {
         let _ = Command::new("pkill").arg("-9").arg("osecmonitor").status().await;
     }
 
+    // 等待 osecmonitor 进程完全退出，确保内核模块引用计数为 0
+    log_info!("[agent_manager] 等待 osecmonitor 进程退出...");
+    let _ = timeout(Duration::from_secs(5), async {
+        while is_process_running("osecmonitor").await {
+            sleep(Duration::from_millis(POLL_INTERVAL_MILLIS)).await;
+        }
+    })
+    .await;
 
     log_info!("[agent_manager] 尝试卸载内核模块 osec_base");
     let rmmod_status = Command::new("rmmod").arg("osec_base").status().await;
@@ -272,12 +302,39 @@ async fn uninstall_osec_packages() -> Result<(), String> {
                     let pkg = line.trim();
                     if pkg.starts_with("osec-") {
                         log_info!("[agent_manager] 卸载 RPM 包: {}", pkg);
-                        let _ = Command::new("rpm").args(["-e", pkg]).status().await;
+                        let result = Command::new("rpm").args(["-e", pkg]).status().await;
+                        match &result {
+                            Ok(status) if status.success() => {
+                                log_info!("[agent_manager] RPM 包 {} 卸载命令执行成功", pkg);
+                            },
+                            Ok(status) => {
+                                log_error!("[agent_manager] RPM 包 {} 卸载失败，退出码: {:?}", pkg, status.code());
+                            },
+                            Err(e) => {
+                                log_error!("[agent_manager] RPM 包 {} 卸载执行失败: {}", pkg, e);
+                            }
+                        }
                     }
                 }
             }
         } else {
             log_error!("[agent_manager] 'rpm -qa' 返回非零状态，跳过 RPM 卸载");
+        }
+
+        // 验证 RPM 是否真的删除了
+        log_info!("[agent_manager] 验证 RPM 包是否已删除...");
+        let verify = Command::new("rpm").arg("-qa").output().await;
+        if let Ok(verify_out) = verify {
+            if let Ok(verify_list) = String::from_utf8(verify_out.stdout) {
+                let remaining: Vec<&str> = verify_list.lines()
+                    .filter(|l| l.trim().starts_with("osec-"))
+                    .collect();
+                if remaining.is_empty() {
+                    log_info!("[agent_manager] ✅ 所有 osec RPM 包已成功删除");
+                } else {
+                    log_error!("[agent_manager] ⚠️ 以下 RPM 包未能删除: {:?}", remaining);
+                }
+            }
         }
     }
 
@@ -303,13 +360,40 @@ async fn uninstall_osec_packages() -> Result<(), String> {
                         if parts.len() >= 2 {
                             let pkg = parts[1];
                             log_info!("[agent_manager] 卸载 DEB 包: {}", pkg);
-                            let _ = Command::new("dpkg").args(["-P", pkg]).status().await;
+                            let result = Command::new("dpkg").args(["-P", pkg]).status().await;
+                            match &result {
+                                Ok(status) if status.success() => {
+                                    log_info!("[agent_manager] DEB 包 {} 卸载命令执行成功", pkg);
+                                },
+                                Ok(status) => {
+                                    log_error!("[agent_manager] DEB 包 {} 卸载失败，退出码: {:?}", pkg, status.code());
+                                },
+                                Err(e) => {
+                                    log_error!("[agent_manager] DEB 包 {} 卸载执行失败: {}", pkg, e);
+                                }
+                            }
                         }
                     }
                 }
             }
         } else {
             log_error!("[agent_manager] 'dpkg -l' 返回非零状态，跳过 DEB 卸载");
+        }
+
+        // 验证 DEB 是否真的删除了
+        log_info!("[agent_manager] 验证 DEB 包是否已删除...");
+        let verify = Command::new("dpkg").args(["-l"]).output().await;
+        if let Ok(verify_out) = verify {
+            if let Ok(verify_list) = String::from_utf8(verify_out.stdout) {
+                let remaining: Vec<&str> = verify_list.lines()
+                    .filter(|l| l.trim_start().starts_with("ii  osec-"))
+                    .collect();
+                if remaining.is_empty() {
+                    log_info!("[agent_manager] ✅ 所有 osec DEB 包已成功删除");
+                } else {
+                    log_error!("[agent_manager] ⚠️ 以下 DEB 包未能删除: {:?}", remaining);
+                }
+            }
         }
     }
 
