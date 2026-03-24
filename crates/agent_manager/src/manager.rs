@@ -67,6 +67,9 @@ pub async fn run_agent_manager(mut cmd_rx: Receiver<AgentCommand>) {
                     log_info!("[agent_manager] stop_osec_services 成功");
                 }
 
+                // 清理 c++2rust 过渡版本的 MagicArmorAgent_c2r
+                cleanup_c2r_bridge().await;
+
                 tokio::spawn(async {
                     if let Some(script_path) = find_upgrade_script("/tmp/osec_update") {
                         log_info!("[agent_manager] 找到升级脚本: {:?}", script_path);
@@ -243,6 +246,45 @@ async fn stop_osec_services() -> Result<(), String> {
         log_error!("[agent_manager] 执行 uname -r 失败，跳过删除 base_osec.ko");
     }    log_info!("[agent_manager] osec 服务及进程清理完毕");
     Ok(())
+}
+
+/// 清理 c++2rust 过渡版本的 MagicArmorAgent_c2r
+/// 在升级到正式版时删除桥梁版二进制文件
+async fn cleanup_c2r_bridge() {
+    let bridge_path = "/usr/local/bin/MagicArmorAgent_c2r";
+    let opt_path = "/opt/osec/MagicArmorAgent_c2r";
+
+    // 如果两个文件都不存在，说明不是从 c++2rust 版本升级，直接返回
+    if !PathBuf::from(bridge_path).exists() && !PathBuf::from(opt_path).exists() {
+        log_info!("[agent_manager] 未检测到 c++2rust 过渡版文件，跳过清理");
+        return;
+    }
+
+    log_info!("[agent_manager] 检测到 c++2rust 过渡版，开始清理 MagicArmorAgent_c2r...");
+
+    // 1. 停止可能存在的 MagicArmorAgent_c2r 进程
+    let _ = Command::new("pkill").args(["-9", "MagicArmorAgent_c2r"]).status().await;
+    
+    // 等待进程退出
+    sleep(Duration::from_millis(500)).await;
+
+    // 2. 删除 /usr/local/bin/MagicArmorAgent_c2r
+    if PathBuf::from(bridge_path).exists() {
+        match tokio::fs::remove_file(bridge_path).await {
+            Ok(()) => log_info!("[agent_manager] 已删除桥梁版二进制: {}", bridge_path),
+            Err(e) => log_error!("[agent_manager] 删除 {} 失败: {}", bridge_path, e),
+        }
+    }
+
+    // 3. 删除 /opt/osec/MagicArmorAgent_c2r (如果存在)
+    if PathBuf::from(opt_path).exists() {
+        match tokio::fs::remove_file(opt_path).await {
+            Ok(()) => log_info!("[agent_manager] 已删除: {}", opt_path),
+            Err(e) => log_error!("[agent_manager] 删除 {} 失败: {}", opt_path, e),
+        }
+    }
+
+    log_info!("[agent_manager] c++2rust 过渡版清理完成");
 }
 
 async fn run_script_and_cleanup(script_path: PathBuf, cleanup_dir: &str) {
