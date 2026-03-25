@@ -254,28 +254,41 @@ async fn cleanup_c2r_bridge() {
     log_info!("[agent_manager] 检查是否需要清理 c++2rust 版本的 RPM/DEB 数据库记录...");
 
     // 1. 清理 RPM 数据库记录（只删记录，不删文件，不触发卸载脚本）
-    let rpm_check = Command::new("rpm").args(["-q", "osec"]).status().await;
-    if let Ok(status) = rpm_check {
-        if status.success() {
-            log_info!("[agent_manager] 发现 RPM 数据库记录，开始清理...");
-            let _ = Command::new("rpm")
-                .args(["-e", "--justdb", "--nodeps", "osec"])
-                .status()
-                .await;
-            log_info!("[agent_manager] RPM 数据库记录已清理");
+    // 先获取完整的包名
+    let rpm_output = Command::new("sh")
+        .args(["-c", "rpm -qa | grep '^osec'"])
+        .output()
+        .await;
+    if let Ok(output) = rpm_output {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let pkg_name = line.trim();
+            if !pkg_name.is_empty() {
+                log_info!("[agent_manager] 发现 RPM 包: {}，清理数据库记录...", pkg_name);
+                let _ = Command::new("rpm")
+                    .args(["-e", "--justdb", "--nodeps", pkg_name])
+                    .status()
+                    .await;
+            }
         }
     }
 
     // 2. 清理 DEB 数据库记录
-    let dpkg_check = Command::new("dpkg").args(["-l", "osec"]).status().await;
-    if let Ok(status) = dpkg_check {
-        if status.success() {
-            log_info!("[agent_manager] 发现 DEB 数据库记录，开始清理...");
-            let _ = Command::new("dpkg")
-                .args(["--remove", "--force-remove-reinstreq", "osec"])
-                .status()
-                .await;
-            log_info!("[agent_manager] DEB 数据库记录已清理");
+    let deb_output = Command::new("sh")
+        .args(["-c", "dpkg -l | grep '^ii.*osec' | awk '{print $2}'"])
+        .output()
+        .await;
+    if let Ok(output) = deb_output {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let pkg_name = line.trim();
+            if !pkg_name.is_empty() {
+                log_info!("[agent_manager] 发现 DEB 包: {}，清理数据库记录...", pkg_name);
+                let _ = Command::new("dpkg")
+                    .args(["--remove", "--force-remove-reinstreq", pkg_name])
+                    .status()
+                    .await;
+            }
         }
     }
 
