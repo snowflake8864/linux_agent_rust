@@ -67,39 +67,14 @@ pub async fn run_agent_manager(mut cmd_rx: Receiver<AgentCommand>) {
                     log_info!("[agent_manager] stop_osec_services 成功");
                 }
 
-                // 删除保护文件，否则 RPM 无法卸载
-                let protect_file = "/opt/osec/.osec.txt";
-                if PathBuf::from(protect_file).exists() {
-                    match tokio::fs::remove_file(protect_file).await {
-                        Ok(()) => log_info!("[agent_manager] 已删除保护文件: {}", protect_file),
-                        Err(e) => log_error!("[agent_manager] 删除保护文件 {} 失败: {}", protect_file, e),
-                    }
-                }
-
-                if let Err(e) = uninstall_osec_packages().await {
-                    log_error!("[agent_manager] 卸载旧 osec 包失败: {}", e);
-                } else {
-                    log_info!("[agent_manager] 旧 osec 包卸载完成（如有）");
-                }
-
+                // 简单升级：只执行升级脚本，不卸载 RPM/DEB
+                // 后期版本会使用 rpm -e --justdb --nodeps 清理数据库记录
                 tokio::spawn(async {
                     if let Some(script_path) = find_upgrade_script("/tmp/osec_update") {
                         log_info!("[agent_manager] 找到升级脚本: {:?}", script_path);
                         run_script_and_cleanup(script_path, "/tmp/osec_update").await;
                         
-                        // 清理自身的桥梁版文件，为下一版本让路
-                        let bridge_path = "/usr/local/bin/MagicArmorAgent_c2r";
-                        let opt_path = "/opt/osec/MagicArmorAgent_c2r";
-                        if PathBuf::from(bridge_path).exists() {
-                            let _ = tokio::fs::remove_file(bridge_path).await;
-                            log_info!("[agent_manager] 已清理桥梁版文件: {}", bridge_path);
-                        }
-                        if PathBuf::from(opt_path).exists() {
-                            let _ = tokio::fs::remove_file(opt_path).await;
-                            log_info!("[agent_manager] 已清理: {}", opt_path);
-                        }
-                        
-                        // 升级完成后重启 agent_manager 服务并退出
+                        // 升级完成后重启 agent_manager 服务
                         log_info!("[agent_manager] 升级脚本执行完成，重启 agent_manager 服务...");
                         let _ = Command::new("systemctl").args(["restart", "agent_manager"]).status().await;
                         log_info!("[agent_manager] 当前进程即将退出，由新版本接管");
