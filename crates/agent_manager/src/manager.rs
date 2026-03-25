@@ -67,7 +67,7 @@ pub async fn run_agent_manager(mut cmd_rx: Receiver<AgentCommand>) {
                     log_info!("[agent_manager] stop_osec_services 成功");
                 }
 
-                // 清理 c++2rust 过渡版本的 MagicArmorAgent_c2r
+                // 清理 c++2rust 过渡版本
                 cleanup_c2r_bridge().await;
 
                 tokio::spawn(async {
@@ -248,56 +248,52 @@ async fn stop_osec_services() -> Result<(), String> {
     Ok(())
 }
 
-/// 清理 c++2rust 过渡版本的 MagicArmorAgent_c2r
-/// 在升级到正式版时删除桥梁版二进制文件和服务文件
+/// 清理 c++2rust 版本遗留的 RPM/DEB 数据库记录和旧 service 文件
+/// v1.0 和 c++2rust 版本的 MagicArmorAgent 都在 /opt/osec/ 下，路径相同，不需要删除二进制
 async fn cleanup_c2r_bridge() {
-    let bridge_path = "/usr/local/bin/MagicArmorAgent_c2r";
-    let opt_path = "/opt/osec/MagicArmorAgent_c2r";
-    let service_path = "/etc/systemd/system/agent_manager.service";
+    log_info!("[agent_manager] 检查是否需要清理 c++2rust 版本的 RPM/DEB 数据库记录...");
 
-    // 如果三个文件都不存在，说明不是从 c++2rust 版本升级，直接返回
-    if !PathBuf::from(bridge_path).exists() 
-        && !PathBuf::from(opt_path).exists() 
-        && !PathBuf::from(service_path).exists() {
-        log_info!("[agent_manager] 未检测到 c++2rust 过渡版文件，跳过清理");
-        return;
-    }
-
-    log_info!("[agent_manager] 检测到 c++2rust 过渡版，开始清理...");
-
-    // 1. 停止可能存在的 MagicArmorAgent_c2r 进程
-    let _ = Command::new("pkill").args(["-9", "MagicArmorAgent_c2r"]).status().await;
-    
-    // 等待进程退出
-    sleep(Duration::from_millis(500)).await;
-
-    // 2. 删除 /usr/local/bin/MagicArmorAgent_c2r
-    if PathBuf::from(bridge_path).exists() {
-        match tokio::fs::remove_file(bridge_path).await {
-            Ok(()) => log_info!("[agent_manager] 已删除桥梁版二进制: {}", bridge_path),
-            Err(e) => log_error!("[agent_manager] 删除 {} 失败: {}", bridge_path, e),
+    // 1. 清理 RPM 数据库记录（只删记录，不删文件，不触发卸载脚本）
+    let rpm_check = Command::new("rpm").args(["-q", "osec"]).status().await;
+    if let Ok(status) = rpm_check {
+        if status.success() {
+            log_info!("[agent_manager] 发现 RPM 数据库记录，开始清理...");
+            let _ = Command::new("rpm")
+                .args(["-e", "--justdb", "--nodeps", "osec"])
+                .status()
+                .await;
+            log_info!("[agent_manager] RPM 数据库记录已清理");
         }
     }
 
-    // 3. 删除 /opt/osec/MagicArmorAgent_c2r (如果存在)
-    if PathBuf::from(opt_path).exists() {
-        match tokio::fs::remove_file(opt_path).await {
-            Ok(()) => log_info!("[agent_manager] 已删除: {}", opt_path),
-            Err(e) => log_error!("[agent_manager] 删除 {} 失败: {}", opt_path, e),
+    // 2. 清理 DEB 数据库记录
+    let dpkg_check = Command::new("dpkg").args(["-l", "osec"]).status().await;
+    if let Ok(status) = dpkg_check {
+        if status.success() {
+            log_info!("[agent_manager] 发现 DEB 数据库记录，开始清理...");
+            let _ = Command::new("dpkg")
+                .args(["--remove", "--force-remove-reinstreq", "osec"])
+                .status()
+                .await;
+            log_info!("[agent_manager] DEB 数据库记录已清理");
         }
     }
 
-    // 4. 删除 /etc/systemd/system/agent_manager.service (c++2rust 版本放在这里)
-    if PathBuf::from(service_path).exists() {
-        match tokio::fs::remove_file(service_path).await {
-            Ok(()) => log_info!("[agent_manager] 已删除桥梁版服务文件: {}", service_path),
-            Err(e) => log_error!("[agent_manager] 删除 {} 失败: {}", service_path, e),
+    // 3. 检查并清理不在标准路径的旧 service 文件
+    // c++2rust 版本应该放在 /usr/lib/systemd/system/ 或 /lib/systemd/system/
+    // 如果发现在 /etc/systemd/system/ 等其他路径，需要清理
+    let etc_service = "/etc/systemd/system/agent_manager.service";
+    if PathBuf::from(etc_service).exists() {
+        log_info!("[agent_manager] 发现非标准路径的 service 文件，清理中...");
+        match tokio::fs::remove_file(etc_service).await {
+            Ok(()) => log_info!("[agent_manager] 已删除: {}", etc_service),
+            Err(e) => log_error!("[agent_manager] 删除 {} 失败: {}", etc_service, e),
         }
         // 重新加载 systemd
         let _ = Command::new("systemctl").arg("daemon-reload").status().await;
     }
 
-    log_info!("[agent_manager] c++2rust 过渡版清理完成");
+    log_info!("[agent_manager] c++2rust 版本清理完成");
 }
 
 async fn run_script_and_cleanup(script_path: PathBuf, cleanup_dir: &str) {
