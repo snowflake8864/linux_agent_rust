@@ -254,41 +254,33 @@ async fn cleanup_c2r_bridge() {
     log_info!("[agent_manager] 检查是否需要清理 c++2rust 版本的 RPM/DEB 数据库记录...");
 
     // 1. 清理 RPM 数据库记录（只删记录，不删文件，不触发卸载脚本）
-    // 先获取完整的包名
-    let rpm_output = Command::new("sh")
-        .args(["-c", "rpm -qa | grep '^osec'"])
-        .output()
-        .await;
-    if let Ok(output) = rpm_output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let pkg_name = line.trim();
-            if !pkg_name.is_empty() {
-                log_info!("[agent_manager] 发现 RPM 包: {}，清理数据库记录...", pkg_name);
-                let _ = Command::new("rpm")
-                    .args(["-e", "--justdb", "--nodeps", pkg_name])
-                    .status()
-                    .await;
-            }
+    // 使用 --allmatches 清理所有匹配的 osec 包
+    let rpm_check = Command::new("rpm").args(["-q", "osec"]).status().await;
+    if let Ok(status) = rpm_check {
+        if status.success() {
+            log_info!("[agent_manager] 发现 RPM 数据库记录，开始清理...");
+            let _ = Command::new("rpm")
+                .args(["-e", "--justdb", "--nodeps", "--allmatches", "osec"])
+                .status()
+                .await;
+            log_info!("[agent_manager] RPM 数据库记录已清理");
         }
     }
 
     // 2. 清理 DEB 数据库记录
+    // 使用 apt-get purge 清理所有 osec 相关包
     let deb_output = Command::new("sh")
-        .args(["-c", "dpkg -l | grep '^ii.*osec' | awk '{print $2}'"])
-        .output()
+        .args(["-c", "dpkg -l | grep -q '^ii.*osec'"])
+        .status()
         .await;
-    if let Ok(output) = deb_output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let pkg_name = line.trim();
-            if !pkg_name.is_empty() {
-                log_info!("[agent_manager] 发现 DEB 包: {}，清理数据库记录...", pkg_name);
-                let _ = Command::new("dpkg")
-                    .args(["--remove", "--force-remove-reinstreq", pkg_name])
-                    .status()
-                    .await;
-            }
+    if let Ok(status) = deb_output {
+        if status.success() {
+            log_info!("[agent_manager] 发现 DEB 数据库记录，开始清理...");
+            let _ = Command::new("sh")
+                .args(["-c", "apt-get purge -y 'osec*' 2>/dev/null || dpkg --remove --force-remove-reinstreq osec 2>/dev/null"])
+                .status()
+                .await;
+            log_info!("[agent_manager] DEB 数据库记录已清理");
         }
     }
 
