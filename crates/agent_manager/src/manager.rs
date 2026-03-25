@@ -249,18 +249,21 @@ async fn stop_osec_services() -> Result<(), String> {
 }
 
 /// 清理 c++2rust 过渡版本的 MagicArmorAgent_c2r
-/// 在升级到正式版时删除桥梁版二进制文件
+/// 在升级到正式版时删除桥梁版二进制文件和服务文件
 async fn cleanup_c2r_bridge() {
     let bridge_path = "/usr/local/bin/MagicArmorAgent_c2r";
     let opt_path = "/opt/osec/MagicArmorAgent_c2r";
+    let service_path = "/etc/systemd/system/agent_manager.service";
 
-    // 如果两个文件都不存在，说明不是从 c++2rust 版本升级，直接返回
-    if !PathBuf::from(bridge_path).exists() && !PathBuf::from(opt_path).exists() {
+    // 如果三个文件都不存在，说明不是从 c++2rust 版本升级，直接返回
+    if !PathBuf::from(bridge_path).exists() 
+        && !PathBuf::from(opt_path).exists() 
+        && !PathBuf::from(service_path).exists() {
         log_info!("[agent_manager] 未检测到 c++2rust 过渡版文件，跳过清理");
         return;
     }
 
-    log_info!("[agent_manager] 检测到 c++2rust 过渡版，开始清理 MagicArmorAgent_c2r...");
+    log_info!("[agent_manager] 检测到 c++2rust 过渡版，开始清理...");
 
     // 1. 停止可能存在的 MagicArmorAgent_c2r 进程
     let _ = Command::new("pkill").args(["-9", "MagicArmorAgent_c2r"]).status().await;
@@ -282,6 +285,16 @@ async fn cleanup_c2r_bridge() {
             Ok(()) => log_info!("[agent_manager] 已删除: {}", opt_path),
             Err(e) => log_error!("[agent_manager] 删除 {} 失败: {}", opt_path, e),
         }
+    }
+
+    // 4. 删除 /etc/systemd/system/agent_manager.service (c++2rust 版本放在这里)
+    if PathBuf::from(service_path).exists() {
+        match tokio::fs::remove_file(service_path).await {
+            Ok(()) => log_info!("[agent_manager] 已删除桥梁版服务文件: {}", service_path),
+            Err(e) => log_error!("[agent_manager] 删除 {} 失败: {}", service_path, e),
+        }
+        // 重新加载 systemd
+        let _ = Command::new("systemctl").arg("daemon-reload").status().await;
     }
 
     log_info!("[agent_manager] c++2rust 过渡版清理完成");
