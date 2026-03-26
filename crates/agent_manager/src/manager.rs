@@ -139,13 +139,14 @@ async fn write_proc_self() -> Result<(), String> {
         .map_err(|e| format!("写入失败: {}", e))?;
 
     log_info!("[agent_manager] ✅ 已写入: {}", content.trim());
-
+/*
     let mut read_buf = String::new();
     fs::File::open(proc_path)
         .and_then(|mut f| f.read_to_string(&mut read_buf))
         .map_err(|e| format!("读取失败: {}", e))?;
 
     log_info!("[agent_manager] 读取结果: {}", read_buf.trim());
+*/  
     Ok(())
 }
 
@@ -268,16 +269,24 @@ async fn cleanup_c2r_bridge() {
     }
 
     // 2. 清理 DEB 数据库记录
-    // 使用 apt-get purge 清理所有 osec 相关包
+    // 直接操作 dpkg 数据库文件删除记录，避免 pre-removal script 失败
     let deb_output = Command::new("sh")
-        .args(["-c", "dpkg -l | grep -q '^ii.*osec'"])
+        .args(["-c", "dpkg -l | grep -q '^[ri].*osec'"])
         .status()
         .await;
     if let Ok(status) = deb_output {
         if status.success() {
             log_info!("[agent_manager] 发现 DEB 数据库记录，开始清理...");
             let _ = Command::new("sh")
-                .args(["-c", "apt-get purge -y 'osec*' 2>/dev/null || dpkg --remove --force-remove-reinstreq osec 2>/dev/null"])
+                .args(["-c", "sed -i '/^Package: osec$/,/^$/d' /var/lib/dpkg/status"])
+                .status()
+                .await;
+            let _ = Command::new("sh")
+                .args(["-c", "rm -f /var/lib/dpkg/info/osec.*"])
+                .status()
+                .await;
+            let _ = Command::new("sh")
+                .args(["-c", "[ -f /var/lib/apt/extended_states ] && sed -i '/^Package: osec$/,/^$/d' /var/lib/apt/extended_states || true"])
                 .status()
                 .await;
             log_info!("[agent_manager] DEB 数据库记录已清理");
