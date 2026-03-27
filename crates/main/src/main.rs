@@ -64,9 +64,6 @@ async fn main() -> std::io::Result<()> {
     }
     log_info!("程序开始启动");
 
-    // 确保内核不被升级
-    ensure_kernel_hold();
-
     // 卸载现有内核驱动
     let _ = unload_driver().ok();
 
@@ -90,6 +87,9 @@ async fn main() -> std::io::Result<()> {
         log_info!("load kernel driver: {}", cfg.mod_ver);
         let _ = cfg.to_ini(&format!("{}/net_info.ini", cfg.app_path));
     }
+
+    // 驱动加载成功后，禁止内核升级
+    ensure_kernel_hold();
 
     // 检查是否为离线模式
     let is_offline = NETINFO_CONFIG.lock().unwrap().is_offline_mode;
