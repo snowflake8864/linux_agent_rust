@@ -3,7 +3,7 @@ use tokio::signal::unix::{signal as unix_signal, SignalKind};
 use online::StartOnline;
 use task::{TaskService, TimerTask};
 use kernel_event::{StartKernelHandler, EventHandler,send_data_to_kernel};
-use kernel_module::{LoadKernelDriver, unload_driver};
+use kernel_module::{LoadKernelDriver, unload_driver, ensure_kernel_hold};
 use common::manager::boot::BootManager;
 use reporter::{AuditLogInfo, StartBashLog};
 use tokio::sync::mpsc;
@@ -62,6 +62,9 @@ async fn main() -> std::io::Result<()> {
         }
     }
     log_info!("程序开始启动");
+
+    // 确保内核不被升级
+    ensure_kernel_hold();
 
     // 卸载现有内核驱动
     let _ = unload_driver().ok();
