@@ -23,11 +23,18 @@ fn check_and_hold_kernel() -> Result<(), String> {
     let kernel_version = get_kernel_version()?;
     log_info!("Checking kernel hold status for {}", kernel_version);
 
-    if !Path::new("/usr/bin/apt-mark").exists() && !Path::new("/usr/bin/dpkg").exists() {
-        log_info!("Not a dpkg-based system, skipping kernel hold");
-        return Ok(());
+    if Path::new("/usr/bin/apt-mark").exists() || Path::new("/usr/bin/dpkg").exists() {
+        hold_kernel_apt(&kernel_version)?;
+    } else if Path::new("/usr/bin/yum").exists() || Path::new("/usr/bin/dnf").exists() {
+        hold_kernel_yum(&kernel_version)?;
+    } else {
+        log_info!("No supported package manager found, skipping kernel hold");
     }
 
+    Ok(())
+}
+
+fn hold_kernel_apt(kernel_version: &str) -> Result<(), String> {
     let image_pkg = format!("linux-image-{}", kernel_version);
     let headers_pkg = format!("linux-headers-{}", kernel_version);
 
@@ -66,6 +73,48 @@ fn check_and_hold_kernel() -> Result<(), String> {
         }
     } else {
         log_info!("✅ Kernel {} is already held", kernel_version);
+    }
+
+    Ok(())
+}
+
+fn hold_kernel_yum(kernel_version: &str) -> Result<(), String> {
+    let rpm_pkg = format!("kernel-{}", kernel_version);
+
+    let output = Command::new("yum")
+        .args(["versionlock", "list"])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    let is_held = output_str.contains(&rpm_pkg) || output_str.contains(&format!("kernel-"));
+
+    if !is_held {
+        log_info!("Kernel {} is not held, attempting to hold via yum versionlock...", kernel_version);
+        
+        let lock_result = Command::new("yum")
+            .args(["versionlock", "add", &rpm_pkg])
+            .output()
+            .map_err(|e| e.to_string())?;
+
+        if lock_result.status.success() {
+            log_info!("✅ Kernel package {} is now held via yum versionlock", rpm_pkg);
+        } else {
+            let stderr = String::from_utf8_lossy(&lock_result.stderr);
+            log_warn!("Failed to hold {} via yum versionlock: {}", rpm_pkg, stderr);
+        }
+
+        let headers_result = Command::new("yum")
+            .args(["versionlock", "add", &format!("kernel-devel-{}", kernel_version)])
+            .output();
+
+        if let Ok(out) = headers_result {
+            if out.status.success() {
+                log_info!("✅ Kernel devel package is now held via yum versionlock");
+            }
+        }
+    } else {
+        log_info!("✅ Kernel {} is already held via yum versionlock", kernel_version);
     }
 
     Ok(())
