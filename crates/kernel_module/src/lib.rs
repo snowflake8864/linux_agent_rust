@@ -13,6 +13,64 @@ pub trait LoadKernelDriver {
     fn load_kernel_driver(&mut self) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
 }
 
+pub fn ensure_kernel_hold() {
+    if let Err(e) = check_and_hold_kernel() {
+        log_warn!("Failed to ensure kernel hold: {}", e);
+    }
+}
+
+fn check_and_hold_kernel() -> Result<(), String> {
+    let kernel_version = get_kernel_version()?;
+    log_info!("Checking kernel hold status for {}", kernel_version);
+
+    if !Path::new("/usr/bin/apt-mark").exists() && !Path::new("/usr/bin/dpkg").exists() {
+        log_info!("Not a dpkg-based system, skipping kernel hold");
+        return Ok(());
+    }
+
+    let image_pkg = format!("linux-image-{}", kernel_version);
+    let headers_pkg = format!("linux-headers-{}", kernel_version);
+
+    let output = Command::new("apt-mark")
+        .args(["showhold", &image_pkg])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    let is_held = String::from_utf8_lossy(&output.stdout).contains(&image_pkg);
+
+    if !is_held {
+        log_info!("Kernel {} is not held, attempting to hold...", kernel_version);
+        
+        let hold_result = Command::new("apt-mark")
+            .arg("hold")
+            .arg(&image_pkg)
+            .output()
+            .map_err(|e| e.to_string())?;
+
+        if hold_result.status.success() {
+            log_info!("✅ Kernel package {} is now held", image_pkg);
+        } else {
+            let stderr = String::from_utf8_lossy(&hold_result.stderr);
+            log_warn!("Failed to hold {}: {}", image_pkg, stderr);
+        }
+
+        let headers_result = Command::new("apt-mark")
+            .arg("hold")
+            .arg(&headers_pkg)
+            .output();
+
+        if let Ok(out) = headers_result {
+            if out.status.success() {
+                log_info!("✅ Kernel headers {} is now held", headers_pkg);
+            }
+        }
+    } else {
+        log_info!("✅ Kernel {} is already held", kernel_version);
+    }
+
+    Ok(())
+}
+
 impl LoadKernelDriver for BootManager {
     fn load_kernel_driver(&mut self) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
