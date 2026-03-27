@@ -79,43 +79,31 @@ fn hold_kernel_apt(kernel_version: &str) -> Result<(), String> {
 }
 
 fn hold_kernel_yum(kernel_version: &str) -> Result<(), String> {
-    let rpm_pkg = format!("kernel-{}", kernel_version);
-
-    let output = Command::new("yum")
-        .args(["versionlock", "list"])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    let output_str = String::from_utf8_lossy(&output.stdout);
-    let is_held = output_str.contains(&rpm_pkg) || output_str.contains("kernel-");
-
-    if !is_held {
-        log_info!("Kernel {} is not held, attempting to hold via yum versionlock...", kernel_version);
-        
-        let lock_result = Command::new("yum")
-            .args(["versionlock", "add", &rpm_pkg])
-            .output()
-            .map_err(|e| e.to_string())?;
-
-        if lock_result.status.success() {
-            log_info!("✅ Kernel package {} is now held via yum versionlock", rpm_pkg);
-        } else {
-            let stderr = String::from_utf8_lossy(&lock_result.stderr);
-            log_warn!("Failed to hold {} via yum versionlock: {}", rpm_pkg, stderr);
-        }
-
-        let headers_result = Command::new("yum")
-            .args(["versionlock", "add", &format!("kernel-devel-{}", kernel_version)])
-            .output();
-
-        if let Ok(out) = headers_result {
-            if out.status.success() {
-                log_info!("✅ Kernel devel package is now held via yum versionlock");
-            }
-        }
-    } else {
-        log_info!("✅ Kernel {} is already held via yum versionlock", kernel_version);
+    let yum_conf = "/etc/yum.conf";
+    
+    if !Path::new(yum_conf).exists() {
+        log_warn!("{} not found, skipping kernel hold", yum_conf);
+        return Ok(());
     }
+
+    let content = fs::read_to_string(yum_conf).map_err(|e| e.to_string())?;
+    
+    if content.contains("exclude=kernel") || content.contains("exclude=kernel*") {
+        log_info!("✅ Kernel already excluded in yum.conf");
+        return Ok(());
+    }
+
+    log_info!("Kernel {} not excluded in yum.conf, adding exclude=kernel*", kernel_version);
+    
+    let exclude_line = "\nexclude=kernel*\n";
+    let new_content = if content.ends_with('\n') {
+        format!("{}{}", content, exclude_line)
+    } else {
+        format!("{}\n{}", content, exclude_line)
+    };
+
+    fs::write(yum_conf, new_content).map_err(|e| e.to_string())?;
+    log_info!("✅ Added exclude=kernel* to {}", yum_conf);
 
     Ok(())
 }
