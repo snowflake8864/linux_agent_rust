@@ -111,8 +111,8 @@ async fn write_proc_self() -> Result<(), String> {
     fs::File::open(proc_path)
         .and_then(|mut f| f.read_to_string(&mut read_buf))
         .map_err(|e| format!("读取失败: {}", e))?;
-*/
     log_info!("[agent_manager] 读取结果: {}", read_buf.trim());
+*/
     Ok(())
 }
 
