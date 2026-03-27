@@ -86,10 +86,11 @@ async fn main() -> std::io::Result<()> {
         cfg.mod_ver = mod_ver;
         log_info!("load kernel driver: {}", cfg.mod_ver);
         let _ = cfg.to_ini(&format!("{}/net_info.ini", cfg.app_path));
-    }
 
-    // 驱动加载成功后，禁止内核升级
-    ensure_kernel_hold();
+        if !cfg.mod_ver.is_empty() {
+            ensure_kernel_hold();
+        }
+    }
 
     // 检查是否为离线模式
     let is_offline = NETINFO_CONFIG.lock().unwrap().is_offline_mode;
