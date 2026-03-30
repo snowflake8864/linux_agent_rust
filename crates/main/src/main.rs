@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 use config::net_info::NETINFO_CONFIG;
 use udisk::{StartUsbService, StartUsbHotplugHandler};
 use docker::StartDockerMonitor;
+use virus_scan_grpc::StartVirusScanGrpcService;
 use std::fs;
 use std::path::Path;
 
@@ -238,6 +239,19 @@ async fn main() -> std::io::Result<()> {
                 .await
                 .map_err(|e| {
                     logging::log_error!("start_docker_monitor_services 失败: {}", e);
+                    std::io::Error::new(std::io::ErrorKind::Other, e)
+                })
+        }
+    });
+
+    // 启动病毒扫描 gRPC 服务
+    let virus_scan_handle = tokio::spawn({
+        let mut init = init.clone();
+        async move {
+            init.start_virus_scan_grpc_service()
+                .await
+                .map_err(|e| {
+                    logging::log_error!("start_virus_scan_grpc_service 失败: {}", e);
                     std::io::Error::new(std::io::ErrorKind::Other, e)
                 })
         }
