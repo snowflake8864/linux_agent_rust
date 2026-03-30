@@ -1,0 +1,12 @@
+#!/bin/bash
+set -e
+
+# Pre-remove script
+if [ "$1" = "remove" ]; then
+    service agent_manager stop >/dev/null 2>&1 || true
+    service osec stop >/dev/null 2>&1 || true
+    
+    # Remove init.d scripts
+    rm -f /etc/init.d/osec 2>/dev/null || true
+    rm -f /etc/init.d/agent_manager 2>/dev/null || true
+fi

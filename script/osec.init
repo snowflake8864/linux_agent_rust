@@ -1,0 +1,84 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          osec
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: OSEC Backend Service
+# Description:       Linux Agent Backend Service - MagicArmor_0
+#chkconfig: 2345 80 20
+#description: OSEC Backend Service
+### END INIT INFO
+
+PID_FILE=/var/run/osec_backend.pid
+BINARY=/opt/osec/MagicArmor_0
+
+start() {
+    if [ -f "$PID_FILE" ]; then
+        OLD_PID=$(cat $PID_FILE)
+        if [ -d "/proc/$OLD_PID" ]; then
+            echo "osec is already running (PID: $OLD_PID)"
+            return 0
+        else
+            rm -f $PID_FILE
+        fi
+    fi
+    
+    $BINARY >/dev/null 2>&1 &
+    echo "osec started"
+}
+
+stop() {
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat $PID_FILE)
+        if [ -d "/proc/$PID" ]; then
+            kill -15 $PID 2>/dev/null
+            sleep 1
+            if [ -d "/proc/$PID" ]; then
+                echo "osec is protected, cannot stop (PID: $PID)"
+            else
+                rm -f $PID_FILE
+                echo "osec stopped"
+            fi
+        else
+            rm -f $PID_FILE
+        fi
+    fi
+}
+
+status() {
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat $PID_FILE)
+        if [ -d "/proc/$PID" ]; then
+            echo "osec is running (PID: $PID)"
+        else
+            echo "osec is not running (stale PID file)"
+        fi
+    else
+        echo "osec is not running"
+    fi
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        sleep 2
+        start
+        ;;
+    status)
+        status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+
+exit 0

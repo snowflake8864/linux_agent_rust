@@ -1,0 +1,84 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          agent_manager
+# Required-Start:    $network $remote_fs $syslog osec
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Agent Manager Service
+# Description:       Linux Agent Manager Service - MagicArmorAgent
+#chkconfig: 2345 81 19
+#description: Agent Manager Service
+### END INIT INFO
+
+PID_FILE=/var/run/agent_manager.pid
+BINARY=/opt/osec/MagicArmorAgent
+
+start() {
+    if [ -f "$PID_FILE" ]; then
+        OLD_PID=$(cat $PID_FILE)
+        if [ -d "/proc/$OLD_PID" ]; then
+            echo "agent_manager is already running (PID: $OLD_PID)"
+            return 0
+        else
+            rm -f $PID_FILE
+        fi
+    fi
+    
+    $BINARY >/dev/null 2>&1 &
+    echo "agent_manager started"
+}
+
+stop() {
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat $PID_FILE)
+        if [ -d "/proc/$PID" ]; then
+            kill -15 $PID 2>/dev/null
+            sleep 1
+            if [ -d "/proc/$PID" ]; then
+                echo "agent_manager is protected, cannot stop (PID: $PID)"
+            else
+                rm -f $PID_FILE
+                echo "agent_manager stopped"
+            fi
+        else
+            rm -f $PID_FILE
+        fi
+    fi
+}
+
+status() {
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat $PID_FILE)
+        if [ -d "/proc/$PID" ]; then
+            echo "agent_manager is running (PID: $PID)"
+        else
+            echo "agent_manager is not running (stale PID file)"
+        fi
+    else
+        echo "agent_manager is not running"
+    fi
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        sleep 2
+        start
+        ;;
+    status)
+        status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+
+exit 0
