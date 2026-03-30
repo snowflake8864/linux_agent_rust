@@ -1,5 +1,6 @@
-use libc::{sigaction, SIGPIPE, SIG_IGN, SA_RESTART, sigemptyset};
+use libc::{sigaction, SIGPIPE, SIG_IGN, SA_RESTART, sigemptyset, fork, setsid, close, dup2};
 use tokio::signal::unix::{signal as unix_signal, SignalKind};
+use clap::Parser;
 use online::StartOnline;
 use task::{TaskService, TimerTask};
 use kernel_event::{StartKernelHandler, EventHandler,send_data_to_kernel};
@@ -16,8 +17,59 @@ use udisk::{StartUsbService, StartUsbHotplugHandler};
 use docker::StartDockerMonitor;
 use std::fs;
 use std::path::Path;
+use std::io::Write;
+use std::os::unix::io::AsRawFd;
+use chrono::Local;
 
 const PID_FILE: &str = "/var/run/osec_backend.pid";
+
+#[derive(Parser, Debug)]
+#[command(name = "osec_backend")]
+#[command(version = "0.10.6")]
+#[command(about = "Linux Agent Backend Service", long_about = None)]
+struct Args {
+    #[arg(short, long, help = "Run in background (daemon mode)")]
+    daemon: bool,
+}
+
+fn daemonize() {
+    unsafe {
+        if fork() != 0 {
+            std::process::exit(0);
+        }
+        
+        if setsid() == -1 {
+            eprintln!("Failed to create new session");
+            std::process::exit(1);
+        }
+        
+        if fork() != 0 {
+            std::process::exit(0);
+        }
+        
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open("/dev/null")
+            .expect("Cannot open /dev/null");
+        
+        let _ = dup2(devnull.as_raw_fd(), 0);
+        let _ = dup2(devnull.as_raw_fd(), 1);
+        let _ = dup2(devnull.as_raw_fd(), 2);
+    }
+    
+    let log_dir = "/var/log/osec";
+    let _ = std::fs::create_dir_all(log_dir);
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!("{}/osec_backend.log", log_dir))
+        .ok();
+    
+    if let Some(mut f) = log_file {
+        let _ = writeln!(f, "[{}] osec_backend started in daemon mode", Local::now().format("%Y-%m-%d %H:%M:%S"));
+    }
+}
 
 fn pid_is_running(pid: u32) -> bool {
     Path::new(&format!("/proc/{}", pid)).exists()
@@ -46,7 +98,21 @@ fn ensure_single_instance() {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    ensure_single_instance(); 
+    let args = Args::parse();
+    
+    if args.daemon {
+        daemonize();
+    }
+    
+    #[cfg(not(feature = "systemd"))]
+    {
+        ensure_single_instance();
+    }
+    
+    #[cfg(feature = "systemd")]
+    {
+        ensure_single_instance();
+    } 
     // 初始化日志
     CustomLogger::init("/opt/osec/osec_backend.conf")
         .await
@@ -265,7 +331,24 @@ async fn main() -> std::io::Result<()> {
 
 }
 
+fn is_self_protected() -> bool {
+    if let Ok(content) = std::fs::read_to_string("/proc/osec/self") {
+        content.contains("system is in self protect")
+    } else {
+        false
+    }
+}
+
 async fn shutdown_signal() {
+    let protected = is_self_protected();
+    
+    if protected {
+        log_warn!("内核驱动已加载，进程处于保护模式，无法被 kill");
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+        }
+    }
+
     let mut sigint = unix_signal(SignalKind::interrupt()).expect("注册 SIGINT 失败");
     let mut sigterm = unix_signal(SignalKind::terminate()).expect("注册 SIGTERM 失败");
 

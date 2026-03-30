@@ -1,27 +1,60 @@
 #!/bin/bash
 #
-PROC_FILE="osec"
+# osec          This starts and stops the osec service
+#
+# chkconfig:    2345 90 10
+# description:  Start or stop the osec security agent
+# processname:  osecmonitor
+#
+
+# 初始化环境变量 (根据你之前的需求)
+if [[ ":$LD_LIBRARY_PATH:" != *:/opt/osec/* ]]; then
+    export LD_LIBRARY_PATH="/opt/osec/:$LD_LIBRARY_PATH"
+fi
+
+PROC_NAME="osecmonitor"  # 🔴 确保这里和 start 启动的程序名一致
+EXEC_PATH="/opt/osec/osecmonitor"
 
 start()
 {
-    /opt/osec/osecmonitor &
+    # 先检查是否已经运行，避免重复启动
+    if pgrep -f "$PROC_NAME" > /dev/null; then
+        echo "$PROC_NAME is already running."
+        return 0
+    fi
+
+    echo "Starting $PROC_NAME..."
+    $EXEC_PATH > /dev/null 2>&1 &
+    sleep 1
+    if pgrep -f "$PROC_NAME" > /dev/null; then
+        echo "OK"
+    else
+        echo "Failed"
+    fi
 }
 
 stop()
 {
-#    /opt/agent/MagicArmor_2
-   pkill -9 MagicArmor_0
-   pkill -9 MagicArmorAgent
-   pkill -9 osecmonitor
+    echo "Stopping $PROC_NAME..."
+    # 🔴 这里要杀掉的进程名必须和 start 启动的一致
+    pkill -9 -f "$PROC_NAME"
+    sleep 1
+    if ! pgrep -f "$PROC_NAME" > /dev/null; then
+        echo "OK"
+    else
+        echo "Failed"
+    fi
 }
 
 status()
 {
-    run_status=$(ps -e|grep MagicArmor_0)
-    if [ "${run_status}X" == "X" ]; then
-        echo "osec is not running..."
+    # 🔴 修复 grep 匹配到自身的问题，使用 pgrep 更准确
+    if pgrep -f "$PROC_NAME" > /dev/null; then
+        echo "$PROC_NAME is running"
+        return 0
     else
-        echo "osec is running"
+        echo "$PROC_NAME is not running"
+        return 1
     fi
 }
 
@@ -40,7 +73,7 @@ status)
     status
     ;;
 *)
-    echo "usage: $0 start|stop|restart"
-    exit 0;
+    echo "usage: $0 {start|stop|restart|status}"
+    exit 1
+    ;;
 esac
-

@@ -1,6 +1,10 @@
 // crates/agent_manager/src/main.rs
 use std::io;
+use std::io::Write;
+use std::os::unix::io::AsRawFd;
+use tokio::signal::unix::{signal as unix_signal, SignalKind};
 use tokio::sync::mpsc;
+use clap::Parser;
 
 mod unix_socket_server;
 mod manager;
@@ -12,13 +16,64 @@ mod agent_cli_client;
 #[cfg(feature = "agent-cli")]
 mod agent_cli_server;
 
-use logging::{log_info, log_error, CustomLogger};
+use logging::{log_info, log_error, log_warn, CustomLogger};
 use manager::{run_agent_manager, AgentCommand};
+use chrono::Local;
 
 use std::fs;
 use std::path::Path;
 
 const PID_FILE: &str = "/var/run/agent_manager.pid";
+
+#[derive(Parser, Debug)]
+#[command(name = "MagicArmorAgent")]
+#[command(version = "0.1.0")]
+#[command(about = "Agent Manager Service", long_about = None)]
+struct Args {
+    #[arg(short, long, help = "Run in background (daemon mode)")]
+    daemon: bool,
+}
+
+fn daemonize() {
+    unsafe {
+        use libc::{fork, setsid, dup2};
+        
+        if fork() != 0 {
+            std::process::exit(0);
+        }
+        
+        if setsid() == -1 {
+            eprintln!("Failed to create new session");
+            std::process::exit(1);
+        }
+        
+        if fork() != 0 {
+            std::process::exit(0);
+        }
+        
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open("/dev/null")
+            .expect("Cannot open /dev/null");
+        
+        let _ = dup2(devnull.as_raw_fd(), 0);
+        let _ = dup2(devnull.as_raw_fd(), 1);
+        let _ = dup2(devnull.as_raw_fd(), 2);
+    }
+    
+    let log_dir = "/var/log/osec";
+    let _ = std::fs::create_dir_all(log_dir);
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!("{}/agent_manager.log", log_dir))
+        .ok();
+    
+    if let Some(mut f) = log_file {
+        let _ = writeln!(f, "[{}] agent_manager started in daemon mode", Local::now().format("%Y-%m-%d %H:%M:%S"));
+    }
+}
 
 fn pid_is_running(pid: u32) -> bool {
     Path::new(&format!("/proc/{}", pid)).exists()
@@ -46,6 +101,12 @@ fn ensure_single_instance() {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    let args = Args::parse();
+    
+    if args.daemon {
+        daemonize();
+    }
+    
     ensure_single_instance();
 
     let args: Vec<String> = std::env::args().collect();
@@ -105,7 +166,40 @@ async fn main() -> io::Result<()> {
     }
 
     log_info!("启动主管理循环 run_agent_manager");
-    run_agent_manager(cmd_rx).await;
+    
+    tokio::select! {
+        _ = run_agent_manager(cmd_rx) => {},
+        _ = shutdown_signal() => {
+            log_info!("收到退出信号");
+        },
+    }
 
     Ok(())
+}
+
+fn is_self_protected() -> bool {
+    if let Ok(content) = std::fs::read_to_string("/proc/osec/self") {
+        content.contains("system is in self protect")
+    } else {
+        false
+    }
+}
+
+async fn shutdown_signal() {
+    let protected = is_self_protected();
+    
+    if protected {
+        log_warn!("内核驱动已加载，进程处于保护模式，无法被 kill");
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+        }
+    }
+
+    let mut sigint = unix_signal(SignalKind::interrupt()).expect("注册 SIGINT 失败");
+    let mut sigterm = unix_signal(SignalKind::terminate()).expect("注册 SIGTERM 失败");
+
+    tokio::select! {
+        _ = sigint.recv() => log_info!("收到 SIGINT (Ctrl+C)"),
+        _ = sigterm.recv() => log_info!("收到 SIGTERM"),
+    }
 }

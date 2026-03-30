@@ -17,6 +17,8 @@ name = "MagicArmor_0"
 path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
 openssl-sys = { version = "0.9", features = ["vendored"] } # 关键修复点
 openssl = {version = "0.10.33", features = ["vendored"]}
 #nix = { version = "0.27", features = ["signal"] }
