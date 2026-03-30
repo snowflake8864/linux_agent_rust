@@ -3,19 +3,12 @@ Description=agent_manager.service
 After=network.target auditd.service multi-user.target graphical.target
 
 [Service]
-Type=simple
-ExecStart=/opt/osec/MagicArmorAgent
-
-RestartKillSignal=SIGKILL
-KillSignal=SIGKILL              
-KillMode=process                
-SendSIGKILL=yes                
-TimeoutStopSec=5              
-
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-Restart=always
-RestartSec=3                
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/osec/osec.init start
+ExecStop=/opt/osec/osec.init stop
+Restart=no
+User=root
 
 [Install]
 WantedBy=multi-user.target

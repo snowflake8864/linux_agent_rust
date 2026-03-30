@@ -6,19 +6,17 @@ if [[ ":$LD_LIBRARY_PATH:" != *:/opt/osec/* ]]; then
 fi
 
 while true; do
-    # 检查MagicArmor_0进程
-    if ! pgrep -f "MagicArmor_0" > /dev/null; then
-
-        /opt/osec/MagicArmor_0 >/dev/null 2>&1 &
-        echo "[$(date)] MagicArmor_0 started"
+    # 检查 magicarmor_0 进程
+    if ! ps -ef | grep "MagicArmor_0" | grep -v grep | grep -q .; then
+      	/opt/osec/MagicArmor_0 > /dev/null 2>&1 &
+     	echo "[$(date)] MagicArmor_0 started"
     fi
 
-    # 检查MagicArmor_cli进程
-    if ! pgrep -f "MagicArmorAgent" > /dev/null; then
-        /opt/osec/MagicArmorAgent >/dev/null 2>&1 &
-        echo "[$(date)] MagicArmorAgent started"
+   # 检查 magicarmor_agent 进程
+    if ! ps -ef | grep "MagicArmorAgent" | grep -v grep | grep -q .; then
+      /opt/osec/MagicArmorAgent > /dev/null 2>&1 &
+      echo "[$(date)] MagicArmorAgent started"
     fi
-
     sleep 10
 done
 

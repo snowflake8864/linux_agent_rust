@@ -3,12 +3,11 @@ Description=OSEC Service
 After=network.target auditd.service multi-user.target graphical.target
 
 [Service]
-Type=simple
-ExecStart=/opt/osec/MagicArmor_0
-ExecReload=/bin/kill -HUP $MAINPID
-KillMode=process
-Restart=on-failure
-RestartSec=5
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/osec/osec.init start
+ExecStop=/opt/osec/osec.init stop
+Restart=no
 User=root
 
 [Install]
