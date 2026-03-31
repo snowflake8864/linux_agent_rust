@@ -240,14 +240,6 @@ if [[ "\$MODE" == "install" ]]; then
 fi
 
 # --- Deploy services (using /etc/init.d, compatible with all Linux distros) ---
-    # 首先清理旧的 systemd 服务文件
-    echo "Cleaning up old systemd services..."
-    for d in /usr/lib/systemd/system /lib/systemd/system /etc/systemd/system; do
-        rm -f "$d/osec.service" "$d/agent_manager.service" "$d/osec_cli.service" 2>/dev/null || true
-    done
-    systemctl daemon-reload 2>/dev/null || true
-
-    # 部署 init.d 脚本
     echo "Setting up services with /etc/init.d..."
     if [[ "\$MODE" == "install" ]]; then
         # 安装两个服务
