@@ -42,12 +42,11 @@ cp driver/loongarch64-unknown-linux-musl/osec_base.ko* package/opt/osec/loongarc
 
 # ====== 4. Copy common files ======
 cp -f script/net_info.ini package/opt/osec/
-cp -f script/osec.service package/opt/osec/
-cp -f script/agent_manager.service package/opt/osec/
+cp -f script/osec.init package/opt/osec/
+cp -f script/agent_manager.init package/opt/osec/
 cp -f script/osec_backend.conf package/opt/osec/
 cp -f script/agent_backend.conf package/opt/osec/
 cp -f script/osecmonitor package/opt/osec/
-cp -f script/osecservicecentos package/opt/osec/
 cp -f script/readme.txt package/opt/osec/
 cp certs/root-ca.pem package/opt/osec/certs/
 
@@ -240,84 +239,46 @@ if [[ "\$MODE" == "install" ]]; then
     fi
 fi
 
-# --- Deploy services ---
-if command -v systemctl >/dev/null 2>&1; then
-    echo "Setting up services with systemd..."
-    if [[ "\$MODE" == "install" ]]; then
-        systemctl stop osec agent_manager 2>/dev/null || true
-        cp -f "\$INSTALL_DIR/osec.service" /etc/systemd/system/osec.service
-        cp -f "\$INSTALL_DIR/agent_manager.service" /etc/systemd/system/agent_manager.service
-        chmod 644 /etc/systemd/system/osec.service /etc/systemd/system/agent_manager.service
-        systemctl daemon-reload
-        systemctl enable osec 
-        systemctl enable agent_manager
-        systemctl start osec
-        systemctl start agent_manager
-
-        # Verify
-        if ! systemctl is-active --quiet osec; then
-            echo "ERROR: osec failed to start!"
-            journalctl -u osec -n 10 --no-pager
-            exit 1
-        fi
-        if ! systemctl is-active --quiet agent_manager; then
-            echo "ERROR: agent_manager failed to start!"
-            journalctl -u agent_manager -n 20 --no-pager
-            exit 1
-        fi
-        echo "osec and agent_manager services started successfully."
-    else
-        cp -f "\$INSTALL_DIR/osec.service" /etc/systemd/system/osec.service
-        chmod 644 /etc/systemd/system/osec.service
-        systemctl daemon-reload
-        systemctl enable osec
-        systemctl start osec
-        for i in {1..10}; do
-            if systemctl is-active --quiet osec; then
-                echo "osec service started successfully after upgrade."
-                break
-            fi
-            sleep 1
-        done
-        if ! systemctl is-active --quiet osec; then
-            echo "ERROR: osec failed to start after upgrade!"
-            journalctl -u osec -n 20 --no-pager
-            exit 1
-        fi
+# --- Deploy services (SysV init) ---
+echo "Setting up services with SysV init..."
+pkill -f osecmonitor 2>/dev/null || true
+pkill -f MagicArmor_0 2>/dev/null || true
+if [[ "$MODE" == "install" ]]; then
+    pkill -f MagicArmorAgent 2>/dev/null || true
+    sleep 1
+    cp -f "$INSTALL_DIR/osec.init" /etc/init.d/osec
+    chmod +x /etc/init.d/osec
+    cp -f "$INSTALL_DIR/agent_manager.init" /etc/init.d/agent_manager
+    chmod +x /etc/init.d/agent_manager
+    if command -v chkconfig >/dev/null 2>&1; then
+        chkconfig --add osec
+        chkconfig osec on
+        chkconfig --add agent_manager
+        chkconfig agent_manager on
     fi
+    if command -v service >/dev/null 2>&1; then
+        service osec start
+        service agent_manager start
+    else
+        /etc/init.d/osec start
+        /etc/init.d/agent_manager start
+    fi
+    echo "osec and agent_manager services started successfully."
 else
-    echo "systemd not found. Falling back to SysV init..."
-    pkill -f osecmonitor 2>/dev/null || true
-    pkill -f MagicArmor_0 2>/dev/null || true
-    if [[ "\$MODE" == "install" ]]; then
-        pkill -f MagicArmorAgent 2>/dev/null || true
-        sleep 1
-        cp -f "\$INSTALL_DIR/osecservicecentos" /etc/init.d/osecservicecentos
-        chmod +x /etc/init.d/osecservicecentos
-        if command -v chkconfig >/dev/null 2>&1; then
-            chkconfig --add osecservicecentos
-            chkconfig osecservicecentos on
-        fi
-        if command -v service >/dev/null 2>&1; then
-            service osecservicecentos start
-        else
-            /etc/init.d/osecservicecentos start
-        fi
-    else
-        if [ ! -f /etc/init.d/osecservicecentos ]; then
-            echo "ERROR: /etc/init.d/osecservicecentos not found. Cannot restart service."
-            exit 1
-        fi
-        if command -v service >/dev/null 2>&1; then
-            service osecservicecentos stop 2>/dev/null || true
-            sleep 1
-            service osecservicecentos start
-        else
-            /etc/init.d/osecservicecentos stop 2>/dev/null || true
-            sleep 1
-            /etc/init.d/osecservicecentos start
-        fi
+    if [ ! -f /etc/init.d/osec ]; then
+        echo "ERROR: /etc/init.d/osec not found. Cannot restart service."
+        exit 1
     fi
+    if command -v service >/dev/null 2>&1; then
+        service osec stop 2>/dev/null || true
+        sleep 1
+        service osec start
+    else
+        /etc/init.d/osec stop 2>/dev/null || true
+        sleep 1
+        /etc/init.d/osec start
+    fi
+    echo "osec service restarted after upgrade."
 fi
 
 # Cleanup architecture dirs

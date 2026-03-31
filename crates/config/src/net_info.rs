@@ -41,6 +41,7 @@ pub struct NetInfoConfig {
     pub syslog_outer_switch: bool,
     pub syslog_inner_switch: bool,
     pub syslog_process_switch: bool,
+    pub syslog_login_switch: bool,
     pub internet_switch: bool,
     pub baseline_switch: bool,
     pub baseline_time: u32,
@@ -287,6 +288,9 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("SERVERINFO", "SYSLOG_PROCESS_SWITCH") {
             config.syslog_process_switch = matches!(value.trim(), "1");
         }
+        if let Some(value) = ini.get("SERVERINFO", "SYSLOG_LOGIN_SWITCH") {
+            config.syslog_login_switch = matches!(value.trim(), "1");
+        }
 
         if let Some(value) = ini.get("SERVERINFO", "HARDWARE_SWITCH") {
             config.hardware_switch = matches!(value.trim(), "1");
@@ -443,6 +447,11 @@ impl NetInfoConfig {
             file,
             "SYSLOG_PROCESS_SWITCH={}",
             self.syslog_process_switch as u8
+        )?;
+        writeln!(
+            file,
+            "SYSLOG_LOGIN_SWITCH={}",
+            self.syslog_login_switch as u8
         )?;
         writeln!(file, "INTERNET_SWITCH={}", self.internet_switch as u8)?;
         writeln!(file, "OFFLINE_MODE={}", self.is_offline_mode as u8)?;

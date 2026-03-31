@@ -89,12 +89,6 @@ if [ -f "$INSTALL_DIR/$BIN_DIR/MagicArmorAgent" ]; then
     chmod +x "$INSTALL_DIR/MagicArmorAgent"
 fi
 
-# Clean old systemd services
-for d in /usr/lib/systemd/system /lib/systemd/system /etc/systemd/system; do
-    rm -f "$d/osec.service" "$d/agent_manager.service" "$d/osec_cli.service" 2>/dev/null || true
-done
-systemctl daemon-reload 2>/dev/null || true
-
 # Setup services using /etc/init.d
 if command -v chkconfig >/dev/null 2>&1; then
     chkconfig --add osec >/dev/null 2>&1 || true

@@ -144,13 +144,6 @@ async fn stop_osec_services() -> Result<(), String> {
         log_info!("[agent_manager] MagicArmor_0 已完全退出");
     }
 
-    let has_systemctl = Command::new("which")
-        .arg("systemctl")
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
     let has_service = Command::new("which")
         .arg("service")
         .output()
@@ -158,31 +151,22 @@ async fn stop_osec_services() -> Result<(), String> {
         .map(|o| o.status.success())
         .unwrap_or(false);
 
-    if has_systemctl {
-        log_info!("[agent_manager] 使用 systemctl 停止 osec");
-        let _ = Command::new("systemctl").args(["stop", "osec"]).status().await;
-        let _ = Command::new("systemctl").args(["disable", "osec"]).status().await;
-
-        if tokio::fs::remove_file("/etc/systemd/system/osec.service").await.is_ok() {
-            log_info!("[agent_manager] 已删除 /etc/systemd/system/osec.service");
-        } else {
-            log_info!("[agent_manager] 未找到或删除失败 /etc/systemd/system/osec.service");
-        }
-
-        let _ = Command::new("systemctl").arg("daemon-reload").status().await;
-    } else if has_service {
+    if has_service {
         log_info!("[agent_manager] 使用 service 停止 osec");
         let _ = Command::new("service").args(["osec", "stop"]).status().await;
         let _ = Command::new("pkill").arg("-9").arg("osecmonitor").status().await;
 
-        if tokio::fs::remove_file("/etc/init.d/osecservicecentos").await.is_ok() {
-            log_info!("[agent_manager] 已删除 /etc/init.d/osecservicecentos");
+        if tokio::fs::remove_file("/etc/init.d/osec").await.is_ok() {
+            log_info!("[agent_manager] 已删除 /etc/init.d/osec");
         }
+        let _ = Command::new("chkconfig").args(["--del", "osec"]).status().await;
     } else {
         log_info!("[agent_manager] 直接使用 pkill 结束 osecmonitor");
         let _ = Command::new("pkill").arg("-9").arg("osecmonitor").status().await;
     }
 
+    // 删除 PID 文件
+    let _ = tokio::fs::remove_file("/var/run/osec_backend.pid").await;
 
     log_info!("[agent_manager] 尝试卸载内核模块 osec_base");
     let rmmod_status = Command::new("rmmod").arg("osec_base").status().await;
@@ -275,13 +259,6 @@ fn find_upgrade_script(dir: &str) -> Option<PathBuf> {
 async fn uninstall_all() {
     log_info!("[agent_manager] 开始执行完整卸载流程...");
 
-    let has_systemctl = Command::new("which")
-        .arg("systemctl")
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
     let has_service = Command::new("which")
         .arg("service")
         .output()
@@ -290,31 +267,28 @@ async fn uninstall_all() {
         .unwrap_or(false);
 
     // 停止 osec 服务
-    if has_systemctl {
-        let _ = Command::new("systemctl").args(["stop", "osec"]).status().await;
-        let _ = Command::new("systemctl").args(["disable", "osec"]).status().await;
-
-        if fs::remove_file("/etc/systemd/system/osec.service").is_ok() {
-            log_info!("[agent_manager] 已删除 osec.service");
-        }
-        let _ = Command::new("systemctl").args(["daemon-reload"]).status().await;
-    } else if has_service {
+    if has_service {
         let _ = Command::new("service").args(["osec", "stop"]).status().await;
-        let _ = fs::remove_file("/etc/init.d/osec");
+        if fs::remove_file("/etc/init.d/osec").is_ok() {
+            log_info!("[agent_manager] 已删除 /etc/init.d/osec");
+        }
+        let _ = Command::new("chkconfig").args(["--del", "osec"]).status().await;
     } else {
         let _ = Command::new("pkill").arg("-f").arg("osecmonitor").status().await;
     }
 
     // 停止 agent_manager 自身服务
-    if has_systemctl {
-        let _ = Command::new("systemctl").args(["disable", "agent_manager"]).status().await;
-        if fs::remove_file("/etc/systemd/system/agent_manager.service").is_ok() {
-            log_info!("[agent_manager] 已删除 agent_manager.service");
+    if has_service {
+        let _ = Command::new("service").args(["agent_manager", "stop"]).status().await;
+        if fs::remove_file("/etc/init.d/agent_manager").is_ok() {
+            log_info!("[agent_manager] 已删除 /etc/init.d/agent_manager");
         }
-        let _ = Command::new("systemctl").args(["daemon-reload"]).status().await;
-    } else if has_service {
-        let _ = fs::remove_file("/etc/init.d/agent_manager");
+        let _ = Command::new("chkconfig").args(["--del", "agent_manager"]).status().await;
     }
+
+    // 删除 PID 文件
+    let _ = fs::remove_file("/var/run/osec_backend.pid");
+    let _ = fs::remove_file("/var/run/agent_manager.pid");
 
     log_info!("[agent_manager] 检查并卸载 osec_base 模块");
     let modinfo = Command::new("modinfo").arg("osec_base").output().await;
