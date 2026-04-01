@@ -718,9 +718,9 @@ impl IpJumpManager {
             added_time: Instant::now(),
         });
 
-        // 添加到系统
+        // 添加到系统（第二个及以后的 IP 会自动成为 secondary，不需要显式指定）
         if !ip_exists_on_iface(iface, ip).await {
-            self.run_ip_cmd(&["addr", "add", &format!("{}/{}", ip, prefix), "dev", iface, "secondary"])
+            self.run_ip_cmd(&["addr", "add", &format!("{}/{}", ip, prefix), "dev", iface])
                 .await
                 .map_err(|e| format!("failed to add secondary ip to system: {}", e))?;
             log_info!("Added secondary IP to system: {} on {}", ip, iface);
@@ -770,11 +770,11 @@ impl IpJumpManager {
                 "[IP-JUMP] 恢复 secondary IP: {} on {}",
                 ip, iface
             );
+            // 不需要 secondary 关键字，第二个及以后的 IP 会自动成为 secondary
             let _ = self.run_ip_cmd(&[
                 "addr", "add",
                 &format!("{}/{}", ip, prefix),
-                "dev", iface,
-                "secondary"
+                "dev", iface
             ]).await;
         }
     }
