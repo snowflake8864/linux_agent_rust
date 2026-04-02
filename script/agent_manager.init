@@ -11,52 +11,76 @@
 #description: Agent Manager Service
 ### END INIT INFO
 
-PID_FILE=/var/run/agent_manager.pid
-BINARY=/opt/osec/MagicArmorAgent
+MONITOR_PID_FILE=/var/run/agent_manager_monitor.pid
+BINARY_PID_FILE=/var/run/agent_manager.pid
+MONITOR=/opt/osec/agent_manager_monitor
 
 start() {
-    if [ -f "$PID_FILE" ]; then
-        OLD_PID=$(cat $PID_FILE)
+    if [ -f "$MONITOR_PID_FILE" ]; then
+        OLD_PID=$(cat $MONITOR_PID_FILE)
         if [ -d "/proc/$OLD_PID" ]; then
-            echo "agent_manager is already running (PID: $OLD_PID)"
+            echo "agent_manager monitor is already running (PID: $OLD_PID)"
             return 0
         else
-            rm -f $PID_FILE
+            rm -f $MONITOR_PID_FILE
         fi
     fi
     
-    $BINARY >/dev/null 2>&1 &
-    echo "agent_manager started"
+    nohup $MONITOR >/dev/null 2>&1 &
+    echo "agent_manager monitor started"
 }
 
 stop() {
-    if [ -f "$PID_FILE" ]; then
-        PID=$(cat $PID_FILE)
+    # Stop monitor first
+    if [ -f "$MONITOR_PID_FILE" ]; then
+        PID=$(cat $MONITOR_PID_FILE)
+        if [ -d "/proc/$PID" ]; then
+            kill -TERM $PID 2>/dev/null
+            sleep 1
+        fi
+        rm -f $MONITOR_PID_FILE
+    fi
+    
+    # Stop the actual process
+    if [ -f "$BINARY_PID_FILE" ]; then
+        PID=$(cat $BINARY_PID_FILE)
         if [ -d "/proc/$PID" ]; then
             kill -15 $PID 2>/dev/null
             sleep 1
             if [ -d "/proc/$PID" ]; then
-                echo "agent_manager is protected, cannot stop (PID: $PID)"
-            else
-                rm -f $PID_FILE
-                echo "agent_manager stopped"
+                kill -9 $PID 2>/dev/null
             fi
-        else
-            rm -f $PID_FILE
         fi
+        rm -f $BINARY_PID_FILE
     fi
+    
+    # Clean up any remaining processes
+    pkill -9 -f "MagicArmorAgent" 2>/dev/null
+    
+    echo "agent_manager stopped"
 }
 
 status() {
-    if [ -f "$PID_FILE" ]; then
-        PID=$(cat $PID_FILE)
+    if [ -f "$MONITOR_PID_FILE" ]; then
+        PID=$(cat $MONITOR_PID_FILE)
         if [ -d "/proc/$PID" ]; then
-            echo "agent_manager is running (PID: $PID)"
+            echo "agent_manager monitor is running (PID: $PID)"
         else
-            echo "agent_manager is not running (stale PID file)"
+            echo "agent_manager monitor is not running (stale PID file)"
         fi
     else
-        echo "agent_manager is not running"
+        echo "agent_manager monitor is not running"
+    fi
+    
+    if [ -f "$BINARY_PID_FILE" ]; then
+        PID=$(cat $BINARY_PID_FILE)
+        if [ -d "/proc/$PID" ]; then
+            echo "agent_manager process is running (PID: $PID)"
+        else
+            echo "agent_manager process is not running (stale PID file)"
+        fi
+    else
+        echo "agent_manager process is not running"
     fi
 }
 
