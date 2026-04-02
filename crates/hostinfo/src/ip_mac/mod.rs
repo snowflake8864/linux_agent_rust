@@ -1,8 +1,33 @@
+use std::env;
 use std::process::Command;
 
+#[allow(dead_code)]
 pub fn get_ip() -> Option<String> {
     let output = Command::new("ip")
-        .args(["addr", "show"])
+        .args(["route", "show", "default"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return get_first_non_loopback_ip();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(line) = stdout.lines().next() {
+        for part in line.split_whitespace() {
+            if part.starts_with("dev ") {
+                let dev = &part[4..];
+                return get_ip_by_interface(dev);
+            }
+        }
+    }
+
+    get_first_non_loopback_ip()
+}
+
+fn get_ip_by_interface(dev: &str) -> Option<String> {
+    let output = Command::new("ip")
+        .args(["addr", "show", dev])
         .output()
         .ok()?;
 
@@ -11,48 +36,51 @@ pub fn get_ip() -> Option<String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut ips = Vec::new();
-
     for line in stdout.lines() {
         let trimmed = line.trim();
-
-        // 匹配 IPv4 地址行：以 "inet " 开头
         if trimmed.starts_with("inet ") {
-            // 提取 IP/掩码 部分（通常是第一个字段 after "inet"）
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() < 2 {
-                continue;
-            }
-
-            let ip_with_prefix = parts[1]; // e.g. "192.168.16.117/16"
-
-            // 跳过 loopback
-            if ip_with_prefix.starts_with("127.") {
-                continue;
-            }
-
-            // 去掉前缀部分（/16, /24 等）
-            if let Some(ip) = ip_with_prefix.split_once('/') {
-                let ip_addr = ip.0;
-                if !ip_addr.is_empty() {
-                    ips.push(ip_addr.to_string());
+            if parts.len() >= 2 {
+                let ip_with_prefix = parts[1];
+                if let Some(ip) = ip_with_prefix.split_once('/') {
+                    return Some(ip.0.to_string());
                 }
             }
         }
     }
+    None
+}
 
-    if ips.is_empty() {
-        None
-    } else {
-        Some(ips.join(","))
+fn get_first_non_loopback_ip() -> Option<String> {
+    let output = Command::new("ip").args(["addr", "show"]).output().ok()?;
+
+    if !output.status.success() {
+        return None;
     }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("inet ") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let ip_with_prefix = parts[1];
+            if ip_with_prefix.starts_with("127.") {
+                continue;
+            }
+            if let Some(ip) = ip_with_prefix.split_once('/') {
+                return Some(ip.0.to_string());
+            }
+        }
+    }
+    None
 }
 
 pub fn get_mac() -> Option<String> {
-    let output = Command::new("ifconfig")
-        .output()
-        .ok()?
-        .stdout;
+    let output = Command::new("ifconfig").output().ok()?.stdout;
 
     let s = String::from_utf8_lossy(&output);
 

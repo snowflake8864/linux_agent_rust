@@ -7,6 +7,9 @@ pub mod timer_task;
 pub mod baseline_task;
 pub mod net_reach_rule;
 pub mod scan_directory_task;
+pub mod security;
+pub mod protocol;
+
 pub use virtual_port_rule::{VirtualPortRule, deserialize_port_range, deserialize_dest_port};
 pub use task_fetcher::TaskService;
 pub use timer_task::TimerTask;

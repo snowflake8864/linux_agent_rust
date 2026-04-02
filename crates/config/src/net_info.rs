@@ -75,6 +75,9 @@ pub struct NetInfoConfig {
     pub clamav_pool_size: usize,
     pub clamav_connection_type: String,
     pub clamav_socket_path: String,
+    pub security_eval_enabled: bool,
+    pub security_eval_server_addr: String,
+    pub security_eval_interval: u32,
 }
 
 enum NetRule<'a> {
@@ -387,6 +390,16 @@ impl NetInfoConfig {
             .get("VIRUS_SCAN", "CLAMAV_SOCKET_PATH")
             .unwrap_or_else(|| "/opt/clamav/var/run/clamd.sock".to_string());
 
+        if let Some(value) = ini.get("SECURITY_EVAL", "ENABLED") {
+            config.security_eval_enabled = matches!(value.trim(), "1");
+        }
+        config.security_eval_server_addr = ini
+            .get("SECURITY_EVAL", "SERVER_ADDR")
+            .unwrap_or_else(|| "127.0.0.1:62201".to_string());
+        if let Some(value) = ini.get("SECURITY_EVAL", "INTERVAL") {
+            config.security_eval_interval = value.parse().unwrap_or(60);
+        }
+
         config
     }
 
@@ -475,6 +488,7 @@ impl NetInfoConfig {
         writeln!(file, "CLAMAV_PORT={}", self.clamav_port)?;
         writeln!(file, "CLAMAV_TIMEOUT={}", self.clamav_timeout_secs)?;
         writeln!(file, "CLAMAV_POOL_SIZE={}", self.clamav_pool_size)?;
+       
         writeln!(
             file,
             "CLAMAV_CONNECTION_TYPE={}",
@@ -484,6 +498,11 @@ impl NetInfoConfig {
         if self.clamav_socket_path.is_empty() {
             writeln!(file, "CLAMAV_SOCKET_PATH=/opt/clamav/var/run/clamd.sock")?;
         }
+        writeln!(file, "[SECURITY_EVAL]")?;
+        writeln!(file, "ENABLED={}", self.security_eval_enabled as u8)?;
+        writeln!(file, "SERVER_ADDR={}", self.security_eval_server_addr)?;
+        writeln!(file, "INTERVAL={}", self.security_eval_interval)?;
+ 
         Ok(())
     }
 

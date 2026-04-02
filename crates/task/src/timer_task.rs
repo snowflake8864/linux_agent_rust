@@ -10,9 +10,11 @@ use hostinfo::net_app::parser_dnat::update_dnat_info;
 use hostinfo::net_app::parser_docker::update_docker_info;
 use hostinfo::net_app::model::write_business_ports_to_proc;
 use config::net_info::NETINFO_CONFIG;
+use hostinfo::ip_mac;
 use crate::baseline_task::{process_baselines_from_client};
 use crate::run_outreach_detection;
 use crate::net_reach_rule::build_outreach_detect_list_json;
+use crate::security::SecurityEvalClient;
 pub trait TimerTask {
     fn start_timer_task(&mut self) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
 }
@@ -34,6 +36,9 @@ impl TimerTask for BootManager {
             let mut baseline_enabled = false;
             let mut outreach_interval: Option<Interval> = None;
             let mut outreach_enabled = false;
+            let mut security_eval_interval: Option<Interval> = None;
+            let mut security_eval_enabled = false;
+            let mut security_client: Option<SecurityEvalClient> = None;
 
             loop {
                 let (switch, time_secs) = self.get_baseline_info();
@@ -60,6 +65,36 @@ impl TimerTask for BootManager {
                     log_info!("停用 Outreach Detect");
                     outreach_interval = None;
                     outreach_enabled = false;
+                }
+                
+                let sec_eval_switch = NETINFO_CONFIG.lock().unwrap().security_eval_enabled;
+                let sec_eval_time = NETINFO_CONFIG.lock().unwrap().security_eval_interval;
+                log_info!("安全评估配置: enabled={}, interval={}s, addr={}", 
+                    sec_eval_switch, sec_eval_time, 
+                    NETINFO_CONFIG.lock().unwrap().security_eval_server_addr);
+                if sec_eval_switch && sec_eval_time > 0 {
+                    if !security_eval_enabled || security_eval_interval.is_none() {
+                        log_info!("启用安全评估，间隔: {} 秒", sec_eval_time);
+                        security_eval_interval = Some(interval(Duration::from_secs(sec_eval_time as u64)));
+                        security_eval_enabled = true;
+                        
+                        if security_client.is_none() {
+                            let server_addr = NETINFO_CONFIG.lock().unwrap().security_eval_server_addr.clone();
+                            match SecurityEvalClient::new(&server_addr).await {
+                                Ok(client) => {
+                                    security_client = Some(client);
+                                    log_info!("安全评估客户端初始化成功");
+                                }
+                                Err(e) => {
+                                    log_error!("安全评估客户端初始化失败: {}", e);
+                                }
+                            }
+                        }
+                    }
+                } else if security_eval_enabled {
+                    log_info!("停用安全评估");
+                    security_eval_interval = None;
+                    security_eval_enabled = false;
                 }
                 tokio::select! {
                     _ = local_interval.tick() => {
@@ -127,6 +162,36 @@ impl TimerTask for BootManager {
                             Err(e) => log_error!("Outreach detection error: {}", e),
                         }
 
+                    }
+
+                    _ = async {
+                        if let Some(ref mut sei) = security_eval_interval {
+                            sei.tick().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    }, if security_eval_interval.is_some() => {
+                        if let Some(ref mut client) = security_client {
+                            // 获取系统 IP 和 MAC
+                            let ip_opt = ip_mac::get_ip();
+                            let mac_opt = ip_mac::get_mac();
+                            
+                            let ip = ip_opt.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+                            let mac_str = mac_opt.unwrap_or_else(|| "00:00:00:00:00:00".to_string());
+                            
+                            log_info!("发送安全评估: IP={}, MAC={}, Score=95", ip, mac_str);
+                            
+                            match client.send_security_eval(&ip, &mac_str, 95).await {
+                                Ok(_) => {
+                                    log_info!("安全评估请求成功");
+                                }
+                                Err(e) => {
+                                    log_error!("安全评估请求失败: {}", e);
+                                }
+                            }
+                        } else {
+                            log_error!("安全评估客户端未初始化");
+                        }
                     }
                 }
             }
