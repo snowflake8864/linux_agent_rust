@@ -127,23 +127,7 @@ async fn is_process_running(name: &str) -> bool {
 async fn stop_osec_services() -> Result<(), String> {
     log_info!("[agent_manager] 开始停止并清理 osec 服务...");
 
-    log_info!("[agent_manager] 发送 SIGKILL 给残留的 MagicArmor_0");
-    let _ = Command::new("pkill").arg("-9").arg("MagicArmor_0").status().await;
-
-    log_info!("[agent_manager] 等待 MagicArmor_0 完全退出 (最多 {} 秒)...", MAX_WAIT_SECONDS);
-    let wait_result = timeout(Duration::from_secs(MAX_WAIT_SECONDS), async {
-        while is_process_running("MagicArmor_0").await {
-            sleep(Duration::from_millis(POLL_INTERVAL_MILLIS)).await;
-        }
-    })
-    .await;
-
-    if wait_result.is_err() {
-        log_error!("[agent_manager] 超时: MagicArmor_0 在 {} 秒内未退出", MAX_WAIT_SECONDS);
-    } else {
-        log_info!("[agent_manager] MagicArmor_0 已完全退出");
-    }
-
+    // v1.0: 统一使用 /etc/init.d/ 管理，先停服务（会停monitor和业务进程）
     let has_service = Command::new("which")
         .arg("service")
         .output()
@@ -154,18 +138,38 @@ async fn stop_osec_services() -> Result<(), String> {
     if has_service {
         log_info!("[agent_manager] 使用 service 停止 osec");
         let _ = Command::new("service").args(["osec", "stop"]).status().await;
-        let _ = Command::new("pkill").arg("-9").arg("osecmonitor").status().await;
-
-        if tokio::fs::remove_file("/etc/init.d/osec").await.is_ok() {
-            log_info!("[agent_manager] 已删除 /etc/init.d/osec");
-        }
-        let _ = Command::new("chkconfig").args(["--del", "osec"]).status().await;
+    } else if std::path::Path::new("/etc/init.d/osec").exists() {
+        log_info!("[agent_manager] 使用 /etc/init.d/osec 停止");
+        let _ = Command::new("/etc/init.d/osec").arg("stop").status().await;
     } else {
-        log_info!("[agent_manager] 直接使用 pkill 结束 osecmonitor");
-        let _ = Command::new("pkill").arg("-9").arg("osecmonitor").status().await;
+        log_info!("[agent_manager] 直接使用 pkill 结束监控脚本");
+        let _ = Command::new("pkill").arg("-TERM").arg("osec_monitor").status().await;
+        sleep(Duration::from_secs(2)).await;
     }
 
-    // 删除 PID 文件
+    // 等待业务进程退出
+    log_info!("[agent_manager] 等待 MagicArmor_0 完全退出 (最多 {} 秒)...", MAX_WAIT_SECONDS);
+    let wait_result = timeout(Duration::from_secs(MAX_WAIT_SECONDS), async {
+        while is_process_running("MagicArmor_0").await {
+            sleep(Duration::from_millis(POLL_INTERVAL_MILLIS)).await;
+        }
+    }).await;
+
+    if wait_result.is_err() {
+        log_error!("[agent_manager] 超时: MagicArmor_0 在 {} 秒内未退出，强制结束", MAX_WAIT_SECONDS);
+        let _ = Command::new("pkill").arg("-9").arg("MagicArmor_0").status().await;
+    } else {
+        log_info!("[agent_manager] MagicArmor_0 已完全退出");
+    }
+
+    // 删除 init 脚本
+    if tokio::fs::remove_file("/etc/init.d/osec").await.is_ok() {
+        log_info!("[agent_manager] 已删除 /etc/init.d/osec");
+    }
+    let _ = Command::new("chkconfig").args(["--del", "osec"]).status().await;
+
+    // 删除所有 PID 文件（monitor + 业务进程）
+    let _ = tokio::fs::remove_file("/var/run/osec_monitor.pid").await;
     let _ = tokio::fs::remove_file("/var/run/osec_backend.pid").await;
 
     log_info!("[agent_manager] 尝试卸载内核模块 osec_base");
@@ -259,6 +263,7 @@ fn find_upgrade_script(dir: &str) -> Option<PathBuf> {
 async fn uninstall_all() {
     log_info!("[agent_manager] 开始执行完整卸载流程...");
 
+    // v1.0: 统一使用 /etc/init.d/ 管理
     let has_service = Command::new("which")
         .arg("service")
         .output()
@@ -269,25 +274,37 @@ async fn uninstall_all() {
     // 停止 osec 服务
     if has_service {
         let _ = Command::new("service").args(["osec", "stop"]).status().await;
-        if fs::remove_file("/etc/init.d/osec").is_ok() {
-            log_info!("[agent_manager] 已删除 /etc/init.d/osec");
-        }
-        let _ = Command::new("chkconfig").args(["--del", "osec"]).status().await;
+    } else if std::path::Path::new("/etc/init.d/osec").exists() {
+        let _ = Command::new("/etc/init.d/osec").arg("stop").status().await;
     } else {
-        let _ = Command::new("pkill").arg("-f").arg("osecmonitor").status().await;
+        let _ = Command::new("pkill").arg("-TERM").arg("osec_monitor").status().await;
+        sleep(Duration::from_secs(2)).await;
+        let _ = Command::new("pkill").arg("-9").arg("MagicArmor_0").status().await;
     }
+    if fs::remove_file("/etc/init.d/osec").is_ok() {
+        log_info!("[agent_manager] 已删除 /etc/init.d/osec");
+    }
+    let _ = Command::new("chkconfig").args(["--del", "osec"]).status().await;
 
     // 停止 agent_manager 自身服务
     if has_service {
         let _ = Command::new("service").args(["agent_manager", "stop"]).status().await;
-        if fs::remove_file("/etc/init.d/agent_manager").is_ok() {
-            log_info!("[agent_manager] 已删除 /etc/init.d/agent_manager");
-        }
-        let _ = Command::new("chkconfig").args(["--del", "agent_manager"]).status().await;
+    } else if std::path::Path::new("/etc/init.d/agent_manager").exists() {
+        let _ = Command::new("/etc/init.d/agent_manager").arg("stop").status().await;
+    } else {
+        let _ = Command::new("pkill").arg("-TERM").arg("agent_manager_monitor").status().await;
+        sleep(Duration::from_secs(2)).await;
+        let _ = Command::new("pkill").arg("-9").arg("MagicArmorAgent").status().await;
     }
+    if fs::remove_file("/etc/init.d/agent_manager").is_ok() {
+        log_info!("[agent_manager] 已删除 /etc/init.d/agent_manager");
+    }
+    let _ = Command::new("chkconfig").args(["--del", "agent_manager"]).status().await;
 
-    // 删除 PID 文件
+    // 删除所有 PID 文件（monitor + 业务进程）
+    let _ = fs::remove_file("/var/run/osec_monitor.pid");
     let _ = fs::remove_file("/var/run/osec_backend.pid");
+    let _ = fs::remove_file("/var/run/agent_manager_monitor.pid");
     let _ = fs::remove_file("/var/run/agent_manager.pid");
 
     log_info!("[agent_manager] 检查并卸载 osec_base 模块");
