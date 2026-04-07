@@ -134,13 +134,35 @@ if [[ "\$MODE" == "install" ]]; then
     chown -R root:root "\$INSTALL_DIR"
 elif [[ "\$MODE" == "upgrade" ]]; then
     [ -d "\$INSTALL_DIR" ] || { echo "Not installed!"; exit 1; }
+    
+    # 停止服务（systemd 或 init.d）
     if command -v systemctl >/dev/null; then
         systemctl stop osec 2>/dev/null || true
     else
-        pkill -f osecmonitor 2>/dev/null || true
+        # 停止新的 monitor
+        [ -f "\$INSTALL_DIR/osec.monitor" ] && "\$INSTALL_DIR/osec.monitor" stop 2>/dev/null || true
+        # 停止老的 osecmonitor
+        pkill -9 -f osecmonitor 2>/dev/null || true
     fi
-    pkill -f MagicArmor_0 2>/dev/null || true
+    
+    # 杀掉所有相关进程
+    pkill -9 -f MagicArmor_0 2>/dev/null || true
+    pkill -9 -f MagicArmorAgent 2>/dev/null || true
     sleep 1
+    
+    # 清理老版本残留（无 systemd 环境）
+    if [ ! -d /run/systemd/system ]; then
+        # 清理老的 init.d 脚本
+        if [ -f /etc/init.d/osecservicecentos ]; then
+            chkconfig --del osecservicecentos 2>/dev/null || true
+            rm -f /etc/init.d/osecservicecentos
+        fi
+        # 清理老的监控脚本
+        rm -f "\$INSTALL_DIR/osecmonitor" 2>/dev/null || true
+        # 清理老的 PID 文件
+        rm -f /var/run/osec.pid 2>/dev/null || true
+    fi
+    
     if lsmod | grep -q osec_base; then
         rmmod osec_base || { echo "Failed to unload osec_base"; exit 1; }
     fi
@@ -241,12 +263,12 @@ if [[ "\$MODE" == "install" ]]; then
     fi
 fi
 
-# --- Deploy services (using /etc/init.d, compatible with all Linux distros) ---
-    echo "Setting up services with /etc/init.d..."
-    if [[ "\$MODE" == "install" ]]; then
-        # 安装两个服务
-        cp -f "\$INSTALL_DIR/osec.init" /etc/init.d/osec >/dev/null 2>&1
-        cp -f "\$INSTALL_DIR/agent_manager.init" /etc/init.d/agent_manager >/dev/null 2>&1
+# --- Deploy services (using init.d + monitor script for non-systemd) ---
+    echo "Setting up services with init.d..."
+    if [[ "$MODE" == "install" ]]; then
+        # 安装两个服务（监控脚本在 /opt/osec 下，由 init.d 调用）
+        cp -f "$INSTALL_DIR/osec.init" /etc/init.d/osec >/dev/null 2>&1
+        cp -f "$INSTALL_DIR/agent_manager.init" /etc/init.d/agent_manager >/dev/null 2>&1
         chmod +x /etc/init.d/osec /etc/init.d/agent_manager
         
         # 添加开机启动
@@ -266,7 +288,7 @@ fi
         echo "osec and agent_manager services started successfully."
     else
         # 升级模式：只升级 osec
-        cp -f "\$INSTALL_DIR/osec.init" /etc/init.d/osec >/dev/null 2>&1
+        cp -f "$INSTALL_DIR/osec.init" /etc/init.d/osec >/dev/null 2>&1
         chmod +x /etc/init.d/osec
         
         if command -v chkconfig >/dev/null 2>&1; then

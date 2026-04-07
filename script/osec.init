@@ -11,52 +11,94 @@
 #description: OSEC Backend Service
 ### END INIT INFO
 
-PID_FILE=/var/run/osec_backend.pid
+NAME=osec
+# 主进程的 PID 文件（由 MagicArmor_0 代码写入）
+MAIN_PID_FILE=/var/run/osec_backend.pid
+# monitor 进程的 PID 文件（由 monitor 脚本写入）
+MONITOR_PID_FILE=/var/run/osec_monitor.pid
+MONITOR_SCRIPT=/opt/osec/osec.monitor
 BINARY=/opt/osec/MagicArmor_0
 
-start() {
-    if [ -f "$PID_FILE" ]; then
-        OLD_PID=$(cat $PID_FILE)
-        if [ -d "/proc/$OLD_PID" ]; then
-            echo "osec is already running (PID: $OLD_PID)"
-            return 0
-        else
-            rm -f $PID_FILE
-        fi
+# 清理老版本残留
+cleanup_legacy() {
+    # 停止并清理老的 osecmonitor
+    pkill -9 -f "osecmonitor" 2>/dev/null || true
+    
+    # 清理老的 init.d 脚本
+    if [ -f /etc/init.d/osecservicecentos ]; then
+        chkconfig --del osecservicecentos 2>/dev/null || true
+        rm -f /etc/init.d/osecservicecentos
     fi
     
-    $BINARY >/dev/null 2>&1 &
-    echo "osec started"
+    # 清理老的监控脚本
+    rm -f /opt/osec/osecmonitor 2>/dev/null || true
+}
+
+start() {
+    # 清理老版本残留
+    cleanup_legacy
+    
+    # 检查是否已在运行（检查主进程）
+    if [ -f "$MAIN_PID_FILE" ]; then
+        OLD_PID=$(cat $MAIN_PID_FILE 2>/dev/null)
+        if [ -n "$OLD_PID" ] && [ -d "/proc/$OLD_PID" ]; then
+            echo "$NAME is already running (PID: $OLD_PID)"
+            return 0
+        else
+            rm -f $MAIN_PID_FILE
+        fi
+    fi
+
+    if [ ! -f "$MONITOR_SCRIPT" ]; then
+        echo "Monitor script not found: $MONITOR_SCRIPT"
+        return 1
+    fi
+
+    chmod +x $MONITOR_SCRIPT
+    bash $MONITOR_SCRIPT start
+    echo "$NAME started"
 }
 
 stop() {
-    if [ -f "$PID_FILE" ]; then
-        PID=$(cat $PID_FILE)
-        if [ -d "/proc/$PID" ]; then
-            kill -15 $PID 2>/dev/null
-            sleep 1
-            if [ -d "/proc/$PID" ]; then
-                echo "osec is protected, cannot stop (PID: $PID)"
-            else
-                rm -f $PID_FILE
-                echo "osec stopped"
+    # 调用 monitor 的 stop 来停止主进程和 monitor
+    if [ -f "$MONITOR_SCRIPT" ]; then
+        $MONITOR_SCRIPT stop 2>/dev/null
+    else
+        # 如果 monitor 脚本不存在，直接清理
+        if [ -f "$MAIN_PID_FILE" ]; then
+            PID=$(cat $MAIN_PID_FILE 2>/dev/null)
+            if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+                kill -15 $PID 2>/dev/null
+                sleep 1
+                kill -9 $PID 2>/dev/null || true
             fi
-        else
-            rm -f $PID_FILE
+            rm -f $MAIN_PID_FILE
+        fi
+        if [ -f "$MONITOR_PID_FILE" ]; then
+            PID=$(cat $MONITOR_PID_FILE 2>/dev/null)
+            if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+                kill -9 $PID 2>/dev/null || true
+            fi
+            rm -f $MONITOR_PID_FILE
         fi
     fi
+    echo "$NAME stopped"
 }
 
 status() {
-    if [ -f "$PID_FILE" ]; then
-        PID=$(cat $PID_FILE)
-        if [ -d "/proc/$PID" ]; then
-            echo "osec is running (PID: $PID)"
+    # 检查主进程是否运行
+    if [ -f "$MAIN_PID_FILE" ]; then
+        PID=$(cat $MAIN_PID_FILE 2>/dev/null)
+        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+            echo "$NAME is running (PID: $PID)"
+            return 0
         else
-            echo "osec is not running (stale PID file)"
+            echo "$NAME is not running (stale PID file)"
+            return 1
         fi
     else
-        echo "osec is not running"
+        echo "$NAME is not running"
+        return 3
     fi
 }
 

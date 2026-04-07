@@ -13,15 +13,89 @@ impl SystemInfo {
         Ok(hostname.trim().to_string())
     }
 
-    /// 获取操作系统版本
+    /// 获取操作系统版本（兼容老系统如 CentOS 6）
     fn get_os_version() -> Result<String, Error> {
-        let os_release = fs::read_to_string("/etc/os-release")?;
-        for line in os_release.lines() {
-            if line.starts_with("NAME=") {
-                return Ok(line.trim_start_matches("NAME=").trim_matches('"').to_string());
+        // 方式1: 读取 /etc/os-release（现代 Linux 发行版）
+        if let Ok(os_release) = fs::read_to_string("/etc/os-release") {
+            for line in os_release.lines() {
+                if line.starts_with("PRETTY_NAME=") {
+                    return Ok(line
+                        .trim_start_matches("PRETTY_NAME=")
+                        .trim_matches('"')
+                        .to_string());
+                }
+                if line.starts_with("NAME=") {
+                    return Ok(line
+                        .trim_start_matches("NAME=")
+                        .trim_matches('"')
+                        .to_string());
+                }
             }
         }
-        Err(io::Error::new(io::ErrorKind::NotFound, "OS version not found"))
+
+        // 方式2: 读取 /etc/redhat-release（CentOS/RHEL 6 等）
+        if let Ok(content) = fs::read_to_string("/etc/redhat-release") {
+            return Ok(content.trim().to_string());
+        }
+
+        // 方式3: 读取 /etc/centos-release
+        if let Ok(content) = fs::read_to_string("/etc/centos-release") {
+            return Ok(content.trim().to_string());
+        }
+
+        // 方式4: 读取 /etc/lsb-release（Ubuntu 老版本）
+        if let Ok(lsb_release) = fs::read_to_string("/etc/lsb-release") {
+            let mut description = None;
+            let mut distro = None;
+            for line in lsb_release.lines() {
+                if line.starts_with("DISTRIB_DESCRIPTION=") {
+                    description = Some(
+                        line.trim_start_matches("DISTRIB_DESCRIPTION=")
+                            .trim_matches('"')
+                            .to_string(),
+                    );
+                }
+                if line.starts_with("DISTRIB_ID=") {
+                    distro = Some(
+                        line.trim_start_matches("DISTRIB_ID=")
+                            .trim_matches('"')
+                            .to_string(),
+                    );
+                }
+            }
+            if let Some(desc) = description {
+                return Ok(desc);
+            }
+            if let Some(distro) = distro {
+                return Ok(distro);
+            }
+        }
+
+        // 方式5: 读取 /etc/debian_version
+        if let Ok(content) = fs::read_to_string("/etc/debian_version") {
+            return Ok(format!("Debian {}", content.trim()));
+        }
+
+        // 方式6: 使用 lsb_release 命令（兜底）
+        if let Ok(output) = Command::new("lsb_release").arg("-d").output() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(desc) = stdout.strip_prefix("Description:\t") {
+                return Ok(desc.trim().to_string());
+            }
+        }
+
+        // 方式7: 使用 uname 命令（最终兜底）
+        if let Ok(output) = Command::new("uname").arg("-s").output() {
+            let os = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !os.is_empty() {
+                return Ok(os);
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "OS version not found",
+        ))
     }
 
     /// 获取内核版本
@@ -32,8 +106,8 @@ impl SystemInfo {
 
     /// 获取操作系统 + 内核信息
     pub fn get_computer_version() -> Result<String, Error> {
-        let os_version = SystemInfo::get_os_version()?;
-        let kernel_version = SystemInfo::get_kernel_version()?;
+        let os_version = SystemInfo::get_os_version().unwrap_or_else(|_| "Unknown".to_string());
+        let kernel_version = SystemInfo::get_kernel_version().unwrap_or_else(|_| "Unknown".to_string());
         Ok(format!("{}_kernel:{}", os_version.replace(' ', ""), kernel_version))
     }
 
