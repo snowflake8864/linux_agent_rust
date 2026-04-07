@@ -164,6 +164,10 @@ async fn stop_osec_services() -> Result<(), String> {
     log_info!("[agent_manager] 发送 SIGKILL 给残留的 MagicArmor_0");
     let _ = Command::new("pkill").arg("-9").arg("MagicArmor_0").status().await;
 
+    log_info!("[agent_manager] 发送 SIGKILL 给残留的 MagicArmor_cli / osec_cli");
+    let _ = Command::new("pkill").arg("-9").arg("MagicArmor_cli").status().await;
+    let _ = Command::new("pkill").arg("-9").arg("osec_cli").status().await;
+
     log_info!("[agent_manager] 等待 MagicArmor_0 完全退出 (最多 {} 秒)...", MAX_WAIT_SECONDS);
     let wait_result = timeout(Duration::from_secs(MAX_WAIT_SECONDS), async {
         while is_process_running("MagicArmor_0").await {
@@ -193,14 +197,31 @@ async fn stop_osec_services() -> Result<(), String> {
         if tokio::fs::remove_file("/etc/init.d/osec").await.is_ok() {
             log_info!("[agent_manager] 已删除 /etc/init.d/osec");
         }
+        if tokio::fs::remove_file("/opt/osec/osec.monitor").await.is_ok() {
+            log_info!("[agent_manager] 已删除 /opt/osec/osec.monitor");
+        }
         let _ = Command::new("chkconfig").args(["--del", "osec"]).status().await;
+        
+        // 清理老版本残留
+        if tokio::fs::remove_file("/etc/init.d/osecservicecentos").await.is_ok() {
+            log_info!("[agent_manager] 已删除老版本 /etc/init.d/osecservicecentos");
+            let _ = Command::new("chkconfig").args(["--del", "osecservicecentos"]).status().await;
+        }
+        let _ = tokio::fs::remove_file("/opt/osec/osecmonitor").await;
     } else {
         log_info!("[agent_manager] 直接使用 pkill 结束 osecmonitor");
         let _ = Command::new("pkill").arg("-9").arg("osecmonitor").status().await;
+        // 清理老版本残留
+        let _ = tokio::fs::remove_file("/etc/init.d/osecservicecentos").await;
+        let _ = tokio::fs::remove_file("/opt/osec/osecmonitor").await;
     }
 
     // 删除 PID 文件
     let _ = tokio::fs::remove_file("/var/run/osec_backend.pid").await;
+    let _ = tokio::fs::remove_file("/var/run/osec.pid").await;
+    let _ = tokio::fs::remove_file("/var/run/osec_monitor.pid").await;
+    let _ = tokio::fs::remove_file("/tmp/.osec_cli.pid").await;
+    let _ = tokio::fs::remove_file("/tmp/.osec_cli.sock").await;
 
     log_info!("[agent_manager] 尝试卸载内核模块 osec_base");
     let rmmod_status = Command::new("rmmod").arg("osec_base").status().await;
@@ -367,6 +388,9 @@ async fn uninstall_all() {
         if fs::remove_file("/etc/init.d/osec").is_ok() {
             log_info!("[agent_manager] 已删除 /etc/init.d/osec");
         }
+        if fs::remove_file("/opt/osec/osec.monitor").is_ok() {
+            log_info!("[agent_manager] 已删除 /opt/osec/osec.monitor");
+        }
         let _ = Command::new("chkconfig").args(["--del", "osec"]).status().await;
     } else {
         let _ = Command::new("pkill").arg("-f").arg("osecmonitor").status().await;
@@ -378,12 +402,19 @@ async fn uninstall_all() {
         if fs::remove_file("/etc/init.d/agent_manager").is_ok() {
             log_info!("[agent_manager] 已删除 /etc/init.d/agent_manager");
         }
+        if fs::remove_file("/opt/osec/agent_manager.monitor").is_ok() {
+            log_info!("[agent_manager] 已删除 /opt/osec/agent_manager.monitor");
+        }
         let _ = Command::new("chkconfig").args(["--del", "agent_manager"]).status().await;
     }
 
     // 删除 PID 文件
     let _ = fs::remove_file("/var/run/osec_backend.pid");
     let _ = fs::remove_file("/var/run/agent_manager.pid");
+    let _ = fs::remove_file("/var/run/osec.pid");
+    let _ = fs::remove_file("/var/run/agent_manager.pid");
+    let _ = fs::remove_file("/var/run/osec_monitor.pid");
+    let _ = fs::remove_file("/var/run/agent_manager_monitor.pid");
 
     log_info!("[agent_manager] 检查并卸载 osec_base 模块");
     let modinfo = Command::new("modinfo").arg("osec_base").output().await;

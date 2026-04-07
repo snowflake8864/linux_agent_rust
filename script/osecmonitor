@@ -1,24 +1,128 @@
 #!/bin/bash
+### BEGIN INIT INFO
+# Provides:          osecmonitor
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: OSEC Monitor (Legacy)
+# Description:       Monitor and auto-restart MagicArmor_0 and MagicArmorAgent
+#chkconfig: 2345 80 20
+#description: OSEC Monitor (Legacy)
+### END INIT INFO
+
+NAME=osecmonitor
+PID_FILE=/var/run/osecmonitor.pid
+CHECK_INTERVAL=10
 
 # 初始化环境变量
 if [[ ":$LD_LIBRARY_PATH:" != *:/opt/osec/* ]]; then
     export LD_LIBRARY_PATH="/opt/osec/:$LD_LIBRARY_PATH"
 fi
 
-while true; do
-    # 检查MagicArmor_0进程
-    if ! pgrep -f "MagicArmor_0" > /dev/null; then
-
-        /opt/osec/MagicArmor_0 >/dev/null 2>&1 &
-        echo "[$(date)] MagicArmor_0 started"
+start() {
+    if [ -f "$PID_FILE" ]; then
+        OLD_PID=$(cat $PID_FILE 2>/dev/null)
+        if [ -n "$OLD_PID" ] && [ -d "/proc/$OLD_PID" ]; then
+            echo "$NAME is already running (PID: $OLD_PID)"
+            return 0
+        else
+            rm -f $PID_FILE
+        fi
     fi
 
-    # 检查MagicArmor_cli进程
-    if ! pgrep -f "MagicArmorAgent" > /dev/null; then
-        /opt/osec/MagicArmorAgent >/dev/null 2>&1 &
-        echo "[$(date)] MagicArmorAgent started"
+    nohup bash -c "
+        while true; do
+            # 检查 MagicArmor_0 进程
+            if ! pgrep -f \"MagicArmor_0\" > /dev/null 2>&1; then
+                /opt/osec/MagicArmor_0 >/dev/null 2>&1 &
+            fi
+            # 检查 MagicArmorAgent 进程
+            if ! pgrep -f \"MagicArmorAgent\" > /dev/null 2>&1; then
+                /opt/osec/MagicArmorAgent >/dev/null 2>&1 &
+            fi
+            sleep $CHECK_INTERVAL
+        done
+    " >/dev/null 2>&1 &
+
+    echo $! > $PID_FILE
+    echo "$NAME started (PID: $(cat $PID_FILE))"
+}
+
+stop() {
+    # 杀掉 MagicArmor_0
+    pkill -15 -f "MagicArmor_0" 2>/dev/null || true
+    sleep 1
+    pkill -9 -f "MagicArmor_0" 2>/dev/null || true
+    
+    # 杀掉 MagicArmorAgent
+    pkill -15 -f "MagicArmorAgent" 2>/dev/null || true
+    sleep 1
+    pkill -9 -f "MagicArmorAgent" 2>/dev/null || true
+    
+    # 杀掉 monitor 进程
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat $PID_FILE 2>/dev/null)
+        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+            kill -15 $PID 2>/dev/null
+            sleep 1
+            kill -9 $PID 2>/dev/null || true
+        fi
+        rm -f $PID_FILE
     fi
+    
+    # 兜底：杀掉所有相关进程
+    pkill -9 -f "MagicArmor" 2>/dev/null || true
+    pkill -9 -f "osecmonitor" 2>/dev/null || true
+    
+    echo "$NAME stopped"
+}
 
-    sleep 10
-done
+status() {
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat $PID_FILE 2>/dev/null)
+        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+            echo "$NAME is running (monitor PID: $PID)"
+        else
+            echo "$NAME is not running (stale PID file)"
+        fi
+    else
+        echo "$NAME is not running"
+    fi
+    
+    # 显示被监控进程的状态
+    if pgrep -f "MagicArmor_0" > /dev/null 2>&1; then
+        echo "MagicArmor_0 is running"
+    else
+        echo "MagicArmor_0 is not running"
+    fi
+    
+    if pgrep -f "MagicArmorAgent" > /dev/null 2>&1; then
+        echo "MagicArmorAgent is running"
+    else
+        echo "MagicArmorAgent is not running"
+    fi
+}
 
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        sleep 2
+        start
+        ;;
+    status)
+        status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+
+exit 0
