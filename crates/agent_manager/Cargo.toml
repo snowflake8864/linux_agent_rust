@@ -32,6 +32,7 @@ tempfile = "3"
 zip = "0.6"
 walkdir = "2.5"
 uname = "0.1"
+netlink = { path = "../netlink" }
 
 # --- TLS / CLI 依赖必须标记为 optional ---
 tokio-rustls = { version = "0.26", optional = true }

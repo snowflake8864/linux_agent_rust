@@ -44,8 +44,8 @@ cp driver/loongarch64-unknown-linux-musl/osec_base.ko* package/opt/osec/loongarc
 cp -f script/net_info.ini package/opt/osec/
 cp -f script/osec.init package/opt/osec/
 cp -f script/agent_manager.init package/opt/osec/
-cp -f script/osec_monitor package/opt/osec/
-cp -f script/agent_manager_monitor package/opt/osec/
+cp -f script/osec.monitor package/opt/osec/
+cp -f script/agent_manager.monitor package/opt/osec/
 cp -f script/osec_backend.conf package/opt/osec/
 cp -f script/agent_backend.conf package/opt/osec/
 cp -f script/osecmonitor package/opt/osec/
@@ -67,6 +67,13 @@ if [[ "\$1" == "--upgrade" ]]; then
     MODE="upgrade"
     shift
 fi
+
+# 日志文件
+LOG_FILE="/var/log/osec_upgrade.log"
+exec >> "\$LOG_FILE" 2>&1
+echo "========================================"
+echo "[\$(date)] \$MODE started"
+echo "========================================"
 
 if [[ "\$MODE" == "install" ]]; then
     echo "🚀 Installing OSEC and Agent Manager (version $VERSION)..."
@@ -163,8 +170,37 @@ elif [[ "\$MODE" == "upgrade" ]]; then
         rm -f /var/run/osec.pid 2>/dev/null || true
     fi
     
+    # 卸载内核模块（带重试和详细日志）
     if lsmod | grep -q osec_base; then
-        rmmod osec_base || { echo "Failed to unload osec_base"; exit 1; }
+        echo "[upgrade] 发现 osec_base 内核模块，准备卸载..."
+        echo "[upgrade] 检查模块使用计数:"
+        cat /proc/modules | grep osec_base || true
+        
+        # 先尝试正常卸载
+        if rmmod osec_base 2>/dev/null; then
+            echo "[upgrade] osec_base 模块已成功卸载"
+        else
+            echo "[upgrade] 正常卸载失败，检查是否有进程占用..."
+            # 检查是否有进程占用
+            lsof /dev/osec 2>/dev/null || true
+            
+            # 强制杀掉所有可能占用驱动的进程
+            pkill -9 -f MagicArmor 2>/dev/null || true
+            sleep 2
+            
+            # 再次尝试卸载
+            if rmmod osec_base 2>/dev/null; then
+                echo "[upgrade] osec_base 模块已成功卸载（第二次尝试）"
+            else
+                echo "[upgrade] 警告: 无法卸载 osec_base 模块，可能被其他进程占用"
+                echo "[upgrade] 尝试强制卸载..."
+                # 最后尝试：不检查错误，继续升级
+                rmmod -f osec_base 2>/dev/null || true
+                echo "[upgrade] 继续升级流程..."
+            fi
+        fi
+    else
+        echo "[upgrade] osec_base 模块未加载，跳过卸载"
     fi
 
     PAYLOAD_LINE=\$(awk '/^__PAYLOAD_BELOW__/ {print NR + 1; exit}' "\$0")
@@ -265,10 +301,10 @@ fi
 
 # --- Deploy services (using init.d + monitor script for non-systemd) ---
     echo "Setting up services with init.d..."
-    if [[ "$MODE" == "install" ]]; then
+    if [[ "\$MODE" == "install" ]]; then
         # 安装两个服务（监控脚本在 /opt/osec 下，由 init.d 调用）
-        cp -f "$INSTALL_DIR/osec.init" /etc/init.d/osec >/dev/null 2>&1
-        cp -f "$INSTALL_DIR/agent_manager.init" /etc/init.d/agent_manager >/dev/null 2>&1
+        cp -f "\$INSTALL_DIR/osec.init" /etc/init.d/osec >/dev/null 2>&1
+        cp -f "\$INSTALL_DIR/agent_manager.init" /etc/init.d/agent_manager >/dev/null 2>&1
         chmod +x /etc/init.d/osec /etc/init.d/agent_manager
         
         # 添加开机启动
@@ -288,7 +324,7 @@ fi
         echo "osec and agent_manager services started successfully."
     else
         # 升级模式：只升级 osec
-        cp -f "$INSTALL_DIR/osec.init" /etc/init.d/osec >/dev/null 2>&1
+        cp -f "\$INSTALL_DIR/osec.init" /etc/init.d/osec >/dev/null 2>&1
         chmod +x /etc/init.d/osec
         
         if command -v chkconfig >/dev/null 2>&1; then
