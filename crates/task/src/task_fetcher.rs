@@ -878,6 +878,9 @@ pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
         log_info!("[upgrade] → 步骤4: 启动新版本服务");
         start_agent().await?;
 
+        log_info!("[upgrade] 等待 socket 就绪...");
+        wait_socket_ready("/tmp/osec_agent.sock", 20, 500).await?;
+
         log_info!("[upgrade] 🎉 主程序热升级完成！新版本已成功运行");
     } else {
         log_info!("[upgrade] ℹ️ 更新包不包含 MagicArmorAgent 二进制（或架构不匹配），仅下发脚本/配置，跳过热升级");
@@ -2616,17 +2619,59 @@ fn build_upload_ip_jump_json(source_ip: &str, target_ip: &str, gateway: &str, ag
     json_data.to_string()
 }
 
+async fn wait_socket_ready(socket_path: &str, max_retries: usize, delay_ms: u64) -> Result<(), String> {
+    for attempt in 1..=max_retries {
+        match UnixStream::connect(socket_path).await {
+            Ok(_) => return Ok(()),
+            Err(_) if attempt < max_retries => {
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            }
+            Err(e) => return Err(format!("等待 socket 就绪超时: {}", e)),
+        }
+    }
+    Ok(())
+}
+
+async fn notify_kernel_network_close() {
+    log_info!("[task_fetcher] 创建 netlink socket 并发送 NL_POLICY_NETWORK_CLOSE");
+    match NlSockInfo::create_socket() {
+        Ok(nl_sock) => {
+            if let Err(e) = nl_sock.send_network_close() {
+                log_error!("[task_fetcher] 发送 network close 失败: {:?}", e);
+            } else {
+                log_info!("[task_fetcher] 已发送 NL_POLICY_NETWORK_CLOSE 给内核");
+            }
+        }
+        Err(e) => {
+            log_error!("[task_fetcher] 创建 netlink socket 失败: {:?}", e);
+        }
+    }
+}
+
 async fn send_command_to_agent(cmd: &str) -> Result<(), String> {
     let socket_path = "/tmp/osec_agent.sock";
-    let mut stream = UnixStream::connect(socket_path)
-        .await
-        .map_err(|e| format!("连接 agent_manager 失败: {}", e))?;
+    const MAX_RETRIES: usize = 30;
+    const RETRY_DELAY_MS: u64 = 500;
 
-    stream
-        .write_all(format!("{}\n", cmd).as_bytes())
-        .await
-        .map_err(|e| format!("发送命令失败: {}", e))?;
-
+    for attempt in 1..=MAX_RETRIES {
+        match UnixStream::connect(socket_path).await {
+            Ok(mut stream) => {
+                stream
+                    .write_all(format!("{}\n", cmd).as_bytes())
+                    .await
+                    .map_err(|e| format!("发送命令失败: {}", e))?;
+                return Ok(());
+            }
+            Err(e) if attempt < MAX_RETRIES => {
+                log_info!("[send_command_to_agent] socket 未就绪 (尝试 {}/{}), 等待 {}ms: {}", 
+                    attempt, MAX_RETRIES, RETRY_DELAY_MS, e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+            }
+            Err(e) => {
+                return Err(format!("连接 agent_manager 失败: {}", e));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2781,6 +2826,12 @@ pub async fn stop_agent() -> Result<(), String> {
         log_info!("[upgrade] 无需停止：没有运行中的 agent_manager / osec_cli / MagicArmorAgent");
     }
 
+    let socket_path = "/tmp/osec_agent.sock";
+    if Path::new(socket_path).exists() {
+        log_info!("[upgrade] 删除旧 socket 文件: {}", socket_path);
+        let _ = tokio::fs::remove_file(socket_path).await;
+    }
+
     Ok(())
 }
 
@@ -2876,6 +2927,14 @@ pub async fn start_agent() -> Result<(), String> {
                 .args(["agent_manager", "start"])
                 .status()
                 .await;
+            
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if is_process_running("MagicArmorAgent").await {
+                    log_info!("[upgrade] MagicArmorAgent 进程已出现");
+                    break;
+                }
+            }
         } else {
             // ---------- fallback：直接后台启动 MagicArmorAgent ----------
             log_info!("[upgrade] 无服务管理器，直接后台启动 MagicArmorAgent");

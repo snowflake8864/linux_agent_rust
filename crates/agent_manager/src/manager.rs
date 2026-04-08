@@ -4,10 +4,11 @@ use tokio::time::{sleep, Duration, timeout};
 use tokio::process::Command;
 use chrono::{Utc, Datelike};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::fs;
 use std::process::Stdio;
 use logging::{log_info, log_error};
+use netlink::netlink::NlSockInfo;
 
 const MAX_WAIT_SECONDS: u64 = 30;
 const POLL_INTERVAL_MILLIS: u64 = 500;
@@ -61,13 +62,15 @@ pub async fn run_agent_manager(mut cmd_rx: Receiver<AgentCommand>) {
                     log_info!("[agent_manager] write_proc_self 成功");
                 }
 
+                log_info!("[agent_manager] 通知内核停止网络审计，释放资源");
+                notify_kernel_network_close().await;
+
                 if let Err(e) = stop_osec_services().await {
                     log_error!("[agent_manager] stop_osec_services error: {}", e);
                 } else {
                     log_info!("[agent_manager] stop_osec_services 成功");
                 }
 
-                // 清理 c++2rust 过渡版本
                 cleanup_c2r_bridge().await;
 
                 tokio::spawn(async {
@@ -139,14 +142,25 @@ async fn write_proc_self() -> Result<(), String> {
         .map_err(|e| format!("写入失败: {}", e))?;
 
     log_info!("[agent_manager] ✅ 已写入: {}", content.trim());
-/*
-    let mut read_buf = String::new();
-    fs::File::open(proc_path)
-        .and_then(|mut f| f.read_to_string(&mut read_buf))
-        .map_err(|e| format!("读取失败: {}", e))?;
 
-    log_info!("[agent_manager] 读取结果: {}", read_buf.trim());
-*/  
+ /*
+     let mut read_buf = String::new();
+     fs::File::open(proc_path)
+         .and_then(|mut f| f.read_to_string(&mut read_buf))
+         .map_err(|e| format!("读取失败: {}", e))?;
+ 
+     log_info!("[agent_manager] 读取结果: {}", read_buf.trim());
+ */
+
+    let output = Command::new("cat")
+        .arg(proc_path)
+        .output()
+        .await
+        .map_err(|e| format!("读取失败: {}", e))?;
+    let result = String::from_utf8_lossy(&output.stdout);
+
+    log_info!("[agent_manager] 读取结果: {}", result.trim());
+
     Ok(())
 }
 
@@ -158,15 +172,89 @@ async fn is_process_running(name: &str) -> bool {
     }
 }
 
+async fn send_update_cmd_to_cpp_agent() {
+    let socket_path = "/opt/osec/local_agent.socket";
+    
+    for attempt in 1..=10 {
+        let output = Command::new("sh")
+            .args(["-c", &format!("echo 'update' | socat - unix-client:{}", socket_path)])
+            .output()
+            .await;
+        
+        match output {
+            Ok(out) if out.status.success() => {
+                log_info!("[agent_manager] 已发送 update 命令给 c++ 版 MagicArmor_0");
+                return;
+            }
+            Ok(_) => {
+                sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => {
+                log_error!("[agent_manager] 发送命令失败: {}", e);
+                sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+    log_error!("[agent_manager] 发送 update 命令超时");
+}
+
+async fn notify_kernel_network_close() {
+    log_info!("[agent_manager] 创建 netlink socket 并发送 NL_POLICY_NETWORK_CLOSE");
+    match NlSockInfo::create_socket() {
+        Ok(nl_sock) => {
+            if let Err(e) = nl_sock.send_network_close() {
+                log_error!("[agent_manager] 发送 network close 失败: {:?}", e);
+            } else {
+                log_info!("[agent_manager] 已发送 NL_POLICY_NETWORK_CLOSE 给内核");
+            }
+        }
+        Err(e) => {
+            log_error!("[agent_manager] 创建 netlink socket 失败: {:?}", e);
+        }
+    }
+}
+
 async fn stop_osec_services() -> Result<(), String> {
     log_info!("[agent_manager] 开始停止并清理 osec 服务...");
 
-    log_info!("[agent_manager] 发送 SIGKILL 给残留的 MagicArmor_0");
-    let _ = Command::new("pkill").arg("-9").arg("MagicArmor_0").status().await;
+    log_info!("[agent_manager] 步骤1: 停止 osec 服务");
+    if Path::new("/run/systemd/system").exists() {
+        let _ = Command::new("systemctl").args(["stop", "osec"]).status().await;
+    } else {
+        let _ = Command::new("service").args(["osec", "stop"]).status().await;
+    }
 
-    log_info!("[agent_manager] 发送 SIGKILL 给残留的 MagicArmor_cli / osec_cli");
+    log_info!("[agent_manager] 步骤3: 等待内核完成处理 (60秒)");
+    for i in 0..60 {
+        sleep(Duration::from_secs(1)).await;
+        if i % 10 == 0 {
+            log_info!("[agent_manager] 已等待 {} 秒...", i + 1);
+        }
+    }
+
+    sleep(Duration::from_millis(500)).await;
+
+    log_info!("[agent_manager] 步骤4: 杀死残留进程");
+    let _ = Command::new("pkill").arg("-9").arg("MagicArmor_0").status().await;
+    let _ = Command::new("killall").arg("-9").arg("MagicArmor_0").status().await;
+    let _ = Command::new("pkill").arg("-9").arg("osecmonitor").status().await;
+    let _ = Command::new("killall").arg("-9").arg("osecmonitor").status().await;
     let _ = Command::new("pkill").arg("-9").arg("MagicArmor_cli").status().await;
+    let _ = Command::new("killall").arg("-9").arg("MagicArmor_cli").status().await;
     let _ = Command::new("pkill").arg("-9").arg("osec_cli").status().await;
+
+    sleep(Duration::from_millis(500)).await;
+
+    log_info!("[agent_manager] 步骤5: 尝试卸载 osec_base 模块");
+    let rmmod_result = Command::new("rmmod").arg("-f").arg("osec_base").status().await;
+    if rmmod_result.is_err() || !rmmod_result.unwrap().success() {
+        log_info!("[agent_manager] osec_base 卸载失败，跳过");
+    } else {
+        log_info!("[agent_manager] osec_base 卸载成功");
+    }
+
+    let lsmod_check = Command::new("bash").args(["-c", "lsmod | grep osec"]).output().await;
+    log_info!("[agent_manager] lsmod 检查: {:?}", String::from_utf8_lossy(&lsmod_check.unwrap().stdout));
 
     log_info!("[agent_manager] 等待 MagicArmor_0 完全退出 (最多 {} 秒)...", MAX_WAIT_SECONDS);
     let wait_result = timeout(Duration::from_secs(MAX_WAIT_SECONDS), async {
@@ -324,14 +412,49 @@ async fn cleanup_c2r_bridge() {
 async fn run_script_and_cleanup(script_path: PathBuf, cleanup_dir: &str) {
     log_info!("[agent_manager] 开始执行升级脚本: {:?}", script_path);
 
-    match Command::new("/bin/bash")
-        .arg(&script_path)
-        .arg("--upgrade")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-    {
+    let _ = Command::new("chmod").arg("+x").arg(&script_path).status().await;
+
+    // 创建日志文件记录升级输出
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open("/var/log/osec_upgrade.log")
+        .ok();
+
+    let result = if let Some(file) = log_file {
+        let stdout = Stdio::from(file);
+        // 需要再次打开文件用于 stderr
+        let stderr_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open("/var/log/osec_upgrade.log")
+            .ok();
+        let stderr = if let Some(f) = stderr_file {
+            Stdio::from(f)
+        } else {
+            Stdio::inherit()
+        };
+        Command::new("/bin/bash")
+            .arg(&script_path)
+            .arg("--upgrade")
+            .stdout(stdout)
+            .stderr(stderr)
+            .status()
+            .await
+    } else {
+        // 回退到 inherit
+        Command::new("/bin/bash")
+            .arg(&script_path)
+            .arg("--upgrade")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .await
+    };
+
+    match result {
         Ok(status) => {
             if status.success() {
                 log_info!("[agent_manager] 升级脚本执行成功 (exit code 0)");
@@ -342,6 +465,7 @@ async fn run_script_and_cleanup(script_path: PathBuf, cleanup_dir: &str) {
                 }
             } else {
                 log_error!("[agent_manager] 升级脚本执行失败，退出码: {:?}", status.code());
+                log_error!("[agent_manager] 请查看 /var/log/osec_upgrade.log 获取详细错误信息");
             }
         }
         Err(e) => {

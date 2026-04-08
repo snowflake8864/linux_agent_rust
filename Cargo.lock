@@ -36,6 +36,7 @@ dependencies = [
  "fs2",
  "log",
  "logging",
+ "netlink",
  "rustls 0.23.21",
  "rustls-native-certs",
  "rustls-pemfile 2.2.0",
