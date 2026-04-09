@@ -117,6 +117,7 @@ enum TaskTypeEnum {
     TaskIpJump = 37,
     TaskSystemBackup = 38,
     TaskSystemRollback = 39,
+    TaskNtpSyncAt = 40,
 }
 #[allow(dead_code)]
 enum NetRule<'a> {
@@ -168,6 +169,7 @@ impl TaskFetcher {
         api_interface.insert("uploadRollback".to_string(), "v1/uploadRollback".to_string());
         api_interface.insert("uploadBackup".to_string(), "v1/uploadBackup".to_string());
         api_interface.insert("getOutreachDetect".to_string(), "v1/getOutreachDetect".to_string());
+        api_interface.insert("getNtpConf".to_string(), "v1/getNtpConf".to_string());
         let net_client = NetClient::new(
             Some(base_url.to_string()),
             true,
@@ -719,6 +721,7 @@ async fn handle_task(&mut self, task_type: TaskTypeEnum) -> Result<(), String> {
         TaskTypeEnum::TaskIpJump => self.task_down_ipjump(37).await, 
         TaskTypeEnum::TaskSystemBackup => self.task_get_system_backups(38).await,
         TaskTypeEnum::TaskSystemRollback => self.task_system_rollback(39).await,
+        TaskTypeEnum::TaskNtpSyncAt => self.task_ntp_sync(40).await,
         _ => Err("Unknown task type".to_string()), // 未知任务类型处理
                                                    //_ => Err(format!("Task not implemented: {:?}", task_type)),
     }
@@ -2387,6 +2390,101 @@ async fn task_system_rollback(&self, task_type: u64) -> Result<(), String> {
     if has_success {
         self.reboot_system().await?;
     }
+
+    Ok(())
+}
+async fn task_ntp_sync(&self, task_type: u64) -> Result<(), String> {
+
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
+    let download_url = match self.api_interface.get("getNtpConf") {
+        Some(url) => url,
+        None => return Err("URL for ntp sync not found".to_string()),
+    };
+
+    let url = format!("{}/{}", self.base_url, download_url);
+    let token = self.get_token();
+    let token_str = token.as_ref().map(|s| s.as_str());
+
+    let response = match self
+        .net_client
+        .post_data_async(&url, "", Duration::from_secs(10), token_str)
+        .await
+        {
+            Ok(res) => res,
+            Err(err) => {
+                eprintln!("Error fetching task: {}", err);
+                return Err(err);
+            }
+        };
+
+    let parsed: Value = match serde_json::from_str(&response) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Failed to parse response: {}", e);
+            return Err("Failed to parse response.".to_string());
+        }
+    };
+
+    if parsed["code"] != "000000" {
+        let msg = parsed["msg"].as_str().unwrap_or("Unknown error");
+        return Err(format!("API error: {}", msg));
+    }
+
+    let ntp_server = parsed["data"]["server_addr"]
+        .as_str()
+        .ok_or("Missing or invalid 'ntp server' field in response")?;
+
+    log_info!("NTP server: {}", ntp_server);
+
+    self.sync_time_via_ntp(ntp_server).await?;
+
+
+    log_info!("NTP time sync completed successfully");
+    Ok(())
+}
+
+async fn sync_time_via_ntp(&self, ntp_server: &str) -> Result<(), String> {
+    let target = if ntp_server.contains(':') {
+        ntp_server.to_string()
+    } else {
+        format!("{}:123", ntp_server)
+    };
+
+    let packet = ntp::request(&target)
+        .map_err(|e| format!("NTP request failed: {}", e))?;
+
+    let ntp_timestamp = packet.transmit_time;
+    let ntp_sec = ntp_timestamp.sec as u64;
+    const NTP_TO_UNIX_OFFSET: u64 = 2208988800;
+    let unix_sec = ntp_sec.saturating_sub(NTP_TO_UNIX_OFFSET);
+
+    let utc_datetime = chrono::DateTime::from_timestamp(unix_sec as i64, 0)
+        .ok_or("Invalid timestamp")?;
+
+    // NTP返回的是UTC时间，转换为本地时区
+    let local_datetime = utc_datetime.with_timezone(&chrono::Local);
+    let date_str = local_datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+    let utc_str = utc_datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+    log_info!("NTP time obtained (UTC: {}, Local: {})", utc_str, date_str);
+    
+    let output = Command::new("date")
+        .arg("-s")
+        .arg(&date_str)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to execute date: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to set system time: {}", stderr));
+    }
+
+    let _ = Command::new("hwclock")
+        .arg("-w")
+        .output()
+        .await;
 
     Ok(())
 }

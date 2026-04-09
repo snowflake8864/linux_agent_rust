@@ -35,6 +35,7 @@ procinfo = { path = "../procinfo" }
 snapman = { path = "../snapman"}
 rules_jump_mgr = { path = "../rules_jump_mgr"}
 libc = "0.2"
+ntp = "0.5"
 [features]
 test_mode = []
 
