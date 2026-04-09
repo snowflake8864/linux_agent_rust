@@ -25,7 +25,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "fs2",
- "log",
+ "log 0.4.29",
  "logging",
  "rustix 0.38.44",
  "rustls 0.23.37",
@@ -320,7 +320,7 @@ version = "0.10.6"
 dependencies = [
  "configparser",
  "hostinfo",
- "log",
+ "log 0.4.29",
  "logging",
  "once_cell",
  "regex",
@@ -337,6 +337,15 @@ name = "constant_time_eq"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "245097e9a4535ee1e3e3931fcfcd55a796a44c643e8596ff6566d68f09b87bbc"
+
+[[package]]
+name = "conv"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78ff10625fd0ac447827aa30ea8b861fead473bb60aeb73af6c1c58caf0d1299"
+dependencies = [
+ "custom_derive",
+]
 
 [[package]]
 name = "core-foundation"
@@ -418,6 +427,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "custom_derive"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef8ae57c4978a2acd8b869ce6b9ca1dfe817bff704c220209fdef2c0b75a01b9"
+
+[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -454,7 +469,7 @@ version = "0.10.6"
 dependencies = [
  "common",
  "config",
- "log",
+ "log 0.4.29",
  "logging",
  "num-derive",
  "num-traits",
@@ -492,7 +507,7 @@ checksum = "4cd405aab171cb85d6735e5c8d9db038c17d3ca007a4d2c25f337935c3d90580"
 dependencies = [
  "humantime",
  "is-terminal",
- "log",
+ "log 0.4.29",
  "regex",
  "termcolor",
 ]
@@ -511,6 +526,15 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "error-chain"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d2f06b9cac1506ece98fe3231e3cc9c4410ec3d5b1f24ae1c8946f0742cdefc"
+dependencies = [
+ "version_check",
 ]
 
 [[package]]
@@ -727,7 +751,7 @@ checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
  "libc",
- "wasi",
+ "wasi 0.11.1+wasi-snapshot-preview1",
 ]
 
 [[package]]
@@ -854,7 +878,7 @@ dependencies = [
  "hex",
  "lazy_static",
  "libc",
- "log",
+ "log 0.4.29",
  "logging",
  "md-5",
  "once_cell",
@@ -1053,7 +1077,7 @@ dependencies = [
  "core-foundation-sys",
  "iana-time-zone-haiku",
  "js-sys",
- "log",
+ "log 0.4.29",
  "wasm-bindgen",
  "windows-core",
 ]
@@ -1255,7 +1279,7 @@ dependencies = [
  "common",
  "docker",
  "hostinfo",
- "log",
+ "log 0.4.29",
  "logging",
  "netlink",
  "reporter",
@@ -1269,7 +1293,7 @@ version = "0.10.6"
 dependencies = [
  "common",
  "levenshtein",
- "log",
+ "log 0.4.29",
  "logging",
  "tokio",
  "tokio-rustls 0.26.4",
@@ -1321,7 +1345,7 @@ dependencies = [
  "kernel_event",
  "kernel_module",
  "libc",
- "log",
+ "log 0.4.29",
  "logging",
  "net_client",
  "netlink",
@@ -1366,6 +1390,15 @@ dependencies = [
 
 [[package]]
 name = "log"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e19e8d5c34a3e0e2223db8e060f9e8264aeeb5c5fc64a4ee9965c062211c024b"
+dependencies = [
+ "log 0.4.29",
+]
+
+[[package]]
+name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
@@ -1377,7 +1410,7 @@ dependencies = [
  "chrono",
  "env_logger",
  "fs_extra",
- "log",
+ "log 0.4.29",
  "serde",
  "serde_json",
  "tokio",
@@ -1434,7 +1467,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc"
 dependencies = [
  "libc",
- "wasi",
+ "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.61.2",
 ]
 
@@ -1451,7 +1484,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "465500e14ea162429d264d44189adc38b199b62b1c21eea9f69e4b73cb03bbf2"
 dependencies = [
  "libc",
- "log",
+ "log 0.4.29",
  "openssl",
  "openssl-probe 0.2.1",
  "openssl-sys",
@@ -1478,7 +1511,7 @@ name = "netblock"
 version = "0.1.0"
 dependencies = [
  "lazy_static",
- "log",
+ "log 0.4.29",
  "logging",
  "serde",
  "serde_json",
@@ -1490,7 +1523,7 @@ name = "netlink"
 version = "0.10.6"
 dependencies = [
  "libc",
- "log",
+ "log 0.4.29",
  "logging",
 ]
 
@@ -1512,6 +1545,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3b335231dfd352ffb0f8017f3b6027a4917f7df785ea2143d8af2adc66980ae"
 dependencies = [
  "winapi 0.3.9",
+]
+
+[[package]]
+name = "ntp"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06b0d2de4a2cd60c3ac85c98a1fc23668bc97bef2b10b706bccd88efb229497d"
+dependencies = [
+ "byteorder",
+ "conv",
+ "custom_derive",
+ "error-chain",
+ "log 0.3.9",
+ "time 0.1.45",
 ]
 
 [[package]]
@@ -1556,7 +1603,7 @@ dependencies = [
  "get_if_addrs",
  "hostinfo",
  "libc",
- "log",
+ "log 0.4.29",
  "logging",
  "net_client",
  "serde",
@@ -1664,7 +1711,7 @@ dependencies = [
 name = "pattern"
 version = "0.1.0"
 dependencies = [
- "log",
+ "log 0.4.29",
  "logging",
  "once_cell",
  "parking_lot",
@@ -1779,7 +1826,7 @@ name = "process_mgr"
 version = "0.10.6"
 dependencies = [
  "hex",
- "log",
+ "log 0.4.29",
  "logging",
  "md-5",
  "once_cell",
@@ -1791,14 +1838,14 @@ name = "procinfo"
 version = "0.1.0"
 dependencies = [
  "libc",
- "log",
+ "log 0.4.29",
  "logging",
  "net_client",
  "nix",
  "process_mgr",
  "serde",
  "serde_json",
- "time",
+ "time 0.3.47",
 ]
 
 [[package]]
@@ -1819,7 +1866,7 @@ checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck",
  "itertools",
- "log",
+ "log 0.4.29",
  "multimap",
  "petgraph",
  "prettyplease",
@@ -1962,7 +2009,7 @@ dependencies = [
  "hex",
  "hostinfo",
  "libc",
- "log",
+ "log 0.4.29",
  "logging",
  "net_client",
  "once_cell",
@@ -1993,7 +2040,7 @@ dependencies = [
  "hyper-tls",
  "ipnet",
  "js-sys",
- "log",
+ "log 0.4.29",
  "mime",
  "native-tls",
  "once_cell",
@@ -2038,7 +2085,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "ipnet",
- "log",
+ "log 0.4.29",
  "logging",
  "net_client",
  "regex",
@@ -2090,7 +2137,7 @@ version = "0.21.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f56a14d1f48b391359b22f731fd4bd7e43c97f3c50eee276f3aa09c94784d3e"
 dependencies = [
- "log",
+ "log 0.4.29",
  "ring",
  "rustls-webpki 0.101.7",
  "sct",
@@ -2103,7 +2150,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "758025cb5fccfd3bc2fd74708fd4682be41d99e5dff73c377c0646c6012c73a4"
 dependencies = [
  "aws-lc-rs",
- "log",
+ "log 0.4.29",
  "once_cell",
  "rustls-pki-types",
  "rustls-webpki 0.103.9",
@@ -2391,7 +2438,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "log",
+ "log 0.4.29",
  "logging",
  "regex",
  "tempfile",
@@ -2518,7 +2565,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "lazy_static",
- "log",
+ "log 0.4.29",
  "logging",
  "md-5",
  "serde",
@@ -2538,11 +2585,12 @@ dependencies = [
  "futures",
  "hostinfo",
  "libc",
- "log",
+ "log 0.4.29",
  "logging",
  "net_client",
  "netblock",
  "netlink",
+ "ntp",
  "num-derive",
  "num-traits",
  "once_cell",
@@ -2580,6 +2628,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "time"
+version = "0.1.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b797afad3f312d1c66a56d11d0316f916356d11bd158fbc6ca6389ff6bf805a"
+dependencies = [
+ "libc",
+ "wasi 0.10.0+wasi-snapshot-preview1",
+ "winapi 0.3.9",
 ]
 
 [[package]]
@@ -2853,7 +2912,7 @@ version = "0.1.0"
 dependencies = [
  "common",
  "config",
- "log",
+ "log 0.4.29",
  "logging",
  "md5",
  "net_client",
@@ -2923,7 +2982,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "24cc0f6d6f267b73e5a2cadf007ba8f9bc39c6a6f9666f8cf25ea809a153b032"
 dependencies = [
  "libc",
- "log",
+ "log 0.4.29",
 ]
 
 [[package]]
@@ -2964,7 +3023,7 @@ dependencies = [
  "common",
  "config",
  "futures",
- "log",
+ "log 0.4.29",
  "logging",
  "net_client",
  "process_mgr",
@@ -2998,6 +3057,12 @@ checksum = "bfa7760aed19e106de2c7c0b581b509f2f25d3dacaf737cb82ac61bc6d760b0e"
 dependencies = [
  "try-lock",
 ]
+
+[[package]]
+name = "wasi"
+version = "0.10.0+wasi-snapshot-preview1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a143597ca7c7793eff794def352d41792a93c481eb1042423ff7ff72ba2c31f"
 
 [[package]]
 name = "wasi"
@@ -3560,7 +3625,7 @@ dependencies = [
  "anyhow",
  "bitflags 2.11.0",
  "indexmap",
- "log",
+ "log 0.4.29",
  "serde",
  "serde_derive",
  "serde_json",
@@ -3579,7 +3644,7 @@ dependencies = [
  "anyhow",
  "id-arena",
  "indexmap",
- "log",
+ "log 0.4.29",
  "semver",
  "serde",
  "serde_derive",
@@ -3622,7 +3687,7 @@ name = "zcopy_mgr"
 version = "0.1.0"
 dependencies = [
  "libc",
- "log",
+ "log 0.4.29",
  "logging",
  "nix",
 ]
@@ -3703,7 +3768,7 @@ dependencies = [
  "hmac",
  "pbkdf2",
  "sha1",
- "time",
+ "time 0.3.47",
  "zstd",
 ]
 
