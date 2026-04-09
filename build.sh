@@ -239,32 +239,73 @@ if [[ "\$MODE" == "install" ]]; then
     fi
 fi
 
-# --- Deploy services (using /etc/init.d, NOT systemd) ---
-    # 首先清理旧的 systemd 服务文件
-    echo "Cleaning up old systemd services..."
-    for d in /usr/lib/systemd/system /lib/systemd/system /etc/systemd/system; do
-        rm -f "$d/osec.service" "$d/agent_manager.service" "$d/osec_cli.service" 2>/dev/null || true
-    done
-    systemctl daemon-reload 2>/dev/null || true
-
-    # 部署 init.d 脚本
-    echo "Setting up services with /etc/init.d..."
-    if [[ "\$MODE" == "install" ]]; then
-        # 安装两个服务
-        cp -f "\$INSTALL_DIR/osec.init" /etc/init.d/osec >/dev/null 2>&1
-        cp -f "\$INSTALL_DIR/agent_manager.init" /etc/init.d/agent_manager >/dev/null 2>&1
-        chmod +x /etc/init.d/osec /etc/init.d/agent_manager
+# --- Deploy services (systemd preferred, fallback to init.d) ---
+    # 检测 systemd 是否可用
+    if [ -d /run/systemd/system ]; then
+        echo "Setting up services with systemd..."
         
-        # 添加开机启动
-        if command -v chkconfig >/dev/null 2>&1; then
-            chkconfig --add osec >/dev/null 2>&1 || true
-            chkconfig --add agent_manager >/dev/null 2>&1 || true
-            chkconfig osec on >/dev/null 2>&1 || true
-            chkconfig agent_manager on >/dev/null 2>&1 || true
-        elif command -v update-rc.d >/dev/null 2>&1; then
-            update-rc.d osec defaults >/dev/null 2>&1 || true
-            update-rc.d agent_manager defaults >/dev/null 2>&1 || true
+        # 清理旧的 systemd 服务文件（如果有）
+        for d in /usr/lib/systemd/system /lib/systemd/system /etc/systemd/system; do
+            rm -f "$d/osec.service" "$d/agent_manager.service" "$d/osec_cli.service" 2>/dev/null || true
+        done
+        systemctl daemon-reload 2>/dev/null || true
+        
+        cp -f "$INSTALL_DIR/osec.service" /etc/systemd/system/osec.service
+        cp -f "$INSTALL_DIR/agent_manager.service" /etc/systemd/system/agent_manager.service
+        chmod 644 /etc/systemd/system/osec.service /etc/systemd/system/agent_manager.service
+        systemctl daemon-reload
+        
+        if [[ "\$MODE" == "install" ]]; then
+            systemctl enable osec agent_manager
+            systemctl start osec agent_manager
+            
+            # systemd 环境不需要 monitor/init 脚本，删除
+            rm -f "$INSTALL_DIR/osec.monitor" 2>/dev/null || true
+            rm -f "$INSTALL_DIR/agent_manager.monitor" 2>/dev/null || true
+            rm -f "$INSTALL_DIR/osec.init" 2>/dev/null || true
+            rm -f "$INSTALL_DIR/agent_manager.init" 2>/dev/null || true
+            
+            echo "osec and agent_manager services started successfully (systemd)."
+        else
+            systemctl restart osec
+            echo "osec service restarted successfully (systemd)."
         fi
+    else
+        # 使用 init.d
+        echo "Setting up services with init.d..."
+        if [[ "\$MODE" == "install" ]]; then
+            cp -f "$INSTALL_DIR/osec.init" /etc/init.d/osec >/dev/null 2>&1
+            cp -f "$INSTALL_DIR/agent_manager.init" /etc/init.d/agent_manager >/dev/null 2>&1
+            chmod +x /etc/init.d/osec /etc/init.d/agent_manager
+            
+            if command -v chkconfig >/dev/null 2>&1; then
+                chkconfig --add osec >/dev/null 2>&1 || true
+                chkconfig --add agent_manager >/dev/null 2>&1 || true
+                chkconfig osec on >/dev/null 2>&1 || true
+                chkconfig agent_manager on >/dev/null 2>&1 || true
+            elif command -v update-rc.d >/dev/null 2>&1; then
+                update-rc.d osec defaults >/dev/null 2>&1 || true
+                update-rc.d agent_manager defaults >/dev/null 2>&1 || true
+            fi
+            
+            service osec start >/dev/null 2>&1 || { echo "ERROR: osec failed to start!"; exit 1; }
+            service agent_manager start >/dev/null 2>&1 || { echo "ERROR: agent_manager failed to start!"; exit 1; }
+            echo "osec and agent_manager services started successfully (init.d)."
+        else
+            cp -f "$INSTALL_DIR/osec.init" /etc/init.d/osec >/dev/null 2>&1
+            chmod +x /etc/init.d/osec
+            
+            if command -v chkconfig >/dev/null 2>&1; then
+                chkconfig --add osec >/dev/null 2>&1 || true
+                chkconfig osec on >/dev/null 2>&1 || true
+            elif command -v update-rc.d >/dev/null 2>&1; then
+                update-rc.d osec defaults >/dev/null 2>&1 || true
+            fi
+            
+            service osec restart >/dev/null 2>&1 || { echo "ERROR: osec failed to restart!"; exit 1; }
+            echo "osec service restarted successfully (init.d)."
+        fi
+    fi
         
         # 启动服务
         service osec start >/dev/null 2>&1 || { echo "ERROR: osec failed to start!"; exit 1; }
