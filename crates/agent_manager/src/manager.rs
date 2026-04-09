@@ -63,7 +63,7 @@ pub async fn run_agent_manager(mut cmd_rx: Receiver<AgentCommand>) {
                 }
 
                 log_info!("[agent_manager] 通知内核停止网络审计，释放资源");
-                notify_kernel_network_close().await;
+                //notify_kernel_network_close().await;
 
                 if let Err(e) = stop_osec_services().await {
                     log_error!("[agent_manager] stop_osec_services error: {}", e);
@@ -224,10 +224,10 @@ async fn stop_osec_services() -> Result<(), String> {
         let _ = Command::new("service").args(["osec", "stop"]).status().await;
     }
 
-    log_info!("[agent_manager] 步骤3: 等待内核完成处理 (60秒)");
-    for i in 0..60 {
+    log_info!("[agent_manager] 步骤3: 等待内核完成处理 (15秒)");
+    for i in 0..15 {
         sleep(Duration::from_secs(1)).await;
-        if i % 10 == 0 {
+        if i % 2 == 0 {
             log_info!("[agent_manager] 已等待 {} 秒...", i + 1);
         }
     }
