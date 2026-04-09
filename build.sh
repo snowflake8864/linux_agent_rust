@@ -257,6 +257,12 @@ if command -v systemctl >/dev/null 2>&1; then
         systemctl start osec
         systemctl start agent_manager
 
+        # systemd 环境不需要 monitor/init 脚本，删除
+        rm -f "\$INSTALL_DIR/osec.monitor" 2>/dev/null || true
+        rm -f "\$INSTALL_DIR/agent_manager.monitor" 2>/dev/null || true
+        rm -f "\$INSTALL_DIR/osec.init" 2>/dev/null || true
+        rm -f "\$INSTALL_DIR/agent_manager.init" 2>/dev/null || true
+
         # Verify
         if ! systemctl is-active --quiet osec; then
             echo "ERROR: osec failed to start!"
