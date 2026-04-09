@@ -1,0 +1,89 @@
+#! /bin/bash
+
+set -e
+
+install_dir="/opt/osec"
+
+case "$1" in
+    configure)
+        chmod 777 /opt/osec/* -R >/dev/null 2>&1 || true
+        chmod 644 /opt/osec/*.service >/dev/null 2>&1 || true
+
+        # 读取配置：查找 config.ini，替换而非追加
+        CONFIG_FILE=""
+        for dir in /opt /root /home "$OLDPWD" /; do
+            if [ -f "$dir/config.ini" ]; then
+                CONFIG_FILE="$dir/config.ini"
+                break
+            fi
+        done
+
+        if [ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ]; then
+            ip=$(grep URL "$CONFIG_FILE" | awk -F '=' '{print $2}')
+            port=$(grep PORT "$CONFIG_FILE" | awk -F '=' '{print $2}')
+            userid=$(grep USER_ID "$CONFIG_FILE" | awk -F '=' '{print $2}')
+            
+            # 使用 sed 替换已有配置行
+            sed -i "s|^SERVER_IP=.*|SERVER_IP=$ip|" /opt/osec/net_info.ini
+            sed -i "s|^SERVER_PORT=.*|SERVER_PORT=$port|" /opt/osec/net_info.ini
+            sed -i "s|^USER_ID=.*|USER_ID=$userid|" /opt/osec/net_info.ini
+            sed -i "s|^SERVERIPPORT=.*|SERVERIPPORT=$ip:$port|" /opt/osec/net_info.ini
+        fi
+
+        touch /opt/osec/.osec.txt
+
+        # 清理老版本残留
+        pkill -9 -f osecmonitor 2>/dev/null || true
+        if [ -f /etc/init.d/osecservicecentos ]; then
+            update-rc.d -f osecservicecentos remove 2>/dev/null || true
+            rm -f /etc/init.d/osecservicecentos
+        fi
+        rm -f /opt/osec/osecmonitor 2>/dev/null || true
+        rm -f /var/run/osec.pid 2>/dev/null || true
+
+        # 优先使用 systemd（如果可用），否则使用 init.d + 监控脚本
+        if [ -d /run/systemd/system ]; then
+            # 使用 systemd
+            cp -f /opt/osec/osec.service /lib/systemd/system/osec.service
+            cp -f /opt/osec/agent_manager.service /lib/systemd/system/agent_manager.service
+            chmod 644 /lib/systemd/system/osec.service /lib/systemd/system/agent_manager.service
+            systemctl daemon-reload
+            systemctl enable osec agent_manager
+            systemctl start osec agent_manager
+
+            # systemd 环境不需要 monitor 脚本，删除
+            rm -f /opt/osec/osec.monitor 2>/dev/null || true
+            rm -f /opt/osec/agent_manager.monitor 2>/dev/null || true
+            rm -f /opt/osec/osec.init 2>/dev/null || true
+            rm -f /opt/osec/agent_manager.init 2>/dev/null || true
+        else
+            # 使用 init.d，监控脚本放在 /opt/osec 下由 init.d 调用
+            cp -f /opt/osec/osec.init /etc/init.d/osec
+            cp -f /opt/osec/agent_manager.init /etc/init.d/agent_manager
+            chmod +x /etc/init.d/osec /etc/init.d/agent_manager
+
+            # 添加开机启动
+            if command -v update-rc.d &> /dev/null; then
+                update-rc.d osec defaults
+                update-rc.d agent_manager defaults
+            elif command -v chkconfig &> /dev/null; then
+                chkconfig --add osec
+                chkconfig --add agent_manager
+                chkconfig osec on
+                chkconfig agent_manager on
+            fi
+
+            # 启动服务
+            service osec start
+            service agent_manager start
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit -1
+        ;;
+esac
