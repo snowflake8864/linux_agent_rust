@@ -167,6 +167,7 @@ impl StartOnline for BootManager {
                                 let url = format!("{}/v1/puthardwareinfo",
                                     net_client.get_base_url().unwrap_or_default());
 
+                                //log_info!("puthardwareinfo: {}", json_data);
                                 match net_client.post_data_async(
                                     &url,
                                     &json_data,
@@ -174,17 +175,20 @@ impl StartOnline for BootManager {
                                     Some(token)
                                 ).await {
                                     Ok(resp) => log_info!("hardware upload response: {}", resp),
-                                    Err(err) => eprintln!("发送指标失败: {}", err),
+                                    Err(err) => log_info!("发送指标失败: {}", err),
                                 }
                             } else {
+                                log_info!("获取系统指标失败");
                                 eprintln!("获取系统指标失败");
                             }
                         }
                         let mut hardware_interval: Option<Interval> = None;
                         let mut hardware_enabled = false;
+                        let mut check_interval = interval(Duration::from_secs(30));
                         loop {
 
                             let (switch, time_secs) = self.get_hardware_info();
+                            //log_info!("启用 hardware {}, 拉取，间隔: {} 秒", switch, time_secs);
                             if switch && time_secs > 0 {
                                 if !hardware_enabled || hardware_interval.is_none() {
                                     log_info!("启用 hardware 拉取，间隔: {} 秒", time_secs);
@@ -199,6 +203,9 @@ impl StartOnline for BootManager {
                             }
 
                             tokio::select! {
+                                _ = check_interval.tick() => {
+                                    // 每 10 秒检查开关变化
+                                }
                                 _ = async {
                                     if let Some(ref mut bi) = hardware_interval {
                                         bi.tick().await
@@ -210,6 +217,7 @@ impl StartOnline for BootManager {
 
                                         // 发送到服务器
                                         let url = format!("{}/v1/puthardwareinfo", net_client.get_base_url().unwrap_or_default());
+                                        //log_info!("puthardwareinfo: {}", json_data);
                                         match net_client.post_data_async(
                                             &url,
                                             &json_data,
@@ -217,9 +225,10 @@ impl StartOnline for BootManager {
                                             Some(&token)
                                         ).await {
                                             Ok(response) => {/*log_info!("hardware upload response:{}",response)*/},
-                                            Err(err) => eprintln!("发送指标失败: {}", err),
+                                            Err(err) => log_info!("发送指标失败: {}", err),
                                         }
                                     } else {
+                                        log_info!("获取系统指标失败");
                                         eprintln!("获取系统指标失败");
                                     }
                                 }
