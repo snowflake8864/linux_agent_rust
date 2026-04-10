@@ -182,6 +182,7 @@ impl StartOnline for BootManager {
                         }
                         let mut hardware_interval: Option<Interval> = None;
                         let mut hardware_enabled = false;
+                        let mut check_interval = interval(Duration::from_secs(30));
                         loop {
 
                             let (switch, time_secs) = self.get_hardware_info();
@@ -199,6 +200,9 @@ impl StartOnline for BootManager {
                             }
 
                             tokio::select! {
+                                _ = check_interval.tick() => {
+                                    // 每 30 秒检查开关变化
+                                }
                                 _ = async {
                                     if let Some(ref mut bi) = hardware_interval {
                                         bi.tick().await
