@@ -133,33 +133,37 @@ fn calc_cpu_use_state(o: &CpuUseState, n: &CpuUseState) -> f32 {
 }
 
 fn get_memory_from_proc_meminfo() -> Option<(u64, u64)> {
-    // 备用方案：从 /proc/meminfo 读取
     let file = File::open("/proc/meminfo").ok()?;
     let reader = BufReader::new(file);
 
     let mut total_kb: Option<u64> = None;
-    let mut available_kb: Option<u64> = None;
+    let mut mem_free: Option<u64> = None;
+    let mut mem_buffer: Option<u64> = None;
+    let mut mem_cache: Option<u64> = None;
 
     for line in reader.lines().map(|l| l.ok()).flatten() {
         if line.starts_with("MemTotal:") {
             total_kb = line.split_whitespace().nth(1)?.parse().ok();
-        } else if line.starts_with("MemAvailable:") {
-            available_kb = line.split_whitespace().nth(1)?.parse().ok();
-        } else if line.starts_with("MemFree:") && available_kb.is_none() {
-            // CentOS 6 没有 MemAvailable，用 MemFree + Buffers + Cached 近似
-            if let Some(free_str) = line.split_whitespace().nth(1) {
-                if let Ok(free) = free_str.parse::<u64>() {
-                    available_kb = Some(free);
-                }
-            }
+        } else if line.starts_with("MemFree:") {
+            mem_free = line.split_whitespace().nth(1)?.parse().ok();
+        } else if line.starts_with("Buffers:") {
+            mem_buffer = line.split_whitespace().nth(1)?.parse().ok();
+        } else if line.starts_with("Cached:") {
+            mem_cache = line.split_whitespace().nth(1)?.parse().ok();
         }
-        if total_kb.is_some() && available_kb.is_some() {
+        if total_kb.is_some() && mem_free.is_some() && mem_buffer.is_some() && mem_cache.is_some() {
             break;
         }
     }
 
-    match (total_kb, available_kb) {
-        (Some(total), Some(available)) => Some((total, available)),
+    match (total_kb, mem_free, mem_buffer, mem_cache) {
+        (Some(total), Some(free), Some(buffer), Some(cache)) => {
+            let used = total
+                .saturating_sub(free)
+                .saturating_sub(buffer)
+                .saturating_sub(cache);
+            Some((total, used))
+        }
         _ => None,
     }
 }
@@ -239,24 +243,16 @@ pub fn get_system_metrics() -> Option<String> {
             "0".to_string()
         };
     */
-    let bytes_to_kb = |bytes: u64| (bytes + 1023) / 1024; // 四舍五入
+    let bytes_to_kb = |bytes: u64| (bytes + 1023) / 1024;
 
-    // 优先使用 sysinfo，获取失败时使用 /proc/meminfo 备用
-    let (total_memory_kb, available_memory_kb) = {
+    // 优先使用 /proc/meminfo 计算内存，更准确
+    let (total_memory_kb, used_memory_kb) = get_memory_from_proc_meminfo().unwrap_or({
         let total = bytes_to_kb(sys.total_memory());
-        let available = bytes_to_kb(sys.available_memory());
-        if total > 0 {
-            (total, available)
-        } else {
-            // sysinfo 获取失败，使用备用方案
-            get_memory_from_proc_meminfo().unwrap_or((0, 0))
-        }
-    };
-    let free_memory_kb = bytes_to_kb(sys.free_memory());
+        let used = bytes_to_kb(sys.used_memory());
+        (total, used)
+    });
 
-    let used_memory_kb = total_memory_kb.saturating_sub(available_memory_kb);
-
-    let mem_size = format!("{}KB", total_memory_kb); // 或转为 MiB 显示
+    let mem_size = format!("{}KB", total_memory_kb);
     let mem_usage = if total_memory_kb > 0 {
         ((used_memory_kb as f32 / total_memory_kb as f32) * 100.0).to_string()
     } else {
