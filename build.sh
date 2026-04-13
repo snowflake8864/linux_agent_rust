@@ -3,7 +3,7 @@ set -e
 
 echo "Start packaging osec..."
 
-VERSION="3.0.1_R4_B3"
+VERSION="3.0.1_R4_B2"
 OUTPUT_DIR="output"
 INSTALLER_NAME="${OUTPUT_DIR}/osec-installer-${VERSION}.sh"
 
@@ -50,6 +50,8 @@ cp -f script/osec_backend.conf package/opt/osec/
 cp -f script/agent_backend.conf package/opt/osec/
 cp -f script/osecmonitor package/opt/osec/
 cp -f script/readme.txt package/opt/osec/
+cp -f script/osec.service package/opt/osec/
+cp -f script/agent_manager.service package/opt/osec/
 cp certs/root-ca.pem package/opt/osec/certs/
 
 # Update version
@@ -330,10 +332,38 @@ rm -rf "\$INSTALL_DIR/x86_64-unknown-linux-musl" \
         fi
         
         if [[ "\$MODE" == "install" ]]; then
-            [ -f "\$UNIT_DIR/osec.service" ] && systemctl enable osec 2>/dev/null || true
-            [ -f "\$UNIT_DIR/agent_manager.service" ] && systemctl enable agent_manager 2>/dev/null || true
-            systemctl start osec 2>/dev/null || true
-            systemctl start agent_manager 2>/dev/null || true
+            # enable 服务
+            if [ -f "\$UNIT_DIR/osec.service" ]; then
+                systemctl enable osec 2>/dev/null || true
+            else
+                echo "ERROR: osec.service not found in \$UNIT_DIR"
+                exit 1
+            fi
+            if [ -f "\$UNIT_DIR/agent_manager.service" ]; then
+                systemctl enable agent_manager 2>/dev/null || true
+            else
+                echo "ERROR: agent_manager.service not found in \$UNIT_DIR"
+                exit 1
+            fi
+            
+            # 启动服务并检查结果
+            echo "Starting osec service..."
+            if systemctl start osec; then
+                echo "osec service started."
+            else
+                echo "ERROR: osec service failed to start!"
+                systemctl status osec --no-pager || true
+                exit 1
+            fi
+            
+            echo "Starting agent_manager service..."
+            if systemctl start agent_manager; then
+                echo "agent_manager service started."
+            else
+                echo "ERROR: agent_manager service failed to start!"
+                systemctl status agent_manager --no-pager || true
+                exit 1
+            fi
             
             # systemd 环境不需要 monitor/init 脚本，删除
             rm -f "\$INSTALL_DIR/osec.monitor" 2>/dev/null || true
