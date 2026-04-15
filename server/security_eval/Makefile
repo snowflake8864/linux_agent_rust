@@ -1,5 +1,6 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2
+CFLAGS = -Wall -Wextra -O2 -static
+CFLAGS_SHARED = -Wall -Wextra -O2
 
 TARGET = security_eval_server
 
