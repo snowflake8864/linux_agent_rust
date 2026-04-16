@@ -286,20 +286,12 @@ async fn uninstall_all() {
     }
     let _ = Command::new("chkconfig").args(["--del", "osec"]).status().await;
 
-    // 停止 agent_manager 自身服务
-    if has_service {
-        let _ = Command::new("service").args(["agent_manager", "stop"]).status().await;
-    } else if std::path::Path::new("/etc/init.d/agent_manager").exists() {
-        let _ = Command::new("/etc/init.d/agent_manager").arg("stop").status().await;
-    } else {
-        let _ = Command::new("pkill").arg("-TERM").arg("agent_manager_monitor").status().await;
-        sleep(Duration::from_secs(2)).await;
-        let _ = Command::new("pkill").arg("-9").arg("MagicArmorAgent").status().await;
-    }
+    // 注意：不停止 agent_manager 自身，卸载完成后会调用 exit(0) 退出
+    // 但需要 chkconfig --del 防止下次开机启动
+    let _ = Command::new("chkconfig").args(["--del", "agent_manager"]).status().await;
     if fs::remove_file("/etc/init.d/agent_manager").is_ok() {
         log_info!("[agent_manager] 已删除 /etc/init.d/agent_manager");
     }
-    let _ = Command::new("chkconfig").args(["--del", "agent_manager"]).status().await;
 
     // 删除所有 PID 文件（monitor + 业务进程）
     let _ = fs::remove_file("/var/run/osec_monitor.pid");
