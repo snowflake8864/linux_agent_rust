@@ -488,15 +488,15 @@ fn find_upgrade_script(dir: &str) -> Option<PathBuf> {
 async fn uninstall_all() {
     log_info!("[agent_manager] 开始执行完整卸载流程...");
 
+    // 注意：不停止 agent_manager 自身，卸载完成后会调用 exit(0) 退出
     // 优先使用 systemd，只要有 systemd 就用它
     if is_systemd_available() {
-        log_info!("[agent_manager] 使用 systemd 停止并禁用服务");
+        log_info!("[agent_manager] 使用 systemd 停止并禁用 osec 服务");
         let _ = Command::new("systemctl").args(["stop", "osec"]).status().await;
-        let _ = Command::new("systemctl").args(["stop", "agent_manager"]).status().await;
         let _ = Command::new("systemctl").args(["disable", "osec"]).status().await;
-        let _ = Command::new("systemctl").args(["disable", "agent_manager"]).status().await;
+        // 不停止 agent_manager，卸载完成后自行退出
         
-        // 清理所有路径的 service 文件
+        // 清理所有路径的 service 文件（包括 agent_manager.service，下次启动会重新安装）
         cleanup_all_service_files("osec").await;
         cleanup_all_service_files("agent_manager").await;
         let _ = Command::new("systemctl").arg("daemon-reload").status().await;
@@ -515,10 +515,9 @@ async fn uninstall_all() {
         // 非 systemd 环境，使用 init.d/monitor
         log_info!("[agent_manager] 非 systemd 环境，使用 init.d 停止服务");
         let _ = Command::new("/opt/osec/osec.monitor").arg("stop").status().await;
-        let _ = Command::new("/opt/osec/agent_manager.monitor").arg("stop").status().await;
         let _ = Command::new("service").args(["osec", "stop"]).status().await;
-        let _ = Command::new("service").args(["agent_manager", "stop"]).status().await;
         let _ = Command::new("pkill").arg("-9").arg("-f").arg("osecmonitor").status().await;
+        // 不停止 agent_manager，卸载完成后自行退出
         
         // 清理 init.d 文件
         if fs::remove_file("/etc/init.d/osec").is_ok() {
