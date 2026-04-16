@@ -221,11 +221,12 @@ async fn notify_kernel_network_close() {
 async fn stop_osec_services() -> Result<(), String> {
     log_info!("[agent_manager] 开始停止并清理 osec 服务...");
 
+    // 注意：不停止 agent_manager 自身，因为升级/更新需要由 MagicArmorAgent 执行
     // 优先使用 systemd，只要有 systemd 就用它
     if is_systemd_available() {
         log_info!("[agent_manager] 使用 systemd 停止 osec 服务");
         let _ = Command::new("systemctl").args(["stop", "osec"]).status().await;
-        let _ = Command::new("systemctl").args(["stop", "agent_manager"]).status().await;
+        // 不停止 agent_manager，它需要在升级完成后自行退出
         
         // 清理可能存在的旧版 init.d 文件
         let _ = tokio::fs::remove_file("/etc/init.d/osec").await;
@@ -240,6 +241,7 @@ async fn stop_osec_services() -> Result<(), String> {
         let _ = Command::new("/opt/osec/osec.monitor").arg("stop").status().await;
         let _ = Command::new("pkill").arg("-9").arg("-f").arg("osecmonitor").status().await;
         let _ = Command::new("service").args(["osec", "stop"]).status().await;
+        // 不停止 agent_manager，它需要在升级完成后自行退出
         let _ = tokio::fs::remove_file("/etc/init.d/osecservicecentos").await;
         let _ = tokio::fs::remove_file("/opt/osec/osecmonitor").await;
     }
