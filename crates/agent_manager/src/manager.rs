@@ -489,12 +489,14 @@ async fn uninstall_all() {
     log_info!("[agent_manager] 开始执行完整卸载流程...");
 
     // 注意：不停止 agent_manager 自身，卸载完成后会调用 exit(0) 退出
+    // 但需要 disable 服务，防止下次开机启动
     // 优先使用 systemd，只要有 systemd 就用它
     if is_systemd_available() {
-        log_info!("[agent_manager] 使用 systemd 停止并禁用 osec 服务");
+        log_info!("[agent_manager] 使用 systemd 停止并禁用服务");
         let _ = Command::new("systemctl").args(["stop", "osec"]).status().await;
         let _ = Command::new("systemctl").args(["disable", "osec"]).status().await;
-        // 不停止 agent_manager，卸载完成后自行退出
+        // 不停止 agent_manager，但需要 disable
+        let _ = Command::new("systemctl").args(["disable", "agent_manager"]).status().await;
         
         // 清理所有路径的 service 文件（包括 agent_manager.service，下次启动会重新安装）
         cleanup_all_service_files("osec").await;
@@ -517,7 +519,8 @@ async fn uninstall_all() {
         let _ = Command::new("/opt/osec/osec.monitor").arg("stop").status().await;
         let _ = Command::new("service").args(["osec", "stop"]).status().await;
         let _ = Command::new("pkill").arg("-9").arg("-f").arg("osecmonitor").status().await;
-        // 不停止 agent_manager，卸载完成后自行退出
+        // 不停止 agent_manager，但需要 chkconfig --del
+        let _ = Command::new("chkconfig").args(["--del", "agent_manager"]).status().await;
         
         // 清理 init.d 文件
         if fs::remove_file("/etc/init.d/osec").is_ok() {
