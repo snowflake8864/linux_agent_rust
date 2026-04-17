@@ -46,8 +46,6 @@ cp -f script/osec.service package/opt/osec/
 cp -f script/agent_manager.service package/opt/osec/
 cp -f script/osec.init package/opt/osec/
 cp -f script/agent_manager.init package/opt/osec/
-cp -f script/osec_monitor package/opt/osec/
-cp -f script/agent_manager_monitor package/opt/osec/
 cp -f script/osec_backend.conf package/opt/osec/
 cp -f script/agent_backend.conf package/opt/osec/
 cp -f script/osecmonitor package/opt/osec/
