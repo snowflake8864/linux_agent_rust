@@ -221,7 +221,16 @@ impl IpJumpManager {
             }
         }
 
-        let _ = self.upload_result_direct(upload_url, &info, token, base_url).await;
+        match self.upload_result_direct(upload_url, &info, token, base_url).await {
+            Ok(_) => {
+                log_info!("[IP-JUMP] 上报跳变结果成功: source_ip={}, target_ip={}, status={}",
+                    info.source_ip, info.target_ip, info.status);
+            }
+            Err(e) => {
+                log_error!("[IP-JUMP] 上报跳变结果失败: source_ip={}, target_ip={}, status={}, error={}",
+                    info.source_ip, info.target_ip, info.status, e);
+            }
+        }
 
         if jump_success {
             let gw = if instr.gateway.is_empty() {
