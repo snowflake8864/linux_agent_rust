@@ -27,6 +27,7 @@ struct IpJumpInstruction {
     gateway: String,
     active_time: u32,
     aging_time: u32,  // 单位：分钟
+    mode: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +58,32 @@ pub struct IpJumpManager {
     pending_persist: Arc<RwLock<Option<PendingPersistInfo>>>,
 }
 
+/// 带指数退避重试的 HTTP POST 请求
+async fn post_data_async_with_retry(
+    client: &NetClient,
+    url: &str,
+    json_data: &str,
+    timeout: Duration,
+    token: Option<&str>,
+    max_retries: u32,
+) -> Result<String, String> {
+    let mut last_err = String::new();
+    for attempt in 0..=max_retries {
+        match client.post_data_async(url, json_data, timeout, token).await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                last_err = e;
+                if attempt < max_retries {
+                    let delay = Duration::from_secs(2_u64.pow(attempt));
+                    log_warn!("HTTP POST 第 {} 次失败，等待 {:?} 后重试: {}", attempt + 1, delay, last_err);
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+    Err(format!("HTTP POST 在 {} 次尝试后仍然失败: {}", max_retries + 1, last_err))
+}
+
 impl IpJumpManager {
     pub fn new(main_interface: &str) -> Arc<Self> {
         Arc::new(IpJumpManager {
@@ -75,6 +102,7 @@ impl IpJumpManager {
         gateway: String,
         active_time: u32,
         aging_time: u32,
+        mode: u32,
     ) -> Result<(), String> {
         if let Some(tx) = IP_JUMP_INSTRUCTION_TX.get() {
             let instr = IpJumpInstruction {
@@ -83,6 +111,7 @@ impl IpJumpManager {
                 gateway,
                 active_time,
                 aging_time,
+                mode,
             };
             tx.send(Some(instr)).map_err(|_| "Failed to send instruction".to_string())?;
             Ok(())
@@ -207,7 +236,7 @@ impl IpJumpManager {
                 target_ip: instr.target_ip.clone(),
                 gateway: instr.gateway.clone(),
             };
-            match self.do_ip_jump_async(config, &mut info).await {
+            match self.do_ip_jump_async(config, &mut info, instr.mode).await {
                 Ok(_) => {
                     log_info!("IP jump success: {:?}", info);
                     info.status = 1;
@@ -239,20 +268,26 @@ impl IpJumpManager {
                 Some(instr.gateway.as_str())
             };
 
-            // 检查是否有 secondary IP，如果有则延后持久化
-            let has_secondary = {
-                let list = self.secondary_ips.read().await;
-                !list.is_empty()
-            };
-
-            if has_secondary {
-                log_info!("[IP-JUMP] 有 {} 个 secondary IP 存在，延后持久化直到老化清理完成", 
-                    self.secondary_ips.read().await.len());
-                // 保存持久化所需信息，供后续使用
-                self.save_pending_persist_info(&instr.source_ip, gw).await;
-            } else {
-                // 没有 secondary IP，立即持久化
+            if instr.mode == 2 {
+                // mode=2: 立即持久化，不等待
+                log_info!("[IP-JUMP] mode=2 立即执行持久化");
                 self.do_persist_ip(&instr.source_ip, gw).await;
+            } else {
+                // 检查是否有 secondary IP，如果有则延后持久化
+                let has_secondary = {
+                    let list = self.secondary_ips.read().await;
+                    !list.is_empty()
+                };
+
+                if has_secondary {
+                    log_info!("[IP-JUMP] 有 {} 个 secondary IP 存在，延后持久化直到老化清理完成",
+                        self.secondary_ips.read().await.len());
+                    // 保存持久化所需信息，供后续使用
+                    self.save_pending_persist_info(&instr.source_ip, gw).await;
+                } else {
+                    // 没有 secondary IP，立即持久化
+                    self.do_persist_ip(&instr.source_ip, gw).await;
+                }
             }
 
             if let Some(mut agent_ip) = get_local_ips_all().await {
@@ -399,10 +434,11 @@ impl IpJumpManager {
         let client = NetClient::new(Some(base_url.to_string()), true)
             .map_err(|e| e.to_string())?;
         let token_str = token.as_deref();
-        let resp = client
-            .post_data_async(url, "", Duration::from_secs(10), token_str)
-            .await
-            .map_err(|e| e.to_string())?;
+        let resp = post_data_async_with_retry(
+            &client, url, "", Duration::from_secs(30), token_str, 3,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         let parsed: Value = serde_json::from_str(&resp)
             .map_err(|e| e.to_string())?;
 
@@ -431,6 +467,10 @@ impl IpJumpManager {
                 .get("aging_time")
                 .and_then(|v: &Value| v.as_u64())
                 .unwrap_or(2) as u32;  // 默认 2 分钟
+            let mode = data
+                .get("mode")
+                .and_then(|v: &Value| v.as_u64())
+                .unwrap_or(1) as u32;
 
             if source_ip.is_empty() && target_ip.is_empty() {
                 return Ok(None);
@@ -442,6 +482,7 @@ impl IpJumpManager {
                 gateway: gateway.to_string(),
                 active_time,
                 aging_time,
+                mode,
             }))
         } else {
             Ok(None)
@@ -466,13 +507,9 @@ impl IpJumpManager {
         let client = NetClient::new(Some(base_url.to_string()), true)
             .map_err(|e| e.to_string())?;
         log_info!("上报跳变结果:url:{},json:{}",url, json_body);
-        match client.post_data_async(
-            &url,
-            &json_body,
-            Duration::from_secs(10),
-            token.as_deref(),
-            ).await {
-            //Ok(response) => println!("服务器响应: {}", response),
+        match post_data_async_with_retry(
+            &client, &url, &json_body, Duration::from_secs(30), token.as_deref(), 3,
+        ).await {
             Ok(response) => {log_info!("服务器响应: {}", response)},
             Err(err) => eprintln!("发送指标失败: {}", err),
         }
@@ -559,7 +596,7 @@ impl IpJumpManager {
         }
     }
 
-    pub async fn do_ip_jump_async(&self, mut config: IpJumpConfig, info: &mut PutIpJumpInfo) -> Result<(), String> {
+    pub async fn do_ip_jump_async(&self, mut config: IpJumpConfig, info: &mut PutIpJumpInfo, mode: u32) -> Result<(), String> {
         //log_info!("Starting IP jump: {} -> {} (gw={})", config.source_ip, config.target_ip, config.gateway);
 
         let (source_ip, _interface) = self.get_primary_ip(&config.source_ip).await?;
@@ -596,26 +633,51 @@ impl IpJumpManager {
             return Err(format!("addr add failed: {}", e));
         }
 
-        // 临时移除所有老的 secondary IP（保留在列表中，只从系统移除）
-        let old_secondaries = self.temporarily_remove_old_secondaries(&backup.interface, &target_ip).await;
+        if mode == 2 {
+            // mode=2: 直接删除原 IP，同时清理所有残留的 secondary IP
+            if let Err(e) = self.run_ip_cmd(&["addr", "del", &format!("{}/{}", config.source_ip, src_prefix), "dev", &backup.interface]).await {
+                log_error!("addr del failed: {}, attempt restore", e);
+                let _ = self.restore_backup(&backup).await;
+                return Err(format!("addr del failed: {}", e));
+            }
+            // 清理系统上所有该接口的 secondary IP，并清空跟踪列表
+            {
+                let mut list = self.secondary_ips.write().await;
+                for info in list.iter() {
+                    if info.interface == backup.interface {
+                        let _ = self.run_ip_cmd(&[
+                            "addr", "del",
+                            &format!("{}/{}", info.ip, info.prefix_len),
+                            "dev", &info.interface
+                        ]).await;
+                    }
+                }
+                list.clear();
+                log_info!("[IP-JUMP] mode=2 已清理所有 secondary IP 并清空跟踪列表");
+            }
+        } else {
+            // mode=1: 原逻辑，保留原 IP 作为 secondary
+            // 临时移除所有老的 secondary IP（保留在列表中，只从系统移除）
+            let old_secondaries = self.temporarily_remove_old_secondaries(&backup.interface, &target_ip).await;
 
-        //log_info!("Removing source IP: {}/{} from {}", config.source_ip, src_prefix, backup.interface);
-        if let Err(e) = self.run_ip_cmd(&["addr", "del", &format!("{}/{}", config.source_ip, src_prefix), "dev", &backup.interface]).await {
-            log_error!("addr del failed: {}, attempt restore", e);
+            //log_info!("Removing source IP: {}/{} from {}", config.source_ip, src_prefix, backup.interface);
+            if let Err(e) = self.run_ip_cmd(&["addr", "del", &format!("{}/{}", config.source_ip, src_prefix), "dev", &backup.interface]).await {
+                log_error!("addr del failed: {}, attempt restore", e);
+                // 恢复老的 secondary IP
+                self.restore_temp_secondaries(&old_secondaries).await;
+                let _ = self.restore_backup(&backup).await;
+                return Err(format!("addr del failed: {}", e));
+            }
+
             // 恢复老的 secondary IP
             self.restore_temp_secondaries(&old_secondaries).await;
-            let _ = self.restore_backup(&backup).await;
-            return Err(format!("addr del failed: {}", e));
-        }
 
-        // 恢复老的 secondary IP
-        self.restore_temp_secondaries(&old_secondaries).await;
-
-        log_info!("[IP-JUMP] 将老IP {} 作为 secondary 加回系统", config.source_ip);
-        if let Err(e) = self.add_secondary_ip(&backup.interface, &config.source_ip, &backup.netmask, src_prefix).await {
-            log_error!("add_secondary_ip failed: {}", e);
-        } else {
-            log_info!("[IP-JUMP] add_secondary_ip 成功: {} on {}", config.source_ip, backup.interface);
+            log_info!("[IP-JUMP] 将老IP {} 作为 secondary 加回系统", config.source_ip);
+            if let Err(e) = self.add_secondary_ip(&backup.interface, &config.source_ip, &backup.netmask, src_prefix).await {
+                log_error!("add_secondary_ip failed: {}", e);
+            } else {
+                log_info!("[IP-JUMP] add_secondary_ip 成功: {} on {}", config.source_ip, backup.interface);
+            }
         }
 
         if !config.gateway.trim().is_empty() {
@@ -1037,14 +1099,15 @@ impl IpJumpManager {
         let net_client = NetClient::new(Some(base_url.to_string()), true)
             .map_err(|e| format!("创建 NetClient 失败: {}", e))?;
 
-        let response = net_client
-            .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
-            .await
-            .map_err(|err| {
-                log_info!("发送指标失败: {}", err);
-                eprintln!("发送指标失败: {}", err);
-                format!("发送指标失败: {}", err)
-            })?;
+        let response = post_data_async_with_retry(
+            &net_client, &url, &json_data, Duration::from_secs(30), token_str, 3,
+        )
+        .await
+        .map_err(|err| {
+            log_info!("发送指标失败: {}", err);
+            eprintln!("发送指标失败: {}", err);
+            format!("发送指标失败: {}", err)
+        })?;
 
         log_info!("服务器响应: {}", response);
         Ok(())
