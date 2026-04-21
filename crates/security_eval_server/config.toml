@@ -1,0 +1,11 @@
+# Security Eval Server Configuration
+# 安全评估服务器配置文件
+
+# 分数阈值
+# 当接收到的分数 >= 此阈值时，执行 floweye table addip 添加 IP
+# 当接收到的分数 < 此阈值时，执行 floweye table rmvip 删除 IP
+score_threshold = 80
+
+# floweye 群组 ID
+# 指定要操作的 floweye 表群组号
+group_id = 1

@@ -78,6 +78,7 @@ pub struct NetInfoConfig {
     pub security_eval_enabled: bool,
     pub security_eval_server_addr: String,
     pub security_eval_interval: u32,
+    pub security_eval_score: u32,
 }
 
 enum NetRule<'a> {
@@ -399,6 +400,9 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("SECURITY_EVAL", "INTERVAL") {
             config.security_eval_interval = value.parse().unwrap_or(60);
         }
+        if let Some(value) = ini.get("SECURITY_EVAL", "SCORE") {
+            config.security_eval_score = value.parse().unwrap_or(95);
+        }
 
         config
     }
@@ -502,6 +506,7 @@ impl NetInfoConfig {
         writeln!(file, "ENABLED={}", self.security_eval_enabled as u8)?;
         writeln!(file, "SERVER_ADDR={}", self.security_eval_server_addr)?;
         writeln!(file, "INTERVAL={}", self.security_eval_interval)?;
+        writeln!(file, "SCORE={}", self.security_eval_score)?;
  
         Ok(())
     }

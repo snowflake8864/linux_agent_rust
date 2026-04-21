@@ -1,9 +1,12 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::process::Command;
 
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 const MAGIC: &[u8; 4] = b"SECV";
 const VERSION: u8 = 0x01;
@@ -19,10 +22,169 @@ static KEY: [u8; KEY_SIZE] = [
 
 #[derive(Parser)]
 #[command(name = "security_eval_server")]
-#[command(about = "Security Evaluation UDP Server", long_about = None)]
+#[command(about = "Security Evaluation UDP Server with Floweye Integration", long_about = None)]
 struct Cli {
     #[arg(short, long, default_value_t = 62201)]
     port: u16,
+    #[arg(short, long, default_value = "/etc/security_eval_server/config.toml")]
+    config: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct ServerConfig {
+    /// 分数阈值，大于等于此分数时添加IP，小于时删除IP
+    score_threshold: u32,
+    /// floweye 群组ID
+    group_id: u32,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            score_threshold: 80,
+            group_id: 1,
+        }
+    }
+}
+
+struct FloweyeManager {
+    /// 已添加到 floweye 的 IP 集合
+    added_ips: RwLock<HashSet<String>>,
+    /// 配置
+    config: ServerConfig,
+}
+
+impl FloweyeManager {
+    fn new(config: ServerConfig) -> Arc<Self> {
+        Arc::new(Self {
+            added_ips: RwLock::new(HashSet::new()),
+            config,
+        })
+    }
+
+    /// 根据分数处理 IP：高分数添加，低分数删除
+    async fn process_ip(&self, ip: &str, score: u32) {
+        let threshold = self.config.score_threshold;
+        let group_id = self.config.group_id;
+
+        if score >= threshold {
+            // 高分数：添加到 floweye
+            self.add_ip_if_not_exists(ip, group_id).await;
+        } else {
+            // 低分数：从 floweye 删除
+            self.remove_ip_if_exists(ip, group_id).await;
+        }
+    }
+
+    /// 添加 IP 到 floweye（先检查是否已存在）
+    async fn add_ip_if_not_exists(&self, ip: &str, group_id: u32) {
+        // 先查询 floweye 实际状态
+        match Self::execute_floweye_get(group_id) {
+            Ok(current_ips) => {
+                if current_ips.iter().any(|x| x == ip) {
+                    log::debug!("IP {} 已在 floweye 群组 {} 中，跳过添加", ip, group_id);
+                    // 同步内存状态
+                    let mut added_ips = self.added_ips.write().await;
+                    added_ips.insert(ip.to_string());
+                    return;
+                }
+            }
+            Err(e) => {
+                log::warn!("查询 floweye 群组 {} 状态失败，继续尝试添加: {}", group_id, e);
+            }
+        }
+
+        match Self::execute_floweye_addip(group_id, ip) {
+            Ok(_) => {
+                log::info!("成功添加 IP {} 到 floweye 群组 {}", ip, group_id);
+                let mut added_ips = self.added_ips.write().await;
+                added_ips.insert(ip.to_string());
+            }
+            Err(e) => {
+                log::error!("添加 IP {} 到 floweye 群组 {} 失败: {}", ip, group_id, e);
+            }
+        }
+    }
+
+    /// 从 floweye 删除 IP（先检查是否存在）
+    async fn remove_ip_if_exists(&self, ip: &str, group_id: u32) {
+        // 先查询 floweye 实际状态
+        match Self::execute_floweye_get(group_id) {
+            Ok(current_ips) => {
+                if !current_ips.iter().any(|x| x == ip) {
+                    log::debug!("IP {} 不在 floweye 群组 {} 中，跳过删除", ip, group_id);
+                    // 同步内存状态
+                    let mut added_ips = self.added_ips.write().await;
+                    added_ips.remove(ip);
+                    return;
+                }
+            }
+            Err(e) => {
+                log::warn!("查询 floweye 群组 {} 状态失败，继续尝试删除: {}", group_id, e);
+            }
+        }
+
+        match Self::execute_floweye_rmvip(group_id, ip) {
+            Ok(_) => {
+                log::info!("成功从 floweye 群组 {} 删除 IP {}", group_id, ip);
+                let mut added_ips = self.added_ips.write().await;
+                added_ips.remove(ip);
+            }
+            Err(e) => {
+                log::error!("从 floweye 群组 {} 删除 IP {} 失败: {}", group_id, ip, e);
+            }
+        }
+    }
+
+    /// 执行 floweye table get 命令，返回当前 IP 列表
+    fn execute_floweye_get(group_id: u32) -> Result<Vec<String>, String> {
+        let output = Command::new("floweye")
+            .args(["table", "get", &format!("id={}", group_id)])
+            .output()
+            .map_err(|e| format!("执行 floweye get 命令失败: {}", e))?;
+
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let ips: Vec<String> = stdout
+                .lines()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            Ok(ips)
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    }
+
+    /// 执行 floweye table addip 命令（成功时无输出）
+    fn execute_floweye_addip(group_id: u32, ip: &str) -> Result<(), String> {
+        let output = Command::new("floweye")
+            .args(["table", "addip", &group_id.to_string(), ip])
+            .output()
+            .map_err(|e| format!("执行 floweye addip 命令失败: {}", e))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    }
+
+    /// 执行 floweye table rmvip 命令（成功时无输出）
+    fn execute_floweye_rmvip(group_id: u32, ip: &str) -> Result<(), String> {
+        let output = Command::new("floweye")
+            .args(["table", "rmvip", &group_id.to_string(), ip])
+            .output()
+            .map_err(|e| format!("执行 floweye rmvip 命令失败: {}", e))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    }
+
+
 }
 
 struct Rc4Context {
@@ -199,7 +361,12 @@ fn build_response(seq: u16, message: &str) -> Vec<u8> {
     response
 }
 
-async fn handle_packet(buf: &[u8], addr: SocketAddr, socket: &Arc<Mutex<UdpSocket>>) {
+async fn handle_packet(
+    buf: &[u8], 
+    addr: SocketAddr, 
+    socket: &Arc<Mutex<UdpSocket>>,
+    floweye_manager: &Arc<FloweyeManager>,
+) {
     log::debug!("收到数据包, len={}", buf.len());
 
     let header = match parse_protocol_header(buf) {
@@ -233,6 +400,9 @@ async fn handle_packet(buf: &[u8], addr: SocketAddr, socket: &Arc<Mutex<UdpSocke
 
     log::info!("收到安全评估请求 - IP: {}, MAC: {}, Score: {}", request.ip, request.mac, request.score);
 
+    // 根据分数处理 floweye
+    floweye_manager.process_ip(&request.ip, request.score).await;
+
     let response = build_response(header.seq, "success");
 
     let socket = socket.lock().await;
@@ -243,12 +413,69 @@ async fn handle_packet(buf: &[u8], addr: SocketAddr, socket: &Arc<Mutex<UdpSocke
     }
 }
 
+/// 加载配置文件
+fn load_config(config_path: &str) -> ServerConfig {
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => {
+            match toml::from_str::<ServerConfig>(&content) {
+                Ok(config) => {
+                    log::info!("从 {} 加载配置成功", config_path);
+                    config
+                }
+                Err(e) => {
+                    log::warn!("解析配置文件失败: {}，使用默认配置", e);
+                    ServerConfig::default()
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("读取配置文件失败: {}，使用默认配置", e);
+            ServerConfig::default()
+        }
+    }
+}
+
+/// 创建默认配置文件
+fn create_default_config(config_path: &str) {
+    let config_dir = std::path::Path::new(config_path).parent();
+    if let Some(dir) = config_dir {
+        let _ = std::fs::create_dir_all(dir);
+    }
+
+    let default_config = r#"# Security Eval Server Configuration
+# 分数阈值，大于等于此分数时添加IP到floweye，小于时删除
+score_threshold = 80
+
+# floweye 群组ID
+group_id = 1
+"#;
+
+    if let Err(e) = std::fs::write(config_path, default_config) {
+        log::warn!("创建默认配置文件失败: {}", e);
+    } else {
+        log::info!("创建默认配置文件: {}", config_path);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
     let port = cli.port;
+
+    // 如果配置文件不存在，创建默认配置
+    if !std::path::Path::new(&cli.config).exists() {
+        create_default_config(&cli.config);
+    }
+
+    // 加载配置
+    let config = load_config(&cli.config);
+    log::info!("配置: score_threshold={}, group_id={}",
+        config.score_threshold, config.group_id);
+
+    // 创建 FloweyeManager
+    let floweye_manager = FloweyeManager::new(config.clone());
 
     let socket = UdpSocket::bind(format!("0.0.0.0:{}", port)).await?;
     log::info!("服务端启动，监听端口 {}", port);
@@ -259,9 +486,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut buf = [0u8; MAX_PACKET_SIZE];
         let (len, addr) = socket.lock().await.recv_from(&mut buf).await?;
         let socket_clone = Arc::clone(&socket);
+        let floweye_manager_clone = Arc::clone(&floweye_manager);
         
         tokio::spawn(async move {
-            handle_packet(&buf[..len], addr, &socket_clone).await;
+            handle_packet(&buf[..len], addr, &socket_clone, &floweye_manager_clone).await;
         });
     }
 }

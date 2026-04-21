@@ -178,10 +178,11 @@ impl TimerTask for BootManager {
                             
                             let ip = ip_opt.clone().unwrap_or_else(|| "127.0.0.1".to_string());
                             let mac_str = mac_opt.unwrap_or_else(|| "00:00:00:00:00:00".to_string());
-                            
-                            log_info!("发送安全评估: IP={}, MAC={}, Score=95", ip, mac_str);
-                            
-                            match client.send_security_eval(&ip, &mac_str, 95).await {
+                            let score = NETINFO_CONFIG.lock().unwrap().security_eval_score;
+
+                            log_info!("发送安全评估: IP={}, MAC={}, Score={}", ip, mac_str, score);
+
+                            match client.send_security_eval(&ip, &mac_str, score).await {
                                 Ok(_) => {
                                     log_info!("安全评估请求成功");
                                 }
