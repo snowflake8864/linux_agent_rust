@@ -35,7 +35,7 @@ pub struct PostDataWithIpResponse {
 impl NetClient {
      pub fn new(base_url: Option<String>, disable_ssl: bool) -> Result<Self, String> {
         let mut client_builder = Client::builder()
-            .timeout(Duration::from_secs(10)); // 设置请求超时时间
+            .timeout(Duration::from_secs(30)); // 设置请求超时时间
 
         // 如果禁用 SSL 证书验证，则设置相应的选项
         if disable_ssl {

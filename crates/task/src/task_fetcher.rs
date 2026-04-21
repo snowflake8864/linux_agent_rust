@@ -1997,7 +1997,7 @@ async fn task_down_pwjump(&self, task_type: u64) -> Result<(), String> {
    status: 0,
    reason: "".to_string(),
    };
-   let jump_result = self.ip_jump_manager.do_ip_jump_async(config, &mut info).await;
+   let jump_result = self.ip_jump_manager.do_ip_jump_async(config, &mut info, mode).await;
    match jump_result {
    Ok(_) => {
    log_info!("ip jump success: {:?}", info);
@@ -2085,7 +2085,7 @@ async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
                 status: 0,
                 reason: "".to_string(),
             };
-            let jump_result = self.ip_jump_manager.do_ip_jump_async(config, &mut info).await;
+            let jump_result = self.ip_jump_manager.do_ip_jump_async(config, &mut info, mode).await;
             match jump_result {
                 Ok(_) => {
                     log_info!("ip jump success: {:?}", info);
@@ -2144,6 +2144,7 @@ async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
                                                 let source_ip = data.get("source_ip").and_then(|v| v.as_str()).unwrap_or("");
                                                 let target_ip = data.get("target_ip").and_then(|v| v.as_str()).unwrap_or("");
                                                 let new_active_time = data.get("active_time").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                                let mode = data.get("mode").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
 
                                                 current_interval = new_active_time;
 
@@ -2162,7 +2163,7 @@ async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
                                                         target_ip: target_ip.to_string(),
                                                         gateway: gateway.to_string(),
                                                     };
-                                                    match ip_jump_manager.do_ip_jump_async(config, &mut info).await {
+                                                    match ip_jump_manager.do_ip_jump_async(config, &mut info, mode).await {
                                                         Ok(_) => {
                                                             log_info!("Auto IP jump success");
                                                             info.status = 1;
@@ -2248,6 +2249,7 @@ async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
     let data = parsed["data"].as_object().ok_or("Missing 'data' object in response")?;
     log_info!(" {:?}", data);
 
+    let mode = data.get("mode").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
     let gateway = data.get("gateway").and_then(|v| v.as_str()).unwrap_or("");
     let source_ip = data.get("source_ip").and_then(|v| v.as_str()).unwrap_or("");
     let target_ip = data.get("target_ip").and_then(|v| v.as_str()).unwrap_or("");
@@ -2255,8 +2257,8 @@ async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
     let aging_time = data.get("aging_time").and_then(|v| v.as_u64()).unwrap_or(2) as u32;  // 默认 2 分钟
 
     log_info!(
-        "IP Jump Task: source_ip={}, target_ip={}, gateway={}, active_time={}, aging_time={}",
-        source_ip, target_ip, gateway, active_time, aging_time
+        "IP Jump Task: mode={},source_ip={}, target_ip={}, gateway={}, active_time={}, aging_time={}",
+        mode,source_ip, target_ip, gateway, active_time, aging_time
     );
 
     if source_ip.is_empty() && target_ip.is_empty() {
@@ -2271,6 +2273,7 @@ async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
         gateway.to_string(),
         active_time,
         aging_time,
+        mode,
     )?;
 
     Ok(())
