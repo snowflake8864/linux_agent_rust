@@ -47,6 +47,36 @@ if [ -f "$INSTALL_DIR/$BIN_DIR/MagicArmorAgent" ]; then
     chmod +x "$INSTALL_DIR/MagicArmorAgent"
 fi
 
+# Handle external config.ini - update net_info.ini
+if [ -f /opt/config.ini ]; then
+    RAW_URL=$(grep -E '^[[:space:]]*URL' /opt/config.ini | cut -d= -f2 | tr -d ' ' | tr -d '\r')
+    RAW_URL=${RAW_URL// /}
+    CLEAN_URL=$(echo "$RAW_URL" | sed -E 's#^https?://##')
+    if [[ "$CLEAN_URL" == *:* ]]; then
+        NEW_IP=${CLEAN_URL%%:*}
+        NEW_PORT=${CLEAN_URL##*:}
+    else
+        NEW_IP=$CLEAN_URL
+        CONFIG_PORT=$(sed -nr 's/^[[:space:]]*PORT[[:space:]]*=[[:space:]]*([0-9]+).*$/\1/p' /opt/config.ini | tr -d '\r')
+        if [ -n "$CONFIG_PORT" ]; then
+            NEW_PORT=$CONFIG_PORT
+        elif [[ "$RAW_URL" == https://* ]]; then
+            NEW_PORT="443"
+        else
+            NEW_PORT="80"
+        fi
+    fi
+    NEW_USERID=$(sed -nr 's/^[[:space:]]*USER_ID[[:space:]]*=(.*)$/\1/p' /opt/config.ini | tr -d '\r')
+    
+    TARGET_FILE="$INSTALL_DIR/net_info.ini"
+    if [ -f "$TARGET_FILE" ]; then
+        sed -i "s|^[[:space:]]*SERVER_IP[[:space:]]*=.*|SERVER_IP=$NEW_IP|" "$TARGET_FILE"
+        sed -i "s|^[[:space:]]*SERVER_PORT[[:space:]]*=.*|SERVER_PORT=$NEW_PORT|" "$TARGET_FILE"
+        sed -i "s|^[[:space:]]*USER_ID[[:space:]]*=.*|USER_ID=$NEW_USERID|" "$TARGET_FILE"
+        sed -i "s|^[[:space:]]*SERVERIPPORT[[:space:]]*=.*|SERVERIPPORT=https://$NEW_IP:$NEW_PORT|" "$TARGET_FILE"
+    fi
+fi
+
 # Setup services using /etc/init.d
 cp -f "$INSTALL_DIR/osec.init" /etc/init.d/osec
 cp -f "$INSTALL_DIR/agent_manager.init" /etc/init.d/agent_manager

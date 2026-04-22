@@ -3,10 +3,11 @@ set -e
 
 # Pre-remove script
 if [ "$1" = "remove" ]; then
-    service agent_manager stop >/dev/null 2>&1 || true
-    service osec stop >/dev/null 2>&1 || true
-    
-    # Remove init.d scripts
-    rm -f /etc/init.d/osec 2>/dev/null || true
-    rm -f /etc/init.d/agent_manager 2>/dev/null || true
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop osec >/dev/null 2>&1 || true
+        systemctl stop agent_manager >/dev/null 2>&1 || true
+    else
+        service agent_manager stop >/dev/null 2>&1 || true
+        service osec stop >/dev/null 2>&1 || true
+    fi
 fi
