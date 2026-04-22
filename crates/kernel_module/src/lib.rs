@@ -187,9 +187,18 @@ impl LoadKernelDriver for BootManager {
                         if exact_driver_path.exists() && !failed_drivers.contains(&exact_driver_path) {
                             failed_drivers.insert(exact_driver_path);
                         } else if failed_drivers.len() >= drivers.len() {
-                            log_error!("All compatible drivers failed, stopping retry");
+                            log_error!("All compatible drivers failed, trying fallback driver tcp_ecn");
+                            if let Ok(driver_name) = try_load_tcp_ecn_driver(&kernel_version).await {
+                                log_info!("tcp_ecn driver loaded successfully: {}", driver_name);
+                                return Ok(driver_name);
+                            }
                             return Err("All available drivers failed to load".into());
                         } else if failed_drivers.contains(&exact_driver_path) {
+                            log_error!("best driver failed to load, trying fallback driver tcp_ecn");
+                            if let Ok(driver_name) = try_load_tcp_ecn_driver(&kernel_version).await {
+                                log_info!("tcp_ecn driver loaded successfully: {}", driver_name);
+                                return Ok(driver_name);
+                            }
                             return Err("best driver failed to load".into());
                         }
                     }
@@ -467,6 +476,60 @@ pub async fn try_load_driver_with_cache(
 
     restore_selinux(original_selinux_state);
     Ok(driver_path.file_name().and_then(|f| f.to_str()).unwrap_or("").trim_start_matches("osec_base.ko-").to_string())
+}
+
+pub async fn try_load_tcp_ecn_driver(kernel_version: &str) -> Result<String, String> {
+    if is_running_in_container() {
+        return Err("Kernel module loading disabled in container".into());
+    }
+
+    if !has_modprobe() {
+        return Err("modprobe not found on system".into());
+    }
+
+    let driver_path = {
+        let exact_driver = Path::new("/opt/osec/").join(format!("tcp_ecn.ko-{}", kernel_version));
+        if exact_driver.exists() {
+            exact_driver
+        } else {
+            let kernel_prefix = extract_kernel_prefix(kernel_version)
+                .ok_or_else(|| "Failed to extract kernel major version".to_string())?;
+            
+            let entries = fs::read_dir("/opt/osec/").map_err(|e| e.to_string())?;
+            let mut best: Option<(PathBuf, usize)> = None;
+            
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+                    if filename.starts_with("tcp_ecn.ko-") {
+                        let suffix = &filename["tcp_ecn.ko-".len()..];
+                        if !suffix.starts_with(&kernel_prefix) {
+                            continue;
+                        }
+                        let score = if suffix == kernel_version {
+                            0
+                        } else {
+                            levenshtein(suffix, kernel_version)
+                        };
+                        if best.is_none() || score < best.as_ref().unwrap().1 {
+                            best = Some((path.clone(), score));
+                            if score == 0 { break; }
+                        }
+                    }
+                }
+            }
+            best.map(|(p, _)| p).ok_or("No tcp_ecn driver found".to_string())?
+        }
+    };
+
+    let output = Command::new("insmod").arg(&driver_path).output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        log_info!("tcp_ecn driver loaded successfully: {}", driver_path.display());
+    } else {
+        return Err(format!("tcp_ecn insmod failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    Ok(driver_path.file_name().and_then(|f| f.to_str()).unwrap_or("").trim_start_matches("tcp_ecn.ko-").to_string())
 }
 
 fn is_driver_loaded_from_system_path(kernel_version: &str) -> bool {
