@@ -275,7 +275,8 @@ async fn main() -> std::io::Result<()> {
 
     log_info!("程序已安全退出");
 
-    Ok(())
+    //Ok(())
+    std::process::exit(0);
 
 }
 
