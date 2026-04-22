@@ -3,11 +3,12 @@
 
 Name: osec
 Version: 3.0.1
-Release: R8_B1
+Release: R8_B2
 Summary: OSEC Linux Security Agent
 License: Proprietary
 Group: System/Security
 BuildArch: noarch
+AutoReqProv: no
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root
 Source0: package.tar.gz
 
@@ -37,11 +38,18 @@ chmod 755 %{buildroot}/opt/osec -R
 chmod +x %{buildroot}/etc/init.d/osec
 chmod +x %{buildroot}/etc/init.d/agent_manager
 
+# Install systemd service files
+mkdir -p %{buildroot}/usr/lib/systemd/system
+cp -f package/opt/osec/osec.service %{buildroot}/usr/lib/systemd/system/
+cp -f package/opt/osec/agent_manager.service %{buildroot}/usr/lib/systemd/system/
+
 %files
 %defattr(-,root,root,-)
 /opt/osec/*
 /etc/init.d/osec
 /etc/init.d/agent_manager
+/usr/lib/systemd/system/osec.service
+/usr/lib/systemd/system/agent_manager.service
 
 %post
 # Post-install script
@@ -89,20 +97,56 @@ if [ -f "$INSTALL_DIR/$BIN_DIR/MagicArmorAgent" ]; then
     chmod +x "$INSTALL_DIR/MagicArmorAgent"
 fi
 
-# Setup services using /etc/init.d
-if command -v chkconfig >/dev/null 2>&1; then
+# Handle external config.ini - update net_info.ini (VERSION by external script)
+if [ -f /opt/config.ini ]; then
+    RAW_URL=$(grep -E '^[[:space:]]*URL' /opt/config.ini | cut -d= -f2 | tr -d ' ' | tr -d '\r')
+    RAW_URL=${RAW_URL// /}
+    CLEAN_URL=$(echo "$RAW_URL" | sed -E 's#^https?://##')
+    if [[ "$CLEAN_URL" == *:* ]]; then
+        NEW_IP=${CLEAN_URL%%:*}
+        NEW_PORT=${CLEAN_URL##*:}
+    else
+        NEW_IP=$CLEAN_URL
+        CONFIG_PORT=$(sed -nr 's/^[[:space:]]*PORT[[:space:]]*=[[:space:]]*([0-9]+).*$/\1/p' /opt/config.ini | tr -d '\r')
+        if [ -n "$CONFIG_PORT" ]; then
+            NEW_PORT=$CONFIG_PORT
+        elif [[ "$RAW_URL" == https://* ]]; then
+            NEW_PORT="443"
+        else
+            NEW_PORT="80"
+        fi
+    fi
+    NEW_USERID=$(sed -nr 's/^[[:space:]]*USER_ID[[:space:]]*=(.*)$/\1/p' /opt/config.ini | tr -d '\r')
+    
+    TARGET_FILE="$INSTALL_DIR/net_info.ini"
+    if [ -f "$TARGET_FILE" ]; then
+        sed -i "s|^[[:space:]]*SERVER_IP[[:space:]]*=.*|SERVER_IP=$NEW_IP|" "$TARGET_FILE"
+        sed -i "s|^[[:space:]]*SERVER_PORT[[:space:]]*=.*|SERVER_PORT=$NEW_PORT|" "$TARGET_FILE"
+        sed -i "s|^[[:space:]]*USER_ID[[:space:]]*=.*|USER_ID=$NEW_USERID|" "$TARGET_FILE"
+        sed -i "s|^[[:space:]]*SERVERIPPORT[[:space:]]*=.*|SERVERIPPORT=https://$NEW_IP:$NEW_PORT|" "$TARGET_FILE"
+    fi
+fi
+
+# Setup services using systemd
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl enable osec >/dev/null 2>&1 || true
+    systemctl enable agent_manager >/dev/null 2>&1 || true
+    systemctl start osec >/dev/null 2>&1 || true
+    systemctl start agent_manager >/dev/null 2>&1 || true
+elif command -v chkconfig >/dev/null 2>&1; then
     chkconfig --add osec >/dev/null 2>&1 || true
     chkconfig --add agent_manager >/dev/null 2>&1 || true
     chkconfig osec on >/dev/null 2>&1 || true
     chkconfig agent_manager on >/dev/null 2>&1 || true
+    service osec start >/dev/null 2>&1 || true
+    service agent_manager start >/dev/null 2>&1 || true
 elif command -v update-rc.d >/dev/null 2>&1; then
     update-rc.d osec defaults >/dev/null 2>&1 || true
     update-rc.d agent_manager defaults >/dev/null 2>&1 || true
+    service osec start >/dev/null 2>&1 || true
+    service agent_manager start >/dev/null 2>&1 || true
 fi
-
-# Start services
-service osec start >/dev/null 2>&1 || true
-service agent_manager start >/dev/null 2>&1 || true
 
 # Cleanup arch dirs
 rm -rf "$INSTALL_DIR/x86_64-unknown-linux-musl" \
@@ -113,14 +157,31 @@ rm -rf "$INSTALL_DIR/x86_64-unknown-linux-musl" \
 %preun
 # Pre-uninstall script
 if [ "$1" = "0" ]; then
-    service agent_manager stop >/dev/null 2>&1 || true
-    service osec stop >/dev/null 2>&1 || true
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop osec >/dev/null 2>&1 || true
+        systemctl stop agent_manager >/dev/null 2>&1 || true
+    else
+        service osec stop >/dev/null 2>&1 || true
+        service agent_manager stop >/dev/null 2>&1 || true
+    fi
 fi
 
 %postun
 # Post-uninstall script
 if [ "$1" = "0" ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable osec >/dev/null 2>&1 || true
+        systemctl disable agent_manager >/dev/null 2>&1 || true
+        rm -f /usr/lib/systemd/system/osec.service
+        rm -f /usr/lib/systemd/system/agent_manager.service
+        systemctl daemon-reload
+    fi
     rm -rf /opt/osec
     rm -f /etc/init.d/osec
     rm -f /etc/init.d/agent_manager
+elif [ "$1" = "1" ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl start osec >/dev/null 2>&1 || true
+        systemctl start agent_manager >/dev/null 2>&1 || true
+    fi
 fi
