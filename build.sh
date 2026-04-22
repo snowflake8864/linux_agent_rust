@@ -41,7 +41,7 @@ cp driver/mips64el-unknown-linux-gnuabi64/osec_base.ko* package/opt/osec/mips64e
 cp driver/loongarch64-unknown-linux-musl/osec_base.ko* package/opt/osec/loongarch64-unknown-linux-musl/ 2>/dev/null || true
 
 # ====== 4. Copy common files ======
-cp -f script/net_info.ini package/opt/osec/
+cp -f script/net_info.ini.guardian-audit package/opt/osec/net_info.ini
 cp -f script/osec.init package/opt/osec/
 cp -f script/agent_manager.init package/opt/osec/
 cp -f script/osec.monitor package/opt/osec/
