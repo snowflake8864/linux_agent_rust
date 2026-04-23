@@ -1,6 +1,12 @@
 # Security Eval Server Configuration
 # 安全评估服务器配置文件
 
+# 监听地址
+bind_host = "0.0.0.0"
+
+# 监听端口
+bind_port = 62201
+
 # 分数阈值
 # 当接收到的分数 >= 此阈值时，执行 floweye table addip 添加 IP
 # 当接收到的分数 < 此阈值时，执行 floweye table rmvip 删除 IP

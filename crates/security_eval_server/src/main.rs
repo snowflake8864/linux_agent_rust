@@ -24,8 +24,6 @@ static KEY: [u8; KEY_SIZE] = [
 #[command(name = "security_eval_server")]
 #[command(about = "Security Evaluation UDP Server with Floweye Integration", long_about = None)]
 struct Cli {
-    #[arg(short, long, default_value_t = 62201)]
-    port: u16,
     #[arg(short, long, default_value = "/etc/security_eval_server/config.toml")]
     config: String,
 }
@@ -36,6 +34,10 @@ struct ServerConfig {
     score_threshold: u32,
     /// floweye 群组ID
     group_id: u32,
+    /// 监听地址
+    bind_host: String,
+    /// 监听端口
+    bind_port: u16,
 }
 
 impl Default for ServerConfig {
@@ -43,6 +45,8 @@ impl Default for ServerConfig {
         Self {
             score_threshold: 80,
             group_id: 1,
+            bind_host: "0.0.0.0".to_string(),
+            bind_port: 62201,
         }
     }
 }
@@ -443,10 +447,21 @@ fn create_default_config(config_path: &str) {
     }
 
     let default_config = r#"# Security Eval Server Configuration
-# 分数阈值，大于等于此分数时添加IP到floweye，小于时删除
+# 安全评估服务器配置文件
+
+# 监听地址
+bind_host = "0.0.0.0"
+
+# 监听端口
+bind_port = 62201
+
+# 分数阈值
+# 当接收到的分数 >= 此阈值时，执行 floweye table addip 添加 IP
+# 当接收到的分数 < 此阈值时，执行 floweye table rmvip 删除 IP
 score_threshold = 80
 
-# floweye 群组ID
+# floweye 群组 ID
+# 指定要操作的 floweye 表群组号
 group_id = 1
 "#;
 
@@ -462,7 +477,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
-    let port = cli.port;
 
     // 如果配置文件不存在，创建默认配置
     if !std::path::Path::new(&cli.config).exists() {
@@ -471,14 +485,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 加载配置
     let config = load_config(&cli.config);
-    log::info!("配置: score_threshold={}, group_id={}",
-        config.score_threshold, config.group_id);
+    log::info!("配置: bind_host={}, bind_port={}, score_threshold={}, group_id={}",
+        config.bind_host, config.bind_port, config.score_threshold, config.group_id);
 
     // 创建 FloweyeManager
     let floweye_manager = FloweyeManager::new(config.clone());
 
-    let socket = UdpSocket::bind(format!("0.0.0.0:{}", port)).await?;
-    log::info!("服务端启动，监听端口 {}", port);
+    let socket = UdpSocket::bind(format!("{}:{}", config.bind_host, config.bind_port)).await?;
+    log::info!("服务端启动，监听地址 {}:{}", config.bind_host, config.bind_port);
 
     let socket = Arc::new(Mutex::new(socket));
 
