@@ -514,9 +514,6 @@ impl IpJumpManager {
             Err(err) => eprintln!("发送指标失败: {}", err),
         }
 
-
-
-
         Ok(())
     }
 
@@ -684,8 +681,8 @@ impl IpJumpManager {
             log_info!("Setting gateway: {} on {}", config.gateway, backup.interface);
             if let Err(e) = self.set_gateway(&config.gateway, &backup.interface).await {
                 log_error!("set_gateway failed: {}, restoring", e);
-                let _ = self.restore_backup(&backup).await;
-                return Err(format!("set gateway failed: {}", e));
+                //let _ = self.restore_backup(&backup).await;
+                //return Err(format!("set gateway failed: {}", e));
             }
         }
 
