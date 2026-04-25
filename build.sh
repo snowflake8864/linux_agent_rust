@@ -3,7 +3,7 @@ set -e
 
 echo "Start packaging osec..."
 
-VERSION="3.0.1_G8_B1"
+VERSION="3.0.1_R4_B2"
 OUTPUT_DIR="output"
 INSTALLER_NAME="${OUTPUT_DIR}/osec-installer-${VERSION}.sh"
 
@@ -35,21 +35,20 @@ cp target/loongarch64-unknown-linux-musl/release/MagicArmorAgent package/opt/ose
 # ====== 3. Copy architecture-specific kernel modules ======
 echo "Copying kernel modules..."
 
-cp driver.enc_flag/x86_64-unknown-linux-musl/osec_base.ko* package/opt/osec/x86_64-unknown-linux-musl/ 2>/dev/null || true
-cp driver.enc_flag/aarch64-unknown-linux-musl/osec_base.ko* package/opt/osec/aarch64-unknown-linux-musl/ 2>/dev/null || true
-cp driver.enc_flag/mips64el-unknown-linux-gnuabi64/osec_base.ko* package/opt/osec/mips64el-unknown-linux-gnuabi64/ 2>/dev/null || true
-cp driver.enc_flag/loongarch64-unknown-linux-musl/osec_base.ko* package/opt/osec/loongarch64-unknown-linux-musl/ 2>/dev/null || true
+cp driver/x86_64-unknown-linux-musl/osec_base.ko* package/opt/osec/x86_64-unknown-linux-musl/ 2>/dev/null || true
+cp driver/aarch64-unknown-linux-musl/osec_base.ko* package/opt/osec/aarch64-unknown-linux-musl/ 2>/dev/null || true
+cp driver/mips64el-unknown-linux-gnuabi64/osec_base.ko* package/opt/osec/mips64el-unknown-linux-gnuabi64/ 2>/dev/null || true
+cp driver/loongarch64-unknown-linux-musl/osec_base.ko* package/opt/osec/loongarch64-unknown-linux-musl/ 2>/dev/null || true
 
 # ====== 4. Copy common files ======
-cp -f script/net_info.ini.greatwall-guard package/opt/osec/net_info.ini
+cp -f script/net_info.ini package/opt/osec/
 cp -f script/osec.init package/opt/osec/
 cp -f script/agent_manager.init package/opt/osec/
-cp -f script/osec.monitor package/opt/osec/
-cp -f script/agent_manager.monitor package/opt/osec/
+cp -f script/osec_monitor package/opt/osec/
+cp -f script/agent_manager_monitor package/opt/osec/
 cp -f script/osec_backend.conf package/opt/osec/
 cp -f script/agent_backend.conf package/opt/osec/
 cp -f script/osecmonitor package/opt/osec/
-cp -f script/osecservicecentos package/opt/osec/
 cp -f script/readme.txt package/opt/osec/
 cp certs/root-ca.pem package/opt/osec/certs/
 
@@ -68,15 +67,6 @@ if [[ "\$1" == "--upgrade" ]]; then
     MODE="upgrade"
     shift
 fi
-
-# 日志文件
-LOG_FILE="/var/log/osec_upgrade.log"
-exec > >(tee -a "$LOG_FILE") 2>&1
-echo "========================================"
-echo "[$(date)] $MODE started"
-echo "========================================"
-echo "[\$(date)] \$MODE started"
-echo "========================================"
 
 if [[ "\$MODE" == "install" ]]; then
     echo "🚀 Installing OSEC and Agent Manager (version $VERSION)..."
@@ -251,124 +241,50 @@ if [[ "\$MODE" == "install" ]]; then
     fi
 fi
 
-# Cleanup architecture dirs (必须在 MagicArmor_0 启动前删除，否则驱动保护导致无法删除)
-echo "Cleaning up architecture directories..."
+# --- Deploy services (using init.d + monitor script for non-systemd) ---
+    echo "Setting up services with init.d..."
+    if [[ "$MODE" == "install" ]]; then
+        # 安装两个服务（监控脚本在 /opt/osec 下，由 init.d 调用）
+        cp -f "$INSTALL_DIR/osec.init" /etc/init.d/osec >/dev/null 2>&1
+        cp -f "$INSTALL_DIR/agent_manager.init" /etc/init.d/agent_manager >/dev/null 2>&1
+        chmod +x /etc/init.d/osec /etc/init.d/agent_manager
+        
+        # 添加开机启动
+        if command -v chkconfig >/dev/null 2>&1; then
+            chkconfig --add osec >/dev/null 2>&1 || true
+            chkconfig --add agent_manager >/dev/null 2>&1 || true
+            chkconfig osec on >/dev/null 2>&1 || true
+            chkconfig agent_manager on >/dev/null 2>&1 || true
+        elif command -v update-rc.d >/dev/null 2>&1; then
+            update-rc.d osec defaults >/dev/null 2>&1 || true
+            update-rc.d agent_manager defaults >/dev/null 2>&1 || true
+        fi
+        
+        # 启动服务
+        service osec start >/dev/null 2>&1 || { echo "ERROR: osec failed to start!"; exit 1; }
+        service agent_manager start >/dev/null 2>&1 || { echo "ERROR: agent_manager failed to start!"; exit 1; }
+        echo "osec and agent_manager services started successfully."
+    else
+        # 升级模式：只升级 osec
+        cp -f "$INSTALL_DIR/osec.init" /etc/init.d/osec >/dev/null 2>&1
+        chmod +x /etc/init.d/osec
+        
+        if command -v chkconfig >/dev/null 2>&1; then
+            chkconfig --add osec >/dev/null 2>&1 || true
+            chkconfig osec on >/dev/null 2>&1 || true
+        elif command -v update-rc.d >/dev/null 2>&1; then
+            update-rc.d osec defaults >/dev/null 2>&1 || true
+        fi
+        
+        service osec restart >/dev/null 2>&1 || { echo "ERROR: osec failed to restart!"; exit 1; }
+        echo "osec service restarted successfully."
+    fi
+
+# Cleanup architecture dirs
 rm -rf "\$INSTALL_DIR/x86_64-unknown-linux-musl" \
        "\$INSTALL_DIR/aarch64-unknown-linux-musl" \
        "\$INSTALL_DIR/mips64el-unknown-linux-gnuabi64" \
        "\$INSTALL_DIR/loongarch64-unknown-linux-musl"
-
-# --- Deploy services (systemd preferred, fallback to init.d + monitor) ---
-    echo "Setting up services..."
-    
-    # 检测 systemd 是否可用
-    if [ -d /run/systemd/system ]; then
-        # 使用 systemd
-        echo "Using systemd..."
-        UNIT_DIR=""
-        for d in /usr/lib/systemd/system /lib/systemd/system /etc/systemd/system; do
-            if [ -d "\$d" ]; then
-                UNIT_DIR="\$d"
-                break
-            fi
-        done
-        
-        if [ -n "\$UNIT_DIR" ]; then
-            [ -f "\$INSTALL_DIR/osec.service" ] && cp -f "\$INSTALL_DIR/osec.service" "\$UNIT_DIR/" && chmod 644 "\$UNIT_DIR/osec.service"
-            [ -f "\$INSTALL_DIR/agent_manager.service" ] && cp -f "\$INSTALL_DIR/agent_manager.service" "\$UNIT_DIR/" && chmod 644 "\$UNIT_DIR/agent_manager.service"
-            systemctl daemon-reload 2>/dev/null || true
-        fi
-        
-        if [[ "\$MODE" == "install" ]]; then
-            # enable 服务
-            if [ -f "\$UNIT_DIR/osec.service" ]; then
-                systemctl enable osec 2>/dev/null || true
-            else
-                echo "ERROR: osec.service not found in \$UNIT_DIR"
-                exit 1
-            fi
-            if [ -f "\$UNIT_DIR/agent_manager.service" ]; then
-                systemctl enable agent_manager 2>/dev/null || true
-            else
-                echo "ERROR: agent_manager.service not found in \$UNIT_DIR"
-                exit 1
-            fi
-            
-            # 启动服务并检查结果
-            echo "Starting osec service..."
-            if systemctl start osec; then
-                echo "osec service started."
-            else
-                echo "ERROR: osec service failed to start!"
-                systemctl status osec --no-pager || true
-                exit 1
-            fi
-            
-            echo "Starting agent_manager service..."
-            if systemctl start agent_manager; then
-                echo "agent_manager service started."
-            else
-                echo "ERROR: agent_manager service failed to start!"
-                systemctl status agent_manager --no-pager || true
-                exit 1
-            fi
-            
-            # systemd 环境不需要 monitor/init 脚本，删除
-            rm -f "\$INSTALL_DIR/osec.monitor" 2>/dev/null || true
-            rm -f "\$INSTALL_DIR/agent_manager.monitor" 2>/dev/null || true
-            rm -f "\$INSTALL_DIR/osec.init" 2>/dev/null || true
-            rm -f "\$INSTALL_DIR/agent_manager.init" 2>/dev/null || true
-            
-            echo "osec and agent_manager services started successfully (systemd)."
-        else
-            # 升级模式：重启 osec，确保 agent_manager 也运行
-            [ -f "\$UNIT_DIR/osec.service" ] && systemctl restart osec 2>/dev/null || true
-            [ -f "\$UNIT_DIR/agent_manager.service" ] && systemctl restart agent_manager 2>/dev/null || true
-            echo "osec and agent_manager services restarted successfully (systemd)."
-        fi
-    else
-        # 使用 init.d + monitor 脚本
-        echo "Using init.d + monitor..."
-        
-        if [[ "\$MODE" == "install" ]]; then
-            cp -f "\$INSTALL_DIR/osec.init" /etc/init.d/osec >/dev/null 2>&1
-            cp -f "\$INSTALL_DIR/agent_manager.init" /etc/init.d/agent_manager >/dev/null 2>&1
-            chmod +x /etc/init.d/osec /etc/init.d/agent_manager
-            
-            if command -v chkconfig >/dev/null 2>&1; then
-                chkconfig --add osec >/dev/null 2>&1 || true
-                chkconfig --add agent_manager >/dev/null 2>&1 || true
-                chkconfig osec on >/dev/null 2>&1 || true
-                chkconfig agent_manager on >/dev/null 2>&1 || true
-            elif command -v update-rc.d >/dev/null 2>&1; then
-                update-rc.d osec defaults >/dev/null 2>&1 || true
-                update-rc.d agent_manager defaults >/dev/null 2>&1 || true
-            fi
-            
-            service osec start >/dev/null 2>&1 || { echo "ERROR: osec failed to start!"; exit 1; }
-            service agent_manager start >/dev/null 2>&1 || { echo "ERROR: agent_manager failed to start!"; exit 1; }
-            echo "osec and agent_manager services started successfully (init.d)."
-        else
-            cp -f "\$INSTALL_DIR/osec.init" /etc/init.d/osec >/dev/null 2>&1
-            cp -f "\$INSTALL_DIR/agent_manager.init" /etc/init.d/agent_manager >/dev/null 2>&1
-            chmod +x /etc/init.d/osec /etc/init.d/agent_manager
-            
-            if command -v chkconfig >/dev/null 2>&1; then
-                chkconfig --add osec >/dev/null 2>&1 || true
-                chkconfig --add agent_manager >/dev/null 2>&1 || true
-                chkconfig osec on >/dev/null 2>&1 || true
-                chkconfig agent_manager on >/dev/null 2>&1 || true
-            elif command -v update-rc.d >/dev/null 2>&1; then
-                update-rc.d osec defaults >/dev/null 2>&1 || true
-                update-rc.d agent_manager defaults >/dev/null 2>&1 || true
-            fi
-            
-            service osec restart >/dev/null 2>&1 || { echo "ERROR: osec failed to restart!"; exit 1; }
-            # agent_manager 可能还在运行，先尝试 restart，失败则 start
-            service agent_manager restart 2>/dev/null || service agent_manager start 2>/dev/null || true
-            echo "osec and agent_manager services restarted successfully (init.d)."
-        fi
-    fi
 
 if [[ "\$MODE" == "install" ]]; then
     echo "✅ Installation completed!"

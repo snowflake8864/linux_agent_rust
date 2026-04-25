@@ -54,5 +54,9 @@ linker = "/usr/bin/mips64el-linux-gnuabi64-gcc"
 #rustflags = ["-C", "target-cpu=mips64r2", "target-feature=+crt-static", "-C", "link-arg=-static"] 
 rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"] 
 
+[target.loongarch64-unknown-linux-musl]
+linker = "/home/zebra/loongarch64-linux-musl/bin/loongarch64-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"]
+
 
 
