@@ -102,10 +102,9 @@ impl BaseOnline {
         let json_str = serde_json::to_string(&base_online)
             .map_err(|e| format!("Failed to serialize to JSON: {}", e))?;
 
-        log_info!("Serialized JSON: {}", json_str);
 
         let url = format!("{}/v1/auth", net_client.get_base_url().unwrap_or_default());
-        println!("==url:{}", url);
+        log_info!("url:{},Serialized JSON: {}", url, json_str);
         match net_client.post_data_async(&url, &json_str, Duration::from_secs(30), None).await {
             Ok(response) => {
                 log_info!("response: {:?}", response);

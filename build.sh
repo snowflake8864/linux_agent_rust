@@ -3,7 +3,7 @@ set -e
 
 echo "Start packaging osec..."
 
-VERSION="3.0.1_T10"
+VERSION="3.0.1_T11"
 OUTPUT_DIR="output"
 INSTALLER_NAME="${OUTPUT_DIR}/osec-installer-${VERSION}.sh"
 
@@ -29,8 +29,8 @@ cp target/mips64el-unknown-linux-gnuabi64/release/MagicArmor_0 package/opt/osec/
 cp target/mips64el-unknown-linux-gnuabi64/release/MagicArmorAgent package/opt/osec/mips64el-unknown-linux-gnuabi64/
 
 # loongarch64 (no MagicArmorAgent)
-cp target/loongarch64-unknown-linux-musl/release/MagicArmor_0 package/opt/osec/loongarch64-unknown-linux-musl/
-cp target/loongarch64-unknown-linux-musl/release/MagicArmorAgent package/opt/osec/loongarch64-unknown-linux-musl/
+#cp target/loongarch64-unknown-linux-musl/release/MagicArmor_0 package/opt/osec/loongarch64-unknown-linux-musl/
+#cp target/loongarch64-unknown-linux-musl/release/MagicArmorAgent package/opt/osec/loongarch64-unknown-linux-musl/
 
 # ====== 3. Copy architecture-specific kernel modules ======
 echo "Copying kernel modules..."
@@ -58,7 +58,7 @@ sed -i '/^VERSION=/d' "$NET_INFO_FILE" 2>/dev/null || true
 sed -i "/\[SERVERINFO\]/a VERSION=$VERSION" "$NET_INFO_FILE"
 
 # ====== 5. Generate install script ======
-cat > "package/install_or_upgrade.sh" << EOF
+cat >"package/install_or_upgrade.sh" <<EOF
 #!/bin/bash
 set -e
 
@@ -353,7 +353,7 @@ EOF
 # ====== 6. Package ======
 cd package
 tar -czf /tmp/osec-payload.tar.gz opt/
-cat install_or_upgrade.sh /tmp/osec-payload.tar.gz > "../$INSTALLER_NAME"
+cat install_or_upgrade.sh /tmp/osec-payload.tar.gz >"../$INSTALLER_NAME"
 chmod +x "../$INSTALLER_NAME"
 rm -f /tmp/osec-payload.tar.gz
 cd ..
