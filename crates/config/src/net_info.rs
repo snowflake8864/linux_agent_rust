@@ -112,7 +112,11 @@ fn run_cmd_capture(cmd: &str, args: &[&str]) -> Result<String, String> {
 
 impl NetInfoConfig {
     /// 获取主接口（基于 server_ip）
+    /// 1. 先尝试 ip route get <server_ip>
+    /// 2. 失败则用 ip route show default（获取默认路由的接口）
+    /// 3. 再失败则找第一个非 lo/127/169.254 的接口
     fn get_main_interface(server_ip: &str) -> Result<String, String> {
+        // 1. 根据 server_ip 路由查找
         let out = run_cmd_capture("ip", &["route", "get", server_ip])
             .map_err(|e| format!("ip route get {} failed: {}", server_ip, e))?;
         let re = regex::Regex::new(r"dev\s+(\S+)").map_err(|e| format!("Regex error: {}", e))?;
@@ -124,6 +128,34 @@ impl NetInfoConfig {
                 }
             }
         }
+
+        // 2. server_ip 可能是 localhost，fallback 到默认路由接口
+        log_info!("ip route get {} returned lo or no match, trying default route", server_ip);
+        let out = run_cmd_capture("ip", &["route", "show", "default"])
+            .map_err(|e| format!("ip route show default failed: {}", e))?;
+        for line in out.lines() {
+            if let Some(cap) = re.captures(line) {
+                let iface = cap.get(1).unwrap().as_str();
+                if iface != "lo" {
+                    return Ok(iface.to_string());
+                }
+            }
+        }
+
+        // 3. 最后手段：找第一个非 lo 且非 link-local 的接口
+        let out = run_cmd_capture("ip", &["-o", "-4", "addr", "show"])
+            .map_err(|e| format!("ip addr show failed: {}", e))?;
+        let re = regex::Regex::new(r"^\d+:\s+([^:\s]+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)/").unwrap();
+        for line in out.lines() {
+            if let Some(cap) = re.captures(line) {
+                let iface = cap.get(1).unwrap().as_str();
+                let addr = cap.get(2).unwrap().as_str();
+                if iface != "lo" && !addr.starts_with("127.") && !addr.starts_with("169.254.") {
+                    return Ok(iface.to_string());
+                }
+            }
+        }
+
         Err(format!(
             "No valid interface found for server_ip {}",
             server_ip
