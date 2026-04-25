@@ -1,0 +1,108 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          osec
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: OSEC Backend Service
+# Description:       Linux Agent Backend Service - MagicArmor_0
+#chkconfig: 2345 80 20
+#description: OSEC Backend Service
+### END INIT INFO
+
+MONITOR_PID_FILE=/var/run/osec_monitor.pid
+BINARY_PID_FILE=/var/run/osec_backend.pid
+MONITOR=/opt/osec/osec_monitor
+
+start() {
+    if [ -f "$MONITOR_PID_FILE" ]; then
+        OLD_PID=$(cat $MONITOR_PID_FILE)
+        if [ -d "/proc/$OLD_PID" ]; then
+            echo "osec monitor is already running (PID: $OLD_PID)"
+            return 0
+        else
+            rm -f $MONITOR_PID_FILE
+        fi
+    fi
+    
+    nohup $MONITOR >/dev/null 2>&1 &
+    echo "osec monitor started"
+}
+
+stop() {
+    # Stop monitor first
+    if [ -f "$MONITOR_PID_FILE" ]; then
+        PID=$(cat $MONITOR_PID_FILE)
+        if [ -d "/proc/$PID" ]; then
+            kill -TERM $PID 2>/dev/null
+            sleep 1
+        fi
+        rm -f $MONITOR_PID_FILE
+    fi
+    
+    # Stop the actual process
+    if [ -f "$BINARY_PID_FILE" ]; then
+        PID=$(cat $BINARY_PID_FILE)
+        if [ -d "/proc/$PID" ]; then
+            kill -15 $PID 2>/dev/null
+            sleep 1
+            if [ -d "/proc/$PID" ]; then
+                kill -9 $PID 2>/dev/null
+            fi
+        fi
+        rm -f $BINARY_PID_FILE
+    fi
+    
+    # Clean up any remaining processes
+    pkill -9 -f "MagicArmor_0" 2>/dev/null
+    
+    echo "osec stopped"
+}
+
+status() {
+    if [ -f "$MONITOR_PID_FILE" ]; then
+        PID=$(cat $MONITOR_PID_FILE)
+        if [ -d "/proc/$PID" ]; then
+            echo "osec monitor is running (PID: $PID)"
+        else
+            echo "osec monitor is not running (stale PID file)"
+        fi
+    else
+        echo "osec monitor is not running"
+    fi
+    
+    if [ -f "$BINARY_PID_FILE" ]; then
+        PID=$(cat $BINARY_PID_FILE)
+        if [ -d "/proc/$PID" ]; then
+            echo "osec process is running (PID: $PID)"
+        else
+            echo "osec process is not running (stale PID file)"
+        fi
+    else
+        echo "osec process is not running"
+    fi
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        sleep 2
+        start
+        ;;
+    status)
+        status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+
+exit 0
