@@ -305,6 +305,10 @@ impl PatternRulesMgr {
 
         self.const_file_patterns.push_str("name=self_3,key=/opt/osec/,case_offset=1\n");
         self.const_file_rules.push_str("target=self,pattern=self_3,type=3\n");
+        self.const_file_patterns.push_str("name=self_4,key=/etc/systemd/system/multi-user.target.wants/osec.\n");
+        self.const_file_rules.push_str("target=self,pattern=self_4,type=3\n");
+        self.const_file_patterns.push_str("name=self_5,key=/etc/systemd/system/multi-user.target.wants/agent_manager.\n");
+        self.const_file_rules.push_str("target=self,pattern=self_5,type=3\n");
         self.set_pattern_rules();
     }
 
