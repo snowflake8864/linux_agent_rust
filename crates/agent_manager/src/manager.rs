@@ -349,9 +349,14 @@ async fn uninstall_all() {
     if has_systemctl {
         let _ = Command::new("systemctl").args(["stop", "osec"]).status().await;
         let _ = Command::new("systemctl").args(["disable", "osec"]).status().await;
+        let _ = Command::new("systemctl").args(["disable", "agent_manager"]).status().await;
 
-        if fs::remove_file("/etc/systemd/system/osec.service").is_ok() {
-            log_info!("[agent_manager] 已删除 osec.service");
+        // 清理所有可能路径的 service 文件
+        let service_dirs = ["/usr/lib/systemd/system", "/lib/systemd/system", "/etc/systemd/system"];
+        for dir in &service_dirs {
+            let _ = fs::remove_file(format!("{}/osec.service", dir));
+            let _ = fs::remove_file(format!("{}/agent_manager.service", dir));
+            let _ = fs::remove_file(format!("{}/osec_cli.service", dir));
         }
         let _ = Command::new("systemctl").args(["daemon-reload"]).status().await;
     } else if has_service {
@@ -361,15 +366,11 @@ async fn uninstall_all() {
         let _ = Command::new("pkill").arg("-f").arg("osecmonitor").status().await;
     }
 
-    // 停止 agent_manager 自身服务
-    if has_systemctl {
-        let _ = Command::new("systemctl").args(["disable", "agent_manager"]).status().await;
-        if fs::remove_file("/etc/systemd/system/agent_manager.service").is_ok() {
-            log_info!("[agent_manager] 已删除 agent_manager.service");
+    // 停止 agent_manager 自身服务（非 systemd 环境）
+    if !has_systemctl {
+        if has_service {
+            let _ = fs::remove_file("/etc/init.d/agent_manager");
         }
-        let _ = Command::new("systemctl").args(["daemon-reload"]).status().await;
-    } else if has_service {
-        let _ = fs::remove_file("/etc/init.d/agent_manager");
     }
 
     log_info!("[agent_manager] 检查并卸载 osec_base 模块");
