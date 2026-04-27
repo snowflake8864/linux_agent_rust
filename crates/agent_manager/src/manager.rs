@@ -293,6 +293,17 @@ async fn uninstall_all() {
         log_info!("[agent_manager] 已删除 /etc/init.d/agent_manager");
     }
 
+    // 清理 systemd service 文件（覆盖所有可能的路径）
+    let service_dirs = ["/usr/lib/systemd/system", "/lib/systemd/system", "/etc/systemd/system"];
+    for dir in &service_dirs {
+        let _ = fs::remove_file(format!("{}/osec.service", dir));
+        let _ = fs::remove_file(format!("{}/agent_manager.service", dir));
+        let _ = fs::remove_file(format!("{}/osec_cli.service", dir));
+    }
+    let _ = Command::new("systemctl").args(["disable", "osec"]).status().await;
+    let _ = Command::new("systemctl").args(["disable", "agent_manager"]).status().await;
+    let _ = Command::new("systemctl").arg("daemon-reload").status().await;
+
     // 删除所有 PID 文件（monitor + 业务进程）
     let _ = fs::remove_file("/var/run/osec_monitor.pid");
     let _ = fs::remove_file("/var/run/osec_backend.pid");
