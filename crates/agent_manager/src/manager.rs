@@ -499,8 +499,9 @@ async fn uninstall_all() {
         let _ = Command::new("systemctl").args(["disable", "agent_manager"]).status().await;
         
         // 清理所有路径的 service 文件（包括 agent_manager.service，下次启动会重新安装）
-        cleanup_all_service_files("osec").await;
-        cleanup_all_service_files("agent_manager").await;
+        cleanup_all_service_files("osec.service").await;
+        cleanup_all_service_files("agent_manager.service").await;
+        cleanup_all_service_files("osec_cli.service").await;
         let _ = Command::new("systemctl").arg("daemon-reload").status().await;
         
         // 清理可能存在的旧版 init.d 文件
