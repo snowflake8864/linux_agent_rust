@@ -2229,8 +2229,17 @@ async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
     let token = self.get_token();
     let token_str = token.as_deref();
 
+    // Include agent_ip in the request body so server can identify this agent
+    let agent_ip = rules_jump_mgr::utils::get_local_ips_all().await.unwrap_or_default();
+    let body = if agent_ip.is_empty() {
+        String::new()
+    } else {
+        json!({"agent_ip": agent_ip}).to_string()
+    };
+    log_info!("getIpJump request body: {}", body);
+
     let response = self.net_client
-        .post_data_async(&url, "", Duration::from_secs(10), token_str)
+        .post_data_async(&url, &body, Duration::from_secs(10), token_str)
         .await
         .map_err(|e| e.to_string())?;
 
