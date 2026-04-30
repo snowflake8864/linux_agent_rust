@@ -4,13 +4,48 @@ use tokio::time::{sleep, Duration, timeout};
 use tokio::process::Command;
 use chrono::{Utc, Datelike};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::fs;
 use std::process::Stdio;
 use logging::{log_info, log_error};
+//use netlink::netlink::NlSockInfo;
 
 const MAX_WAIT_SECONDS: u64 = 30;
 const POLL_INTERVAL_MILLIS: u64 = 500;
+
+fn is_systemd_available() -> bool {
+    std::path::Path::new("/run/systemd/system").exists()
+}
+
+fn get_systemd_unit_dir() -> &'static str {
+    if std::path::Path::new("/usr/lib/systemd/system").exists() {
+        "/usr/lib/systemd/system"
+    } else if std::path::Path::new("/lib/systemd/system").exists() {
+        "/lib/systemd/system"
+    } else {
+        "/etc/systemd/system"
+    }
+}
+
+async fn cleanup_all_service_files(service_name: &str) {
+    let dirs = ["/usr/lib/systemd/system", "/lib/systemd/system", "/etc/systemd/system"];
+    for dir in dirs {
+        let path = format!("{}/{}", dir, service_name);
+        if tokio::fs::remove_file(&path).await.is_ok() {
+            log_info!("[agent_manager] 已清理 {}", path);
+        }
+    }
+}
+
+fn cleanup_all_service_files_sync(service_name: &str) {
+    let dirs = ["/usr/lib/systemd/system", "/lib/systemd/system", "/etc/systemd/system"];
+    for dir in dirs {
+        let path = format!("{}/{}", dir, service_name);
+        if fs::remove_file(&path).is_ok() {
+            log_info!("[agent_manager] 已清理 {}", path);
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum AgentCommand {
@@ -106,13 +141,25 @@ async fn write_proc_self() -> Result<(), String> {
         .map_err(|e| format!("写入失败: {}", e))?;
 
     log_info!("[agent_manager] ✅ 已写入: {}", content.trim());
-/*
-    let mut read_buf = String::new();
-    fs::File::open(proc_path)
-        .and_then(|mut f| f.read_to_string(&mut read_buf))
+
+ /*
+     let mut read_buf = String::new();
+     fs::File::open(proc_path)
+         .and_then(|mut f| f.read_to_string(&mut read_buf))
+         .map_err(|e| format!("读取失败: {}", e))?;
+ 
+     log_info!("[agent_manager] 读取结果: {}", read_buf.trim());
+ */
+
+    let output = Command::new("cat")
+        .arg(proc_path)
+        .output()
+        .await
         .map_err(|e| format!("读取失败: {}", e))?;
-    log_info!("[agent_manager] 读取结果: {}", read_buf.trim());
-*/
+    let result = String::from_utf8_lossy(&output.stdout);
+
+    log_info!("[agent_manager] 读取结果: {}", result.trim());
+
     Ok(())
 }
 
@@ -123,54 +170,100 @@ async fn is_process_running(name: &str) -> bool {
         _ => false,
     }
 }
-
+/*
+async fn notify_kernel_network_close() {
+    log_info!("[agent_manager] 创建 netlink socket 并发送 NL_POLICY_NETWORK_CLOSE");
+    match NlSockInfo::create_socket() {
+        Ok(nl_sock) => {
+            if let Err(e) = nl_sock.send_network_close() {
+                log_error!("[agent_manager] 发送 network close 失败: {:?}", e);
+            } else {
+                log_info!("[agent_manager] 已发送 NL_POLICY_NETWORK_CLOSE 给内核");
+            }
+        }
+        Err(e) => {
+            log_error!("[agent_manager] 创建 netlink socket 失败: {:?}", e);
+        }
+    }
+}
+*/
 async fn stop_osec_services() -> Result<(), String> {
     log_info!("[agent_manager] 开始停止并清理 osec 服务...");
 
-    // v1.0: 统一使用 /etc/init.d/ 管理，先停服务（会停monitor和业务进程）
-    let has_service = Command::new("which")
-        .arg("service")
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if has_service {
-        log_info!("[agent_manager] 使用 service 停止 osec");
-        let _ = Command::new("service").args(["osec", "stop"]).status().await;
-    } else if std::path::Path::new("/etc/init.d/osec").exists() {
-        log_info!("[agent_manager] 使用 /etc/init.d/osec 停止");
-        let _ = Command::new("/etc/init.d/osec").arg("stop").status().await;
+    // 注意：不停止 agent_manager 自身，因为升级/更新需要由 MagicArmorAgent 执行
+    // 优先使用 systemd，只要有 systemd 就用它
+    if is_systemd_available() {
+        log_info!("[agent_manager] 使用 systemd 停止 osec 服务");
+        let _ = Command::new("systemctl").args(["stop", "osec"]).status().await;
+        // 不停止 agent_manager，它需要在升级完成后自行退出
+        
+        // 清理可能存在的旧版 init.d 文件
+        let _ = tokio::fs::remove_file("/etc/init.d/osec").await;
+        let _ = tokio::fs::remove_file("/etc/init.d/osecservicecentos").await;
+        let _ = tokio::fs::remove_file("/opt/osec/osec.monitor").await;
+        let _ = tokio::fs::remove_file("/opt/osec/osecmonitor").await;
+        let _ = Command::new("chkconfig").args(["--del", "osec"]).status().await;
+        let _ = Command::new("chkconfig").args(["--del", "osecservicecentos"]).status().await;
     } else {
-        log_info!("[agent_manager] 直接使用 pkill 结束监控脚本");
-        let _ = Command::new("pkill").arg("-TERM").arg("osec_monitor").status().await;
-        sleep(Duration::from_secs(2)).await;
+        // 非 systemd 环境，使用 init.d/monitor
+        log_info!("[agent_manager] 非 systemd 环境，使用 init.d 停止服务");
+        let _ = Command::new("/opt/osec/osec.monitor").arg("stop").status().await;
+        let _ = Command::new("pkill").arg("-9").arg("-f").arg("osecmonitor").status().await;
+        let _ = Command::new("service").args(["osec", "stop"]).status().await;
+        // 不停止 agent_manager，它需要在升级完成后自行退出
+        let _ = tokio::fs::remove_file("/etc/init.d/osecservicecentos").await;
+        let _ = tokio::fs::remove_file("/opt/osec/osecmonitor").await;
     }
 
-    // 等待业务进程退出
+    log_info!("[agent_manager] 步骤3: 等待内核完成处理 (15秒)");
+    for i in 0..15 {
+        sleep(Duration::from_secs(1)).await;
+        if i % 2 == 0 {
+            log_info!("[agent_manager] 已等待 {} 秒...", i + 1);
+        }
+    }
+
+    sleep(Duration::from_millis(500)).await;
+
+    log_info!("[agent_manager] 步骤4: 杀死残留进程");
+    let _ = Command::new("pkill").arg("-9").arg("-f").arg("MagicArmor_0").status().await;
+    let _ = Command::new("killall").arg("-9").arg("MagicArmor_0").status().await;
+    let _ = Command::new("pkill").arg("-9").arg("-f").arg("osecmonitor").status().await;
+    let _ = Command::new("killall").arg("-9").arg("osecmonitor").status().await;
+
+    sleep(Duration::from_millis(500)).await;
+
+    log_info!("[agent_manager] 步骤5: 尝试卸载 osec_base 模块");
+    let rmmod_result = Command::new("rmmod").arg("-f").arg("osec_base").status().await;
+    if rmmod_result.is_err() || !rmmod_result.unwrap().success() {
+        log_info!("[agent_manager] osec_base 卸载失败，跳过");
+    } else {
+        log_info!("[agent_manager] osec_base 卸载成功");
+    }
+
+    let lsmod_check = Command::new("bash").args(["-c", "lsmod | grep osec"]).output().await;
+    log_info!("[agent_manager] lsmod 检查: {:?}", String::from_utf8_lossy(&lsmod_check.unwrap().stdout));
+
     log_info!("[agent_manager] 等待 MagicArmor_0 完全退出 (最多 {} 秒)...", MAX_WAIT_SECONDS);
     let wait_result = timeout(Duration::from_secs(MAX_WAIT_SECONDS), async {
         while is_process_running("MagicArmor_0").await {
             sleep(Duration::from_millis(POLL_INTERVAL_MILLIS)).await;
         }
-    }).await;
+    })
+    .await;
 
     if wait_result.is_err() {
-        log_error!("[agent_manager] 超时: MagicArmor_0 在 {} 秒内未退出，强制结束", MAX_WAIT_SECONDS);
-        let _ = Command::new("pkill").arg("-9").arg("MagicArmor_0").status().await;
+        log_error!("[agent_manager] 超时: MagicArmor_0 在 {} 秒内未退出", MAX_WAIT_SECONDS);
     } else {
         log_info!("[agent_manager] MagicArmor_0 已完全退出");
     }
 
-    // 删除 init 脚本
-    if tokio::fs::remove_file("/etc/init.d/osec").await.is_ok() {
-        log_info!("[agent_manager] 已删除 /etc/init.d/osec");
-    }
-    let _ = Command::new("chkconfig").args(["--del", "osec"]).status().await;
-
-    // 删除所有 PID 文件（monitor + 业务进程）
-    let _ = tokio::fs::remove_file("/var/run/osec_monitor.pid").await;
+    // 删除 PID 文件
     let _ = tokio::fs::remove_file("/var/run/osec_backend.pid").await;
+    let _ = tokio::fs::remove_file("/var/run/osec.pid").await;
+    let _ = tokio::fs::remove_file("/var/run/osec_monitor.pid").await;
+    let _ = tokio::fs::remove_file("/tmp/.osec_cli.pid").await;
+    let _ = tokio::fs::remove_file("/tmp/.osec_cli.sock").await;
 
     log_info!("[agent_manager] 尝试卸载内核模块 osec_base");
     let rmmod_status = Command::new("rmmod").arg("osec_base").status().await;
@@ -205,21 +298,57 @@ async fn stop_osec_services() -> Result<(), String> {
         }
     } else {
         log_error!("[agent_manager] 执行 uname -r 失败，跳过删除 base_osec.ko");
-    }    log_info!("[agent_manager] osec 服务及进程清理完毕");
+    }
+    log_info!("[agent_manager] osec 服务及进程清理完毕");
     Ok(())
 }
 
 async fn run_script_and_cleanup(script_path: PathBuf, cleanup_dir: &str) {
     log_info!("[agent_manager] 开始执行升级脚本: {:?}", script_path);
 
-    match Command::new("/bin/bash")
-        .arg(&script_path)
-        .arg("--upgrade")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-    {
+    let _ = Command::new("chmod").arg("+x").arg(&script_path).status().await;
+
+    // 创建日志文件记录升级输出
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open("/var/log/osec_upgrade.log")
+        .ok();
+
+    let result = if let Some(file) = log_file {
+        let stdout = Stdio::from(file);
+        // 需要再次打开文件用于 stderr
+        let stderr_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open("/var/log/osec_upgrade.log")
+            .ok();
+        let stderr = if let Some(f) = stderr_file {
+            Stdio::from(f)
+        } else {
+            Stdio::inherit()
+        };
+        Command::new("/bin/bash")
+            .arg(&script_path)
+            .arg("--upgrade")
+            .stdout(stdout)
+            .stderr(stderr)
+            .status()
+            .await
+    } else {
+        // 回退到 inherit
+        Command::new("/bin/bash")
+            .arg(&script_path)
+            .arg("--upgrade")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .await
+    };
+
+    match result {
         Ok(status) => {
             if status.success() {
                 log_info!("[agent_manager] 升级脚本执行成功 (exit code 0)");
@@ -230,6 +359,7 @@ async fn run_script_and_cleanup(script_path: PathBuf, cleanup_dir: &str) {
                 }
             } else {
                 log_error!("[agent_manager] 升级脚本执行失败，退出码: {:?}", status.code());
+                log_error!("[agent_manager] 请查看 /var/log/osec_upgrade.log 获取详细错误信息");
             }
         }
         Err(e) => {
@@ -263,52 +393,72 @@ fn find_upgrade_script(dir: &str) -> Option<PathBuf> {
 async fn uninstall_all() {
     log_info!("[agent_manager] 开始执行完整卸载流程...");
 
-    // v1.0: 统一使用 /etc/init.d/ 管理
-    let has_service = Command::new("which")
-        .arg("service")
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    // 停止 osec 服务
-    if has_service {
-        let _ = Command::new("service").args(["osec", "stop"]).status().await;
-    } else if std::path::Path::new("/etc/init.d/osec").exists() {
-        let _ = Command::new("/etc/init.d/osec").arg("stop").status().await;
-    } else {
-        let _ = Command::new("pkill").arg("-TERM").arg("osec_monitor").status().await;
-        sleep(Duration::from_secs(2)).await;
-        let _ = Command::new("pkill").arg("-9").arg("MagicArmor_0").status().await;
-    }
-    if fs::remove_file("/etc/init.d/osec").is_ok() {
-        log_info!("[agent_manager] 已删除 /etc/init.d/osec");
-    }
-    let _ = Command::new("chkconfig").args(["--del", "osec"]).status().await;
-
     // 注意：不停止 agent_manager 自身，卸载完成后会调用 exit(0) 退出
-    // 但需要 chkconfig --del 防止下次开机启动
-    let _ = Command::new("chkconfig").args(["--del", "agent_manager"]).status().await;
-    if fs::remove_file("/etc/init.d/agent_manager").is_ok() {
-        log_info!("[agent_manager] 已删除 /etc/init.d/agent_manager");
+    // 但需要 disable 服务，防止下次开机启动
+    // 优先使用 systemd，只要有 systemd 就用它
+    if is_systemd_available() {
+        log_info!("[agent_manager] 使用 systemd 停止并禁用服务");
+        let _ = Command::new("systemctl").args(["stop", "osec"]).status().await;
+        let _ = Command::new("systemctl").args(["disable", "osec"]).status().await;
+        // 不停止 agent_manager，但需要 disable
+        let _ = Command::new("systemctl").args(["disable", "agent_manager"]).status().await;
+        
+        // 清理所有路径的 service 文件（包括 agent_manager.service，下次启动会重新安装）
+        cleanup_all_service_files("osec.service").await;
+        cleanup_all_service_files("agent_manager.service").await;
+        cleanup_all_service_files("osec_cli.service").await;
+        let _ = Command::new("systemctl").arg("daemon-reload").status().await;
+        
+        // 清理可能存在的旧版 init.d 文件
+        let _ = fs::remove_file("/etc/init.d/osec");
+        let _ = fs::remove_file("/etc/init.d/agent_manager");
+        let _ = fs::remove_file("/etc/init.d/osecservicecentos");
+        let _ = fs::remove_file("/opt/osec/osec.monitor");
+        let _ = fs::remove_file("/opt/osec/agent_manager.monitor");
+        let _ = fs::remove_file("/opt/osec/osecmonitor");
+        let _ = Command::new("chkconfig").args(["--del", "osec"]).status().await;
+        let _ = Command::new("chkconfig").args(["--del", "agent_manager"]).status().await;
+        let _ = Command::new("chkconfig").args(["--del", "osecservicecentos"]).status().await;
+    } else {
+        // 非 systemd 环境，使用 init.d/monitor
+        log_info!("[agent_manager] 非 systemd 环境，使用 init.d 停止服务");
+        let _ = Command::new("/opt/osec/osec.monitor").arg("stop").status().await;
+        let _ = Command::new("service").args(["osec", "stop"]).status().await;
+        let _ = Command::new("pkill").arg("-9").arg("-f").arg("osecmonitor").status().await;
+        // 不停止 agent_manager，但需要 chkconfig --del
+        let _ = Command::new("chkconfig").args(["--del", "agent_manager"]).status().await;
+        
+        // 清理 init.d 文件
+        if fs::remove_file("/etc/init.d/osec").is_ok() {
+            log_info!("[agent_manager] 已删除 /etc/init.d/osec");
+        }
+        if fs::remove_file("/etc/init.d/agent_manager").is_ok() {
+            log_info!("[agent_manager] 已删除 /etc/init.d/agent_manager");
+        }
+        if fs::remove_file("/etc/init.d/osecservicecentos").is_ok() {
+            log_info!("[agent_manager] 已删除 /etc/init.d/osecservicecentos");
+        }
+        if fs::remove_file("/opt/osec/osec.monitor").is_ok() {
+            log_info!("[agent_manager] 已删除 /opt/osec/osec.monitor");
+        }
+        if fs::remove_file("/opt/osec/agent_manager.monitor").is_ok() {
+            log_info!("[agent_manager] 已删除 /opt/osec/agent_manager.monitor");
+        }
+        if fs::remove_file("/opt/osec/osecmonitor").is_ok() {
+            log_info!("[agent_manager] 已删除 /opt/osec/osecmonitor");
+        }
+        let _ = Command::new("chkconfig").args(["--del", "osec"]).status().await;
+        let _ = Command::new("chkconfig").args(["--del", "agent_manager"]).status().await;
+        let _ = Command::new("chkconfig").args(["--del", "osecservicecentos"]).status().await;
     }
 
-    // 清理 systemd service 文件（覆盖所有可能的路径）
-    let service_dirs = ["/usr/lib/systemd/system", "/lib/systemd/system", "/etc/systemd/system"];
-    for dir in &service_dirs {
-        let _ = fs::remove_file(format!("{}/osec.service", dir));
-        let _ = fs::remove_file(format!("{}/agent_manager.service", dir));
-        let _ = fs::remove_file(format!("{}/osec_cli.service", dir));
-    }
-    let _ = Command::new("systemctl").args(["disable", "osec"]).status().await;
-    let _ = Command::new("systemctl").args(["disable", "agent_manager"]).status().await;
-    let _ = Command::new("systemctl").arg("daemon-reload").status().await;
-
-    // 删除所有 PID 文件（monitor + 业务进程）
-    let _ = fs::remove_file("/var/run/osec_monitor.pid");
+    // 删除 PID 文件
     let _ = fs::remove_file("/var/run/osec_backend.pid");
-    let _ = fs::remove_file("/var/run/agent_manager_monitor.pid");
     let _ = fs::remove_file("/var/run/agent_manager.pid");
+    let _ = fs::remove_file("/var/run/osec.pid");
+    let _ = fs::remove_file("/var/run/agent_manager.pid");
+    let _ = fs::remove_file("/var/run/osec_monitor.pid");
+    let _ = fs::remove_file("/var/run/agent_manager_monitor.pid");
 
     log_info!("[agent_manager] 检查并卸载 osec_base 模块");
     let modinfo = Command::new("modinfo").arg("osec_base").output().await;
