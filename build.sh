@@ -312,72 +312,81 @@ rm -rf "\$INSTALL_DIR/x86_64-unknown-linux-musl" \
 
 # --- Deploy services (systemd preferred, fallback to init.d + monitor) ---
     echo "Setting up services..."
-    
-    # 检测 systemd 是否可用
-    if [ -d /run/systemd/system ]; then
-        # 使用 systemd
-        echo "Using systemd..."
-        UNIT_DIR=""
-        for d in /usr/lib/systemd/system /lib/systemd/system /etc/systemd/system; do
-            if [ -d "\$d" ]; then
+# 检测 systemd 是否可用
+if [ -d /run/systemd/system ]; then
+    # 使用 systemd
+    echo "Using systemd..."
+    UNIT_DIR=""
+    # 按优先级遍历，但只选择可写的目录
+    for d in /usr/lib/systemd/system /lib/systemd/system /etc/systemd/system; do
+        if [ -d "\$d" ]; then
+            # 尝试创建临时文件以测试可写性
+            if touch "\$d/.systemd_writable_test" 2>/dev/null; then
+                rm -f "\$d/.systemd_writable_test"
                 UNIT_DIR="\$d"
+                echo "Selected writable unit directory: \$d"
                 break
+            else
+                echo "Directory \$d exists but is read-only, skipping..."
             fi
-        done
-        
-        if [ -n "\$UNIT_DIR" ]; then
-            [ -f "\$INSTALL_DIR/osec.service" ] && cp -f "\$INSTALL_DIR/osec.service" "\$UNIT_DIR/" && chmod 644 "\$UNIT_DIR/osec.service"
-            [ -f "\$INSTALL_DIR/agent_manager.service" ] && cp -f "\$INSTALL_DIR/agent_manager.service" "\$UNIT_DIR/" && chmod 644 "\$UNIT_DIR/agent_manager.service"
-            systemctl daemon-reload 2>/dev/null || true
         fi
-        
-        if [[ "\$MODE" == "install" ]]; then
-            # enable 服务
-            if [ -f "\$UNIT_DIR/osec.service" ]; then
-                systemctl enable osec 2>/dev/null || true
-            else
-                echo "ERROR: osec.service not found in \$UNIT_DIR"
-                exit 1
-            fi
-            if [ -f "\$UNIT_DIR/agent_manager.service" ]; then
-                systemctl enable agent_manager 2>/dev/null || true
-            else
-                echo "ERROR: agent_manager.service not found in \$UNIT_DIR"
-                exit 1
-            fi
-            
-            # 启动服务并检查结果
-            echo "Starting osec service..."
-            if systemctl start osec; then
-                echo "osec service started."
-            else
-                echo "ERROR: osec service failed to start!"
-                systemctl status osec --no-pager || true
-                exit 1
-            fi
-            
-            echo "Starting agent_manager service..."
-            if systemctl start agent_manager; then
-                echo "agent_manager service started."
-            else
-                echo "ERROR: agent_manager service failed to start!"
-                systemctl status agent_manager --no-pager || true
-                exit 1
-            fi
-            
-            # systemd 环境不需要 monitor/init 脚本，删除
-            rm -f "\$INSTALL_DIR/osec.monitor" 2>/dev/null || true
-            rm -f "\$INSTALL_DIR/agent_manager.monitor" 2>/dev/null || true
-            rm -f "\$INSTALL_DIR/osec.init" 2>/dev/null || true
-            rm -f "\$INSTALL_DIR/agent_manager.init" 2>/dev/null || true
-            
-            echo "osec and agent_manager services started successfully (systemd)."
+    done
+
+    if [ -z "\$UNIT_DIR" ]; then
+        echo "ERROR: No writable systemd unit directory found in searched paths." >&2
+        exit 1
+    fi
+
+    # 复制 service 文件
+    [ -f "\$INSTALL_DIR/osec.service" ] && cp -f "\$INSTALL_DIR/osec.service" "\$UNIT_DIR/" && chmod 644 "\$UNIT_DIR/osec.service"
+    [ -f "\$INSTALL_DIR/agent_manager.service" ] && cp -f "\$INSTALL_DIR/agent_manager.service" "\$UNIT_DIR/" && chmod 644 "\$UNIT_DIR/agent_manager.service"
+    systemctl daemon-reload 2>/dev/null || true
+
+    if [[ "\$MODE" == "install" ]]; then
+        # enable 服务
+        if [ -f "\$UNIT_DIR/osec.service" ]; then
+            systemctl enable osec 2>/dev/null || true
         else
-            # 升级模式：重启 osec，确保 agent_manager 也运行
-            [ -f "\$UNIT_DIR/osec.service" ] && systemctl restart osec 2>/dev/null || true
-            [ -f "\$UNIT_DIR/agent_manager.service" ] && systemctl restart agent_manager 2>/dev/null || true
-            echo "osec and agent_manager services restarted successfully (systemd)."
+            echo "ERROR: osec.service not found in \$UNIT_DIR"
+            exit 1
         fi
+        if [ -f "\$UNIT_DIR/agent_manager.service" ]; then
+            systemctl enable agent_manager 2>/dev/null || true
+        else
+            echo "ERROR: agent_manager.service not found in \$UNIT_DIR"
+            exit 1
+        fi
+
+        # 启动服务并检查结果
+        echo "Starting osec service..."
+        if systemctl start osec; then
+            echo "osec service started."
+        else
+            echo "ERROR: osec service failed to start!"
+            systemctl status osec --no-pager || true
+            exit 1
+        fi
+
+        echo "Starting agent_manager service..."
+        if systemctl start agent_manager; then
+            echo "agent_manager service started."
+        else
+            echo "ERROR: agent_manager service failed to start!"
+            systemctl status agent_manager --no-pager || true
+            exit 1
+        fi
+
+        # systemd 环境不需要 monitor/init 脚本，删除
+        rm -f "\$INSTALL_DIR/osec.monitor" "\$INSTALL_DIR/agent_manager.monitor" \
+              "\$INSTALL_DIR/osec.init" "\$INSTALL_DIR/agent_manager.init" 2>/dev/null || true
+
+        echo "osec and agent_manager services started successfully (systemd)."
+    else
+        # 升级模式：重启 osec 和 agent_manager
+        [ -f "\$UNIT_DIR/osec.service" ] && systemctl restart osec 2>/dev/null || true
+        [ -f "\$UNIT_DIR/agent_manager.service" ] && systemctl restart agent_manager 2>/dev/null || true
+        echo "osec and agent_manager services restarted successfully (systemd)."
+    fi
     else
         # 使用 init.d + monitor 脚本
         echo "Using init.d + monitor..."
