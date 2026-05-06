@@ -1,0 +1,129 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          agent_manager_monitor
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Agent Manager Monitor Script
+# Description:       Monitor and auto-restart Agent Manager Service
+### END INIT INFO
+
+NAME=agent_manager_monitor
+# 主进程的 PID 文件（由 MagicArmorAgent 代码写入）
+MAIN_PID_FILE=/var/run/agent_manager.pid
+# monitor 自身的 PID 文件（用于 stop/restart）
+MONITOR_PID_FILE=/var/run/agent_manager_monitor.pid
+BINARY=/opt/osec/MagicArmorAgent
+CHECK_INTERVAL=5
+
+start() {
+    # 检查 monitor 是否已在运行
+    if [ -f "$MONITOR_PID_FILE" ]; then
+        OLD_PID=$(cat $MONITOR_PID_FILE 2>/dev/null)
+        if [ -n "$OLD_PID" ] && [ -d "/proc/$OLD_PID" ]; then
+            echo "$NAME is already running (PID: $OLD_PID)"
+            return 0
+        else
+            rm -f $MONITOR_PID_FILE
+        fi
+    fi
+
+    # 启动监控循环（使用主进程的 PID 文件检查）
+    nohup bash -c "
+        while true; do
+            if [ -f \"$MAIN_PID_FILE\" ]; then
+                PID=\$(cat \"$MAIN_PID_FILE\" 2>/dev/null)
+                if [ -z \"\$PID\" ] || [ ! -d \"/proc/\$PID\" ]; then
+                    $BINARY >/dev/null 2>&1 &
+                fi
+            else
+                $BINARY >/dev/null 2>&1 &
+            fi
+            sleep $CHECK_INTERVAL
+        done
+    " >/dev/null 2>&1 &
+
+    echo $! > $MONITOR_PID_FILE
+    echo "$NAME started (monitor PID: $(cat $MONITOR_PID_FILE))"
+}
+
+stop() {
+    # 先杀主进程（通过 PID 文件）
+    if [ -f "$MAIN_PID_FILE" ]; then
+        PID=$(cat $MAIN_PID_FILE 2>/dev/null)
+        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+            kill -15 $PID 2>/dev/null
+            sleep 1
+            kill -9 $PID 2>/dev/null || true
+        fi
+        rm -f $MAIN_PID_FILE
+    fi
+    
+    # 兜底：杀掉所有 MagicArmorAgent 进程
+    pkill -15 -f "MagicArmorAgent" 2>/dev/null || true
+    sleep 1
+    pkill -9 -f "MagicArmorAgent" 2>/dev/null || true
+    
+    # 再杀 monitor 进程
+    if [ -f "$MONITOR_PID_FILE" ]; then
+        PID=$(cat $MONITOR_PID_FILE 2>/dev/null)
+        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+            kill -15 $PID 2>/dev/null
+            sleep 1
+            kill -9 $PID 2>/dev/null || true
+        fi
+        rm -f $MONITOR_PID_FILE
+    fi
+    
+    echo "$NAME stopped"
+}
+
+status() {
+    # 检查主进程状态
+    if [ -f "$MAIN_PID_FILE" ]; then
+        PID=$(cat $MAIN_PID_FILE 2>/dev/null)
+        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+            echo "MagicArmorAgent is running (PID: $PID)"
+        else
+            echo "MagicArmorAgent is not running (stale PID file)"
+        fi
+    else
+        echo "MagicArmorAgent is not running (no PID file)"
+    fi
+    
+    # 检查 monitor 状态
+    if [ -f "$MONITOR_PID_FILE" ]; then
+        PID=$(cat $MONITOR_PID_FILE 2>/dev/null)
+        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+            echo "$NAME is running (monitor PID: $PID)"
+        else
+            echo "$NAME is not running (stale PID file)"
+        fi
+    else
+        echo "$NAME is not running (no PID file)"
+    fi
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        sleep 2
+        start
+        ;;
+    status)
+        status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+
+exit 0
