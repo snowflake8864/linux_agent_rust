@@ -19,6 +19,12 @@ use std::path::Path;
 
 const PID_FILE: &str = "/var/run/osec_backend.pid";
 
+fn is_rocky_linux() -> bool {
+    std::fs::read_to_string("/etc/os-release")
+        .map(|content| content.to_lowercase().contains("rocky"))
+        .unwrap_or(false)
+}
+
 fn pid_is_running(pid: u32) -> bool {
     Path::new(&format!("/proc/{}", pid)).exists()
 }
@@ -63,11 +69,13 @@ async fn main() -> std::io::Result<()> {
     }
     log_info!("程序开始启动");
 
-    // 确保内核不被升级
-    ensure_kernel_hold();
+    if !is_rocky_linux() {
+        // 确保内核不被升级
+        ensure_kernel_hold();
 
-    // 卸载现有内核驱动
-    let _ = unload_driver().ok();
+        // 卸载现有内核驱动
+        let _ = unload_driver().ok();
+    }
 
     // 初始化 BootManager
     let init = BootManager::init().await;
@@ -77,17 +85,21 @@ async fn main() -> std::io::Result<()> {
     let (token_tx, token_rx) = mpsc::channel::<String>(8);
     let (host_is_offline_tx, host_is_offline_rx) = mpsc::channel::<bool>(8);
 
-    // 加载内核驱动并更新 mod_ver
-    {
-        let mut cfg = NETINFO_CONFIG.lock().unwrap();
-        let mut init = init.clone();
-        let mod_ver = init.load_kernel_driver().await.unwrap_or_else(|e| {
-            logging::log_error!("驱动加载失败: {}", e);
-            String::new()
-        });
-        cfg.mod_ver = mod_ver;
-        log_info!("load kernel driver: {}", cfg.mod_ver);
-        let _ = cfg.to_ini(&format!("{}/net_info.ini", cfg.app_path));
+    if !is_rocky_linux() {
+        // 加载内核驱动并更新 mod_ver
+        {
+            let mut cfg = NETINFO_CONFIG.lock().unwrap();
+            let mut init = init.clone();
+            let mod_ver = init.load_kernel_driver().await.unwrap_or_else(|e| {
+                logging::log_error!("驱动加载失败: {}", e);
+                String::new()
+            });
+            cfg.mod_ver = mod_ver;
+            log_info!("load kernel driver: {}", cfg.mod_ver);
+            let _ = cfg.to_ini(&format!("{}/net_info.ini", cfg.app_path));
+        }
+    } else {
+        log_info!("Rocky Linux detected, skipping kernel driver loading");
     }
 
     // 检查是否为离线模式
@@ -249,10 +261,12 @@ async fn main() -> std::io::Result<()> {
     log_info!("程序退出，执行清理...");
 
     // 卸载驱动
-    if let Err(e) = unload_driver() {
-        log_error!("卸载驱动失败: {}", e);
-    } else {
-        log_info!("驱动卸载成功");
+    if !is_rocky_linux() {
+        if let Err(e) = unload_driver() {
+            log_error!("卸载驱动失败: {}", e);
+        } else {
+            log_info!("驱动卸载成功");
+        }
     }
 
     // 可选：等待一小段时间让日志 flush（如果日志是异步的）
