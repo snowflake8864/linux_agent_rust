@@ -274,8 +274,8 @@ async fn main() -> std::io::Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     log_info!("程序已安全退出");
-
-    Ok(())
+     std::process::exit(0);
+    //Ok(())
 
 }
 
