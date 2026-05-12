@@ -1,0 +1,14 @@
+[Unit]
+Description=Security Evaluator Service - Guardian Audit
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/osec/security-evaluator
+Restart=always
+RestartSec=5
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

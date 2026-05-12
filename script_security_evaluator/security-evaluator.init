@@ -1,0 +1,103 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          security-evaluator
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Security Evaluator Service
+# Description:       Guardian Audit Security Evaluator
+# chkconfig: 2345 85 15
+### END INIT INFO
+
+NAME=security-evaluator
+PID_FILE=/var/run/security-evaluator.pid
+BINARY=/opt/osec/security-evaluator
+MONITOR_SCRIPT=/opt/osec/security-evaluator.monitor
+
+start() {
+    if [ -f "$PID_FILE" ]; then
+        OLD_PID=$(cat $PID_FILE 2>/dev/null)
+        if [ -n "$OLD_PID" ] && [ -d "/proc/$OLD_PID" ]; then
+            echo "$NAME is already running (PID: $OLD_PID)"
+            return 0
+        else
+            rm -f $PID_FILE
+        fi
+    fi
+
+    if [ ! -x "$BINARY" ]; then
+        echo "Binary not found: $BINARY"
+        return 1
+    fi
+
+    mkdir -p /opt/osec/log
+
+    echo "Starting $NAME..."
+    nohup $BINARY > /dev/null 2>&1 &
+    sleep 2
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat $PID_FILE)
+        echo "$NAME started (PID: $PID)"
+    else
+        echo "$NAME start failed"
+        return 1
+    fi
+}
+
+stop() {
+    echo "Stopping $NAME..."
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat $PID_FILE 2>/dev/null)
+        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+            kill -15 $PID 2>/dev/null
+            sleep 2
+            if [ -d "/proc/$PID" ]; then
+                kill -9 $PID 2>/dev/null || true
+            fi
+            echo "$NAME stopped"
+        else
+            echo "$NAME is not running"
+        fi
+        rm -f $PID_FILE
+    else
+        pkill -15 -f "security-evaluator" 2>/dev/null || true
+        sleep 1
+        pkill -9 -f "security-evaluator" 2>/dev/null || true
+        echo "$NAME stopped (by process name)"
+    fi
+}
+
+restart() { stop; sleep 1; start; }
+
+status() {
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat $PID_FILE 2>/dev/null)
+        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+            echo "$NAME is running (PID: $PID)"
+            return 0
+        else
+            echo "$NAME is not running (stale PID file)"
+            rm -f $PID_FILE
+            return 1
+        fi
+    else
+        PID=$(pgrep -f "security-evaluator" 2>/dev/null | head -1)
+        if [ -n "$PID" ]; then
+            echo "$NAME is running (PID: $PID, no PID file)"
+            return 0
+        else
+            echo "$NAME is not running"
+            return 1
+        fi
+    fi
+}
+
+case "$1" in
+    start) start ;;
+    stop) stop ;;
+    restart) restart ;;
+    status) status ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
+exit 0

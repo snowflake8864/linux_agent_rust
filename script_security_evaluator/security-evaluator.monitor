@@ -1,0 +1,112 @@
+#!/bin/bash
+
+BINARY=/opt/osec/security-evaluator
+PID_FILE=/var/run/security-evaluator.pid
+MONITOR_PID_FILE=/var/run/security-evaluator-monitor.pid
+LOG_FILE=/opt/osec/log/security-evaluator-monitor.log
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+start() {
+    # 检查监控进程是否已经在运行
+    if [ -f "$MONITOR_PID_FILE" ]; then
+        OLD_MONITOR_PID=$(cat "$MONITOR_PID_FILE" 2>/dev/null)
+        if [ -n "$OLD_MONITOR_PID" ] && [ -d "/proc/$OLD_MONITOR_PID" ]; then
+            log "monitor 已在运行 (PID: $OLD_MONITOR_PID)"
+            return 0
+        else
+            rm -f "$MONITOR_PID_FILE"
+        fi
+    fi
+
+    # Create log directory
+    mkdir -p /opt/osec/log
+
+    # Start monitor loop in background
+    nohup bash -c '
+        while true; do
+            # 检查主进程是否在运行（同时检查 PID 文件和 /proc）
+            NEED_START=false
+            if [ -f /var/run/security-evaluator.pid ]; then
+                MAIN_PID=$(cat /var/run/security-evaluator.pid 2>/dev/null)
+                if [ -n "$MAIN_PID" ] && [ -d "/proc/$MAIN_PID" ]; then
+                    # 进程正常运行，不需要拉起
+                    :
+                else
+                    # PID 文件存在但进程不在了，清理残留
+                    rm -f /var/run/security-evaluator.pid 2>/dev/null
+                    NEED_START=true
+                fi
+            else
+                NEED_START=true
+            fi
+
+            if [ "$NEED_START" = true ]; then
+                echo "[$(date)] 主进程未运行，启动 security-evaluator..." >> '"$LOG_FILE"'
+                /opt/osec/security-evaluator >> '"$LOG_FILE"' 2>&1 &
+                sleep 2
+            fi
+            sleep 5
+        done
+    ' > /dev/null 2>&1 &
+
+    MONITOR_PID=$!
+    echo $MONITOR_PID > "$MONITOR_PID_FILE"
+    log "Monitor 已启动 (PID: $MONITOR_PID)"
+}
+
+stop() {
+    # 先停止监控进程（包括其子 shell）
+    if [ -f "$MONITOR_PID_FILE" ]; then
+        MONITOR_PID=$(cat "$MONITOR_PID_FILE" 2>/dev/null)
+        if [ -n "$MONITOR_PID" ] && [ -d "/proc/$MONITOR_PID" ]; then
+            kill -TERM -$MONITOR_PID 2>/dev/null || true
+            sleep 1
+            kill -9 -$MONITOR_PID 2>/dev/null || true
+            kill -9 $MONITOR_PID 2>/dev/null || true
+            rm -f "$MONITOR_PID_FILE"
+            log "Monitor 已停止 (PID: $MONITOR_PID)"
+        else
+            rm -f "$MONITOR_PID_FILE"
+        fi
+    fi
+
+    # 杀掉残留的 monitor bash 子进程
+    pkill -9 -f "security-evaluator.monitor" 2>/dev/null || true
+
+    # 停止主进程
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+            kill -15 $PID 2>/dev/null
+            sleep 2
+            if [ -d "/proc/$PID" ]; then
+                kill -9 $PID 2>/dev/null || true
+            fi
+            log "security-evaluator 已停止 (PID: $PID)"
+        fi
+        rm -f "$PID_FILE"
+    fi
+
+    # 兜底：按进程名查找
+    pkill -15 -f "security-evaluator" 2>/dev/null || true
+    sleep 1
+    pkill -9 -f "security-evaluator" 2>/dev/null || true
+
+    log "security-evaluator 及相关进程已清理"
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac

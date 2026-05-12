@@ -24,6 +24,7 @@ members = [
      "crates/snapman",
      "crates/rules_jump_mgr",
      "crates/agent_manager",
+    "crates/guardian_audit",
 ]
 
 [profile.dev]
