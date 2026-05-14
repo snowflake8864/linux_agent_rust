@@ -1,0 +1,13 @@
+[package]
+name = "ip_jump_controller_egui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.30"
+egui = "0.30"
+egui_extras = "0.30"
+tiny_http = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
