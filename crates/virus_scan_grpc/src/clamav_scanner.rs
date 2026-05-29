@@ -2,8 +2,6 @@
 use logging::{log_error, log_info};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 #[derive(Debug, Clone)]
@@ -43,36 +41,48 @@ impl ClamAVConnectionPool {
     }
 
     pub async fn scan_file(&self, path: &str) -> Result<ScanResult, String> {
-        let permits = self.semaphore.available_permits();
-        //log_info!("ClamAV: 获取连接，并发数={}, 路径={}", self.pool_size - permits, path);
-        let _permit = self.semaphore.acquire().await.map_err(|e| format!("Semaphore error: {}", e))?;
-        
-        let path_owned = path.to_string();
-        let connection_info = self.connection_info.clone();
         let timeout_duration = self.timeout;
 
-        let response = async move {
+        let _permit = timeout(timeout_duration, self.semaphore.acquire())
+            .await
+            .map_err(|_| "ClamAV: 获取扫描槽位超时".to_string())?
+            .map_err(|e| format!("Semaphore error: {}", e))?;
+
+        let path_owned = path.to_string();
+        let connection_info = self.connection_info.clone();
+
+        let response = timeout(timeout_duration, async move {
             match &connection_info {
                 ClamAVConnection::Tcp { host, port } => {
                     let addr = format!("{}:{}", host, port);
-                    let mut stream = timeout(timeout_duration, TcpStream::connect(&addr)).await
+                    let mut stream = timeout(timeout_duration, tokio::net::TcpStream::connect(&addr)).await
                         .map_err(|_| "TCP connect timeout")?
                         .map_err(|e| format!("TCP connect failed: {}", e))?;
-                    
-                    stream.write_all(b"zINSTREAM\0").await.map_err(|e| format!("Write failed: {}", e))?;
-                    
+
+                    timeout(timeout_duration, stream.write_all(b"zINSTREAM\0")).await
+                        .map_err(|_| "Write command timeout")?
+                        .map_err(|e| format!("Write failed: {}", e))?;
+
                     let file_data = timeout(timeout_duration, tokio::fs::read(&path_owned)).await
                         .map_err(|_| "File read timeout")?
                         .map_err(|e| format!("Cannot read file {}: {}", path_owned, e))?;
-                    
+
                     for chunk in file_data.chunks(4096) {
                         let len = (chunk.len() as u32).to_be_bytes();
-                        stream.write_all(&len).await.map_err(|e| format!("Write len failed: {}", e))?;
-                        stream.write_all(chunk).await.map_err(|e| format!("Write data failed: {}", e))?;
+                        timeout(timeout_duration, stream.write_all(&len)).await
+                            .map_err(|_| "Write chunk len timeout")?
+                            .map_err(|e| format!("Write len failed: {}", e))?;
+                        timeout(timeout_duration, stream.write_all(chunk)).await
+                            .map_err(|_| "Write chunk data timeout")?
+                            .map_err(|e| format!("Write data failed: {}", e))?;
                     }
-                    stream.write_all(&0u32.to_be_bytes()).await.map_err(|e| format!("Write end failed: {}", e))?;
-                    stream.flush().await.map_err(|e| format!("Flush failed: {}", e))?;
-                    
+                    timeout(timeout_duration, stream.write_all(&0u32.to_be_bytes())).await
+                        .map_err(|_| "Write end marker timeout")?
+                        .map_err(|e| format!("Write end failed: {}", e))?;
+                    timeout(timeout_duration, stream.flush()).await
+                        .map_err(|_| "Flush timeout")?
+                        .map_err(|e| format!("Flush failed: {}", e))?;
+
                     let mut response = String::new();
                     timeout(timeout_duration, stream.read_to_string(&mut response)).await
                         .map_err(|_| "Read timeout")?
@@ -84,21 +94,31 @@ impl ClamAVConnectionPool {
                     let mut stream = timeout(timeout_duration, UnixStream::connect(socket_path)).await
                         .map_err(|_| "Unix connect timeout")?
                         .map_err(|e| format!("Unix socket connect failed: {}", e))?;
-                    
-                    stream.write_all(b"zINSTREAM\0").await.map_err(|e| format!("Write failed: {}", e))?;
-                    
+
+                    timeout(timeout_duration, stream.write_all(b"zINSTREAM\0")).await
+                        .map_err(|_| "Write command timeout")?
+                        .map_err(|e| format!("Write failed: {}", e))?;
+
                     let file_data = timeout(timeout_duration, tokio::fs::read(&path_owned)).await
                         .map_err(|_| "File read timeout")?
                         .map_err(|e| format!("Cannot read file {}: {}", path_owned, e))?;
-                    
+
                     for chunk in file_data.chunks(4096) {
                         let len = (chunk.len() as u32).to_be_bytes();
-                        stream.write_all(&len).await.map_err(|e| format!("Write len failed: {}", e))?;
-                        stream.write_all(chunk).await.map_err(|e| format!("Write data failed: {}", e))?;
+                        timeout(timeout_duration, stream.write_all(&len)).await
+                            .map_err(|_| "Write chunk len timeout")?
+                            .map_err(|e| format!("Write len failed: {}", e))?;
+                        timeout(timeout_duration, stream.write_all(chunk)).await
+                            .map_err(|_| "Write chunk data timeout")?
+                            .map_err(|e| format!("Write data failed: {}", e))?;
                     }
-                    stream.write_all(&0u32.to_be_bytes()).await.map_err(|e| format!("Write end failed: {}", e))?;
-                    stream.flush().await.map_err(|e| format!("Flush failed: {}", e))?;
-                    
+                    timeout(timeout_duration, stream.write_all(&0u32.to_be_bytes())).await
+                        .map_err(|_| "Write end marker timeout")?
+                        .map_err(|e| format!("Write end failed: {}", e))?;
+                    timeout(timeout_duration, stream.flush()).await
+                        .map_err(|_| "Flush timeout")?
+                        .map_err(|e| format!("Flush failed: {}", e))?;
+
                     let mut response = String::new();
                     timeout(timeout_duration, stream.read_to_string(&mut response)).await
                         .map_err(|_| "Read timeout")?
@@ -106,13 +126,10 @@ impl ClamAVConnectionPool {
                     Ok(response)
                 }
             }
-        }.await;
-
-        let permits = self.semaphore.available_permits();
-        //log_info!("ClamAV: 释放连接，并发数={}", self.pool_size - permits);
+        }).await;
 
         match response {
-            Ok(resp) => {
+            Ok(Ok(resp)) => {
                 if resp.contains("FOUND") {
                     let virus_name = resp
                         .split("FOUND")
@@ -132,7 +149,8 @@ impl ClamAVConnectionPool {
                     Ok(ScanResult::Error { message: resp })
                 }
             }
-            Err(e) => Ok(ScanResult::Error { message: e }),
+            Ok(Err(e)) => Ok(ScanResult::Error { message: e }),
+            Err(_) => Ok(ScanResult::Error { message: "ClamAV: 扫描超时".to_string() }),
         }
     }
 
@@ -144,7 +162,7 @@ impl ClamAVConnectionPool {
             match &connection_info {
                 ClamAVConnection::Tcp { host, port } => {
                     let addr = format!("{}:{}", host, port);
-                    let mut stream = timeout(timeout_duration, TcpStream::connect(&addr)).await
+                    let mut stream = timeout(timeout_duration, tokio::net::TcpStream::connect(&addr)).await
                         .map_err(|_| "TCP connect timeout")?
                         .map_err(|e| format!("TCP connect failed: {}", e))?;
                     stream.write_all(b"PING\n").await.map_err(|e| format!("Write failed: {}", e))?;

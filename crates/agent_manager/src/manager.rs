@@ -38,11 +38,15 @@ pub async fn run_agent_manager(mut cmd_rx: Receiver<AgentCommand>) {
                 }
 
                 tokio::spawn(async {
-                    if let Some(script_path) = find_upgrade_script("/tmp/osec_update") {
-                        log_info!("[agent_manager] 找到升级脚本: {:?}", script_path);
-                        run_script_and_cleanup(script_path, "/tmp/osec_update").await;
+                    let scripts = find_upgrade_scripts("/tmp/osec_update");
+                    if scripts.is_empty() {
+                        log_error!("[agent_manager] 未找到升级脚本 (osec-installer*.sh / ccw-installer-*.sh)");
                     } else {
-                        log_error!("[agent_manager] 未找到升级脚本 (osec-installer*.sh)");
+                        log_info!("[agent_manager] 找到 {} 个升级脚本", scripts.len());
+                        for s in &scripts {
+                            log_info!("[agent_manager]   - {:?}", s.file_name());
+                        }
+                        run_scripts_and_cleanup(scripts, "/tmp/osec_update").await;
                     }
                 });
             }
@@ -277,55 +281,90 @@ async fn stop_osec_services() -> Result<(), String> {
     Ok(())
 }
 
-async fn run_script_and_cleanup(script_path: PathBuf, cleanup_dir: &str) {
-    log_info!("[agent_manager] 开始执行升级脚本: {:?}", script_path);
+async fn run_scripts_and_cleanup(script_paths: Vec<PathBuf>, cleanup_dir: &str) {
+    for script_path in &script_paths {
+        log_info!("[agent_manager] 开始执行升级脚本: {:?}", script_path);
 
-    match Command::new("/bin/bash")
-        .arg(&script_path)
-        .arg("--upgrade")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-    {
-        Ok(status) => {
-            if status.success() {
-                log_info!("[agent_manager] 升级脚本执行成功 (exit code 0)");
-                if fs::remove_dir_all(cleanup_dir).is_ok() {
-                    log_info!("[agent_manager] 已清理临时目录: {}", cleanup_dir);
+        match Command::new("/bin/bash")
+            .arg(script_path)
+            .arg("--upgrade")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .await
+        {
+            Ok(status) => {
+                if status.success() {
+                    log_info!("[agent_manager] 升级脚本执行成功 (exit code 0)");
                 } else {
-                    log_error!("[agent_manager] 清理临时目录失败: {}", cleanup_dir);
+                    log_error!(
+                        "[agent_manager] 升级脚本执行失败 {:?}，退出码: {:?}",
+                        script_path.file_name(),
+                        status.code()
+                    );
                 }
-            } else {
-                log_error!("[agent_manager] 升级脚本执行失败，退出码: {:?}", status.code());
+            }
+            Err(e) => {
+                log_error!("[agent_manager] 启动升级脚本失败 {:?}: {}", script_path.file_name(), e);
             }
         }
-        Err(e) => {
-            log_error!("[agent_manager] 启动升级脚本失败: {}", e);
-        }
+    }
+
+    if fs::remove_dir_all(cleanup_dir).is_ok() {
+        log_info!("[agent_manager] 已清理临时目录: {}", cleanup_dir);
+    } else {
+        log_error!("[agent_manager] 清理临时目录失败: {}", cleanup_dir);
     }
 }
 
-fn find_upgrade_script(dir: &str) -> Option<PathBuf> {
-    match fs::read_dir(dir) {
+fn find_upgrade_scripts(dir: &str) -> Vec<PathBuf> {
+    let ccw_prefix = if cfg!(target_arch = "x86_64") {
+        "ccw-installer-x86_64-"
+    } else if cfg!(target_arch = "aarch64") {
+        "ccw-installer-aarch64-"
+    } else {
+        "ccw-installer-"
+    };
+
+    let mut scripts = match fs::read_dir(dir) {
         Ok(entries) => {
+            let mut result: Vec<PathBuf> = Vec::new();
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with("osec-installer") && name.ends_with(".sh") {
-                        log_info!("[agent_manager] 找到升级脚本: {:?}", path);
-                        return Some(path);
+                    if (name.starts_with("osec-installer") || name.starts_with(ccw_prefix))
+                        && name.ends_with(".sh")
+                    {
+                        result.push(path);
                     }
                 }
             }
-            log_info!("[agent_manager] 在 {} 中未找到 osec-upgrade*.sh 脚本", dir);
-            None
+            result
         }
         Err(e) => {
             log_error!("[agent_manager] 读取升级目录 {} 失败: {}", dir, e);
-            None
+            return Vec::new();
         }
+    };
+
+    // 排序：ccw-installer 先执行，osec-installer 后执行
+    scripts.sort_by(|a, b| {
+        let a_name = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let b_name = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let a_is_ccw = a_name.starts_with("ccw-");
+        let b_is_ccw = b_name.starts_with("ccw-");
+        match (a_is_ccw, b_is_ccw) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a_name.cmp(b_name),
+        }
+    });
+
+    if scripts.is_empty() {
+        log_info!("[agent_manager] 在 {} 中未找到升级脚本 (osec-installer*.sh / ccw-installer-*.sh)", dir);
     }
+
+    scripts
 }
 
 async fn uninstall_all() {
@@ -345,14 +384,14 @@ async fn uninstall_all() {
         .map(|o| o.status.success())
         .unwrap_or(false);
 
+    let service_dirs = ["/usr/lib/systemd/system", "/lib/systemd/system", "/etc/systemd/system"];
+
     // 停止 osec 服务
     if has_systemctl {
         let _ = Command::new("systemctl").args(["stop", "osec"]).status().await;
         let _ = Command::new("systemctl").args(["disable", "osec"]).status().await;
         let _ = Command::new("systemctl").args(["disable", "agent_manager"]).status().await;
 
-        // 清理所有可能路径的 service 文件
-        let service_dirs = ["/usr/lib/systemd/system", "/lib/systemd/system", "/etc/systemd/system"];
         for dir in &service_dirs {
             let _ = fs::remove_file(format!("{}/osec.service", dir));
             let _ = fs::remove_file(format!("{}/agent_manager.service", dir));
@@ -401,6 +440,44 @@ async fn uninstall_all() {
         }
     } else {
         log_info!("[agent_manager] 安装目录 {} 不存在，跳过删除", install_path);
+    }
+
+    // 卸载 ClamAV
+    log_info!("[agent_manager] 开始卸载 ClamAV...");
+    let clamav_path = "/opt/clamav";
+    if PathBuf::from(clamav_path).exists() {
+        log_info!("[agent_manager] 停止 clamav 服务...");
+        if has_systemctl {
+            let _ = Command::new("systemctl").args(["stop", "clamav"]).status().await;
+            let _ = Command::new("systemctl").args(["disable", "clamav"]).status().await;
+            for dir in &service_dirs {
+                let _ = fs::remove_file(format!("{}/clamav.service", dir));
+            }
+            let _ = Command::new("systemctl").args(["daemon-reload"]).status().await;
+        }
+        if Command::new("rm").args(["-rf", clamav_path]).status().await.is_ok() {
+            log_info!("[agent_manager] 已删除 ClamAV 目录: {}", clamav_path);
+        } else {
+            log_error!("[agent_manager] 删除 {} 失败", clamav_path);
+        }
+        let _ = fs::remove_file("/etc/ld.so.conf.d/clamav.conf");
+        let _ = Command::new("ldconfig").status().await;
+    } else {
+        log_info!("[agent_manager] ClamAV 目录 {} 不存在，跳过", clamav_path);
+    }
+
+    // 卸载 Lynis
+    let lynis_path = "/opt/lynis";
+    if PathBuf::from(lynis_path).exists() {
+        let _ = Command::new("rm").args(["-rf", lynis_path]).status().await;
+        log_info!("[agent_manager] 已删除 Lynis 目录: {}", lynis_path);
+    }
+
+    // 卸载 Bundle
+    let bundle_path = "/opt/EndpointSecurityApp";
+    if PathBuf::from(bundle_path).exists() {
+        let _ = Command::new("rm").args(["-rf", bundle_path]).status().await;
+        log_info!("[agent_manager] 已删除 Bundle 目录: {}", bundle_path);
     }
 
     log_info!("[agent_manager] 所有卸载步骤已完成");

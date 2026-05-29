@@ -103,12 +103,14 @@ impl AvSelfProtecNetlink {
         let proc_hash = if Self::looks_like_path(&proc_dir) {
             match get_md5_global(proc_dir.as_str()) {
                 Ok(hash) => {
+                    /*
                     log_info!(
                         "[to_log_info] pid={} md5({}) = {}",
                         self.pid,
                         proc_dir,
                         hash
                     );
+                    */
                     Some(hash)
                 }
                 Err(err) => {
@@ -169,7 +171,7 @@ impl SelfProtectAuditHandler {
             return Err("解析失败".to_string());
         }
 
-        log_info!("解析结果: {:?}", log_vec);
+        //log_info!("解析结果: {:?}", log_vec);
 
         let net_client = match NetClient::new(Some(self.boot_manager.get_base_url()), true) {
             Ok(client) => client,
@@ -188,7 +190,7 @@ impl SelfProtectAuditHandler {
 
             match build_self_protect_alert_log_json(&log_vec, &mut json_str) {
                 Ok(()) => {
-                    log_info!("生成 JSON: {}", json_str);
+                    //log_info!("生成 JSON: {}", json_str);
                     match net_client
                         .post_data_async(
                             &url,

@@ -116,6 +116,8 @@ impl StartVirusScanGrpcService for BootManager {
             log_info!("病毒扫描 gRPC 服务正在启动: {}", addr);
 
             Server::builder()
+                .http2_keepalive_interval(Some(Duration::from_secs(30)))
+                .http2_keepalive_timeout(Some(Duration::from_secs(15)))
                 .add_service(crate::proto::virus_scan_service_server::VirusScanServiceServer::new(grpc_service))
                 // ============================================================
                 // 漏洞扫描服务 (接收外部推送的漏洞数据)
