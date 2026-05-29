@@ -49,7 +49,7 @@ impl VirusScanService for VirusScanGrpcService {
                                         .start_scan(&req.target, &req.exclude_dirs, tx_clone)
                                         .await
                                     {
-                                        Ok(scan_id) => {
+                                        Ok((scan_id, msg)) => {
                                             log_info!("[gRPC] 扫描启动成功, scan_id={}", scan_id);
                                             let _ = tx
                                                 .send(Ok(ServerMessage {
@@ -58,7 +58,7 @@ impl VirusScanService for VirusScanGrpcService {
                                                             crate::proto::StartScanResponse {
                                                                 success: true,
                                                                 scan_id,
-                                                                message: "扫描已启动".to_string(),
+                                                                message: msg,
                                                             },
                                                         ),
                                                     ),

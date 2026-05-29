@@ -824,19 +824,28 @@ pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
     archive.extract(temp_dir).map_err(|e| e.to_string())?;
     log_info!("✅ 更新包已解压到: {}", temp_dir);
 
-    let mut script_path: Option<PathBuf> = None;
+    let ccw_prefix = if cfg!(target_arch = "x86_64") {
+        "ccw-installer-x86_64-"
+    } else if cfg!(target_arch = "aarch64") {
+        "ccw-installer-aarch64-"
+    } else {
+        "ccw-installer-"
+    };
+
+    let mut script_paths: Vec<PathBuf> = Vec::new();
     for entry in fs::read_dir(temp_dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
         if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-            if name.starts_with("osec-installer") && name.ends_with(".sh") {
-                script_path = Some(path);
-                break;
+            if (name.starts_with("osec-installer") || name.starts_with(ccw_prefix))
+                && name.ends_with(".sh")
+            {
+                script_paths.push(path);
             }
         }
     }
 
-    let script_path_ref = script_path.as_ref().ok_or_else(|| {
+    if script_paths.is_empty() {
         let mut files = vec![];
         if let Ok(entries) = fs::read_dir(temp_dir) {
             for entry in entries.flatten() {
@@ -847,10 +856,13 @@ pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
                 }
             }
         }
-        format!("未找到以 'osec-installer' 开头的脚本文件，临时目录文件列表: {:?}", files)
-    })?;
+        return Err(format!(
+            "未找到升级脚本 (osec-installer*.sh / ccw-installer-*.sh)，临时目录文件列表: {:?}",
+            files
+        ));
+    }
 
-    log_info!("✅ 找到升级脚本: {:?}", script_path_ref);
+    log_info!("✅ 找到 {} 个升级脚本: {:?}", script_paths.len(), script_paths);
 
 
     let binary_name = "MagicArmorAgent";
