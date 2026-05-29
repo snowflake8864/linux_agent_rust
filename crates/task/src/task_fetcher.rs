@@ -790,7 +790,7 @@ pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
     let token_str = token_owned.as_deref();
 
     let response = self.net_client
-        .post_data_async(&url, "", Duration::from_secs(10), token_str)
+        .post_data_async(&url, "", Duration::from_secs(100), token_str)
         .await
         .map_err(|e| format!("Error fetching update info: {}", e))?;
 
