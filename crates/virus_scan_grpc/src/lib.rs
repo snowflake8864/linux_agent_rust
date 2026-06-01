@@ -4,7 +4,7 @@ pub mod proto {
     tonic::include_proto!("lynis_scan");
 }
 
-pub mod clamav_scanner;
+pub mod vigilixav_scanner;
 pub mod scan_task_mgr;
 pub mod grpc_service;
 pub mod service;
@@ -12,7 +12,7 @@ pub mod vuln_service;
 pub mod lynis_scanner;
 pub mod lynis_service;
 
-pub use clamav_scanner::{ClamAVConnectionPool, ClamAVConfig, ScanResult};
+pub use vigilixav_scanner::{VigilixAVConnectionPool, VigilixAVConfig, ScanResult, DispositionAction, DispositionResult};
 pub use scan_task_mgr::ScanTaskManager;
 pub use grpc_service::VirusScanGrpcService;
 pub use vuln_service::VulnScanGrpcService;

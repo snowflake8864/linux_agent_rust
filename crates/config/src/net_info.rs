@@ -68,13 +68,13 @@ pub struct NetInfoConfig {
     pub virus_scan_grpc_addr: String,
     pub virus_scan_dev_grpc_addr: String,
     pub virus_scan_batch_size: usize,
-    pub clamav_enabled: bool,
-    pub clamav_host: String,
-    pub clamav_port: u16,
-    pub clamav_timeout_secs: u64,
-    pub clamav_pool_size: usize,
-    pub clamav_connection_type: String,
-    pub clamav_socket_path: String,
+    pub vigilixav_enabled: bool,
+    pub vigilixav_host: String,
+    pub vigilixav_port: u16,
+    pub vigilixav_timeout_secs: u64,
+    pub vigilixav_pool_size: usize,
+    pub vigilixav_connection_type: String,
+    pub vigilixav_socket_path: String,
 }
 
 enum NetRule<'a> {
@@ -358,34 +358,34 @@ impl NetInfoConfig {
             config.virus_scan_batch_size = 100;
         }
 
-        if let Some(value) = ini.get("VIRUS_SCAN", "CLAMAV_ENABLED") {
-            config.clamav_enabled = matches!(value.trim(), "1");
+        if let Some(value) = ini.get("VIRUS_SCAN", "VIGILIXAV_ENABLED") {
+            config.vigilixav_enabled = matches!(value.trim(), "1");
         }
-        config.clamav_host = ini
-            .get("VIRUS_SCAN", "CLAMAV_HOST")
+        config.vigilixav_host = ini
+            .get("VIRUS_SCAN", "VIGILIXAV_HOST")
             .unwrap_or_else(|| "127.0.0.1".to_string());
-        if let Some(value) = ini.get("VIRUS_SCAN", "CLAMAV_PORT") {
-            config.clamav_port = value.parse().unwrap_or(3310);
+        if let Some(value) = ini.get("VIRUS_SCAN", "VIGILIXAV_PORT") {
+            config.vigilixav_port = value.parse().unwrap_or(3310);
         } else {
-            config.clamav_port = 3310;
+            config.vigilixav_port = 3310;
         }
-        if let Some(value) = ini.get("VIRUS_SCAN", "CLAMAV_TIMEOUT") {
-            config.clamav_timeout_secs = value.parse().unwrap_or(60);
+        if let Some(value) = ini.get("VIRUS_SCAN", "VIGILIXAV_TIMEOUT") {
+            config.vigilixav_timeout_secs = value.parse().unwrap_or(60);
         } else {
-            config.clamav_timeout_secs = 60;
+            config.vigilixav_timeout_secs = 60;
         }
-        if let Some(value) = ini.get("VIRUS_SCAN", "CLAMAV_POOL_SIZE") {
-            config.clamav_pool_size = value.parse().unwrap_or(10);
+        if let Some(value) = ini.get("VIRUS_SCAN", "VIGILIXAV_POOL_SIZE") {
+            config.vigilixav_pool_size = value.parse().unwrap_or(10);
         } else {
-            config.clamav_pool_size = 10;
+            config.vigilixav_pool_size = 10;
         }
 
-        config.clamav_connection_type = ini
-            .get("VIRUS_SCAN", "CLAMAV_CONNECTION_TYPE")
+        config.vigilixav_connection_type = ini
+            .get("VIRUS_SCAN", "VIGILIXAV_CONNECTION_TYPE")
             .unwrap_or_else(|| "tcp".to_string());
-        config.clamav_socket_path = ini
-            .get("VIRUS_SCAN", "CLAMAV_SOCKET_PATH")
-            .unwrap_or_else(|| "/opt/clamav/var/run/clamd.sock".to_string());
+        config.vigilixav_socket_path = ini
+            .get("VIRUS_SCAN", "VIGILIXAV_SOCKET_PATH")
+            .unwrap_or_else(|| "/opt/vigilixav/var/run/vigilixd.sock".to_string());
 
         config
     }
@@ -470,19 +470,19 @@ impl NetInfoConfig {
         writeln!(file, "GRPC_ADDR={}", self.virus_scan_grpc_addr)?;
         writeln!(file, "DEV_GRPC_ADDR={}", self.virus_scan_dev_grpc_addr)?;
         writeln!(file, "BATCH_SIZE={}", self.virus_scan_batch_size)?;
-        writeln!(file, "CLAMAV_ENABLED={}", self.clamav_enabled as u8)?;
-        writeln!(file, "CLAMAV_HOST={}", self.clamav_host)?;
-        writeln!(file, "CLAMAV_PORT={}", self.clamav_port)?;
-        writeln!(file, "CLAMAV_TIMEOUT={}", self.clamav_timeout_secs)?;
-        writeln!(file, "CLAMAV_POOL_SIZE={}", self.clamav_pool_size)?;
+        writeln!(file, "VIGILIXAV_ENABLED={}", self.vigilixav_enabled as u8)?;
+        writeln!(file, "VIGILIXAV_HOST={}", self.vigilixav_host)?;
+        writeln!(file, "VIGILIXAV_PORT={}", self.vigilixav_port)?;
+        writeln!(file, "VIGILIXAV_TIMEOUT={}", self.vigilixav_timeout_secs)?;
+        writeln!(file, "VIGILIXAV_POOL_SIZE={}", self.vigilixav_pool_size)?;
         writeln!(
             file,
-            "CLAMAV_CONNECTION_TYPE={}",
-            self.clamav_connection_type
+            "VIGILIXAV_CONNECTION_TYPE={}",
+            self.vigilixav_connection_type
         )?;
-        writeln!(file, "CLAMAV_SOCKET_PATH={}", self.clamav_socket_path)?;
-        if self.clamav_socket_path.is_empty() {
-            writeln!(file, "CLAMAV_SOCKET_PATH=/opt/clamav/var/run/clamd.sock")?;
+        writeln!(file, "VIGILIXAV_SOCKET_PATH={}", self.vigilixav_socket_path)?;
+        if self.vigilixav_socket_path.is_empty() {
+            writeln!(file, "VIGILIXAV_SOCKET_PATH=/opt/vigilixav/var/run/vigilixd.sock")?;
         }
         Ok(())
     }

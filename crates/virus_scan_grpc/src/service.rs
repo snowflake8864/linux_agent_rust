@@ -6,7 +6,7 @@ use tonic::transport::Server;
 use logging::{log_error, log_info,log_warn};
 use common::manager::boot::BootManager;
 use net_client::core::NetClient;
-use crate::clamav_scanner::{ClamAVConnectionPool, ClamAVConnection};
+use crate::vigilixav_scanner::{VigilixAVConnectionPool, VigilixAVConnection};
 
 pub trait StartVirusScanGrpcService {
     fn start_virus_scan_grpc_service(
@@ -27,20 +27,20 @@ impl StartVirusScanGrpcService for BootManager {
         &mut self,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
-            let (virus_scan_enabled, virus_scan_dev_mode, virus_scan_grpc_addr, virus_scan_dev_grpc_addr, clamav_enabled, clamav_host, clamav_port, clamav_timeout_secs, clamav_pool_size, clamav_connection_type, clamav_socket_path) = {
+            let (virus_scan_enabled, virus_scan_dev_mode, virus_scan_grpc_addr, virus_scan_dev_grpc_addr, vigilixav_enabled, vigilixav_host, vigilixav_port, vigilixav_timeout_secs, vigilixav_pool_size, vigilixav_connection_type, vigilixav_socket_path) = {
                 let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
                 (
                     cfg.virus_scan_enabled,
                     cfg.virus_scan_dev_mode,
                     cfg.virus_scan_grpc_addr.clone(),
                     cfg.virus_scan_dev_grpc_addr.clone(),
-                    cfg.clamav_enabled,
-                    cfg.clamav_host.clone(),
-                    cfg.clamav_port,
-                    cfg.clamav_timeout_secs,
-                    cfg.clamav_pool_size,
-                    cfg.clamav_connection_type.clone(),
-                    cfg.clamav_socket_path.clone(),
+                    cfg.vigilixav_enabled,
+                    cfg.vigilixav_host.clone(),
+                    cfg.vigilixav_port,
+                    cfg.vigilixav_timeout_secs,
+                    cfg.vigilixav_pool_size,
+                    cfg.vigilixav_connection_type.clone(),
+                    cfg.vigilixav_socket_path.clone(),
                 )
             };
             
@@ -54,35 +54,35 @@ impl StartVirusScanGrpcService for BootManager {
                 virus_scan_grpc_addr
             };
             
-            // 检查 ClamAV 是否启用
-            let scanner = if clamav_enabled {
-                let timeout = Duration::from_secs(clamav_timeout_secs);
+            // 检查 VigilixAV 是否启用
+            let scanner = if vigilixav_enabled {
+                let timeout = Duration::from_secs(vigilixav_timeout_secs);
                 
-                let connection = match clamav_connection_type.to_lowercase().as_str() {
+                let connection = match vigilixav_connection_type.to_lowercase().as_str() {
                     "unix" | "socket" => {
-                        log_info!("ClamAV: 使用 Unix socket 连接, path={}", clamav_socket_path);
-                        ClamAVConnection::Unix { socket_path: clamav_socket_path.clone() }
+                        log_info!("VigilixAV: 使用 Unix socket 连接, path={}", vigilixav_socket_path);
+                        VigilixAVConnection::Unix { socket_path: vigilixav_socket_path.clone() }
                     }
                     _ => {
-                        log_info!("ClamAV: 使用 TCP socket 连接, host={}, port={}", clamav_host, clamav_port);
-                        ClamAVConnection::Tcp { host: clamav_host.clone(), port: clamav_port }
+                        log_info!("VigilixAV: 使用 TCP socket 连接, host={}, port={}", vigilixav_host, vigilixav_port);
+                        VigilixAVConnection::Tcp { host: vigilixav_host.clone(), port: vigilixav_port }
                     }
                 };
                 
-                let pool = Arc::new(ClamAVConnectionPool::new(connection, timeout, clamav_pool_size));
+                let pool = Arc::new(VigilixAVConnectionPool::new(connection, timeout, vigilixav_pool_size));
                 
                 match pool.ping().await {
                     Ok(_) => {
-                        log_info!("ClamAV 连接池创建成功，大小={}", clamav_pool_size);
+                        log_info!("VigilixAV 连接池创建成功，大小={}", vigilixav_pool_size);
                         Some(pool)
                     }
                     Err(e) => {
-                        log_warn!("ClamAV 连接失败: {}，病毒扫描功能不可用", e);
+                        log_warn!("VigilixAV 连接失败: {}，病毒扫描功能不可用", e);
                         None
                     }
                 }
             } else {
-                log_warn!("ClamAV 未启用，病毒扫描功能不可用");
+                log_warn!("VigilixAV 未启用，病毒扫描功能不可用");
                 None
             };
             

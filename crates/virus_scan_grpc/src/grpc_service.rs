@@ -102,6 +102,61 @@ impl VirusScanService for VirusScanGrpcService {
                                         .await;
                                 }
 
+                                crate::proto::client_message::Cmd::DisposeFile(req) => {
+                                    log_info!("[gRPC] 收到处置请求: scan_id={}, file={}, action={:?}",
+                                        req.scan_id, req.file_path, req.action);
+                                    let scanner = task_mgr.vigilixav_scanner();
+                                    match scanner {
+                                        Some(scanner) => {
+                                            let action = if req.action == 1 {
+                                                crate::vigilixav_scanner::DispositionAction::Move {
+                                                    quarantine_dir: req.quarantine_dir.clone(),
+                                                }
+                                            } else {
+                                                crate::vigilixav_scanner::DispositionAction::Remove
+                                            };
+                                            let result = scanner.dispose_file(&req.file_path, action).await;
+                                            let (success, message) = match result {
+                                                crate::vigilixav_scanner::DispositionResult::Success { message } => {
+                                                    (true, message)
+                                                }
+                                                crate::vigilixav_scanner::DispositionResult::Error { message } => {
+                                                    (false, message)
+                                                }
+                                            };
+                                            let _ = tx.send(Ok(ServerMessage {
+                                                event: Some(
+                                                    crate::proto::server_message::Event::DisposeResult(
+                                                        crate::proto::DisposeFileResponse {
+                                                            scan_id: req.scan_id,
+                                                            file_path: req.file_path,
+                                                            action: req.action,
+                                                            success,
+                                                            message,
+                                                        },
+                                                    ),
+                                                ),
+                                            })).await;
+                                        }
+                                        None => {
+                                            log_error!("[gRPC] VigilixAV 扫描器不可用，无法执行处置操作");
+                                            let _ = tx.send(Ok(ServerMessage {
+                                                event: Some(
+                                                    crate::proto::server_message::Event::DisposeResult(
+                                                        crate::proto::DisposeFileResponse {
+                                                            scan_id: req.scan_id,
+                                                            file_path: req.file_path,
+                                                            action: req.action,
+                                                            success: false,
+                                                            message: "VigilixAV scanner not available".to_string(),
+                                                        },
+                                                    ),
+                                                ),
+                                            })).await;
+                                        }
+                                    }
+                                }
+
                                 _ => {}
                             }
                         }
