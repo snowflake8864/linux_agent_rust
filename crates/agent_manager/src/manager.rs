@@ -442,28 +442,28 @@ async fn uninstall_all() {
         log_info!("[agent_manager] 安装目录 {} 不存在，跳过删除", install_path);
     }
 
-    // 卸载 ClamAV
-    log_info!("[agent_manager] 开始卸载 ClamAV...");
-    let clamav_path = "/opt/clamav";
-    if PathBuf::from(clamav_path).exists() {
-        log_info!("[agent_manager] 停止 clamav 服务...");
+    // 卸载 VigilixAV
+    log_info!("[agent_manager] 开始卸载 VigilixAV...");
+    let vigilixav_path = "/opt/vigilixav";
+    if PathBuf::from(vigilixav_path).exists() {
+        log_info!("[agent_manager] 停止 vigilixav 服务...");
         if has_systemctl {
-            let _ = Command::new("systemctl").args(["stop", "clamav"]).status().await;
-            let _ = Command::new("systemctl").args(["disable", "clamav"]).status().await;
+            let _ = Command::new("systemctl").args(["stop", "vigilixav"]).status().await;
+            let _ = Command::new("systemctl").args(["disable", "vigilixav"]).status().await;
             for dir in &service_dirs {
-                let _ = fs::remove_file(format!("{}/clamav.service", dir));
+                let _ = fs::remove_file(format!("{}/vigilixav.service", dir));
             }
             let _ = Command::new("systemctl").args(["daemon-reload"]).status().await;
         }
-        if Command::new("rm").args(["-rf", clamav_path]).status().await.is_ok() {
-            log_info!("[agent_manager] 已删除 ClamAV 目录: {}", clamav_path);
+        if Command::new("rm").args(["-rf", vigilixav_path]).status().await.is_ok() {
+            log_info!("[agent_manager] 已删除 VigilixAV 目录: {}", vigilixav_path);
         } else {
-            log_error!("[agent_manager] 删除 {} 失败", clamav_path);
+            log_error!("[agent_manager] 删除 {} 失败", vigilixav_path);
         }
-        let _ = fs::remove_file("/etc/ld.so.conf.d/clamav.conf");
+        let _ = fs::remove_file("/etc/ld.so.conf.d/vigilixav.conf");
         let _ = Command::new("ldconfig").status().await;
     } else {
-        log_info!("[agent_manager] ClamAV 目录 {} 不存在，跳过", clamav_path);
+        log_info!("[agent_manager] VigilixAV 目录 {} 不存在，跳过", vigilixav_path);
     }
 
     // 卸载 Lynis

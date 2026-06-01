@@ -1,5 +1,5 @@
 use crate::proto::{ScanProgress, VirusAlert, ScanCompleted, ServerMessage, FileScanResult};
-use crate::clamav_scanner::{ClamAVConnectionPool, ScanResult};
+use crate::vigilixav_scanner::{VigilixAVConnectionPool, ScanResult};
 use chrono::Utc;
 use common::manager::boot::BootManager;
 use logging::{log_error, log_info};
@@ -99,7 +99,7 @@ pub struct ScanTaskManager {
     tasks: Arc<Mutex<HashMap<String, ScanTask>>>,
     net_client: Arc<net_client::core::NetClient>,
     server_b_url: String,
-    clamav_scanner: Option<Arc<ClamAVConnectionPool>>,
+    vigilixav_scanner: Option<Arc<VigilixAVConnectionPool>>,
     virus_tx: mpsc::Sender<VirusScanAlert>,
     virus_rx: Arc<Mutex<mpsc::Receiver<VirusScanAlert>>>,
     boot_manager: Option<BootManager>,
@@ -146,22 +146,26 @@ impl ScanTaskManager {
     pub fn new(
         net_client: Arc<net_client::core::NetClient>,
         server_b_url: String,
-        clamav_scanner: Option<Arc<ClamAVConnectionPool>>,
+        vigilixav_scanner: Option<Arc<VigilixAVConnectionPool>>,
         boot_manager: Option<BootManager>,
     ) -> Self {
         let (virus_tx, virus_rx) = mpsc::channel(1024);
-        let concurrency = config::net_info::NETINFO_CONFIG.lock().unwrap().clamav_pool_size;
+        let concurrency = config::net_info::NETINFO_CONFIG.lock().unwrap().vigilixav_pool_size;
         log_info!("扫描并发数设置为: {}", concurrency);
         Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             net_client,
             server_b_url,
-            clamav_scanner,
+            vigilixav_scanner,
             virus_tx,
             virus_rx: Arc::new(Mutex::new(virus_rx)),
             boot_manager,
             scan_semaphore: Arc::new(Semaphore::new(concurrency)),
         }
+    }
+
+    pub fn vigilixav_scanner(&self) -> Option<Arc<VigilixAVConnectionPool>> {
+        self.vigilixav_scanner.clone()
     }
 
     pub fn start_virus_report_worker(&self) {
@@ -335,7 +339,7 @@ impl ScanTaskManager {
                     dirs_to_scan.push(entry.path());
                 }
                 Ok(ft) if ft.is_file() => {
-                    let scanner = self.clamav_scanner.clone();
+                    let scanner = self.vigilixav_scanner.clone();
                     let scan_id_inner = scan_id.to_string();
                     let file_path_clone = file_path.clone();
                     let semaphore_clone = semaphore.clone();
@@ -363,8 +367,8 @@ impl ScanTaskManager {
                                 }
                             }
                         } else {
-                            log_error!("[SCAN] {} -> ERROR: ClamAV 不可用", file_path_clone);
-                            (ScanAction::Error("ClamAV 不可用".to_string()), file_path_clone, scan_start.elapsed().as_millis() as i64)
+                            log_error!("[SCAN] {} -> ERROR: VigilixAV 不可用", file_path_clone);
+                            (ScanAction::Error("VigilixAV 不可用".to_string()), file_path_clone, scan_start.elapsed().as_millis() as i64)
                         }
                     }));
                 }
@@ -503,7 +507,7 @@ impl Clone for ScanTaskManager {
             tasks: Arc::clone(&self.tasks),
             net_client: Arc::clone(&self.net_client),
             server_b_url: self.server_b_url.clone(),
-            clamav_scanner: self.clamav_scanner.as_ref().map(|s| Arc::clone(s)),
+            vigilixav_scanner: self.vigilixav_scanner.as_ref().map(|s| Arc::clone(s)),
             virus_tx: self.virus_tx.clone(),
             virus_rx: Arc::clone(&self.virus_rx),
             boot_manager: self.boot_manager.clone(),
