@@ -347,13 +347,13 @@ fn find_upgrade_scripts(dir: &str) -> Vec<PathBuf> {
         }
     };
 
-    // 排序：osec-installer 先执行，ccw-installer 后执行
+    // 排序：ccw-installer 先执行，osec-installer 后执行
     scripts.sort_by(|a, b| {
         let a_name = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let b_name = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let a_is_osec = a_name.starts_with("osec-");
-        let b_is_osec = b_name.starts_with("osec-");
-        match (a_is_osec, b_is_osec) {
+        let a_is_ccw = a_name.starts_with("ccw-");
+        let b_is_ccw = b_name.starts_with("ccw-");
+        match (a_is_ccw, b_is_ccw) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
             _ => a_name.cmp(b_name),
