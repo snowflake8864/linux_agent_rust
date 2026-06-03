@@ -347,18 +347,8 @@ fn find_upgrade_scripts(dir: &str) -> Vec<PathBuf> {
         }
     };
 
-    // 排序：ccw-installer 先执行，osec-installer 后执行
-    scripts.sort_by(|a, b| {
-        let a_name = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let b_name = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let a_is_ccw = a_name.starts_with("ccw-");
-        let b_is_ccw = b_name.starts_with("ccw-");
-        match (a_is_ccw, b_is_ccw) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a_name.cmp(b_name),
-        }
-    });
+    // ccw-installer 先执行，osec-installer 后执行（各只有一个）
+    scripts.sort_by_key(|p| !p.file_name().and_then(|n| n.to_str()).unwrap_or("").starts_with("ccw-"));
 
     if scripts.is_empty() {
         log_info!("[agent_manager] 在 {} 中未找到升级脚本 (osec-installer*.sh / ccw-installer-*.sh)", dir);
