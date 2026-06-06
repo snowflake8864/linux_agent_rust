@@ -1332,6 +1332,28 @@ pub async fn task_down_virtual_port(&self, task_type: u64) -> Result<(), String>
         .collect();
 
     let total = valid_rules.len();
+
+    // Update gRPC cache BEFORE proc write (cache works even without kernel module)
+    {
+        let proto_rules: Vec<grpc_gateway::virtual_port::VirtualPortRule> = valid_rules
+            .iter()
+            .map(|r| grpc_gateway::virtual_port::VirtualPortRule {
+                alarm_level: r.alarm_level,
+                dest_ip: r.dest_ip.clone(),
+                dest_port: r.dest_port.clone(),
+                dest_port_type: r.dest_port_type,
+                id: r.id,
+                protocol: r.protocol.clone(),
+                source_ip: r.source_ip.clone(),
+                source_port_start: r.source_port_range.0 as u32,
+                source_port_end: r.source_port_range.1 as u32,
+                r#type: r.r#type.clone(),
+            })
+            .collect();
+        *VIRTUAL_PORT_CACHE.lock().unwrap() = proto_rules;
+        notify_policy_change(PolicyChangeType::VirtualPortChanged);
+    }
+
     if total == 0 {
         log_error!("No valid rules to write to /proc/osec/net_rules");
         return Ok(());
@@ -1394,25 +1416,6 @@ pub async fn task_down_virtual_port(&self, task_type: u64) -> Result<(), String>
         .map_err(|e| format!("Failed to flush /proc/osec/net_rules: {}", e))?;
 
     log_info!("Successfully wrote {} rules to /proc/osec/net_rules", total);
-
-    // Update gRPC cache
-    let proto_rules: Vec<grpc_gateway::virtual_port::VirtualPortRule> = valid_rules
-        .iter()
-        .map(|r| grpc_gateway::virtual_port::VirtualPortRule {
-            alarm_level: r.alarm_level,
-            dest_ip: r.dest_ip.clone(),
-            dest_port: r.dest_port.clone(),
-            dest_port_type: r.dest_port_type,
-            id: r.id,
-            protocol: r.protocol.clone(),
-            source_ip: r.source_ip.clone(),
-            source_port_start: r.source_port_range.0 as u32,
-            source_port_end: r.source_port_range.1 as u32,
-            r#type: r.r#type.clone(),
-        })
-        .collect();
-    *VIRTUAL_PORT_CACHE.lock().unwrap() = proto_rules;
-    notify_policy_change(PolicyChangeType::VirtualPortChanged);
 
     Ok(())
 }
