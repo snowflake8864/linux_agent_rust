@@ -124,14 +124,14 @@ impl BackupService for BackupServiceImpl {
     async fn create_backup(&self, req: Request<CreateBackupRequest>) -> Result<Response<CreateBackupResponse>, Status> {
         require_offline()?;
         let name = req.into_inner().name;
-        let id = self.data_hub.create_backup(&name)
+        let id = self.data_hub.create_backup(&name).await
             .map_err(|e| Status::internal(e))?;
         Ok(Response::new(CreateBackupResponse { success: true, backup_id: id, message: "备份已创建".into() }))
     }
     async fn restore_backup(&self, req: Request<RestoreBackupRequest>) -> Result<Response<RestoreBackupResponse>, Status> {
         require_offline()?;
         let id = req.into_inner().backup_id;
-        self.data_hub.restore_backup(&id)
+        self.data_hub.restore_backup(&id).await
             .map_err(|e| Status::internal(e))?;
         Ok(Response::new(RestoreBackupResponse { success: true, message: "还原已执行".into() }))
     }

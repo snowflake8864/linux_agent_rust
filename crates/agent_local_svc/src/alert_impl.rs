@@ -21,11 +21,33 @@ impl AlertService for AlertServiceImpl {
 
     async fn subscribe_alerts(
         &self,
-        _: Request<AlertFilter>,
+        request: Request<AlertFilter>,
     ) -> Result<Response<Self::SubscribeAlertsStream>, Status> {
-        // TODO: capture alerts from reporter's log_worker channel
-        // For now, keep the stream alive with no events
-        let (_tx, rx) = mpsc::channel::<Result<AlertEvent, Status>>(64);
+        let filter = request.into_inner();
+        let mut broadcast_rx = grpc_gateway::notify::subscribe_alerts();
+        let (tx, rx) = mpsc::channel::<Result<AlertEvent, Status>>(256);
+
+        tokio::spawn(async move {
+            loop {
+                match broadcast_rx.recv().await {
+                    Ok(event) => {
+                        // Apply filter (0 = ALL)
+                        if filter.r#type != 0 && event.r#type != filter.r#type {
+                            continue;
+                        }
+                        if tx.send(Ok(event)).await.is_err() {
+                            break; // client disconnected
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!("Alert broadcast lagged by {} messages", n);
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
