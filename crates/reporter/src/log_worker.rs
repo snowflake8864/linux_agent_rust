@@ -8,8 +8,6 @@ use crate::AuditLogInfo;
 use crate::build_alert_log_json;
 use logging::{log_info,log_error};
 use net_client::core::NetClient;
-use grpc_gateway::alert::AlertEvent;
-use grpc_gateway::notify::broadcast_alert;
 
 
 pub trait StartBashLog {
@@ -50,26 +48,7 @@ impl StartBashLog for BootManager {
                                 }
                                 */
                                 log_buffer.push(log.clone());
-                                // Also broadcast to gRPC AlertService subscribers
-                                let alert_type = match log.n_type {
-                                    9003 | 9004 | 9005 | 9006 => 3, // DEVICE_ALERT
-                                    4001 | 4003 => 1,               // PROCESS_ALERT
-                                    _ => 0,                          // ALERT_UNKNOWN
-                                };
-                                broadcast_alert(AlertEvent {
-                                    alert_id: uuid::Uuid::new_v4().to_string(),
-                                    r#type: alert_type,
-                                    level: log.n_level,
-                                    timestamp: log.n_time,
-                                    file_path: log.file_path.clone().unwrap_or_default(),
-                                    process_name: log.exception_process.clone().unwrap_or_default(),
-                                    md5: log.md5.clone().unwrap_or_default(),
-                                    remark: log.notice_remark.clone().unwrap_or_default(),
-                                    peripheral_name: log.peripheral_name.clone().unwrap_or_default(),
-                                    peripheral_eid: log.peripheral_eid.clone().unwrap_or_default(),
-                                    rename_dir: log.rename_dir.clone().unwrap_or_default(),
-                                    p_param: log.p_param.clone().unwrap_or_default(),
-                                });
+                                crate::broadcast_audit_log(&log);
                             }
                             None => {
                                 log_error!("file_audit_log_rx 通道已关闭，退出任务。");
