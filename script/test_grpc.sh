@@ -250,6 +250,14 @@ test_w11() { grpc_expect_perm_denied "更新虚拟端口（在线拒绝）" \
     virtual_port.proto virtual_port.VirtualPortService UpdateVirtualPort \
     '{"rules": [{"alarm_level":1,"dest_ip":"192.168.1.1","dest_port":"80","dest_port_type":0,"id":1,"protocol":"tcp","source_ip":"10.0.0.1","source_port_start":8080,"source_port_end":8080,"type":"tcp"}]}'; }
 
+test_w12() { grpc_expect_perm_denied "更新目录保护策略（在线拒绝）" \
+    dir_policy.proto dir_policy.DirPolicyService UpdateDirPolicy \
+    '{"rules": [{"dir":"/opt","pid":0,"typ":1}]}'; }
+
+test_w13() { grpc_expect_perm_denied "更新勒索保护策略（在线拒绝）" \
+    extort_policy.proto extort_policy.ExtortPolicyService UpdateExtortPolicy \
+    '{"rules": [{"file_type":"doc","typ":1}]}'; }
+
 # ── menu ───────────────────────────────────────────────────────────────
 
 show_menu() {
@@ -274,7 +282,8 @@ show_menu() {
     echo -e "${CYAN}║${NC}   w5) SubmitTask     w6) ExecuteIpJump                    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   w7) ExecutePwJump  w8) CreateBackup                     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   w9) RestoreBackup  w10) UpdateTrustDir                  ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   w11) UpdateVirtualPort                                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   w11) UpdateVirtualPort w12) UpdateDirPolicy                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   w13) UpdateExtortPolicy                                  ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}all${NC}  测试全部只读接口                                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${RED}write${NC} 测试全部写接口（验证在线拒绝）                    ${CYAN}║${NC}"
@@ -332,7 +341,7 @@ case "${1:-menu}" in
                 w8) test_w8 ;;
                 w9) test_w9 ;;
                 w10) test_w10 ;;
-                w11) test_w11 ;;
+                w11) test_w11 ;; w12) test_w12 ;; w13) test_w13 ;;
                 all)
                     echo -e "\n${GREEN}── 测试全部只读接口 ──${NC}"
                     for i in $(seq 1 16); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
@@ -340,7 +349,7 @@ case "${1:-menu}" in
                     ;;
                 write)
                     echo -e "\n${RED}── 测试全部写接口（预期全部 PERMISSION_DENIED）──${NC}"
-                    test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11
+                    test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11; test_w12; test_w13
                     print_result
                     ;;
                 stream)
@@ -352,7 +361,7 @@ case "${1:-menu}" in
                     echo -e "\n${GREEN}── 测试全部接口 ──${NC}"
                     for i in $(seq 1 16); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
                     test_17; test_18
-                    test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11
+                    test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11; test_w12; test_w13
                     print_result
                     ;;
                 q|Q|quit|exit) echo "退出"; break ;;
@@ -367,7 +376,7 @@ case "${1:-menu}" in
         print_result
         ;;
     write)
-        test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11
+        test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11; test_w12; test_w13
         print_result
         ;;
     stream)
@@ -377,7 +386,7 @@ case "${1:-menu}" in
     full)
         for i in $(seq 1 16); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
         test_17; test_18
-        test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11
+        test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11; test_w12; test_w13
         print_result
         ;;
     *)
