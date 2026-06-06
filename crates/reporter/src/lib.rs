@@ -32,7 +32,7 @@ impl RulesType {
         }
     }
 }
-#[derive(Serialize,  Debug)]
+#[derive(Serialize, Debug, Clone)]
 pub struct AuditLogInfo {
     pub file_path: Option<String>,
     pub rename_dir: Option<String>,
