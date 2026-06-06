@@ -285,16 +285,30 @@ impl AgentDataHub {
     // TrustDir operations
     // ========================================================================
 
-    /// Get global trust directories.
+    /// Get global trust directories from cache.
     pub fn get_trust_dir(&self) -> Vec<pattern::GlobalTrustDir> {
-        // PROCESS_PATTERN_RULES_MGR holds trust dirs but serialized to strings.
-        // We can't easily deserialize them back. For now, return empty.
-        // TODO: add a Vec<GlobalTrustDir> getter to ProcessPatternRulesMgr
-        Vec::new()
+        grpc_gateway::notify::TRUST_DIR_CACHE.lock().unwrap()
+            .iter()
+            .map(|d| pattern::GlobalTrustDir {
+                dir: d.dir.clone(),
+                typ: d.r#type as u8,
+                is_extend: d.is_extend as u8,
+            })
+            .collect()
     }
 
-    /// Update global trust directories and push to kernel.
+    /// Update global trust directories and push to kernel + cache.
     pub fn update_trust_dir(&self, dirs: Vec<pattern::GlobalTrustDir>) -> Result<(), String> {
+        // Update cache (proto types)
+        *grpc_gateway::notify::TRUST_DIR_CACHE.lock().unwrap() = dirs
+            .iter()
+            .map(|d| grpc_gateway::trust_dir::GlobalTrustDir {
+                dir: d.dir.clone(),
+                r#type: d.typ as u32,
+                is_extend: d.is_extend as u32,
+            })
+            .collect();
+        // Push to kernel
         pattern::process_pattern_rules_mgr::PROCESS_PATTERN_RULES_MGR
             .lock()
             .set_global_trust_dir(dirs);
@@ -306,11 +320,28 @@ impl AgentDataHub {
     // VirtualPort operations
     // ========================================================================
 
-    /// Write virtual port rules to /proc/osec/net_rules.
+    /// Write virtual port rules to /proc/osec/net_rules + cache.
     pub async fn update_virtual_port(
         &self,
         rules: Vec<task::virtual_port_rule::VirtualPortRule>,
     ) -> Result<(), String> {
+        // Update cache (proto types)
+        let proto_rules: Vec<grpc_gateway::virtual_port::VirtualPortRule> = rules
+            .iter()
+            .map(|r| grpc_gateway::virtual_port::VirtualPortRule {
+                alarm_level: r.alarm_level,
+                dest_ip: r.dest_ip.clone(),
+                dest_port: r.dest_port.clone(),
+                dest_port_type: r.dest_port_type,
+                id: r.id,
+                protocol: r.protocol.clone(),
+                source_ip: r.source_ip.clone(),
+                source_port_start: r.source_port_range.0 as u32,
+                source_port_end: r.source_port_range.1 as u32,
+                r#type: r.r#type.clone(),
+            })
+            .collect();
+        *grpc_gateway::notify::VIRTUAL_PORT_CACHE.lock().unwrap() = proto_rules;
         let valid_rules: Vec<_> = rules.into_iter()
             .filter(|r| !r.source_ip.is_empty())
             .collect();

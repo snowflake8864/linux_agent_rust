@@ -80,3 +80,9 @@ pub static DIR_POLICY_CACHE: LazyLock<Mutex<Vec<crate::dir_policy::DirectionScan
 
 pub static EXTORT_POLICY_CACHE: LazyLock<Mutex<Vec<crate::extort_policy::ExtortProtectRule>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+
+pub static VIRTUAL_PORT_CACHE: LazyLock<Mutex<Vec<crate::virtual_port::VirtualPortRule>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+pub static TRUST_DIR_CACHE: LazyLock<Mutex<Vec<crate::trust_dir::GlobalTrustDir>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));

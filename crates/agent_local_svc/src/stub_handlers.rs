@@ -223,7 +223,8 @@ pub struct VirtualPortServiceImpl {
 #[tonic::async_trait]
 impl VirtualPortService for VirtualPortServiceImpl {
     async fn get_virtual_port(&self, _: Request<grpc_gateway::common::Empty>) -> Result<Response<VirtualPortList>, Status> {
-        Ok(Response::new(VirtualPortList { rules: vec![] }))
+        let rules = grpc_gateway::notify::VIRTUAL_PORT_CACHE.lock().unwrap().clone();
+        Ok(Response::new(VirtualPortList { rules }))
     }
     async fn update_virtual_port(&self, req: Request<VirtualPortList>) -> Result<Response<SimpleResponse>, Status> {
         require_offline()?;
