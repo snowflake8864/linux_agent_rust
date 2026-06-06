@@ -48,6 +48,62 @@ pub struct AuditLogInfo {
     pub p_param: Option<String>,
 }
 
+/// Convert AuditLogInfo to AlertEvent and broadcast to gRPC AlertService.
+/// n_type mapping: 9003-9006→DEVICE, 4001/4003→PROCESS, rest→UNKNOWN.
+pub fn broadcast_audit_log(log: &AuditLogInfo) {
+    let alert_type = match log.n_type {
+        9003 | 9004 | 9005 | 9006 => 3, // DEVICE_ALERT
+        4001 | 4003 => 1,               // PROCESS_ALERT
+        _ => 0,                          // ALERT_UNKNOWN
+    };
+    grpc_gateway::notify::broadcast_alert(grpc_gateway::alert::AlertEvent {
+        alert_id: uuid::Uuid::new_v4().to_string(),
+        r#type: alert_type,
+        level: log.n_level,
+        timestamp: log.n_time,
+        file_path: log.file_path.clone().unwrap_or_default(),
+        process_name: log.exception_process.clone().unwrap_or_default(),
+        md5: log.md5.clone().unwrap_or_default(),
+        remark: log.notice_remark.clone().unwrap_or_default(),
+        peripheral_name: log.peripheral_name.clone().unwrap_or_default(),
+        peripheral_eid: log.peripheral_eid.clone().unwrap_or_default(),
+        rename_dir: log.rename_dir.clone().unwrap_or_default(),
+        p_param: log.p_param.clone().unwrap_or_default(),
+        n_type: log.n_type as u32,
+    });
+}
+
+/// Broadcast SysNetLog (network communication log) to gRPC AlertService.
+pub fn broadcast_net_log(log: &crate::SysNetLog) {
+    grpc_gateway::notify::broadcast_alert(grpc_gateway::alert::AlertEvent {
+        alert_id: uuid::Uuid::new_v4().to_string(),
+        r#type: 4, level: 1, timestamp: log.time as u64,
+        file_path: log.p_dir.clone().unwrap_or_default(),
+        process_name: String::new(),
+        md5: log.hash.clone().unwrap_or_default(),
+        remark: format!("proto:{} {}:{}", log.proto, log.source_ip.clone().unwrap_or_default(), log.source_port),
+        peripheral_name: String::new(), peripheral_eid: String::new(),
+        rename_dir: String::new(), p_param: String::new(),
+        n_type: log.log_type as u32,
+    });
+}
+
+/// Broadcast SyslogSshLog (SSH login log) to gRPC AlertService.
+pub fn broadcast_ssh_log(log: &crate::SyslogSshLog) {
+    grpc_gateway::notify::broadcast_alert(grpc_gateway::alert::AlertEvent {
+        alert_id: uuid::Uuid::new_v4().to_string(),
+        r#type: 0, level: if log.status == 0 { 1 } else { 2 },
+        timestamp: log.time as u64,
+        file_path: String::new(),
+        process_name: format!("ssh:{}", log.username),
+        md5: String::new(),
+        remark: format!("IP:{} type:{}", log.ip, log.login_type),
+        peripheral_name: String::new(), peripheral_eid: String::new(),
+        rename_dir: String::new(), p_param: String::new(),
+        n_type: log.log_type as u32,
+    });
+}
+
 #[derive(Debug)]
 pub struct EdrProcessLog {
     pub uid: String,

@@ -34,4 +34,5 @@ message AlertEvent {
     string peripheral_eid = 10;
     string rename_dir = 11;
     string p_param = 12;
+    uint32 n_type = 13;  // 原始事件类型码 (对应 AuditLogInfo.n_type)
 }
