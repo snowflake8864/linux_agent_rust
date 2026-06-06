@@ -289,6 +289,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}  ${RED}write${NC} 测试全部写接口（验证在线拒绝）                    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}stream${NC} 测试全部流式接口                                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}full${NC}  测试全部接口（读写+流）                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}listen [秒]${NC} 监听告警流（默认300秒，Ctrl+C停止）    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  q    退出                                              ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -357,6 +358,17 @@ case "${1:-menu}" in
                     test_17; test_18
                     print_result
                     ;;
+                listen|listen\ *)
+                    local secs=300
+                    [[ "$choice" =~ listen[[:space:]]+([0-9]+) ]] && secs="${BASH_REMATCH[1]}"
+                    echo -e "\n${YELLOW}── 监听告警流 ${secs}秒 (Ctrl+C 停止) ──${NC}"
+                    timeout "$secs" grpcurl -plaintext \
+                        -import-path "$PROTO_DIR" \
+                        -proto common.proto -proto alert.proto \
+                        -d '{"type": 0}' \
+                        "$GRPC_ADDR" alert.AlertService/SubscribeAlerts 2>&1 || true
+                    echo -e "${GREEN}监听结束${NC}"
+                    ;;
                 full)
                     echo -e "\n${GREEN}── 测试全部接口 ──${NC}"
                     for i in $(seq 1 16); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
@@ -382,6 +394,15 @@ case "${1:-menu}" in
     stream)
         test_17; test_18
         print_result
+        ;;
+    listen)
+        echo -e "${YELLOW}监听告警流 ${2:-300}秒 (Ctrl+C 停止)${NC}"
+        timeout "${2:-300}" grpcurl -plaintext \
+            -import-path "$PROTO_DIR" \
+            -proto common.proto -proto alert.proto \
+            -d '{"type": 0}' \
+            "$GRPC_ADDR" alert.AlertService/SubscribeAlerts 2>&1 || true
+        echo -e "${GREEN}监听结束${NC}"
         ;;
     full)
         for i in $(seq 1 16); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
