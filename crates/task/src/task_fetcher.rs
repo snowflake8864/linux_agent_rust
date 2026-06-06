@@ -40,7 +40,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
-use grpc_gateway::notify::{notify_policy_change, init_local_task_rx, DIR_POLICY_CACHE, EXTORT_POLICY_CACHE};
+use grpc_gateway::notify::{notify_policy_change, init_local_task_rx, DIR_POLICY_CACHE, EXTORT_POLICY_CACHE, VIRTUAL_PORT_CACHE, TRUST_DIR_CACHE};
 use grpc_gateway::policy_watch::PolicyChangeType;
 
 static AUTO_IP_JUMP_DAEMON_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -1395,6 +1395,25 @@ pub async fn task_down_virtual_port(&self, task_type: u64) -> Result<(), String>
 
     log_info!("Successfully wrote {} rules to /proc/osec/net_rules", total);
 
+    // Update gRPC cache
+    let proto_rules: Vec<grpc_gateway::virtual_port::VirtualPortRule> = valid_rules
+        .iter()
+        .map(|r| grpc_gateway::virtual_port::VirtualPortRule {
+            alarm_level: r.alarm_level,
+            dest_ip: r.dest_ip.clone(),
+            dest_port: r.dest_port.clone(),
+            dest_port_type: r.dest_port_type,
+            id: r.id,
+            protocol: r.protocol.clone(),
+            source_ip: r.source_ip.clone(),
+            source_port_start: r.source_port_range.0 as u32,
+            source_port_end: r.source_port_range.1 as u32,
+            r#type: r.r#type.clone(),
+        })
+        .collect();
+    *VIRTUAL_PORT_CACHE.lock().unwrap() = proto_rules;
+    notify_policy_change(PolicyChangeType::VirtualPortChanged);
+
     Ok(())
 }
 
@@ -1873,6 +1892,15 @@ async fn task_global_dir(&self,task_type: u64) -> Result<(), String> {
                 };
 
                 PROCESS_PATTERN_RULES_MGR.lock().set_global_trust_dir(trust_dirs.clone());
+
+                // Update gRPC cache
+                {
+                    let proto_dirs: Vec<grpc_gateway::trust_dir::GlobalTrustDir> = trust_dirs.iter().map(|d| grpc_gateway::trust_dir::GlobalTrustDir {
+                        dir: d.dir.clone(), r#type: d.typ as u32, is_extend: d.is_extend as u32,
+                    }).collect();
+                    *TRUST_DIR_CACHE.lock().unwrap() = proto_dirs;
+                    notify_policy_change(PolicyChangeType::TrustDirChanged);
+                }
                 let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
                 pattern_mgr.set_global_trust_dir(trust_dirs);
             } else {
