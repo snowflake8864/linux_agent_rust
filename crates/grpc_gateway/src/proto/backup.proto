@@ -1,0 +1,40 @@
+syntax = "proto3";
+package backup;
+
+import "common.proto";
+
+service BackupService {
+    rpc GetBackupList(common.Empty) returns (BackupList);
+    rpc CreateBackup(CreateBackupRequest) returns (CreateBackupResponse);
+    rpc RestoreBackup(RestoreBackupRequest) returns (RestoreBackupResponse);
+}
+
+message BackupInfo {
+    string backup_id = 1;
+    string name = 2;
+    string created_at = 3;
+    uint64 size_bytes = 4;
+}
+
+message BackupList {
+    repeated BackupInfo backups = 1;
+}
+
+message CreateBackupRequest {
+    string name = 1;
+}
+
+message CreateBackupResponse {
+    bool success = 1;
+    string backup_id = 2;
+    string message = 3;
+}
+
+message RestoreBackupRequest {
+    string backup_id = 1;
+}
+
+message RestoreBackupResponse {
+    bool success = 1;
+    string message = 2;
+}

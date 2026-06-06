@@ -1,0 +1,28 @@
+syntax = "proto3";
+package virtual_port;
+
+import "common.proto";
+
+service VirtualPortService {
+    rpc GetVirtualPort(common.Empty) returns (VirtualPortList);
+    rpc UpdateVirtualPort(VirtualPortList) returns (common.SimpleResponse);
+}
+
+// 对应 Rust: task::virtual_port_rule::VirtualPortRule
+// 复用 handler: 写 /proc/osec/net_rules
+message VirtualPortRule {
+    uint32 alarm_level = 1;
+    string dest_ip = 2;
+    string dest_port = 3;
+    uint32 dest_port_type = 4;
+    uint32 id = 5;
+    string protocol = 6;
+    string source_ip = 7;
+    uint32 source_port_start = 8;
+    uint32 source_port_end = 9;
+    string type = 10;
+}
+
+message VirtualPortList {
+    repeated VirtualPortRule rules = 1;
+}

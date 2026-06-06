@@ -1,0 +1,24 @@
+syntax = "proto3";
+package ip_policy;
+
+import "common.proto";
+
+service IpPolicyService {
+    rpc GetIpBlockPolicy(common.Empty) returns (IpBlockPolicy);
+    rpc UpdateIpBlockPolicy(IpBlockPolicy) returns (common.SimpleResponse);
+    rpc GetIpBlackPolicy(common.Empty) returns (IpBlockPolicy);
+    rpc UpdateIpBlackPolicy(IpBlockPolicy) returns (common.SimpleResponse);
+}
+
+// 对应 Rust: netblock::ip_policy::IpPolicy
+// 复用 handler: update_and_write_policies()
+message IpPolicyItem {
+    string ip = 1;
+    uint32 direction = 2;
+    uint64 duration = 3;
+    bool is_ipv6 = 4;
+}
+
+message IpBlockPolicy {
+    repeated IpPolicyItem items = 1;
+}

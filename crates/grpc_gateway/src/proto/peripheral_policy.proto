@@ -1,0 +1,24 @@
+syntax = "proto3";
+package peripheral_policy;
+
+import "common.proto";
+
+service PeripheralPolicyService {
+    rpc GetPeripheralPolicy(common.Empty) returns (PeripheralPolicy);
+    rpc UpdatePeripheralPolicy(PeripheralPolicy) returns (common.SimpleResponse);
+}
+
+// 对应 Rust: udisk::device::UsbInfo
+// 复用 handler: SHARED_USB_LIST.update_whitelist() / update_blacklist()
+message UsbDevice {
+    string peripheral_eid = 1;
+    string peripheral_name = 2;
+    string intro = 3;
+    string type_ = 4;
+    bool allow = 5;
+}
+
+message PeripheralPolicy {
+    repeated UsbDevice devices = 1;
+    bool is_white = 2;
+}

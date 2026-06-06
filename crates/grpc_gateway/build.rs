@@ -1,0 +1,29 @@
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tonic_prost_build::configure()
+        .compile_protos(
+            &[
+                "src/proto/common.proto",
+                "src/proto/virus_scan.proto",
+                "src/proto/vuln_scan.proto",
+                "src/proto/agent_status.proto",
+                "src/proto/alert.proto",
+                "src/proto/config.proto",
+                "src/proto/task_local.proto",
+                "src/proto/process_policy.proto",
+                "src/proto/peripheral_policy.proto",
+                "src/proto/dir_policy.proto",
+                "src/proto/extort_policy.proto",
+                "src/proto/ip_policy.proto",
+                "src/proto/jump.proto",
+                "src/proto/backup.proto",
+                "src/proto/outreach_detect.proto",
+                "src/proto/trust_dir.proto",
+                "src/proto/virtual_port.proto",
+                "src/proto/data_query.proto",
+                "src/proto/policy_watch.proto",
+            ],
+            &["src/proto"],
+        )
+        .unwrap();
+    Ok(())
+}
