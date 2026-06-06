@@ -2,6 +2,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use tonic::Status;
 
 use grpc_gateway::policy_watch::PolicyChangeType;
+use grpc_gateway::dir_policy::DirectionScanRule;
+use grpc_gateway::extort_policy::ExtortProtectRule;
 
 /// Agent operation mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +372,32 @@ impl AgentDataHub {
         snapman::restore_snapshot(backup_id).await.map_err(|e| format!("{:?}", e))?;
         self.notify(PolicyChangeType::BackupListChanged);
         Ok(())
+    }
+
+    // ========================================================================
+    // DirPolicy cache operations
+    // ========================================================================
+
+    pub fn get_cached_dir_policy(&self) -> Vec<DirectionScanRule> {
+        grpc_gateway::notify::DIR_POLICY_CACHE.lock().unwrap().clone()
+    }
+
+    pub fn set_cached_dir_policy(&self, rules: Vec<DirectionScanRule>) {
+        *grpc_gateway::notify::DIR_POLICY_CACHE.lock().unwrap() = rules;
+        self.notify(PolicyChangeType::DirPolicyChanged);
+    }
+
+    // ========================================================================
+    // ExtortPolicy cache operations
+    // ========================================================================
+
+    pub fn get_cached_extort_policy(&self) -> Vec<ExtortProtectRule> {
+        grpc_gateway::notify::EXTORT_POLICY_CACHE.lock().unwrap().clone()
+    }
+
+    pub fn set_cached_extort_policy(&self, rules: Vec<ExtortProtectRule>) {
+        *grpc_gateway::notify::EXTORT_POLICY_CACHE.lock().unwrap() = rules;
+        self.notify(PolicyChangeType::ExtortPolicyChanged);
     }
 
     /// Execute password jump. Returns (status, reason).
