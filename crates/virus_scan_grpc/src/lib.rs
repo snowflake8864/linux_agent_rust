@@ -1,7 +1,6 @@
-pub mod proto {
-    tonic::include_proto!("virus_scan");
-    tonic::include_proto!("vuln_scan");
-}
+// Re-export proto types from grpc_gateway
+pub use grpc_gateway::virus_scan;
+pub use grpc_gateway::vuln_scan;
 
 pub mod clamav_scanner;
 pub mod scan_task_mgr;

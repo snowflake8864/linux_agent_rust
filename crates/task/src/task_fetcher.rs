@@ -40,6 +40,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use grpc_gateway::notify::notify_policy_change;
+use grpc_gateway::policy_watch::PolicyChangeType;
 
 static AUTO_IP_JUMP_DAEMON_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -690,7 +692,7 @@ pub async fn run(
 
 /// 根据任务类型处理任务
 async fn handle_task(&mut self, task_type: TaskTypeEnum) -> Result<(), String> {
-    match task_type {
+    let result = match task_type {
         TaskTypeEnum::TaskUploadProcess => self.task_upload_process(0).await,
         TaskTypeEnum::TaskUpdate => self.task_update(1).await,
         TaskTypeEnum::TaskUploadDir => self.task_upload_dir(2).await,
@@ -717,14 +719,32 @@ async fn handle_task(&mut self, task_type: TaskTypeEnum) -> Result<(), String> {
         TaskTypeEnum::TaskGlobalDir => self.task_global_dir(33).await,
         TaskTypeEnum::TaskUpdateUUI => self.task_update_uuid(34).await,
         TaskTypeEnum::TaskOutReachDetect => self.task_outreach_detect(35).await,
-        TaskTypeEnum::TaskPwJump => self.task_down_pwjump(36).await, 
-        TaskTypeEnum::TaskIpJump => self.task_down_ipjump(37).await, 
+        TaskTypeEnum::TaskPwJump => self.task_down_pwjump(36).await,
+        TaskTypeEnum::TaskIpJump => self.task_down_ipjump(37).await,
         TaskTypeEnum::TaskSystemBackup => self.task_get_system_backups(38).await,
         TaskTypeEnum::TaskSystemRollback => self.task_system_rollback(39).await,
         TaskTypeEnum::TaskNtpSyncAt => self.task_ntp_sync(40).await,
-        _ => Err("Unknown task type".to_string()), // 未知任务类型处理
-                                                   //_ => Err(format!("Task not implemented: {:?}", task_type)),
+        _ => Err("Unknown task type".to_string()),
+    };
+
+    // On success, notify gRPC subscribers about the policy change
+    if result.is_ok() {
+        match task_type {
+            TaskTypeEnum::TaskDownConf => notify_policy_change(PolicyChangeType::ConfigChanged),
+            TaskTypeEnum::TaskDownWhite | TaskTypeEnum::TaskDownBlack => notify_policy_change(PolicyChangeType::ProcessPolicyChanged),
+            TaskTypeEnum::TaskDownDirPolicy => notify_policy_change(PolicyChangeType::DirPolicyChanged),
+            TaskTypeEnum::TaskDownExtort => notify_policy_change(PolicyChangeType::ExtortPolicyChanged),
+            TaskTypeEnum::TaskDownNetBlockPolicy => notify_policy_change(PolicyChangeType::IpBlockPolicyChanged),
+            TaskTypeEnum::TaskDownBlackIpPolicy => notify_policy_change(PolicyChangeType::IpBlackPolicyChanged),
+            TaskTypeEnum::TaskGetWhitePeripherals | TaskTypeEnum::TaskGetBlackPeripherals => notify_policy_change(PolicyChangeType::PeripheralPolicyChanged),
+            TaskTypeEnum::TaskDownVirtualPort => notify_policy_change(PolicyChangeType::VirtualPortChanged),
+            TaskTypeEnum::TaskOutReachDetect => notify_policy_change(PolicyChangeType::OutreachRulesChanged),
+            TaskTypeEnum::TaskGlobalDir => notify_policy_change(PolicyChangeType::TrustDirChanged),
+            _ => {}
+        }
     }
+
+    result
 }
 
 // 处理 TASK_UPLOAD_PROCESS 任务

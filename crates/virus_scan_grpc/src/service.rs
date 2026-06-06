@@ -7,6 +7,17 @@ use logging::{log_error, log_info,log_warn};
 use common::manager::boot::BootManager;
 use net_client::core::NetClient;
 use crate::clamav_scanner::{ClamAVConnectionPool, ClamAVConnection};
+use agent_local_svc::{
+    AgentDataHub,
+    ConfigServiceImpl, ProcessPolicyServiceImpl, PeripheralPolicyServiceImpl,
+    IpPolicyServiceImpl, DataQueryServiceImpl, OutreachDetectServiceImpl,
+    AgentStatusServiceImpl, AlertServiceImpl, LocalTaskServiceImpl,
+    PolicyWatchServiceImpl,
+};
+use agent_local_svc::stub_handlers::{
+    DirPolicyServiceImpl, ExtortPolicyServiceImpl, JumpServiceImpl,
+    BackupServiceImpl, TrustDirServiceImpl, VirtualPortServiceImpl,
+};
 
 pub trait StartVirusScanGrpcService {
     fn start_virus_scan_grpc_service(
@@ -116,13 +127,97 @@ impl StartVirusScanGrpcService for BootManager {
             log_info!("病毒扫描 gRPC 服务正在启动: {}", addr);
 
             Server::builder()
-                .add_service(crate::proto::virus_scan_service_server::VirusScanServiceServer::new(grpc_service))
+                .add_service(grpc_gateway::virus_scan::virus_scan_service_server::VirusScanServiceServer::new(grpc_service))
                 // ============================================================
                 // 漏洞扫描服务 (如需关闭，注释掉下面几行)
                 // ============================================================
-                .add_service(crate::proto::vuln_scan_service_server::VulnScanServiceServer::new(
+                .add_service(grpc_gateway::vuln_scan::vuln_scan_service_server::VulnScanServiceServer::new(
                     crate::VulnScanGrpcService::new(self.clone(), vuln_base_url),
                 ))
+                // ============================================================
+                // 新增：本地管理 gRPC 服务（在线只读，离线读写）
+                // ============================================================
+                .add_service(
+                    grpc_gateway::agent_status::agent_status_service_server::AgentStatusServiceServer::new(
+                        AgentStatusServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::alert::alert_service_server::AlertServiceServer::new(
+                        AlertServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::config::config_service_server::ConfigServiceServer::new(
+                        ConfigServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::task_local::local_task_service_server::LocalTaskServiceServer::new(
+                        LocalTaskServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::process_policy::process_policy_service_server::ProcessPolicyServiceServer::new(
+                        ProcessPolicyServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::peripheral_policy::peripheral_policy_service_server::PeripheralPolicyServiceServer::new(
+                        PeripheralPolicyServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::ip_policy::ip_policy_service_server::IpPolicyServiceServer::new(
+                        IpPolicyServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::data_query::data_query_service_server::DataQueryServiceServer::new(
+                        DataQueryServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::outreach_detect::outreach_detect_service_server::OutreachDetectServiceServer::new(
+                        OutreachDetectServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::policy_watch::policy_watch_service_server::PolicyWatchServiceServer::new(
+                        PolicyWatchServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
+                // Stub services
+                .add_service(
+                    grpc_gateway::dir_policy::dir_policy_service_server::DirPolicyServiceServer::new(
+                        DirPolicyServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::extort_policy::extort_policy_service_server::ExtortPolicyServiceServer::new(
+                        ExtortPolicyServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::jump::jump_service_server::JumpServiceServer::new(
+                        JumpServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::backup::backup_service_server::BackupServiceServer::new(
+                        BackupServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::trust_dir::trust_dir_service_server::TrustDirServiceServer::new(
+                        TrustDirServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::virtual_port::virtual_port_service_server::VirtualPortServiceServer::new(
+                        VirtualPortServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                    )
+                )
                 // ============================================================
                 .serve(addr)
                 .await

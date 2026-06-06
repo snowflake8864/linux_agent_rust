@@ -1,0 +1,30 @@
+[package]
+name = "agent_local_svc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tonic = "0.14"
+prost = "0.14"
+tonic-prost = "0.14"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+chrono = "0.4"
+
+grpc_gateway = { path = "../grpc_gateway" }
+config = { path = "../config" }
+process_mgr = { path = "../process_mgr" }
+pattern = { path = "../pattern" }
+netblock = { path = "../netblock" }
+task = { path = "../task" }
+hostinfo = { path = "../hostinfo" }
+snapman = { path = "../snapman" }
+rules_jump_mgr = { path = "../rules_jump_mgr" }
+procinfo = { path = "../procinfo" }
+logging = { path = "../logging" }
+common = { path = "../common" }
+udisk = { path = "../udisk" }

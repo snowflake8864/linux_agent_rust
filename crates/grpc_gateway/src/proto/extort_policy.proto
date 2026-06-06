@@ -1,0 +1,21 @@
+syntax = "proto3";
+package extort_policy;
+
+import "common.proto";
+
+service ExtortPolicyService {
+    rpc GetExtortPolicy(common.Empty) returns (ExtortPolicy);
+    rpc UpdateExtortPolicy(ExtortPolicy) returns (common.SimpleResponse);
+}
+
+// 对应 Rust: pattern::pattern_rules_mgr::POLICY_EXIPOR_PROTECT
+// 复用 handler: PatternRulesMgr::parse_exipor_policy_from_json() → set_exiport_dir()
+message ExtortProtectRule {
+    string file_type = 1;
+    uint32 typ = 2;
+    map<string, string> map_comm = 3;  // hash → process_name
+}
+
+message ExtortPolicy {
+    repeated ExtortProtectRule rules = 1;
+}

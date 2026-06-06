@@ -1,0 +1,442 @@
+================================================================================
+  gRPC 客户端接口说明 — Flutter/Dart 开发者文档
+  分支: 804_v2
+  日期: 2026-06-06
+================================================================================
+
+一、概述
+================================================================================
+
+  Agent 通过 gRPC 提供本地服务，客户端（Flutter/Dart）只需调用这些 gRPC API
+  即可获取数据、展示界面。客户端不需要关心 Agent 是否在线、不需要知道服务器地址。
+
+  连接地址: http://127.0.0.1:50051 （plaintext, 无 TLS）
+  Proto 文件: crates/grpc_gateway/src/proto/
+
+  权限模型:
+    - Agent 在线时: 所有 Get*/Subscribe* 方法可用；Update*/Execute* 返回 PERMISSION_DENIED
+    - Agent 离线时: 全部方法可用
+
+
+二、Dart 客户端生成
+================================================================================
+
+  方式1: 用 proto 文件直接生成 Dart 代码
+
+    # 安装 protoc 和 dart plugin
+    sudo apt install protobuf-compiler
+    dart pub global activate protoc_plugin
+
+    # 生成 Dart 代码（以 config.proto 为例）
+    protoc \
+      -I=crates/grpc_gateway/src/proto \
+      --dart_out=grpc:lib/generated \
+      crates/grpc_gateway/src/proto/common.proto \
+      crates/grpc_gateway/src/proto/config.proto \
+      crates/grpc_gateway/src/proto/agent_status.proto \
+      ... (共18个 .proto)
+
+  方式2: 在 pubspec.yaml 中依赖 grpc 包，用 build_runner
+    （推荐，因为 18 个 proto 手动生成较繁琐）
+
+  生成后的 Dart 类可直接调用，示例见下文。
+
+
+三、初始化连接
+================================================================================
+
+  import 'package:grpc/grpc.dart';
+  import 'generated/config.pbgrpc.dart';  // 生成的代码
+
+  final channel = ClientChannel('127.0.0.1',
+    port: 50051,
+    options: ChannelOptions(
+      credentials: ChannelCredentials.insecure(),  // 无 TLS
+      // 超时设置
+      idleTimeout: Duration(minutes: 5),
+    ),
+  );
+
+  final configClient = ConfigServiceClient(channel);
+
+
+四、API 清单
+================================================================================
+
+  4.1 AgentStatusService — 仪表盘
+  --------------------------------------------------------------------------
+    文件: agent_status.proto
+    包名: agent_status
+
+    rpc GetAgentStatus(Empty) returns (AgentStatus);
+
+    // Dart 调用:
+    final resp = await statusClient.getAgentStatus(Empty());
+    print(resp.isOnline);       // bool — 是否在线
+    print(resp.agentVersion);   // String — Agent版本号
+    print(resp.osInfo);         // String — OS信息
+    print(resp.modules);        // List<ModuleStatus> — 各模块状态
+    print(resp.deviceUid);      // String — 设备唯一ID
+    print(resp.hostName);       // String — 主机名
+
+
+  4.2 AlertService — 告警推送（流式）
+  --------------------------------------------------------------------------
+    文件: alert.proto
+    包名: alert
+
+    rpc SubscribeAlerts(AlertFilter) returns (stream AlertEvent);
+
+    // Dart 调用:
+    final stream = alertClient.subscribeAlerts(AlertFilter(type: AlertType.ALL));
+    await for (var event in stream) {
+      print('告警: ${event.type} level=${event.level}');
+      if (event.filePath.isNotEmpty) print('  文件: ${event.filePath}');
+      if (event.processName.isNotEmpty) print('  进程: ${event.processName}');
+    }
+
+    告警类型枚举:
+      ALERT_UNKNOWN = 0
+      PROCESS_ALERT = 1   — 进程异常告警
+      FILE_ALERT = 2      — 文件保护告警
+      DEVICE_ALERT = 3    — 外接设备告警
+      NETWORK_ALERT = 4   — 网络告警
+      RANSOMWARE_ALERT = 5 — 勒索软件告警
+
+
+  4.3 ConfigService — 配置管理
+  --------------------------------------------------------------------------
+    文件: config.proto
+    包名: config
+
+    rpc GetConfig(Empty) returns (ConfigData);        // 始终可用
+    rpc UpdateConfig(ConfigData) returns (ConfigResponse); // 仅离线
+
+    主要字段（ConfigData）:
+      crontime          uint32   — 任务轮询间隔(秒)
+      file_switch       bool     — 文件保护开关
+      proc_switch       bool     — 进程保护开关
+      extortion_protect bool     — 勒索保护
+      usb_switch        bool     — USB管控开关
+      self_protect_switch bool   — 自保护开关
+      ... (共29个字段，详见 config.proto)
+
+    // Dart 调用 — 读:
+    final cfg = await configClient.getConfig(Empty());
+    print('轮询间隔: ${cfg.crontime}秒');
+    print('文件保护: ${cfg.fileSwitch}');
+
+    // Dart 调用 — 写（仅离线）:
+    try {
+      final resp = await configClient.updateConfig(
+        ConfigData(crontime: 120, fileSwitch: true));
+      print(resp.message);
+    } on GrpcError catch (e) {
+      if (e.code == StatusCode.permissionDenied) {
+        print('在线模式，不允许修改');
+      }
+    }
+
+
+  4.4 ProcessPolicyService — 进程策略
+  --------------------------------------------------------------------------
+    文件: process_policy.proto
+    包名: process_policy
+
+    rpc GetProcessPolicy(Empty) returns (ProcessPolicy);
+    rpc UpdateProcessPolicy(ProcessPolicy) returns (SimpleResponse);
+
+    // 读:
+    final policy = await processPolicyClient.getProcessPolicy(Empty());
+    print('白名单hash数: ${policy.hashList.length}');
+
+    // 写（仅离线）:
+    await processPolicyClient.updateProcessPolicy(
+      ProcessPolicy(hashList: ['abc123', 'def456'], isWhite: true));
+
+
+  4.5 PeripheralPolicyService — 外设策略
+  --------------------------------------------------------------------------
+    文件: peripheral_policy.proto
+    包名: peripheral_policy
+
+    rpc GetPeripheralPolicy(Empty) returns (PeripheralPolicy);
+    rpc UpdatePeripheralPolicy(PeripheralPolicy) returns (SimpleResponse);
+
+    UsbDevice 字段:
+      peripheralEid  String  — 设备唯一标识
+      peripheralName String  — 设备名称
+      intro          String  — 描述
+      type           String  — 类型
+      allow          bool    — 是否允许
+
+    // 读:
+    final policy = await peripheralClient.getPeripheralPolicy(Empty());
+    for (var d in policy.devices) {
+      print('${d.peripheralName}: ${d.allow ? "允许" : "禁止"}');
+    }
+
+
+  4.6 IpPolicyService — IP阻断/黑名单
+  --------------------------------------------------------------------------
+    文件: ip_policy.proto
+    包名: ip_policy
+
+    rpc GetIpBlockPolicy(Empty) returns (IpBlockPolicy);
+    rpc UpdateIpBlockPolicy(IpBlockPolicy) returns (SimpleResponse);
+    rpc GetIpBlackPolicy(Empty) returns (IpBlockPolicy);
+    rpc UpdateIpBlackPolicy(IpBlockPolicy) returns (SimpleResponse);
+
+    IpPolicyItem 字段:
+      ip        String  — IP 地址
+      direction uint32  — 阻断方向
+      duration  uint64  — 阻断时长(秒), 0=永久
+      isIpv6    bool    — 是否IPv6
+
+    // 读:
+    final block = await ipClient.getIpBlockPolicy(Empty());
+    for (var item in block.items) {
+      print('${item.ip} 阻断 ${item.duration}秒');
+    }
+
+
+  4.7 JumpService — IP跳变/密码跳变
+  --------------------------------------------------------------------------
+    文件: jump.proto
+    包名: jump
+
+    rpc GetJumpStatus(Empty) returns (JumpStatus);
+    rpc ExecuteIpJump(IpJumpRequest) returns (IpJumpResponse);   // 仅离线
+    rpc ExecutePwJump(PwJumpRequest) returns (PwJumpResponse);   // 仅离线
+
+    // 读状态:
+    final status = await jumpClient.getJumpStatus(Empty());
+    print('当前IP: ${status.currentIp}');
+
+    // 执行IP跳变（仅离线）:
+    final resp = await jumpClient.executeIpJump(IpJumpRequest(
+      gateway: '192.168.1.1',
+      sourceIp: '10.0.0.5',
+      targetIp: '10.0.0.6',
+      mode: 1,
+    ));
+
+
+  4.8 BackupService — 备份/还原
+  --------------------------------------------------------------------------
+    文件: backup.proto
+    包名: backup
+
+    rpc GetBackupList(Empty) returns (BackupList);
+    rpc CreateBackup(CreateBackupRequest) returns (CreateBackupResponse);  // 仅离线
+    rpc RestoreBackup(RestoreBackupRequest) returns (RestoreBackupResponse); // 仅离线
+
+
+  4.9 DataQueryService — 实时数据查询
+  --------------------------------------------------------------------------
+    文件: data_query.proto
+    包名: data_query
+
+    rpc GetProcessList(ProcessFilter) returns (ProcessList);
+    rpc GetPortList(Empty) returns (PortList);
+    rpc GetUsbDeviceList(Empty) returns (UsbDeviceList);
+
+    // 进程列表（可排序/限制数量）:
+    final procs = await queryClient.getProcessList(
+      ProcessFilter(limit: 20, sortBy: 'pid'));
+    for (var p in procs.processes) {
+      print('PID=${p.pid} ${p.name} ${p.exePath}');
+    }
+
+    // 端口列表:
+    final ports = await queryClient.getPortList(Empty());
+    for (var p in ports.ports) {
+      print('${p.protocol}:${p.port} → ${p.processName}');
+    }
+
+
+  4.10 PolicyWatchService — 策略变更通知（被动推送）
+  --------------------------------------------------------------------------
+    文件: policy_watch.proto
+    包名: policy_watch
+
+    rpc SubscribePolicyChanges(Empty) returns (stream PolicyChangeEvent);
+
+    // Dart 调用 — 保持常驻连接:
+    final changeStream = watchClient.subscribePolicyChanges(Empty());
+    await for (var event in changeStream) {
+      switch (event.type) {
+        case PolicyChangeType.CONFIG_CHANGED:
+          // 刷新配置 → 调 configClient.getConfig()
+          break;
+        case PolicyChangeType.PROCESS_POLICY_CHANGED:
+          // 刷新进程策略 → 调 processPolicyClient.getProcessPolicy()
+          break;
+        case PolicyChangeType.IP_BLOCK_POLICY_CHANGED:
+          // 刷新IP策略 → 调 ipClient.getIpBlockPolicy()
+          break;
+        // ... 其他类型同理
+      }
+    }
+
+    变更类型枚举:
+      CONFIG_CHANGED = 0              — 配置变更
+      PROCESS_POLICY_CHANGED = 1      — 进程策略变更
+      PERIPHERAL_POLICY_CHANGED = 2   — 外设策略变更
+      DIR_POLICY_CHANGED = 3          — 目录保护策略变更
+      EXTORT_POLICY_CHANGED = 4       — 勒索保护策略变更
+      IP_BLOCK_POLICY_CHANGED = 5     — IP阻断策略变更
+      IP_BLACK_POLICY_CHANGED = 6     — IP黑名单变更
+      OUTREACH_RULES_CHANGED = 7      — 外联检测规则变更
+      TRUST_DIR_CHANGED = 8           — 信任目录变更
+      VIRTUAL_PORT_CHANGED = 9        — 虚拟端口规则变更
+      JUMP_STATUS_CHANGED = 10        — 跳变状态变更
+      BACKUP_LIST_CHANGED = 11        — 备份列表变更
+      AGENT_STATUS_CHANGED = 12       — Agent状态变更
+
+
+  4.11 LocalTaskService — 本地任务下发（仅离线）
+  --------------------------------------------------------------------------
+    文件: task_local.proto
+    包名: task_local
+
+    rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+
+    // Dart 调用:
+    final resp = await taskClient.submitTask(
+      SubmitTaskRequest(taskIds: [6, 19, 33, 4]));
+    for (var r in resp.results) {
+      print('Task ${r.taskId}: ${r.success ? "成功" : r.message}');
+    }
+
+    常用 task ID:
+      6  — 远程配置更新
+      19 — 勒索保护策略
+      33 — 全局信任目录
+      4  — 目录保护策略
+      3  — 进程白名单
+      7  — 进程黑名单
+      36 — 密码跳变
+      37 — IP跳变
+
+
+  4.12 VirusScanService — 病毒扫描（双向流，已有功能）
+  --------------------------------------------------------------------------
+    文件: virus_scan.proto
+    包名: virus_scan
+
+    rpc StreamControl(stream ClientMessage) returns (stream ServerMessage);
+
+    // 此接口为双向流，已有 egui 客户端实现可参考。
+    // 详见 endpoint_security_egui/src/grpc_client.rs
+
+
+五、Flutter 客户端最佳实践
+================================================================================
+
+  5.1 启动时获取初始数据（各调一次）
+
+    Future<void> loadInitialData() async {
+      final results = await Future.wait([
+        statusClient.getAgentStatus(Empty()),
+        configClient.getConfig(Empty()),
+        processClient.getProcessPolicy(Empty()),
+        peripheralClient.getPeripheralPolicy(Empty()),
+        ipClient.getIpBlockPolicy(Empty()),
+        ipClient.getIpBlackPolicy(Empty()),
+        outreachClient.getOutreachRules(Empty()),
+        queryClient.getProcessList(ProcessFilter(limit: 50)),
+        queryClient.getPortList(Empty()),
+        jumpClient.getJumpStatus(Empty()),
+        backupClient.getBackupList(Empty()),
+      ]);
+      // 更新 UI state
+    }
+
+
+  5.2 订阅变更流（保持常驻，被动更新）
+
+    void startSubscriptions() {
+      // 策略变更
+      watchClient.subscribePolicyChanges(Empty()).listen((event) {
+        switch (event.type) {
+          case PolicyChangeType.CONFIG_CHANGED:
+            _refreshConfig();    // 调 GetConfig
+            break;
+          case PolicyChangeType.PROCESS_POLICY_CHANGED:
+            _refreshProcessPolicy();
+            break;
+          // ...
+        }
+      });
+
+      // 告警
+      alertClient.subscribeAlerts(AlertFilter()).listen((event) {
+        _addAlert(event);  // 添加到告警列表
+      });
+    }
+
+
+  5.3 离线模式识别
+
+    // 不需要额外判断——在线模式下调写操作会返回 GrpcError(code: PERMISSION_DENIED)
+    try {
+      await configClient.updateConfig(newConfig);
+    } on GrpcError catch (e) {
+      if (e.code == StatusCode.permissionDenied) {
+        // 当前在线，不允许写入 → 隐藏"保存"按钮或置灰
+        setState(() => _editable = false);
+      }
+    }
+
+    // 或者从 GetAgentStatus 的 isOnline 字段判断
+    final status = await statusClient.getAgentStatus(Empty());
+    final isOffline = !status.isOnline;
+
+
+  5.4 连接管理
+
+    // 创建一次 channel，全局复用
+    class GrpcClientManager {
+      static final _channel = ClientChannel('127.0.0.1',
+        port: 50051,
+        options: ChannelOptions(credentials: ChannelCredentials.insecure()),
+      );
+
+      static final configClient = ConfigServiceClient(_channel);
+      static final statusClient = AgentStatusServiceClient(_channel);
+      // ... 其他 client
+
+      static Future<void> shutdown() async {
+        await _channel.shutdown();
+      }
+    }
+
+
+六、错误处理
+================================================================================
+
+  所有 gRPC 调用可能返回以下错误状态:
+
+    PERMISSION_DENIED (7)  — 在线模式不允许写操作
+    UNIMPLEMENTED (12)     — 功能尚未实现（stub handler）
+    INTERNAL (13)          — 内部错误，message 中包含详情
+    UNAVAILABLE (14)       — gRPC 服务未启动（Agent 未运行）
+
+  Dart 示例:
+    try {
+      await configClient.updateConfig(...);
+    } on GrpcError catch (e) {
+      switch (e.code) {
+        case StatusCode.permissionDenied:
+          showToast('在线模式，请通过管理平台操作');
+          break;
+        case StatusCode.unavailable:
+          showToast('Agent 未运行或 gRPC 服务未启动');
+          break;
+        default:
+          showToast('错误: ${e.message}');
+      }
+    }
+
+================================================================================

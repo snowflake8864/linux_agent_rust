@@ -1,0 +1,49 @@
+syntax = "proto3";
+package jump;
+
+import "common.proto";
+
+service JumpService {
+    rpc GetJumpStatus(common.Empty) returns (JumpStatus);
+    rpc ExecuteIpJump(IpJumpRequest) returns (IpJumpResponse);
+    rpc ExecutePwJump(PwJumpRequest) returns (PwJumpResponse);
+}
+
+// 对应 Rust: rules_jump_mgr::IpJumpConfig
+message IpJumpRequest {
+    string gateway = 1;
+    string source_ip = 2;
+    string target_ip = 3;
+    uint32 mode = 4;
+    uint32 allow_size = 5;
+    uint32 aging_time = 6;
+    uint32 active_time = 7;
+}
+
+// 对应 Rust: rules_jump_mgr::PutIpJumpInfo
+message IpJumpResponse {
+    bool success = 1;
+    string source_ip = 2;
+    string target_ip = 3;
+    string gateway = 4;
+    string agent_ip = 5;
+    uint32 status = 6;
+    string reason = 7;
+}
+
+message PwJumpRequest {
+    string new_password = 1;
+}
+
+// 对应 Rust: rules_jump_mgr::PutPwJumpInfo
+message PwJumpResponse {
+    bool success = 1;
+    uint32 status = 2;
+    string reason = 3;
+}
+
+message JumpStatus {
+    string current_ip = 1;
+    string last_ip_jump_time = 2;
+    string last_pw_jump_time = 3;
+}
