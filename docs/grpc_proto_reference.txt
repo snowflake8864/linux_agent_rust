@@ -1,0 +1,226 @@
+================================================================================
+  Flutter 客户端 Proto 文件参考
+  分支: 804_v2
+  日期: 2026-06-06
+================================================================================
+
+  目录: crates/grpc_gateway/src/proto/
+
+  客户端只需这 19 个 proto 文件即可生成 Dart gRPC 代码。
+
+
+一、文件清单 & 用途
+================================================================================
+
+  1. common.proto — 公共类型
+  --------------------------------------------------------------------------
+    用途: 被其他 proto 引用，定义 Empty 和 SimpleResponse
+    内容:
+      message Empty {}
+      message SimpleResponse { bool success; string message; }
+
+
+  2. agent_status.proto — 仪表盘（仅读）
+  --------------------------------------------------------------------------
+    用途: Flutter 首页看板，显示 Agent 运行状态
+    接口:
+      rpc GetAgentStatus(Empty) returns (AgentStatus)
+    返回: 在线状态、版本号、OS信息、CPU/内存、各模块开关状态、设备ID、主机名
+
+
+  3. alert.proto — 告警推送（订阅流）
+  --------------------------------------------------------------------------
+    用途: Flutter 实时接收所有告警/日志事件（被动推送，不轮询）
+    接口:
+      rpc SubscribeAlerts(AlertFilter) returns (stream AlertEvent)
+    AlertEvent 字段:
+      alert_id         — 唯一ID (UUID)
+      type             — 大类: 0=未知 1=进程 2=文件 3=外设 4=网络 5=勒索
+      level            — 严重级别
+      timestamp        — 事件时间戳
+      file_path        — 涉及文件路径
+      process_name     — 涉及进程名
+      md5              — 文件MD5
+      remark           — 备注(IP/类型等)
+      peripheral_name  — 外设名称
+      peripheral_eid   — 外设ID
+      rename_dir       — 重命名目录
+      p_param          — 进程参数
+      n_type           — 原始事件类型码(精准分类)
+    n_type 对照:
+      4001,4003 → 进程事件   9003-9006 → 外设事件
+      其余 → 文件保护/自保护/通信日志/SSH登录
+    覆盖所有日志: 文件保护 / 进程启动 / 对外通信 / SSH登录 / 外设 / 勒索
+
+
+  4. config.proto — 配置管理（在线只读 / 离线读写）
+  --------------------------------------------------------------------------
+    用途: 查看/修改 Agent 配置（29个字段）
+    接口:
+      rpc GetConfig(Empty) returns (ConfigData)           // 始终可用
+      rpc UpdateConfig(ConfigData) returns (ConfigResponse) // 仅离线
+    字段: crontime / file_switch / proc_switch / usb_switch /
+          extortion_protect / self_protect_switch / outreach_switch ...
+    (完整字段见 config.proto)
+
+
+  5. task_local.proto — 本地任务下发（仅离线）
+  --------------------------------------------------------------------------
+    用途: 离线模式下 Flutter 替代服务器下发任务给 Agent
+    接口:
+      rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse)
+    常用 task_id:
+      6=配置更新 3=进程白名单 7=进程黑名单 4=目录保护 19=勒索保护
+      36=密码跳变 37=IP跳变 38=备份 39=还原 40=NTP同步
+
+
+  6. process_policy.proto — 进程白/黑名单（在线只读 / 离线读写）
+  --------------------------------------------------------------------------
+    用途: 查看/更新进程执行策略（hash值列表）
+    接口:
+      rpc GetProcessPolicy(Empty) returns (ProcessPolicy)
+      rpc UpdateProcessPolicy(ProcessPolicy) returns (SimpleResponse)
+
+
+  7. peripheral_policy.proto — 外设白/黑名单（在线只读 / 离线读写）
+  --------------------------------------------------------------------------
+    用途: 查看/更新USB外设策略
+    接口:
+      rpc GetPeripheralPolicy(Empty) returns (PeripheralPolicy)
+      rpc UpdatePeripheralPolicy(PeripheralPolicy) returns (SimpleResponse)
+
+
+  8. dir_policy.proto — 目录保护策略（在线只读 / 离线读写）
+  --------------------------------------------------------------------------
+    用途: 查看/更新受保护的目录列表
+    接口:
+      rpc GetDirPolicy(Empty) returns (DirPolicy)
+      rpc UpdateDirPolicy(DirPolicy) returns (SimpleResponse)
+
+
+  9. extort_policy.proto — 勒索保护策略（在线只读 / 离线读写）
+  --------------------------------------------------------------------------
+    用途: 查看/更新防勒索保护的目录和文件类型
+    接口:
+      rpc GetExtortPolicy(Empty) returns (ExtortPolicy)
+      rpc UpdateExtortPolicy(ExtortPolicy) returns (SimpleResponse)
+
+
+  10. ip_policy.proto — IP 阻断/黑名单（在线只读 / 离线读写）
+  --------------------------------------------------------------------------
+    用途: 查看/更新IP阻断策略和黑名单
+    接口:
+      rpc GetIpBlockPolicy(Empty) returns (IpBlockPolicy)
+      rpc UpdateIpBlockPolicy(IpBlockPolicy) returns (SimpleResponse)
+      rpc GetIpBlackPolicy(Empty) returns (IpBlockPolicy)
+      rpc UpdateIpBlackPolicy(IpBlockPolicy) returns (SimpleResponse)
+
+
+  11. jump.proto — IP/密码跳变（在线只读 / 离线读写）
+  --------------------------------------------------------------------------
+    用途: 查看跳变状态 / 执行跳变
+    接口:
+      rpc GetJumpStatus(Empty) returns (JumpStatus)
+      rpc ExecuteIpJump(IpJumpRequest) returns (IpJumpResponse)   // 仅离线
+      rpc ExecutePwJump(PwJumpRequest) returns (PwJumpResponse)   // 仅离线
+
+
+  12. backup.proto — 备份/还原（在线只读 / 离线读写）
+  --------------------------------------------------------------------------
+    用途: 查看备份列表 / 创建备份 / 系统还原
+    接口:
+      rpc GetBackupList(Empty) returns (BackupList)
+      rpc CreateBackup(CreateBackupRequest) returns (CreateBackupResponse)  // 仅离线
+      rpc RestoreBackup(RestoreBackupRequest) returns (RestoreBackupResponse)// 仅离线
+
+
+  13. outreach_detect.proto — 外联检测规则（在线只读 / 离线读写）
+  --------------------------------------------------------------------------
+    用途: 查看/更新外联检测目标地址和方法
+    接口:
+      rpc GetOutreachRules(Empty) returns (OutreachRules)
+      rpc UpdateOutreachRules(OutreachRules) returns (SimpleResponse)
+
+
+  14. trust_dir.proto — 全局信任目录（在线只读 / 离线读写）
+  --------------------------------------------------------------------------
+    用途: 查看/更新全局信任目录（不受保护策略约束）
+    接口:
+      rpc GetTrustDir(Empty) returns (TrustDirList)
+      rpc UpdateTrustDir(TrustDirList) returns (SimpleResponse)
+
+
+  15. virtual_port.proto — 虚拟端口规则（在线只读 / 离线读写）
+  --------------------------------------------------------------------------
+    用途: 查看/更新端口虚开/转发规则
+    接口:
+      rpc GetVirtualPort(Empty) returns (VirtualPortList)
+      rpc UpdateVirtualPort(VirtualPortList) returns (SimpleResponse)
+
+
+  16. data_query.proto — 实时数据查询（仅读）
+  --------------------------------------------------------------------------
+    用途: 查询当前运行的进程列表、端口列表、USB设备列表
+    接口:
+      rpc GetProcessList(ProcessFilter) returns (ProcessList)
+      rpc GetPortList(Empty) returns (PortList)
+      rpc GetUsbDeviceList(Empty) returns (UsbDeviceList)
+
+
+  17. policy_watch.proto — 策略变更通知（订阅流）
+  --------------------------------------------------------------------------
+    用途: Agent 内存中的策略/配置变更时，被动推送事件给 Flutter
+          Flutter 收到事件后调对应 GetXxx() 刷新数据
+    接口:
+      rpc SubscribePolicyChanges(Empty) returns (stream PolicyChangeEvent)
+    PolicyChangeType 枚举:
+      CONFIG_CHANGED=0 / PROCESS_POLICY_CHANGED=1 /
+      PERIPHERAL_POLICY_CHANGED=2 / DIR_POLICY_CHANGED=3 /
+      EXTORT_POLICY_CHANGED=4 / IP_BLOCK_POLICY_CHANGED=5 /
+      IP_BLACK_POLICY_CHANGED=6 / OUTREACH_RULES_CHANGED=7 /
+      TRUST_DIR_CHANGED=8 / VIRTUAL_PORT_CHANGED=9 /
+      JUMP_STATUS_CHANGED=10 / BACKUP_LIST_CHANGED=11 /
+      AGENT_STATUS_CHANGED=12
+
+
+  18. virus_scan.proto — 病毒扫描（双向流，始终可用）
+  --------------------------------------------------------------------------
+    用途: 病毒扫描，客户端发指令 / Agent 推实时进度和告警
+    接口:
+      rpc StreamControl(stream ClientMessage) returns (stream ServerMessage)
+
+
+  19. vuln_scan.proto — 漏洞扫描上报（始终可用）
+  --------------------------------------------------------------------------
+    用途: 外部漏洞扫描器上报结果，Agent 转发给服务器
+    接口:
+      rpc PutVulnScan(PutVulnScanRequest) returns (PutVulnScanResponse)
+
+
+二、权限模型速查
+================================================================================
+
+  在线模式（服务器可达）:  所有 Get*/Subscribe* 可用
+                         所有 Update*/Execute* → PERMISSION_DENIED
+
+  离线模式（服务器不可达）: 所有接口全部可用
+
+
+三、Flutter 启动流程
+================================================================================
+
+  1. 调所有 GetXxx() 各一次（拿初始数据）
+  2. 订阅 SubscribeAlerts()（持续接收告警/日志）
+  3. 订阅 SubscribePolicyChanges()（持续接收配置/策略变更通知）
+  4. 收到 PolicyChangeEvent → 调对应 GetXxx() 刷新数据
+  5. 不轮询，不主动拉取，完全被动
+
+
+四、生成 Dart 代码
+================================================================================
+
+  protoc -I=crates/grpc_gateway/src/proto \
+    --dart_out=grpc:lib/generated \
+    crates/grpc_gateway/src/proto/*.proto
+
+================================================================================
