@@ -199,6 +199,73 @@
     预期: {"success": true, "message": "IP阻断策略已更新"}
 
 
+  4.4 执行 IP 跳变（仅离线）
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{"gateway":"192.168.1.1","source_ip":"10.0.0.5","target_ip":"10.0.0.6","mode":1}' \
+      127.0.0.1:50051 \
+      jump.JumpService/ExecuteIpJump
+
+    预期（在线模式）: PERMISSION_DENIED
+    预期（离线模式）: {"success": true, "status": 1, ...}
+
+
+  4.5 执行密码跳变（仅离线）
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{"new_password":"test123"}' \
+      127.0.0.1:50051 \
+      jump.JumpService/ExecutePwJump
+
+    预期（在线模式）: PERMISSION_DENIED
+
+
+  4.6 创建备份（仅离线）
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{"name":"test_backup"}' \
+      127.0.0.1:50051 \
+      backup.BackupService/CreateBackup
+
+    预期（在线模式）: PERMISSION_DENIED
+
+
+  4.7 还原备份（仅离线）
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{"backup_id":"abc123"}' \
+      127.0.0.1:50051 \
+      backup.BackupService/RestoreBackup
+
+    预期（在线模式）: PERMISSION_DENIED
+
+
+  4.8 更新信任目录（仅离线）
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{"dirs": [{"dir":"/opt","type":1,"is_extend":0}]}' \
+      127.0.0.1:50051 \
+      trust_dir.TrustDirService/UpdateTrustDir
+
+    预期（在线模式）: PERMISSION_DENIED
+
+
+  4.9 更新虚拟端口规则（仅离线）
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{"rules": [{"alarm_level":1,"dest_ip":"192.168.1.1","dest_port":"80","dest_port_type":0,"id":1,"protocol":"tcp","source_ip":"10.0.0.1","source_port_start":8080,"source_port_end":8080,"type":"tcp"}]}' \
+      127.0.0.1:50051 \
+      virtual_port.VirtualPortService/UpdateVirtualPort
+
+    预期（在线模式）: PERMISSION_DENIED
+
+
 五、流式接口测试（需要客户端长连接）
 ================================================================================
 

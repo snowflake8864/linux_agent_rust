@@ -1183,3 +1183,31 @@
      → 建议全部走 gRPC，Flutter/dart 的 grpc 包很成熟
 
 ================================================================================
+
+附录A: 实施状态 (tag: 804_v2-grpc-base)
+================================================================================
+
+  ✅ = 已完整实现   ⚠️ = 待深入集成
+
+  | Service           | 读(Get/Subscribe) | 写(Update/Execute) | 说明                      |
+  |-------------------|-------------------|---------------------|--------------------------|
+  | VirusScanService  | ✅                | ✅                   | 已有，双向流病毒扫描          |
+  | VulnScanService   | ✅                | ✅                   | 已有，漏洞数据上报            |
+  | AgentStatusService| ✅                | —                   | 仪表盘状态                  |
+  | ConfigService     | ✅                | ✅                   | 配置读/写                  |
+  | ProcessPolicyService | ✅             | ✅                   | 进程白/黑名单               |
+  | PeripheralPolicyService | ✅         | ✅                   | 外设策略                    |
+  | IpPolicyService   | ✅                | ✅                   | IP阻断/黑名单               |
+  | JumpService       | ✅                | ✅                   | IP跳变 + 密码跳变            |
+  | BackupService     | ✅                | ✅                   | 备份创建 + 还原              |
+  | TrustDirService   | ✅                | ✅                   | 全局信任目录                 |
+  | VirtualPortService| ✅                | ✅                   | 虚拟端口规则                 |
+  | OutreachDetectService | ✅           | ✅                   | 外联检测规则                 |
+  | DataQueryService  | ✅                | —                   | 进程/端口/USB 查询           |
+  | PolicyWatchService| ✅ (订阅流)        | —                   | 策略变更通知                 |
+  | AlertService      | ⚠️ (订阅流)       | —                   | 待接 log_worker channel    |
+  | LocalTaskService  | —                | ⚠️                  | 待接 TaskFetcher           |
+  | DirPolicyService  | ⚠️               | ⚠️                  | 需 BootManager 的 pattern_mgr |
+  | ExtortPolicyService | ⚠️             | ⚠️                  | 需 BootManager 的 pattern_mgr |
+
+================================================================================
