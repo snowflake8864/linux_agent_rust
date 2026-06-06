@@ -1,0 +1,21 @@
+syntax = "proto3";
+package dir_policy;
+
+import "common.proto";
+
+service DirPolicyService {
+    rpc GetDirPolicy(common.Empty) returns (DirPolicy);
+    rpc UpdateDirPolicy(DirPolicy) returns (common.SimpleResponse);
+}
+
+// 对应 Rust: task::scan_directory_task::DirectionScanRule
+// 复用 handler: PatternRulesMgr::parse_policy_from_json() → set_protect_dir()
+message DirectionScanRule {
+    string dir = 1;
+    uint32 pid = 2;
+    uint32 typ = 3;
+}
+
+message DirPolicy {
+    repeated DirectionScanRule rules = 1;
+}

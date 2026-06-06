@@ -24,6 +24,8 @@ members = [
      "crates/snapman",
      "crates/rules_jump_mgr",
      "crates/agent_manager",
+    "crates/grpc_gateway",
+    "crates/agent_local_svc",
 ]
 
 [profile.dev]

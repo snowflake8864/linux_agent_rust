@@ -1,0 +1,1185 @@
+================================================================================
+  离线模式 & gRPC 接口设计文档  v2
+  分支: 804_v2 (基于 804)
+  日期: 2026-06-06
+================================================================================
+
+一、背景和目标
+================================================================================
+
+  当前 Agent (MagicArmorAgent) 与远程管理服务器的 HTTP REST 通信已经成型:
+    - POST /v1/auth         上线注册
+    - POST /v1/gettask      定时轮询任务
+    - POST /v1/getconf →    策略/配置下发 → 存入 Agent 内存
+       (POLICY_MANAGER / pattern_mgr / SHARED_USB_LIST / IP_POLICIES 等)
+    - POST /v1/alertupload  批量上报告警
+    - 其他 30+ 个 v1/ API
+
+  ★ 在线 HTTP 路径已完成，本次不做任何修改。
+
+  新增目标: 搭建本地 gRPC 服务层，使 Flutter GUI 客户端能够:
+    在线时: 通过 gRPC 从 Agent 内存中读取服务器下发的策略/状态数据（只读看板）
+    离线时: 通过 gRPC 替代服务器进行管控（读写，可下发任务/修改策略）
+
+
+二、核心设计原则
+================================================================================
+
+  1. ★ 在线 HTTP 路径不动 —— /v1/auth、/v1/gettask、/v1/getconf 等全部保持原样
+
+  2. 新增 gRPC 层，定位为"Agent 内存数据的查询/写入通道":
+
+     ★ Flutter 端只调用本工程提供的 gRPC API，不需要关心 HTTP、不需要知道
+       服务器地址、不区分在线离线。协议就 gRPC 一个入口。
+
+     ★ 数据更新全被动推送，Flutter 不用轮询:
+
+        Flutter 启动时调一次 GetXxx() 拿初始数据，之后订阅对应的流
+        （SubscribeAlerts / SubscribePolicyChanges），Agent 内存数据变化时
+        主动推事件，Flutter 收到事件后再调 GetXxx() 拉最新数据。
+
+        Flutter 启动流程:
+          ① GetConfig()           ← 拿初始配置
+          ② GetProcessPolicy()    ← 拿初始进程策略
+          ③ GetDirPolicy()        ← 拿初始目录策略
+          ④ ... （所有 GetXxx 各调一次）
+          ⑤ SubscribeAlerts()     ← 订阅告警流（持续推）
+          ⑥ SubscribePolicyChanges() ← 订阅策略变更流（持续推）
+
+        运行时更新流程（被动）:
+          服务器 ──HTTP──→ Agent 内存变了
+                              │
+              SubscribePolicyChanges 推事件 "PROCESS_POLICY_CHANGED"
+                              │
+           Flutter 收到 → 调 GetProcessPolicy() 拉最新
+           Flutter 不用轮询，完全被动
+
+     在线时（服务器可达）:
+       服务器 ──HTTP──→ Agent ─→ 策略存入内存 (POLICY_MANAGER / pattern_mgr / ...)
+                                    │
+       Flutter ──gRPC(只读)──────→ 只读 + 订阅流被动更新，不可修改
+
+     离线时（服务器不可达）:
+       服务器 ✗
+       Flutter ──gRPC(读写)──→ 直接读写 Agent 内存中的策略/配置
+                              (写操作复用现有的 handler/setter)
+
+  3. gRPC 接口的数据格式与现有 Rust 结构体对齐，写操作直接复用现有 handler
+     （handle_task / update_config_from_json / POLICY_MANAGER.set_policy_process /
+       SHARED_USB_LIST.update_whitelist 等），不写两套逻辑。
+
+  4. gRPC 框架从 virus_scan_grpc 中独立出来，新建 grpc_gateway crate
+     统一管理所有 proto 定义和 gRPC Server 构建。
+
+  5. 每个功能独立一个 proto 文件，好管理，Dart 端也能按需引入。
+
+
+三、在线/离线权限模型
+================================================================================
+
+  ┌─ 在线模式（服务器可达）─┐          ┌─ 离线模式（服务器不可达）─┐
+  │                         │          │                          │
+  │  远程服务器 ──HTTP──→ Agent       │   Flutter GUI ──gRPC──→ Agent
+  │      ↓ 下发任务           │          │      ↓ 下发任务           │
+  │      ↓ 下发策略           │          │      ↓ 修改配置           │
+  │      ↓ 修改配置           │          │      ↓ 更新策略           │
+  │                         │          │                          │
+  │  Flutter GUI ──gRPC──→ Agent      │   Agent 完全受 GUI 管控    │
+  │      只看，不控           │          │                          │
+  │  数据来源=服务器下发到     │          │  数据来源=GUI 本地写入     │
+  │  Agent内存中的策略/配置    │          │                          │
+  └─────────────────────────┘          └──────────────────────────┘
+
+  在线时 Flutter 可以（全部 gRPC 读操作）:
+    ✅ 看仪表盘/Agent 状态
+    ✅ 看实时告警流
+    ✅ 看进程列表、端口列表、USB 设备列表
+    ✅ 看当前配置（只读）
+    ✅ 看进程白/黑名单（只读）
+    ✅ 看外设白/黑名单（只读）
+    ✅ 看目录保护策略（只读）
+    ✅ 看勒索保护策略（只读）
+    ✅ 看 IP 阻断策略（只读）
+    ✅ 看外联检测规则（只读）
+    ✅ 看全局信任目录（只读）
+    ✅ 看虚拟端口规则（只读）
+    ✅ 看跳变状态、备份列表
+    ✅ 病毒扫描（本地扫描，不影响服务器管控）
+
+  在线时 Flutter 不可以（所有写操作返回 permission_denied）:
+    ❌ 下发任务
+    ❌ 修改配置/开关
+    ❌ 更新任何策略
+    ❌ 执行 IP/密码跳变
+    ❌ 创建/还原备份
+    ❌ 同步 NTP
+
+  离线时 Flutter:
+    ✅ 所有操作全部可用（读写）
+
+
+四、离线检测 & 模式切换
+================================================================================
+
+  4.1 全局状态
+
+      enum AgentMode {
+          Online,   // 服务器可达，HTTP 通信正常
+          Offline,  // 服务器不可达，gRPC 本地管控
+      }
+
+      AgentMode 由 Arc<AtomicU8> 维护，gRPC 每个 handler 入口都能读取。
+
+  4.2 切换逻辑
+
+      在线 → 离线:
+        - /v1/auth 连续失败 N 次（连接超时/DNS 失败/拒绝连接）
+        - 或 OFFLINE_MODE 配置项 = 1（手动强制离线）
+        - 触发: 设置 mode = Offline，gRPC 写操作不再拒绝
+
+      离线 → 在线:
+        - 后台定时探测 /v1/auth 恢复成功
+        - 触发: 设置 mode = Online，gRPC 写操作返回 permission_denied
+        - 补报离线期间产生的日志/告警到服务器
+
+  4.3 现有关键通道
+
+      已有 host_is_offline_tx / host_is_offline_rx 通道（main.rs 中已建好但未使用）。
+      需要扩展为: 写入全局 AgentMode 状态，gRPC 服务据此控制权限。
+
+  4.4 gRPC 权限检查（每个写操作入口）
+
+      fn require_offline(mode: &Arc<AtomicU8>) -> Result<(), Status> {
+          if mode.load(Ordering::Relaxed) == AgentMode::Online as u8 {
+              return Err(Status::permission_denied(
+                  "在线模式下不允许此操作，请通过管理平台执行"
+              ));
+          }
+          Ok(())
+      }
+
+
+五、gRPC 架构重构方案
+================================================================================
+
+  5.1 当前问题
+
+      virus_scan_grpc/ 把 proto 定义、gRPC Server 启动、病毒扫描业务
+      逻辑全混在一起，扩展性差。
+
+  5.2 拆分方案
+
+      crates/
+      ├── grpc_gateway/              ← 新建：gRPC 框架层（纯通用）
+      │   ├── build.rs               ← 统一编译所有 .proto
+      │   ├── Cargo.toml             ← tonic, prost, tonic-build
+      │   └── src/
+      │       ├── proto/             ← 所有 proto 定义集中在此
+      │       │   ├── common.proto           (通用类型: Empty, SimpleResponse)
+      │       │   ├── virus_scan.proto       (已有，迁入)
+      │       │   ├── vuln_scan.proto        (已有，迁入)
+      │       │   ├── agent_status.proto     (仪表盘)
+      │       │   ├── alert.proto            (告警)
+      │       │   ├── config.proto           (配置管理)
+      │       │   ├── task_local.proto       (本地任务下发)
+      │       │   ├── process_policy.proto   (进程策略)
+      │       │   ├── peripheral_policy.proto(外设策略)
+      │       │   ├── dir_policy.proto       (目录保护策略)
+      │       │   ├── extort_policy.proto    (勒索保护策略)
+      │       │   ├── ip_policy.proto        (IP阻断/黑名单)
+      │       │   ├── jump.proto             (IP跳变/密码跳变)
+      │       │   ├── backup.proto           (备份/还原)
+      │       │   ├── outreach_detect.proto  (外联检测规则)
+      │       │   ├── trust_dir.proto        (全局信任目录)
+      │       │   ├── virtual_port.proto     (虚拟端口规则)
+      │       │   ├── data_query.proto       (数据查询：进程/端口/USB)
+      │       │   └── policy_watch.proto     (策略变更通知流)
+      │       ├── lib.rs              ← tonic::include_proto! 全部引入
+      │       └── server.rs           ← 通用 GrpcServerBuilder
+      │
+      ├── virus_scan_grpc/           ← 重构：只保留扫描业务逻辑
+      │   ├── Cargo.toml             ← 依赖 grpc_gateway
+      │   └── src/
+      │       ├── virus_scan_impl.rs ← impl VirusScanService
+      │       ├── vuln_scan_impl.rs  ← impl VulnScanService
+      │       ├── scan_task_mgr.rs   ← 扫描任务管理
+      │       └── clamav_scanner.rs  ← ClamAV 连接池
+      │
+      ├── agent_local_svc/           ← 新建：离线模式本地服务
+      │   ├── Cargo.toml             ← 依赖 grpc_gateway + 各业务 crate
+      │   └── src/
+      │       ├── agent_status_impl.rs
+      │       ├── alert_impl.rs
+      │       ├── config_impl.rs
+      │       ├── task_local_impl.rs
+      │       ├── policy_read_impl.rs   ← 策略只读查询（在线/离线均可用）
+      │       ├── policy_write_impl.rs  ← 策略写操作（仅离线可用）
+      │       └── data_query_impl.rs
+      │
+      └── main/                      ← 装配层
+          └── src/main.rs            ← 按在线/离线模式注册 service
+
+
+六、Proto 文件逐个定义
+================================================================================
+
+  说明:
+    - 每个 message 标注了对应的 Rust 结构体，字段一一对应
+    - 所有消息字段的命名规则: Rust snake_case → proto snake_case（prost 自动处理）
+    - optional 标注表示 Rust 侧为 Option<T>
+
+  --------------------------------------------------------------------------
+  6.0 common.proto — 通用类型
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package common;
+
+    message Empty {}
+
+    message SimpleResponse {
+        bool success = 1;
+        string message = 2;
+    }
+
+  --------------------------------------------------------------------------
+  6.1 agent_status.proto — 仪表盘（始终可用）
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package agent_status;
+
+    import "common.proto";
+
+    service AgentStatusService {
+        rpc GetAgentStatus(common.Empty) returns (AgentStatus);
+    }
+
+    message AgentStatus {
+        bool is_online = 1;
+        string agent_version = 2;
+        string os_info = 3;
+        int32 protection_days = 4;
+        CpuMemInfo cpu_mem = 5;
+        repeated ModuleStatus modules = 6;
+        string device_uid = 7;
+        string host_name = 8;
+    }
+
+    message CpuMemInfo {
+        string cpu_usage = 1;
+        string mem_usage = 2;
+        string disk_usage = 3;
+    }
+
+    message ModuleStatus {
+        string name = 1;       // 模块名: file_protect, proc_protect 等
+        bool enabled = 2;
+        string status = 3;     // "运行中" / "未启用" / "异常"
+    }
+
+  --------------------------------------------------------------------------
+  6.2 alert.proto — 告警推送（始终可用）
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package alert;
+
+    import "common.proto";
+
+    service AlertService {
+        rpc SubscribeAlerts(AlertFilter) returns (stream AlertEvent);
+    }
+
+    message AlertFilter {
+        AlertType type = 1;  // 0=ALL
+    }
+
+    enum AlertType {
+        ALERT_UNKNOWN = 0;
+        PROCESS_ALERT = 1;
+        FILE_ALERT = 2;
+        DEVICE_ALERT = 3;
+        NETWORK_ALERT = 4;
+        RANSOMWARE_ALERT = 5;
+    }
+
+    // 对应 Rust: reporter::AuditLogInfo
+    message AlertEvent {
+        string alert_id = 1;
+        AlertType type = 2;
+        uint32 level = 3;                // n_level
+        uint64 timestamp = 4;            // n_time
+        string file_path = 5;            // file_path (Option → 空串)
+        string process_name = 6;         // exception_process
+        string md5 = 7;                  // md5
+        string remark = 8;               // notice_remark
+        string peripheral_name = 9;      // peripheral_name
+        string peripheral_eid = 10;      // peripheral_eid
+        string rename_dir = 11;          // rename_dir
+        string p_param = 12;             // p_param
+    }
+
+  --------------------------------------------------------------------------
+  6.3 config.proto — 配置管理（读: 始终可用 / 写: 仅离线）
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package config;
+
+    import "common.proto";
+
+    service ConfigService {
+        rpc GetConfig(common.Empty) returns (ConfigData);     // 始终可用
+        rpc UpdateConfig(ConfigData) returns (ConfigResponse); // 仅离线
+    }
+
+    // 对应 Rust: config::net_info::NetInfoConfig
+    // 字段名与 JSON key 一致，与 update_config_from_json 使用的 key 对齐
+    message ConfigData {
+        uint32 crontime = 1;
+        bool file_switch = 2;
+        bool proc_switch = 3;
+        bool extortion_protect = 4;
+        bool extortion_switch = 5;
+        bool file_protect = 6;
+        bool self_protect_switch = 7;
+        bool open_port_switch = 8;
+        bool dynamic_switch = 9;
+        bool proc_protect = 10;
+        bool usb_protect = 11;
+        bool usb_switch = 12;
+        bool syslog_inner_switch = 13;
+        bool syslog_outer_switch = 14;
+        bool syslog_dns_switch = 15;
+        bool internet_switch = 16;
+        bool syslog_process_switch = 17;
+        bool syslog_login_switch = 18;
+        bool outreach_switch = 19;
+        bool baseline_switch = 20;
+        bool hardware_switch = 21;
+        uint32 logproto = 22;
+        uint32 logsent = 23;
+        uint32 debug_switch = 24;        // cli_port
+        uint32 module_switch = 25;
+        uint32 outreach_time = 26;
+        uint32 baseline_time = 27;
+        uint32 hardware_time = 28;
+        string logipport = 29;
+    }
+
+    message ConfigResponse {
+        bool success = 1;
+        string message = 2;
+    }
+
+  --------------------------------------------------------------------------
+  6.4 task_local.proto — 本地任务下发（仅离线可用）
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package task_local;
+
+    import "common.proto";
+
+    service LocalTaskService {
+        rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+    }
+
+    // 对应 HTTP: {"code":"000000", "data":{"tasklist":[6,19,33,4]}}
+    // 复用 handler: TaskFetcher::handle_task(TaskTypeEnum)
+    message SubmitTaskRequest {
+        repeated int32 task_ids = 1;  // TaskTypeEnum 的数值
+    }
+
+    message SubmitTaskResponse {
+        bool success = 1;
+        repeated TaskResult results = 2;
+    }
+
+    message TaskResult {
+        int32 task_id = 1;
+        bool success = 2;
+        string message = 3;
+    }
+
+  --------------------------------------------------------------------------
+  6.5 process_policy.proto — 进程策略（读: 始终可用 / 写: 仅离线）
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package process_policy;
+
+    import "common.proto";
+
+    service ProcessPolicyService {
+        rpc GetProcessPolicy(common.Empty) returns (ProcessPolicy);      // 始终可用
+        rpc UpdateProcessPolicy(ProcessPolicy) returns (common.SimpleResponse); // 仅离线
+    }
+
+    // 对应 HTTP: /v1/getprocwl 或 /v1/getprocbl 返回的 data.proclist
+    // 复用 handler: POLICY_MANAGER.set_policy_process()
+    message ProcessPolicy {
+        repeated string hash_list = 1;
+        bool is_white = 2;  // true=白名单, false=黑名单
+    }
+
+  --------------------------------------------------------------------------
+  6.6 peripheral_policy.proto — 外设策略（读: 始终可用 / 写: 仅离线）
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package peripheral_policy;
+
+    import "common.proto";
+
+    service PeripheralPolicyService {
+        rpc GetPeripheralPolicy(common.Empty) returns (PeripheralPolicy);       // 始终可用
+        rpc UpdatePeripheralPolicy(PeripheralPolicy) returns (common.SimpleResponse); // 仅离线
+    }
+
+    // 对应 Rust: udisk::device::UsbInfo
+    // 复用 handler: SHARED_USB_LIST.update_whitelist() / update_blacklist()
+    message UsbDevice {
+        string peripheral_eid = 1;   // perpheral_eid
+        string peripheral_name = 2;  // perpheral_name
+        string intro = 3;            // intro
+        string type_ = 4;            // type_
+        bool allow = 5;              // allow
+    }
+
+    message PeripheralPolicy {
+        repeated UsbDevice devices = 1;
+        bool is_white = 2;  // true=白名单, false=黑名单
+    }
+
+  --------------------------------------------------------------------------
+  6.7 dir_policy.proto — 目录保护策略（读: 始终可用 / 写: 仅离线）
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package dir_policy;
+
+    import "common.proto";
+
+    service DirPolicyService {
+        rpc GetDirPolicy(common.Empty) returns (DirPolicy);            // 始终可用
+        rpc UpdateDirPolicy(DirPolicy) returns (common.SimpleResponse); // 仅离线
+    }
+
+    // 对应 Rust: task::scan_directory_task::DirectionScanRule
+    // 复用 handler: PatternRulesMgr::parse_policy_from_json() → set_protect_dir()
+    message DirectionScanRule {
+        string dir = 1;
+        uint32 pid = 2;
+        uint32 typ = 3;      // 对应 #[serde(rename = "type")]
+    }
+
+    message DirPolicy {
+        repeated DirectionScanRule rules = 1;
+    }
+
+  --------------------------------------------------------------------------
+  6.8 extort_policy.proto — 勒索保护策略（读: 始终可用 / 写: 仅离线）
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package extort_policy;
+
+    import "common.proto";
+
+    service ExtortPolicyService {
+        rpc GetExtortPolicy(common.Empty) returns (ExtortPolicy);             // 始终可用
+        rpc UpdateExtortPolicy(ExtortPolicy) returns (common.SimpleResponse); // 仅离线
+    }
+
+    // 对应 Rust: pattern::pattern_rules_mgr::POLICY_EXIPOR_PROTECT
+    // 复用 handler: PatternRulesMgr::parse_exipor_policy_from_json() → set_exiport_dir()
+    message ExtortProtectRule {
+        string file_type = 1;       // file_type（如 "doc", "pdf"）
+        uint32 typ = 2;             // typ
+        map<string, string> map_comm = 3;  // hash → process_name
+    }
+
+    message ExtortPolicy {
+        repeated ExtortProtectRule rules = 1;
+    }
+
+  --------------------------------------------------------------------------
+  6.9 ip_policy.proto — IP 阻断/黑名单策略（读: 始终可用 / 写: 仅离线）
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package ip_policy;
+
+    import "common.proto";
+
+    service IpPolicyService {
+        rpc GetIpBlockPolicy(common.Empty) returns (IpBlockPolicy);           // 始终可用
+        rpc UpdateIpBlockPolicy(IpBlockPolicy) returns (common.SimpleResponse); // 仅离线
+        rpc GetIpBlackPolicy(common.Empty) returns (IpBlockPolicy);           // 始终可用
+        rpc UpdateIpBlackPolicy(IpBlockPolicy) returns (common.SimpleResponse); // 仅离线
+    }
+
+    // 对应 Rust: netblock::ip_policy::IpPolicy
+    // 复用 handler: update_and_write_policies()
+    message IpPolicyItem {
+        string ip = 1;           // IP 地址（IPv4 或 IPv6）
+        uint32 direction = 2;    // 阻断方向
+        uint64 duration = 3;     // 阻断时长（秒），0=永久
+        bool is_ipv6 = 4;        // 是否 IPv6
+    }
+
+    message IpBlockPolicy {
+        repeated IpPolicyItem items = 1;
+    }
+
+  --------------------------------------------------------------------------
+  6.10 jump.proto — IP跳变/密码跳变（读状态: 始终可用 / 执行: 仅离线）
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package jump;
+
+    import "common.proto";
+
+    service JumpService {
+        rpc GetJumpStatus(common.Empty) returns (JumpStatus);      // 始终可用
+        rpc ExecuteIpJump(IpJumpRequest) returns (IpJumpResponse);  // 仅离线
+        rpc ExecutePwJump(PwJumpRequest) returns (PwJumpResponse);  // 仅离线
+    }
+
+    // 对应 Rust: rules_jump_mgr::IpJumpConfig
+    message IpJumpRequest {
+        string gateway = 1;
+        string source_ip = 2;
+        string target_ip = 3;    // CIDR 或单个 IP
+        uint32 mode = 4;
+        uint32 allow_size = 5;
+        uint32 aging_time = 6;
+        uint32 active_time = 7;
+    }
+
+    // 对应 Rust: rules_jump_mgr::PutIpJumpInfo
+    message IpJumpResponse {
+        bool success = 1;
+        string source_ip = 2;
+        string target_ip = 3;
+        string gateway = 4;
+        string agent_ip = 5;
+        uint32 status = 6;      // 0=初始, 1=成功, 2=失败
+        string reason = 7;
+    }
+
+    // 对应 HTTP: {"pw":"new_password"}
+    message PwJumpRequest {
+        string new_password = 1;
+    }
+
+    // 对应 Rust: rules_jump_mgr::PutPwJumpInfo
+    message PwJumpResponse {
+        bool success = 1;
+        uint32 status = 2;      // 0=初始, 1=成功, 2=失败
+        string reason = 3;
+    }
+
+    message JumpStatus {
+        string current_ip = 1;
+        string last_ip_jump_time = 2;
+        string last_pw_jump_time = 3;
+    }
+
+  --------------------------------------------------------------------------
+  6.11 backup.proto — 备份/还原（读列表: 始终可用 / 创建&还原: 仅离线）
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package backup;
+
+    import "common.proto";
+
+    service BackupService {
+        rpc GetBackupList(common.Empty) returns (BackupList);              // 始终可用
+        rpc CreateBackup(CreateBackupRequest) returns (CreateBackupResponse); // 仅离线
+        rpc RestoreBackup(RestoreBackupRequest) returns (RestoreBackupResponse); // 仅离线
+    }
+
+    message BackupInfo {
+        string backup_id = 1;
+        string name = 2;
+        string created_at = 3;
+        uint64 size_bytes = 4;
+    }
+
+    message BackupList {
+        repeated BackupInfo backups = 1;
+    }
+
+    message CreateBackupRequest {
+        string name = 1;
+    }
+
+    message CreateBackupResponse {
+        bool success = 1;
+        string backup_id = 2;
+        string message = 3;
+    }
+
+    message RestoreBackupRequest {
+        string backup_id = 1;
+    }
+
+    message RestoreBackupResponse {
+        bool success = 1;
+        string message = 2;
+    }
+
+  --------------------------------------------------------------------------
+  6.12 outreach_detect.proto — 外联检测规则（读: 始终可用 / 写: 仅离线）
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package outreach_detect;
+
+    import "common.proto";
+
+    service OutreachDetectService {
+        rpc GetOutreachRules(common.Empty) returns (OutreachRules);             // 始终可用
+        rpc UpdateOutreachRules(OutreachRules) returns (common.SimpleResponse); // 仅离线
+    }
+
+    // 对应 Rust: task::net_reach_rule::OutreachDetectRule
+    // 复用 handler: update_global_outreach_rules()
+    message OutreachDetectRule {
+        string addr = 1;      // 目标地址
+        string method = 2;    // 检测方法
+        uint32 type = 3;      // 规则类型（注意 proto 关键字转义）
+    }
+
+    message OutreachRules {
+        repeated OutreachDetectRule rules = 1;
+    }
+
+  --------------------------------------------------------------------------
+  6.13 trust_dir.proto — 全局信任目录（读: 始终可用 / 写: 仅离线）
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package trust_dir;
+
+    import "common.proto";
+
+    service TrustDirService {
+        rpc GetTrustDir(common.Empty) returns (TrustDirList);              // 始终可用
+        rpc UpdateTrustDir(TrustDirList) returns (common.SimpleResponse);  // 仅离线
+    }
+
+    // 对应 Rust: pattern::GlobalTrustDir
+    // 复用 handler: PROCESS_PATTERN_RULES_MGR.set_global_trust_dir()
+    message GlobalTrustDir {
+        string dir = 1;
+        uint32 type = 2;       // typ
+        uint32 is_extend = 3;  // is_extend
+    }
+
+    message TrustDirList {
+        repeated GlobalTrustDir dirs = 1;
+    }
+
+  --------------------------------------------------------------------------
+  6.14 virtual_port.proto — 虚拟端口规则（读: 始终可用 / 写: 仅离线）
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package virtual_port;
+
+    import "common.proto";
+
+    service VirtualPortService {
+        rpc GetVirtualPort(common.Empty) returns (VirtualPortList);            // 始终可用
+        rpc UpdateVirtualPort(VirtualPortList) returns (common.SimpleResponse); // 仅离线
+    }
+
+    // 对应 Rust: task::virtual_port_rule::VirtualPortRule
+    // 复用 handler: 写 /proc/osec/net_rules
+    message VirtualPortRule {
+        uint32 alarm_level = 1;
+        string dest_ip = 2;
+        string dest_port = 3;         // 单个端口或 Range（如 "80" 或 "8080-8090"）
+        uint32 dest_port_type = 4;    // 0=端口号, 其他=转发类型
+        uint32 id = 5;
+        string protocol = 6;          // "tcp" / "udp"
+        string source_ip = 7;
+        uint32 source_port_start = 8; // 对应 source_port_range.0
+        uint32 source_port_end = 9;   // 对应 source_port_range.1
+        string type = 10;             // 规则类型字符串
+    }
+
+    message VirtualPortList {
+        repeated VirtualPortRule rules = 1;
+    }
+
+  --------------------------------------------------------------------------
+  6.15 data_query.proto — 数据查询（始终可用）
+  --------------------------------------------------------------------------
+
+    syntax = "proto3";
+    package data_query;
+
+    import "common.proto";
+
+    service DataQueryService {
+        rpc GetProcessList(ProcessFilter) returns (ProcessList);
+        rpc GetPortList(common.Empty) returns (PortList);
+        rpc GetUsbDeviceList(common.Empty) returns (UsbDeviceList);
+    }
+
+    message ProcessFilter {
+        int32 limit = 1;       // 0=全部
+        string sort_by = 2;    // "cpu" / "mem" / "pid"
+    }
+
+    message ProcessInfo {
+        int32 pid = 1;
+        string name = 2;
+        string exe_path = 3;
+        string hash = 4;
+        string cpu_usage = 5;
+        string mem_usage = 6;
+        string user = 7;
+    }
+
+    message ProcessList {
+        repeated ProcessInfo processes = 1;
+    }
+
+    message PortInfo {
+        string protocol = 1;
+        uint32 port = 2;
+        string process_name = 3;
+        int32 pid = 4;
+    }
+
+    message PortList {
+        repeated PortInfo ports = 1;
+    }
+
+    message UsbDeviceList {
+        repeated peripheral_policy.UsbDevice devices = 1;
+    }
+
+  --------------------------------------------------------------------------
+  6.16 virus_scan.proto — 病毒扫描（已有，迁入，不改）
+  --------------------------------------------------------------------------
+
+    内容不变，从 virus_scan_grpc/src/proto/ 迁移过来。
+
+  --------------------------------------------------------------------------
+  6.17 vuln_scan.proto — 漏洞扫描（已有，迁入，不改）
+  --------------------------------------------------------------------------
+
+    内容不变，从 virus_scan_grpc/src/proto/ 迁移过来。
+
+  --------------------------------------------------------------------------
+  6.18 policy_watch.proto — 策略变更通知流（始终可用）
+  --------------------------------------------------------------------------
+
+    解决的问题: 服务器随时可能通过 HTTP 更新策略，Flutter 不能一直轮询
+              GetXxx()，需要被动通知。
+
+    实现方式: Agent HTTP handler 更新内存数据后，往 tokio::broadcast channel
+             发一个事件，gRPC 流订阅这个 channel 推给 Flutter。
+
+    syntax = "proto3";
+    package policy_watch;
+
+    import "common.proto";
+
+    service PolicyWatchService {
+        // 订阅策略变更通知（服务端流推送）
+        rpc SubscribePolicyChanges(common.Empty) returns (stream PolicyChangeEvent);
+    }
+
+    message PolicyChangeEvent {
+        PolicyChangeType type = 1;
+        uint64 timestamp = 2;  // 变更时间戳（毫秒）
+    }
+
+    enum PolicyChangeType {
+        CONFIG_CHANGED = 0;              // → Flutter 调 GetConfig()
+        PROCESS_POLICY_CHANGED = 1;      // → Flutter 调 GetProcessPolicy()
+        PERIPHERAL_POLICY_CHANGED = 2;   // → Flutter 调 GetPeripheralPolicy()
+        DIR_POLICY_CHANGED = 3;          // → Flutter 调 GetDirPolicy()
+        EXTORT_POLICY_CHANGED = 4;       // → Flutter 调 GetExtortPolicy()
+        IP_BLOCK_POLICY_CHANGED = 5;     // → Flutter 调 GetIpBlockPolicy()
+        IP_BLACK_POLICY_CHANGED = 6;     // → Flutter 调 GetIpBlackPolicy()
+        OUTREACH_RULES_CHANGED = 7;      // → Flutter 调 GetOutreachRules()
+        TRUST_DIR_CHANGED = 8;           // → Flutter 调 GetTrustDir()
+        VIRTUAL_PORT_CHANGED = 9;        // → Flutter 调 GetVirtualPort()
+        JUMP_STATUS_CHANGED = 10;        // → Flutter 调 GetJumpStatus()
+        BACKUP_LIST_CHANGED = 11;        // → Flutter 调 GetBackupList()
+        AGENT_STATUS_CHANGED = 12;       // → Flutter 调 GetAgentStatus()
+    }
+
+    Rust 侧伪代码（在现有 HTTP handler 最后加一行）:
+
+        // e.g. task_down_white() 最后:
+        policy_change_broadcast.send(PolicyChangeType::PROCESS_POLICY_CHANGED);
+
+    gRPC 侧伪代码:
+
+        async fn subscribe_policy_changes(&self, _: Request<Empty>)
+            -> Result<Response<...>, Status>
+        {
+            let mut rx = policy_change_broadcast.subscribe();
+            let (tx, out_rx) = mpsc::channel(16);
+            tokio::spawn(async move {
+                while let Ok(change) = rx.recv().await {
+                    tx.send(Ok(PolicyChangeEvent {
+                        r#type: change as i32,
+                        timestamp: now_millis(),
+                    })).await;
+                }
+            });
+            Ok(Response::new(ReceiverStream::new(out_rx)))
+        }
+
+
+七、Proto 文件与 Rust 结构体 / HTTP API 对照总表
+================================================================================
+
+  | Proto 文件            | gRPC Service            | 对应 Rust 结构体              | 对应 HTTP API               |
+  |----------------------|------------------------|------------------------------|-----------------------------|
+  | common.proto         | （公共类型）             | —                            | —                           |
+  | agent_status.proto   | AgentStatusService     | — (硬件采集数据)               | v1/puthardwareinfo (上报)    |
+  | alert.proto          | AlertService           | AuditLogInfo                 | v1/alertupload (上报)        |
+  | config.proto         | ConfigService          | NetInfoConfig                | v1/getconf                  |
+  | task_local.proto     | LocalTaskService       | TaskTypeEnum                 | v1/gettask                  |
+  | process_policy.proto | ProcessPolicyService   | POLICY_MANAGER               | v1/getprocwl / v1/getprocbl |
+  | peripheral_policy.proto | PeripheralPolicyService | UsbInfo / SHARED_USB_LIST | v1/getwhiteperipherals / v1/getblackperipherals |
+  | dir_policy.proto     | DirPolicyService       | DirectionScanRule            | v1/getdirpolicy             |
+  | extort_policy.proto  | ExtortPolicyService    | POLICY_EXIPOR_PROTECT        | v1/getprotect               |
+  | ip_policy.proto      | IpPolicyService        | IpPolicy / IP_POLICIES       | v1/getPlugging / v1/getipblacklist |
+  | jump.proto           | JumpService            | IpJumpConfig / PutPwJumpInfo | v1/getIpJump / v1/getPwJump |
+  | backup.proto         | BackupService          | snapman                      | v1/getBackups / v1/getRollbacks |
+  | outreach_detect.proto | OutreachDetectService | OutreachDetectRule           | v1/getOutreachDetect        |
+  | trust_dir.proto      | TrustDirService        | GlobalTrustDir               | v1/gettrustdir              |
+  | virtual_port.proto   | VirtualPortService     | VirtualPortRule              | v1/getvirtualport           |
+  | data_query.proto     | DataQueryService       | (procinfo / netapp / udisk)  | v1/uploadproc / v1/upserviceport / v1/addperipherals |
+  | virus_scan.proto     | VirusScanService       | (已有)                        | — (本地)                     |
+  | vuln_scan.proto      | VulnScanService        | (已有)                        | — (本地)                     |
+  | policy_watch.proto   | PolicyWatchService     | broadcast channel             | (无对应，纯内部通知)            |
+
+
+八、数据同步流程（在线 + 离线）
+================================================================================
+
+  8.1 总体原则
+
+    ★ Flutter 只调 gRPC，不关心 Agent 和服务器之间怎么通信
+    ★ Flutter 不轮询任何数据，所有更新靠 gRPC 流被动推送
+    ★ 在线时只读，离线时可读写
+
+  8.2 Flutter 启动流程
+
+    Flutter 启动
+      │
+      ├──① GetAgentStatus()        ← 拿仪表盘数据（一次）
+      ├──② GetConfig()             ← 拿当前配置（一次，来自 NETINFO_CONFIG）
+      ├──③ GetProcessPolicy()      ← 拿进程白/黑名单（一次，来自 POLICY_MANAGER）
+      ├──④ GetDirPolicy()          ← 拿目录保护策略（一次，来自 pattern_mgr）
+      ├──⑤ GetExtortPolicy()       ← 拿勒索保护策略（一次）
+      ├──⑥ GetIpBlockPolicy()      ← 拿 IP 阻断策略（一次）
+      ├──⑦ GetIpBlackPolicy()      ← 拿 IP 黑名单（一次）
+      ├──⑧ GetPeripheralPolicy()   ← 拿外设策略（一次，来自 SHARED_USB_LIST）
+      ├──⑨ GetOutreachRules()      ← 拿外联检测规则（一次）
+      ├──⑩ GetTrustDir()           ← 拿信任目录（一次）
+      ├──⑪ GetVirtualPort()        ← 拿虚拟端口规则（一次）
+      ├──⑫ GetJumpStatus()         ← 拿跳变状态（一次）
+      ├──⑬ GetBackupList()         ← 拿备份列表（一次）
+      │
+      ├──⑭ SubscribeAlerts()       ← 订阅告警流（持续）
+      └──⑮ SubscribePolicyChanges() ← 订阅策略变更流（持续）
+
+  8.3 在线模式运行时更新（被动推送）
+
+    服务器任何时候都可能通过 HTTP 更新策略，Agent 更新内存后立即推送:
+
+    服务器 ──HTTP──→ Agent ─→ POLICY_MANAGER.lock() = 新数据
+                        │
+                        │  policy_change_broadcast.send(PROCESS_POLICY_CHANGED)
+                        │
+                        ↓
+              SubscribePolicyChanges 流推: {type: PROCESS_POLICY_CHANGED, timestamp: ...}
+                        │
+                        ↓
+              Flutter 收到 → 调 GetProcessPolicy() 拉最新数据 → 刷新 UI
+              Flutter 不轮询，完全被动
+
+    所有策略类型的更新路径:
+
+    服务器 HTTP           Agent 内存更新              gRPC 推送事件              Flutter 刷新
+    ─────────────────────────────────────────────────────────────────────────────────
+    POST /v1/getconf    → NETINFO_CONFIG.lock()    → CONFIG_CHANGED          → GetConfig()
+    POST /v1/getprocwl  → POLICY_MANAGER.lock()    → PROCESS_POLICY_CHANGED  → GetProcessPolicy()
+    POST /v1/getprocbl  → POLICY_MANAGER.lock()    → PROCESS_POLICY_CHANGED  → GetProcessPolicy()
+    POST /v1/getdirpolicy → pattern_mgr.lock()     → DIR_POLICY_CHANGED      → GetDirPolicy()
+    POST /v1/getprotect → pattern_mgr.lock()       → EXTORT_POLICY_CHANGED   → GetExtortPolicy()
+    POST /v1/getPlugging → IP_POLICIES             → IP_BLOCK_POLICY_CHANGED → GetIpBlockPolicy()
+    POST /v1/getipblacklist → IP_POLICIES          → IP_BLACK_POLICY_CHANGED → GetIpBlackPolicy()
+    ...白名单              → SHARED_USB_LIST.lock() → PERIPHERAL_POLICY_CHANGED → GetPeripheralPolicy()
+    ...外联检测规则         → outreach_rules         → OUTREACH_RULES_CHANGED  → GetOutreachRules()
+    ...信任目录            → PROCESS_PATTERN_RULES  → TRUST_DIR_CHANGED       → GetTrustDir()
+    ...虚拟端口            → /proc/osec/net_rules   → VIRTUAL_PORT_CHANGED    → GetVirtualPort()
+    ...IP跳变/密码跳变      → jump状态变化           → JUMP_STATUS_CHANGED     → GetJumpStatus()
+
+  8.4 离线模式
+
+    服务器不可达，无 HTTP 推送。
+    Flutter 通过 gRPC 写操作直接修改 Agent 内存 → Agent 自己更新后
+    同样发 policy_change_broadcast，其他订阅者也能收到。
+
+  8.5 结论
+
+    在线模式下:
+      - 读操作从内存获取数据，零额外开销
+      - 数据变更通过 gRPC 流被动推送，Flutter 不轮询
+      - HTTP 路径完全不动，只在原有 handler 末尾加一行 broadcast.send()
+
+    离线模式下:
+      - 写操作直接修改同一份内存数据
+      - 同样走 broadcast 通知，逻辑一致
+
+
+九、AgentDataHub — 统一数据访问层
+================================================================================
+
+  9.1 问题
+
+    当前 Agent 的策略/配置数据分散在各 crate 的全局变量中:
+
+      POLICY_MANAGER        ← process_mgr crate     — Mutex<ProcessPolicyManager>
+      NETINFO_CONFIG        ← config crate          — Mutex<NetInfoConfig>
+      SHARED_USB_LIST       ← udisk crate           — Mutex<UsbListManager>
+      pattern_mgr           ← pattern crate         — Mutex<PatternRulesMgr>
+      IP_POLICIES           ← netblock crate        — RwLock<HashMap>
+      outreach_rules        ← task crate            — RwLock<Vec<OutreachDetectRule>>
+      PROCESS_PATTERN_RULES ← pattern crate         — Mutex<ProcessPatternRulesMgr>
+      ...
+
+    问题:
+      - gRPC handler 要读策略，得各自 import 不同 crate 的全局变量
+      - 变更通知要每个 HTTP handler 各自发，散落各处容易遗漏
+      - 写操作要各自加锁、修改、发通知，逻辑重复
+
+  9.2 三种方案对比
+
+    |                        | 各自独立全局变量(现状) | 一个大结构体全包    | AgentDataHub(推荐) |
+    |------------------------|----------------------|---------------------|--------------------|
+    | 锁粒度                  | ✅ 细，互不干扰       | ❌ 粗，一锁全堵      | ✅ 细，独立锁       |
+    | 对现有HTTP代码影响        | —                    | ❌ 全改              | ✅ 完全不动          |
+    | gRPC handler 依赖        | ❌ 各自 import 一堆   | ✅ 只依赖 Arc\<State\> | ✅ 只依赖 Arc\<Hub\> |
+    | 变更通知统一入口           | ❌ 各自为政          | ✅ 统一              | ✅ 统一              |
+    | 代码发现性               | ❌ 散落各处          | ✅ 一个文件看全貌     | ✅ 一个 hub 看全貌   |
+    | 测试 mock               | ❌ 各自 mock         | ✅ 一个 mock          | ✅ 一个 mock         |
+
+  9.3 方案：AgentDataHub
+
+    不动现有全局变量，只在上面加一个薄的统一访问层，gRPC handler 全部通过 Hub 读写。
+
+    位置: crates/agent_local_svc/src/data_hub.rs
+
+    ┌──────────────────────────────────────────────────┐
+    │                  AgentDataHub                     │
+    │                                                  │
+    │  change_tx: broadcast::Sender<PolicyChangeType>   │  ← 策略变更广播通道
+    │                                                  │
+    │  ── 读方法（在线+离线都可用）───────────────────── │
+    │  get_config()          → 读 NETINFO_CONFIG       │
+    │  get_process_policy()  → 读 POLICY_MANAGER       │
+    │  get_peripheral_policy() → 读 SHARED_USB_LIST    │
+    │  get_dir_policy()      → 读 pattern_mgr          │
+    │  get_extort_policy()   → 读 pattern_mgr          │
+    │  get_ip_block_policy() → 读 IP_POLICIES          │
+    │  get_ip_black_policy() → 读 IP_POLICIES          │
+    │  get_outreach_rules()  → 读 outreach_rules       │
+    │  get_trust_dir()       → 读 PROCESS_PATTERN_RULES│
+    │  get_virtual_port()    → 读 /proc/osec/net_rules │
+    │  get_jump_status()     → 读 IpJumpManager / PwMgr│
+    │  get_backup_list()     → 读 snapman              │
+    │  get_agent_status()    → 组装系统信息            │
+    │  get_process_list()    → 读 procinfo             │
+    │  get_port_list()       → 读 netapp               │
+    │  get_usb_device_list() → 读 udisk                │
+    │                                                  │
+    │  ── 写方法（仅离线可用）────────────────────────── │
+    │  update_config(cfg)    → 写 NETINFO_CONFIG + notify│
+    │  update_process_policy(...) → 写 POLICY_MANAGER + notify │
+    │  update_peripheral_policy(...) → 写 SHARED_USB_LIST + notify │
+    │  update_dir_policy(...)    → 写 pattern_mgr + notify │
+    │  ...（同类）                                    │
+    │                                                  │
+    │  ── 通知 ─────────────────────────────────────── │
+    │  notify(change_type)    → 广播给所有 gRPC 订阅者   │
+    │  subscribe_changes()    → 返回 broadcast Receiver │
+    └──────────────────────────────────────────────────┘
+
+  9.4 伪代码
+
+    pub struct AgentDataHub {
+        change_tx: broadcast::Sender<PolicyChangeType>,
+    }
+
+    impl AgentDataHub {
+        pub fn new() -> Self {
+            let (change_tx, _) = broadcast::channel(64);
+            Self { change_tx }
+        }
+
+        /// 通知所有 gRPC 订阅者：某类策略已变更
+        pub fn notify(&self, change: PolicyChangeType) {
+            let _ = self.change_tx.send(change);
+        }
+
+        /// gRPC SubscribePolicyChanges 用
+        pub fn subscribe_changes(&self) -> broadcast::Receiver<PolicyChangeType> {
+            self.change_tx.subscribe()
+        }
+
+        // ── 读示例 ──
+
+        pub fn get_config(&self) -> NetInfoConfig {
+            NETINFO_CONFIG.lock().unwrap().clone()
+        }
+
+        pub fn get_process_policy(&self, is_white: bool) -> ProcessPolicy {
+            let mgr = POLICY_MANAGER.lock().unwrap();
+            let hashes = if is_white { mgr.get_white_list() } else { mgr.get_black_list() };
+            ProcessPolicy { hash_list: hashes, is_white }
+        }
+
+        // ── 写示例 ──
+
+        pub fn update_process_policy(&self, hash_list: &[String], is_white: bool) -> Result<(), String> {
+            POLICY_MANAGER.lock().unwrap().set_policy_process(hash_list, is_white);
+            self.notify(PolicyChangeType::PROCESS_POLICY_CHANGED);
+            Ok(())
+        }
+
+        pub fn update_config(&self, cfg_data: &ConfigData) -> Result<(), String> {
+            // 复用现有 update_config_from_json 的核心逻辑
+            let mut guard = NETINFO_CONFIG.lock().unwrap();
+            // ... 应用配置变更到 *guard ...
+            guard.to_ini(&format!("{}/net_info.ini", guard.app_path))?;
+            self.notify(PolicyChangeType::CONFIG_CHANGED);
+            Ok(())
+        }
+    }
+
+  9.5 HTTP handler 改动（极小）
+
+    在现有 HTTP handler 末尾加一行 notify() 即可接入 gRPC 通知。改动量很小:
+
+      // task_fetcher.rs — task_down_white()
+      async fn task_down_white(&self, ...) -> Result<(), String> {
+          // ... 现有代码：拉取、解析、更新 POLICY_MANAGER ...
+          // ★ 新增一行:
+          self.data_hub.notify(PolicyChangeType::PROCESS_POLICY_CHANGED);
+          Ok(())
+      }
+
+    其他 handler 同理，每个只在末尾加一行 notify()。
+
+  9.6 gRPC handler 用法
+
+    // agent_local_svc/src/config_impl.rs
+    pub struct ConfigServiceImpl {
+        data_hub: Arc<AgentDataHub>,
+        agent_mode: Arc<AtomicU8>,
+    }
+
+    #[tonic::async_trait]
+    impl ConfigService for ConfigServiceImpl {
+        async fn get_config(&self, _: Request<Empty>)
+            -> Result<Response<ConfigData>, Status>
+        {
+            let cfg = self.data_hub.get_config();
+            Ok(Response::new(cfg.to_proto()))
+        }
+
+        async fn update_config(&self, req: Request<ConfigData>)
+            -> Result<Response<ConfigResponse>, Status>
+        {
+            require_offline(&self.agent_mode)?;       // 在线模式拒绝
+            let cfg = req.into_inner();
+            self.data_hub.update_config(&cfg)
+                .map(|_| Response::new(ConfigResponse { success: true, ... }))
+                .map_err(|e| Status::internal(e))
+        }
+    }
+
+
+十、实施阶段
+================================================================================
+
+  阶段0: 实现 AgentDataHub
+    - 新建 crates/agent_local_svc/src/data_hub.rs
+    - 封装所有全局变量的读写操作
+    - 内置 broadcast channel 实现变更通知
+    - HTTP handler 末尾加一行 hub.notify()（逐个改，量小）
+    - gRPC handler 全部通过 Hub 读写
+
+  阶段1: 创建 grpc_gateway crate
+    - 新建 crates/grpc_gateway/
+    - 编写全部 18 个 .proto 文件
+    - build.rs 编译所有 proto
+    - lib.rs 用 tonic::include_proto! 引入各 package
+    - 实现通用 GrpcServerBuilder（可链式 add_service）
+
+  阶段2: 重构 virus_scan_grpc
+    - 删除 src/proto/ 目录
+    - Cargo.toml 依赖 grpc_gateway
+    - virus_scan_impl.rs 使用 grpc_gateway::proto::virus_scan 的类型
+    - 验证编译通过
+
+  阶段3: 离线检测状态机
+    - 定义 AgentMode 全局状态（Arc<AtomicU8>）
+    - 利用已有 host_is_offline 通道驱动模式切换
+    - auth 连续失败 → 设 Offline; 后台探测恢复 → 设 Online
+    - ★ 不改 online 模块的 HTTP 逻辑，只监听其状态变化
+
+  阶段4: 实现 agent_local_svc crate 的 gRPC handler
+    - 每个 service 一个 impl 文件
+    - 读操作: 通过 data_hub.get_xxx() 读取
+    - 写操作: require_offline() 检查 → data_hub.update_xxx() 写入
+    - 告警流: SubscribeAlerts 从 log_worker 的 channel 分叉推流
+    - 变更流: SubscribePolicyChanges 从 data_hub.subscribe_changes() 订阅
+
+  阶段5: main.rs 装配
+    - 创建 AgentDataHub（Arc）注入所有 gRPC handler
+    - 在线: 注册所有 Get*(读) + SubscribeAlerts + SubscribePolicyChanges + VirusScan
+    - 离线: 注册全部读写 service
+    - 监听地址: 在线 127.0.0.1:50051，离线可配 0.0.0.0
+
+  阶段6: Flutter GUI 对接
+    - 基于 grpc_gateway 的 proto 生成 Dart 客户端代码
+    - 替换模拟数据为真实 gRPC 调用
+    - 在线/离线 UI 状态区分
+
+
+十一、待确认事项
+================================================================================
+
+  1. 告警是否需要历史查询 API？Flutter 客户端有日期筛选器
+     → 如需，新增 AlertService.GetAlertHistory(TimeRange) returns (AlertList)
+
+  2. 离线模式 gRPC 监听地址：
+     → 在线时 127.0.0.1:50051（仅本机）
+     → 离线时是否自动切到 0.0.0.0:50051（允许局域网其他设备连）？
+
+  3. 本地数据持久化方案：SQLite 还是 JSON Lines 文件？
+
+  4. 是否需要为简单查询提供 HTTP API（如 GetAgentStatus）？
+     → 建议全部走 gRPC，Flutter/dart 的 grpc 包很成熟
+
+================================================================================

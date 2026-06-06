@@ -1,5 +1,5 @@
-use crate::proto::{PutVulnScanRequest, PutVulnScanResponse};
-use crate::proto::vuln_scan_service_server::VulnScanService;
+use grpc_gateway::vuln_scan::{PutVulnScanRequest, PutVulnScanResponse};
+use grpc_gateway::vuln_scan::vuln_scan_service_server::VulnScanService;
 use common::manager::boot::BootManager;
 use logging::{log_error, log_info};
 use serde::Serialize;

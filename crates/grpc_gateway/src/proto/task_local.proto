@@ -1,0 +1,25 @@
+syntax = "proto3";
+package task_local;
+
+import "common.proto";
+
+service LocalTaskService {
+    rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+}
+
+// 对应 HTTP: {"code":"000000", "data":{"tasklist":[6,19,33,4]}}
+// 复用 handler: TaskFetcher::handle_task(TaskTypeEnum)
+message SubmitTaskRequest {
+    repeated int32 task_ids = 1;
+}
+
+message SubmitTaskResponse {
+    bool success = 1;
+    repeated TaskResult results = 2;
+}
+
+message TaskResult {
+    int32 task_id = 1;
+    bool success = 2;
+    string message = 3;
+}

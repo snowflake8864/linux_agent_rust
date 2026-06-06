@@ -1,0 +1,21 @@
+syntax = "proto3";
+package trust_dir;
+
+import "common.proto";
+
+service TrustDirService {
+    rpc GetTrustDir(common.Empty) returns (TrustDirList);
+    rpc UpdateTrustDir(TrustDirList) returns (common.SimpleResponse);
+}
+
+// 对应 Rust: pattern::GlobalTrustDir
+// 复用 handler: PROCESS_PATTERN_RULES_MGR.set_global_trust_dir()
+message GlobalTrustDir {
+    string dir = 1;
+    uint32 type = 2;
+    uint32 is_extend = 3;
+}
+
+message TrustDirList {
+    repeated GlobalTrustDir dirs = 1;
+}

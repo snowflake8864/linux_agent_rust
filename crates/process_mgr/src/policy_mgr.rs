@@ -135,6 +135,14 @@ impl ProcessPolicyManager {
             }
         }
     }
+
+    pub fn get_white_list(&self) -> Vec<String> {
+        self.white_set.iter().cloned().collect()
+    }
+
+    pub fn get_black_list(&self) -> Vec<String> {
+        self.black_set.iter().cloned().collect()
+    }
 }
 pub static POLICY_MANAGER: Lazy<Mutex<ProcessPolicyManager>> = Lazy::new(|| {
     Mutex::new(ProcessPolicyManager::new(true))

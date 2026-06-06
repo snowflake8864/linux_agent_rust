@@ -1,0 +1,29 @@
+syntax = "proto3";
+package policy_watch;
+
+import "common.proto";
+
+service PolicyWatchService {
+    rpc SubscribePolicyChanges(common.Empty) returns (stream PolicyChangeEvent);
+}
+
+message PolicyChangeEvent {
+    PolicyChangeType type = 1;
+    uint64 timestamp = 2;
+}
+
+enum PolicyChangeType {
+    CONFIG_CHANGED = 0;
+    PROCESS_POLICY_CHANGED = 1;
+    PERIPHERAL_POLICY_CHANGED = 2;
+    DIR_POLICY_CHANGED = 3;
+    EXTORT_POLICY_CHANGED = 4;
+    IP_BLOCK_POLICY_CHANGED = 5;
+    IP_BLACK_POLICY_CHANGED = 6;
+    OUTREACH_RULES_CHANGED = 7;
+    TRUST_DIR_CHANGED = 8;
+    VIRTUAL_PORT_CHANGED = 9;
+    JUMP_STATUS_CHANGED = 10;
+    BACKUP_LIST_CHANGED = 11;
+    AGENT_STATUS_CHANGED = 12;
+}

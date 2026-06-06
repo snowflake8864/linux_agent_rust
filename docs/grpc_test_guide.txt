@@ -1,0 +1,330 @@
+================================================================================
+  gRPC 服务测试指南
+  分支: 804_v2
+  日期: 2026-06-06
+================================================================================
+
+一、前置条件
+================================================================================
+
+  1. Agent 已编译运行（cargo build && ./target/debug/MagicArmor_0）
+  2. gRPC 服务已启动（默认监听 127.0.0.1:50051）
+  3. 安装 grpcurl 工具（用于命令行测试）
+
+     安装 grpcurl:
+       # Ubuntu/Debian
+       sudo apt install grpcurl
+
+       # 或从 GitHub 下载
+       curl -sSL https://github.com/fullstorydev/grpcurl/releases/latest \
+         | grep browser_download_url | grep linux | cut -d'"' -f4 | xargs curl -L -o /usr/local/bin/grpcurl
+       chmod +x /usr/local/bin/grpcurl
+
+
+二、查看所有可用服务
+================================================================================
+
+  # 列出所有注册的 gRPC services
+  grpcurl -plaintext 127.0.0.1:50051 list
+
+  预期输出（18个service）:
+    agent_status.AgentStatusService
+    alert.AlertService
+    backup.BackupService
+    common.(empty)
+    config.ConfigService
+    data_query.DataQueryService
+    dir_policy.DirPolicyService
+    extort_policy.ExtortPolicyService
+    ip_policy.IpPolicyService
+    jump.JumpService
+    outreach_detect.OutreachDetectService
+    peripheral_policy.PeripheralPolicyService
+    policy_watch.PolicyWatchService
+    process_policy.ProcessPolicyService
+    task_local.LocalTaskService
+    trust_dir.TrustDirService
+    virtual_port.VirtualPortService
+    virus_scan.VirusScanService
+    vuln_scan.VulnScanService
+
+  # 列出某个 service 的所有方法
+  grpcurl -plaintext 127.0.0.1:50051 list config.ConfigService
+
+
+三、读操作测试（始终可用，无论在线/离线）
+================================================================================
+
+  3.1 获取 Agent 状态
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{}' \
+      127.0.0.1:50051 \
+      agent_status.AgentStatusService/GetAgentStatus
+
+    预期: 返回 is_online, agent_version, os_info, modules 等字段
+
+
+  3.2 获取当前配置
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{}' \
+      127.0.0.1:50051 \
+      config.ConfigService/GetConfig
+
+    预期: 返回 crontime, file_switch, proc_switch 等配置字段
+
+
+  3.3 获取进程策略（白名单）
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{}' \
+      127.0.0.1:50051 \
+      process_policy.ProcessPolicyService/GetProcessPolicy
+
+    预期: 返回 hash_list 和 is_white 字段
+
+
+  3.4 获取外设策略
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{}' \
+      127.0.0.1:50051 \
+      peripheral_policy.PeripheralPolicyService/GetPeripheralPolicy
+
+    预期: 返回 devices 列表
+
+
+  3.5 获取 IP 阻断策略
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{}' \
+      127.0.0.1:50051 \
+      ip_policy.IpPolicyService/GetIpBlockPolicy
+
+    预期: 返回 items 列表
+
+
+  3.6 获取进程列表
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{"limit": 10, "sort_by": "pid"}' \
+      127.0.0.1:50051 \
+      data_query.DataQueryService/GetProcessList
+
+    预期: 返回 processes 列表（最多10个，按PID排序）
+
+
+  3.7 获取端口列表
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{}' \
+      127.0.0.1:50051 \
+      data_query.DataQueryService/GetPortList
+
+    预期: 返回 ports 列表
+
+
+  3.8 获取外联检测规则
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{}' \
+      127.0.0.1:50051 \
+      outreach_detect.OutreachDetectService/GetOutreachRules
+
+    预期: 返回 rules 列表
+
+
+四、写操作测试（仅离线模式可用）
+================================================================================
+
+  说明: 写操作在在线模式下会返回 PERMISSION_DENIED。
+        测试前需确保 Agent 处于离线模式（断开网络或设置 OFFLINE_MODE=1）。
+
+  4.1 更新配置
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{
+        "crontime": 120,
+        "file_switch": true,
+        "proc_switch": false,
+        "usb_switch": true
+      }' \
+      127.0.0.1:50051 \
+      config.ConfigService/UpdateConfig
+
+    预期（在线模式）:
+      ERROR: Code: PermissionDenied
+      Message: 在线模式下不允许此操作，请通过管理平台执行
+
+    预期（离线模式）:
+      {"success": true, "message": "配置已更新"}
+
+
+  4.2 更新进程策略
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{
+        "hash_list": ["abc123hash", "def456hash"],
+        "is_white": true
+      }' \
+      127.0.0.1:50051 \
+      process_policy.ProcessPolicyService/UpdateProcessPolicy
+
+    预期: {"success": true, "message": "进程策略已更新"}
+
+
+  4.3 更新 IP 阻断策略
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{
+        "items": [
+          {"ip": "192.168.1.100", "direction": 1, "duration": 3600, "is_ipv6": false}
+        ]
+      }' \
+      127.0.0.1:50051 \
+      ip_policy.IpPolicyService/UpdateIpBlockPolicy
+
+    预期: {"success": true, "message": "IP阻断策略已更新"}
+
+
+五、流式接口测试（需要客户端长连接）
+================================================================================
+
+  5.1 订阅策略变更通知
+  --------------------------------------------------------------------------
+
+    # 保持连接，等待策略变更事件
+    grpcurl -plaintext \
+      -d '{}' \
+      127.0.0.1:50051 \
+      policy_watch.PolicyWatchService/SubscribePolicyChanges
+
+    预期: 连接保持打开。当服务器下发策略时，会收到事件:
+      {"type": "CONFIG_CHANGED", "timestamp": ...}
+      {"type": "PROCESS_POLICY_CHANGED", "timestamp": ...}
+
+    触发方式: 保持此连接打开，另开终端写一次配置（离线模式下 UpdateConfig），
+             此连接应收到 CONFIG_CHANGED 事件。
+
+
+  5.2 订阅告警
+  --------------------------------------------------------------------------
+
+    grpcurl -plaintext \
+      -d '{"type": 0}' \
+      127.0.0.1:50051 \
+      alert.AlertService/SubscribeAlerts
+
+    预期: 连接保持打开。当有告警产生时，会收到 AlertEvent。
+    （当前为 stub 实现，暂无事件推送）
+
+
+  5.3 病毒扫描（双向流，已有功能）
+  --------------------------------------------------------------------------
+
+    此接口为双向流，grpcurl 不直接支持双向流测试。
+    需要使用客户端代码或专门的 gRPC 客户端工具测试。
+    在 egui 客户端（endpoint_security_egui）中已验证可用。
+
+
+六、自动化测试脚本
+================================================================================
+
+  以下脚本可一键跑完所有读操作测试:
+
+  #!/bin/bash
+  # test_grpc.sh — 测试所有 gRPC 读操作
+
+  GRPC_ADDR="127.0.0.1:50051"
+  PASS=0
+  FAIL=0
+
+  test_get() {
+    local svc=$1 method=$2 desc=$3
+    echo -n "[TEST] $desc ... "
+    if grpcurl -plaintext -d '{}' "$GRPC_ADDR" "$svc/$method" >/dev/null 2>&1; then
+      echo "PASS"
+      ((PASS++))
+    else
+      echo "FAIL"
+      ((FAIL++))
+    fi
+  }
+
+  echo "===== gRPC Read-Only Tests ====="
+  test_get agent_status.AgentStatusService GetAgentStatus "Agent状态"
+  test_get config.ConfigService GetConfig "配置查询"
+  test_get process_policy.ProcessPolicyService GetProcessPolicy "进程策略"
+  test_get peripheral_policy.PeripheralPolicyService GetPeripheralPolicy "外设策略"
+  test_get ip_policy.IpPolicyService GetIpBlockPolicy "IP阻断策略"
+  test_get ip_policy.IpPolicyService GetIpBlackPolicy "IP黑名单"
+  test_get outreach_detect.OutreachDetectService GetOutreachRules "外联规则"
+  test_get dir_policy.DirPolicyService GetDirPolicy "目录保护"
+  test_get extort_policy.ExtortPolicyService GetExtortPolicy "勒索保护"
+  test_get trust_dir.TrustDirService GetTrustDir "信任目录"
+  test_get virtual_port.VirtualPortService GetVirtualPort "虚拟端口"
+  test_get backup.BackupService GetBackupList "备份列表"
+  test_get jump.JumpService GetJumpStatus "跳变状态"
+
+  echo "===== Data Query Tests ====="
+  grpcurl -plaintext \
+    -d '{"limit": 5, "sort_by": "pid"}' \
+    "$GRPC_ADDR" data_query.DataQueryService/GetProcessList >/dev/null 2>&1 \
+    && echo "[TEST] 进程列表 ... PASS" || echo "[TEST] 进程列表 ... FAIL"
+
+  grpcurl -plaintext \
+    -d '{}' "$GRPC_ADDR" data_query.DataQueryService/GetPortList >/dev/null 2>&1 \
+    && echo "[TEST] 端口列表 ... PASS" || echo "[TEST] 端口列表 ... FAIL"
+
+  grpcurl -plaintext \
+    -d '{}' "$GRPC_ADDR" data_query.DataQueryService/GetUsbDeviceList >/dev/null 2>&1 \
+    && echo "[TEST] USB设备列表 ... PASS" || echo "[TEST] USB设备列表 ... FAIL"
+
+  echo "===== Permission Test ====="
+  if grpcurl -plaintext \
+    -d '{"crontime": 60}' "$GRPC_ADDR" config.ConfigService/UpdateConfig 2>&1 \
+    | grep -q "在线模式下不允许此操作"; then
+    echo "[TEST] 在线模式写保护 ... PASS"
+  else
+    echo "[TEST] 在线模式写保护 ... FAIL"
+  fi
+
+  echo "===== Done ====="
+
+
+七、调试技巧
+================================================================================
+
+  1. 查看完整响应（含 header）:
+     grpcurl -v -plaintext ...
+
+  2. 指定 proto 文件（grpcurl 可以从 proto 推断类型）:
+     grpcurl -import-path crates/grpc_gateway/src/proto \
+             -proto config.proto \
+             -plaintext 127.0.0.1:50051 \
+             config.ConfigService/GetConfig
+
+  3. 测试超时（避免卡住）:
+     grpcurl -connect-timeout 5 -max-time 10 -plaintext ...
+
+  4. 检查 gRPC 是否监听:
+     ss -tlnp | grep 50051
+     # 应显示: 127.0.0.1:50051 ... MagicArmor_0
+
+  5. 查看 Agent 日志:
+     # Agent 日志在 /opt/osec/logs/ 或控制台输出
+     # gRPC 相关日志以 "[gRPC]" 为前缀
+
+================================================================================
