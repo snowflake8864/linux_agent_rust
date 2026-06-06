@@ -18,16 +18,24 @@ impl LocalTaskService for LocalTaskServiceImpl {
     ) -> Result<Response<SubmitTaskResponse>, Status> {
         require_offline()?;
         let req = request.into_inner();
-        let results: Vec<TaskResult> = req
-            .task_ids
-            .iter()
-            .map(|&id| TaskResult {
-                task_id: id,
-                success: false,
-                message: format!("Task #{} — not yet wired to task_fetcher", id),
-            })
-            .collect();
-        // TODO: wire to TaskFetcher::handle_task()
+
+        let mut results = Vec::new();
+        for task_id in req.task_ids {
+            if grpc_gateway::notify::submit_local_task(task_id) {
+                results.push(TaskResult {
+                    task_id,
+                    success: true,
+                    message: "任务已提交".into(),
+                });
+            } else {
+                results.push(TaskResult {
+                    task_id,
+                    success: false,
+                    message: "任务通道未就绪（Agent 未完全启动）".into(),
+                });
+            }
+        }
+
         Ok(Response::new(SubmitTaskResponse {
             success: results.iter().all(|r| r.success),
             results,

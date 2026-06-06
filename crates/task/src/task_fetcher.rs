@@ -40,7 +40,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
-use grpc_gateway::notify::notify_policy_change;
+use grpc_gateway::notify::{notify_policy_change, init_local_task_rx};
 use grpc_gateway::policy_watch::PolicyChangeType;
 
 static AUTO_IP_JUMP_DAEMON_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -623,6 +623,9 @@ pub async fn run(
     let mut task_interval = interval(Duration::from_secs(initial_cron_time as u64));
     let mut current_cron_time = initial_cron_time;
 
+    // Initialize local task channel (for offline gRPC task submissions)
+    let mut local_task_rx = init_local_task_rx();
+
     loop {
         let new_cron_time = {
             let cfg = NETINFO_CONFIG.lock().unwrap();
@@ -683,6 +686,18 @@ pub async fn run(
                         eprintln!("Error fetching task: {}", err);
                         log_info!("服务器离线或网络错误: {}", err);
                     }
+                }
+            }
+            // Local task injection (from gRPC LocalTaskService, offline only)
+            Some(task_id) = local_task_rx.recv() => {
+                let task_id_u32 = task_id as u32;
+                if let Some(task_type) = TaskTypeEnum::from_u32(task_id_u32) {
+                    log_info!("[本地任务] task ID: {}, type: {:?}", task_id, task_type);
+                    if let Err(e) = task_fetcher.handle_task(task_type).await {
+                        log_info!("[本地任务] 处理失败 {}: {}", task_id, e);
+                    }
+                } else {
+                    log_info!("[本地任务] 未知 task ID: {}", task_id);
                 }
             }
         }

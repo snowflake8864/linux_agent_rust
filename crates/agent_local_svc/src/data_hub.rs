@@ -359,15 +359,15 @@ impl AgentDataHub {
     // ========================================================================
 
     /// Create a system snapshot.
-    pub fn create_backup(&self, name: &str) -> Result<String, String> {
-        let id = snapman::create_snapshot(name).map_err(|e| format!("{:?}", e))?;
+    pub async fn create_backup(&self, name: &str) -> Result<String, String> {
+        let id = snapman::create_snapshot(name, "").await.map_err(|e| format!("{:?}", e))?;
         self.notify(PolicyChangeType::BackupListChanged);
         Ok(id)
     }
 
     /// Restore a system snapshot.
-    pub fn restore_backup(&self, backup_id: &str) -> Result<(), String> {
-        snapman::restore_snapshot(backup_id).map_err(|e| format!("{:?}", e))?;
+    pub async fn restore_backup(&self, backup_id: &str) -> Result<(), String> {
+        snapman::restore_snapshot(backup_id).await.map_err(|e| format!("{:?}", e))?;
         self.notify(PolicyChangeType::BackupListChanged);
         Ok(())
     }
