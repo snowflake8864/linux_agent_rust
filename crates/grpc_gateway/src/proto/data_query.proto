@@ -1,0 +1,45 @@
+syntax = "proto3";
+package data_query;
+
+import "common.proto";
+import "peripheral_policy.proto";
+
+service DataQueryService {
+    rpc GetProcessList(ProcessFilter) returns (ProcessList);
+    rpc GetPortList(common.Empty) returns (PortList);
+    rpc GetUsbDeviceList(common.Empty) returns (UsbDeviceList);
+}
+
+message ProcessFilter {
+    int32 limit = 1;
+    string sort_by = 2;
+}
+
+message ProcessInfo {
+    int32 pid = 1;
+    string name = 2;
+    string exe_path = 3;
+    string hash = 4;
+    string cpu_usage = 5;
+    string mem_usage = 6;
+    string user = 7;
+}
+
+message ProcessList {
+    repeated ProcessInfo processes = 1;
+}
+
+message PortInfo {
+    string protocol = 1;
+    uint32 port = 2;
+    string process_name = 3;
+    int32 pid = 4;
+}
+
+message PortList {
+    repeated PortInfo ports = 1;
+}
+
+message UsbDeviceList {
+    repeated peripheral_policy.UsbDevice devices = 1;
+}

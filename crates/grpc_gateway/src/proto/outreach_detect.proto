@@ -1,0 +1,21 @@
+syntax = "proto3";
+package outreach_detect;
+
+import "common.proto";
+
+service OutreachDetectService {
+    rpc GetOutreachRules(common.Empty) returns (OutreachRules);
+    rpc UpdateOutreachRules(OutreachRules) returns (common.SimpleResponse);
+}
+
+// 对应 Rust: task::net_reach_rule::OutreachDetectRule
+// 复用 handler: update_global_outreach_rules()
+message OutreachDetectRule {
+    string addr = 1;
+    string method = 2;
+    uint32 type = 3;
+}
+
+message OutreachRules {
+    repeated OutreachDetectRule rules = 1;
+}

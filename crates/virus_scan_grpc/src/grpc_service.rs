@@ -1,5 +1,5 @@
-use crate::proto::{ClientMessage, Pong, ServerMessage};
-use crate::proto::virus_scan_service_server::VirusScanService;
+use grpc_gateway::virus_scan::{ClientMessage, Pong, ServerMessage};
+use grpc_gateway::virus_scan::virus_scan_service_server::VirusScanService;
 use crate::scan_task_mgr::ScanTaskManager;
 use crate::STREAM_BUFFER_SIZE;
 use futures::Stream;
@@ -42,7 +42,7 @@ impl VirusScanService for VirusScanGrpcService {
                     Ok(msg) => {
                         if let Some(cmd) = msg.cmd {
                             match cmd {
-                                crate::proto::client_message::Cmd::StartScan(req) => {
+                                grpc_gateway::virus_scan::client_message::Cmd::StartScan(req) => {
                                     log_info!("[gRPC] 收到扫描请求: target={}, excludes={:?}", req.target, req.exclude_dirs);
                                     let tx_clone = tx.clone();
                                     match task_mgr
@@ -54,8 +54,8 @@ impl VirusScanService for VirusScanGrpcService {
                                             let _ = tx
                                                 .send(Ok(ServerMessage {
                                                     event: Some(
-                                                        crate::proto::server_message::Event::StartResponse(
-                                                            crate::proto::StartScanResponse {
+                                                        grpc_gateway::virus_scan::server_message::Event::StartResponse(
+                                                            grpc_gateway::virus_scan::StartScanResponse {
                                                                 success: true,
                                                                 scan_id,
                                                                 message: "扫描已启动".to_string(),
@@ -70,8 +70,8 @@ impl VirusScanService for VirusScanGrpcService {
                                             let _ = tx
                                                 .send(Ok(ServerMessage {
                                                     event: Some(
-                                                        crate::proto::server_message::Event::Error(
-                                                            crate::proto::ScanError {
+                                                        grpc_gateway::virus_scan::server_message::Event::Error(
+                                                            grpc_gateway::virus_scan::ScanError {
                                                                 scan_id: String::new(),
                                                                 code: "START_FAILED".to_string(),
                                                                 message: e,
@@ -84,17 +84,17 @@ impl VirusScanService for VirusScanGrpcService {
                                     }
                                 }
 
-                                crate::proto::client_message::Cmd::StopScan(req) => {
+                                grpc_gateway::virus_scan::client_message::Cmd::StopScan(req) => {
                                     log_info!("[gRPC] 收到停止扫描请求: scan_id={}", req.scan_id);
                                     task_mgr.stop_scan(&req.scan_id).await;
                                 }
 
-                                crate::proto::client_message::Cmd::Ping(ping) => {
+                                grpc_gateway::virus_scan::client_message::Cmd::Ping(ping) => {
                                     log_info!("[gRPC] 收到 PING, timestamp={}", ping.timestamp);
                                     let _ = tx
                                         .send(Ok(ServerMessage {
                                             event: Some(
-                                                crate::proto::server_message::Event::Pong(Pong {
+                                                grpc_gateway::virus_scan::server_message::Event::Pong(Pong {
                                                     timestamp: ping.timestamp,
                                                 }),
                                             ),

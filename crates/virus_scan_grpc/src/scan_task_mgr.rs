@@ -1,4 +1,4 @@
-use crate::proto::{ScanProgress, VirusAlert, ScanCompleted, ServerMessage, FileScanResult};
+use grpc_gateway::virus_scan::{ScanProgress, VirusAlert, ScanCompleted, ServerMessage, FileScanResult};
 use crate::clamav_scanner::{ClamAVConnectionPool, ScanResult};
 use chrono::Utc;
 use common::manager::boot::BootManager;
@@ -262,7 +262,7 @@ impl ScanTaskManager {
             duration_ms,
         };
         let _ = task.tx.send(Ok(ServerMessage {
-            event: Some(crate::proto::server_message::Event::Completed(completed)),
+            event: Some(grpc_gateway::virus_scan::server_message::Event::Completed(completed)),
         })).await;
 
         self.report_virus_alerts().await;
@@ -384,7 +384,7 @@ impl ScanTaskManager {
                         current_path: file_path.clone(),
                     };
                     let _ = task.tx.send(Ok(ServerMessage {
-                        event: Some(crate::proto::server_message::Event::Progress(progress)),
+                        event: Some(grpc_gateway::virus_scan::server_message::Event::Progress(progress)),
                     })).await;
                 }
             }
@@ -437,7 +437,7 @@ impl ScanTaskManager {
         };
 
         let _ = task.tx.send(Ok(ServerMessage {
-            event: Some(crate::proto::server_message::Event::VirusAlert(alert)),
+            event: Some(grpc_gateway::virus_scan::server_message::Event::VirusAlert(alert)),
         })).await;
 
         let virus_scan_alert = VirusScanAlert {
@@ -472,7 +472,7 @@ impl ScanTaskManager {
         };
 
         let _ = task.tx.send(Ok(ServerMessage {
-            event: Some(crate::proto::server_message::Event::FileScanResult(result)),
+            event: Some(grpc_gateway::virus_scan::server_message::Event::FileScanResult(result)),
         })).await;
 
         //log_info!("[gRPC] 上报文件结果: {} -> {} ({}ms)", file_path, status, scan_time_ms);

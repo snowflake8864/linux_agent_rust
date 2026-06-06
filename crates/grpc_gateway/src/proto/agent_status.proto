@@ -1,0 +1,31 @@
+syntax = "proto3";
+package agent_status;
+
+import "common.proto";
+
+service AgentStatusService {
+    rpc GetAgentStatus(common.Empty) returns (AgentStatus);
+}
+
+message AgentStatus {
+    bool is_online = 1;
+    string agent_version = 2;
+    string os_info = 3;
+    int32 protection_days = 4;
+    CpuMemInfo cpu_mem = 5;
+    repeated ModuleStatus modules = 6;
+    string device_uid = 7;
+    string host_name = 8;
+}
+
+message CpuMemInfo {
+    string cpu_usage = 1;
+    string mem_usage = 2;
+    string disk_usage = 3;
+}
+
+message ModuleStatus {
+    string name = 1;
+    bool enabled = 2;
+    string status = 3;
+}

@@ -1,0 +1,16 @@
+syntax = "proto3";
+package process_policy;
+
+import "common.proto";
+
+service ProcessPolicyService {
+    rpc GetProcessPolicy(common.Empty) returns (ProcessPolicy);
+    rpc UpdateProcessPolicy(ProcessPolicy) returns (common.SimpleResponse);
+}
+
+// 对应 HTTP: /v1/getprocwl 或 /v1/getprocbl 返回的 data.proclist
+// 复用 handler: POLICY_MANAGER.set_policy_process()
+message ProcessPolicy {
+    repeated string hash_list = 1;
+    bool is_white = 2;
+}

@@ -1,0 +1,37 @@
+syntax = "proto3";
+package alert;
+
+import "common.proto";
+
+service AlertService {
+    rpc SubscribeAlerts(AlertFilter) returns (stream AlertEvent);
+}
+
+message AlertFilter {
+    AlertType type = 1;
+}
+
+enum AlertType {
+    ALERT_UNKNOWN = 0;
+    PROCESS_ALERT = 1;
+    FILE_ALERT = 2;
+    DEVICE_ALERT = 3;
+    NETWORK_ALERT = 4;
+    RANSOMWARE_ALERT = 5;
+}
+
+// 对应 Rust: reporter::AuditLogInfo
+message AlertEvent {
+    string alert_id = 1;
+    AlertType type = 2;
+    uint32 level = 3;
+    uint64 timestamp = 4;
+    string file_path = 5;
+    string process_name = 6;
+    string md5 = 7;
+    string remark = 8;
+    string peripheral_name = 9;
+    string peripheral_eid = 10;
+    string rename_dir = 11;
+    string p_param = 12;
+}
