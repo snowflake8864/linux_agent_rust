@@ -337,7 +337,7 @@ impl NetServiceLogHandler {
                         Duration::from_secs(10),
                         self.boot_manager.get_token().await.as_deref(),
                     ).await {
-                        Ok(response) => {/*log_info!("服务器响应: {}", response)*/},
+                        Ok(response) => { for log in &vec_net_log { crate::broadcast_net_log(log); } },
                         Err(err) => eprintln!("发送指标失败: {}", err),
                     }
 
@@ -562,7 +562,7 @@ impl NetServiceLogHandler {
                         Duration::from_secs(10),
                         self.boot_manager.get_token().await.as_deref(),
                     ).await {
-                        Ok(response) => {/*log_info!("服务器响应: {}", response)*/},
+                        Ok(response) => { for log in &vec_net_log { crate::broadcast_net_log(log); } },
                         Err(err) => eprintln!("发送指标失败: {}", err),
                     }
 
