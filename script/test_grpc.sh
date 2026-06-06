@@ -226,6 +226,30 @@ test_w5() { grpc_expect_perm_denied "下发任务（在线拒绝）" \
     task_local.proto task_local.LocalTaskService SubmitTask \
     '{"task_ids": [6, 19]}'; }
 
+test_w6() { grpc_expect_perm_denied "IP跳变（在线拒绝）" \
+    jump.proto jump.JumpService ExecuteIpJump \
+    '{"gateway":"192.168.1.1","source_ip":"10.0.0.5","target_ip":"10.0.0.6","mode":1}'; }
+
+test_w7() { grpc_expect_perm_denied "密码跳变（在线拒绝）" \
+    jump.proto jump.JumpService ExecutePwJump \
+    '{"new_password":"test123"}'; }
+
+test_w8() { grpc_expect_perm_denied "创建备份（在线拒绝）" \
+    backup.proto backup.BackupService CreateBackup \
+    '{"name":"test_bak"}'; }
+
+test_w9() { grpc_expect_perm_denied "还原备份（在线拒绝）" \
+    backup.proto backup.BackupService RestoreBackup \
+    '{"backup_id":"abc123"}'; }
+
+test_w10() { grpc_expect_perm_denied "更新信任目录（在线拒绝）" \
+    trust_dir.proto trust_dir.TrustDirService UpdateTrustDir \
+    '{"dirs": [{"dir":"/opt","type":1,"is_extend":0}]}'; }
+
+test_w11() { grpc_expect_perm_denied "更新虚拟端口（在线拒绝）" \
+    virtual_port.proto virtual_port.VirtualPortService UpdateVirtualPort \
+    '{"rules": [{"alarm_level":1,"dest_ip":"192.168.1.1","dest_port":"80","dest_port_type":0,"id":1,"protocol":"tcp","source_ip":"10.0.0.1","source_port_start":8080,"source_port_end":8080,"type":"tcp"}]}'; }
+
 # ── menu ───────────────────────────────────────────────────────────────
 
 show_menu() {
@@ -246,8 +270,11 @@ show_menu() {
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${RED}写接口（仅离线可用，在线应返回 PERMISSION_DENIED）${NC}       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   w1) UpdateConfig   w2) UpdateProcessPolicy              ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   w3) UpdatePeripheral w4) UpdateIpBlockPolicy             ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   w5) SubmitTask                                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   w3) UpdatePeripheral w4) UpdateIpBlockPolicy            ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   w5) SubmitTask     w6) ExecuteIpJump                    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   w7) ExecutePwJump  w8) CreateBackup                     ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   w9) RestoreBackup  w10) UpdateTrustDir                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   w11) UpdateVirtualPort                                  ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}all${NC}  测试全部只读接口                                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${RED}write${NC} 测试全部写接口（验证在线拒绝）                    ${CYAN}║${NC}"
@@ -300,6 +327,12 @@ case "${1:-menu}" in
                 w3) test_w3 ;;
                 w4) test_w4 ;;
                 w5) test_w5 ;;
+                w6) test_w6 ;;
+                w7) test_w7 ;;
+                w8) test_w8 ;;
+                w9) test_w9 ;;
+                w10) test_w10 ;;
+                w11) test_w11 ;;
                 all)
                     echo -e "\n${GREEN}── 测试全部只读接口 ──${NC}"
                     for i in $(seq 1 16); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
@@ -307,7 +340,7 @@ case "${1:-menu}" in
                     ;;
                 write)
                     echo -e "\n${RED}── 测试全部写接口（预期全部 PERMISSION_DENIED）──${NC}"
-                    test_w1; test_w2; test_w3; test_w4; test_w5
+                    test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11
                     print_result
                     ;;
                 stream)
@@ -319,7 +352,7 @@ case "${1:-menu}" in
                     echo -e "\n${GREEN}── 测试全部接口 ──${NC}"
                     for i in $(seq 1 16); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
                     test_17; test_18
-                    test_w1; test_w2; test_w3; test_w4; test_w5
+                    test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11
                     print_result
                     ;;
                 q|Q|quit|exit) echo "退出"; break ;;
@@ -334,7 +367,7 @@ case "${1:-menu}" in
         print_result
         ;;
     write)
-        test_w1; test_w2; test_w3; test_w4; test_w5
+        test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11
         print_result
         ;;
     stream)
@@ -344,7 +377,7 @@ case "${1:-menu}" in
     full)
         for i in $(seq 1 16); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
         test_17; test_18
-        test_w1; test_w2; test_w3; test_w4; test_w5
+        test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11
         print_result
         ;;
     *)
