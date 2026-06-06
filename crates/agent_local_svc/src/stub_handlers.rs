@@ -1,8 +1,6 @@
-//! Stub implementations for gRPC services that require deeper integration
-//! with pattern_mgr (via BootManager), snapman, jump managers, etc.
-//! These return "not yet implemented" for now.
+//! Service implementations that require pattern_mgr, snapman, jump managers, etc.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
 
 use grpc_gateway::common::SimpleResponse;
@@ -32,16 +30,43 @@ use crate::data_hub::{require_offline, AgentDataHub};
 
 pub struct DirPolicyServiceImpl {
     pub data_hub: Arc<AgentDataHub>,
+    pub pattern_mgr: Arc<Mutex<pattern::pattern_rules_mgr::PatternRulesMgr>>,
 }
 
 #[tonic::async_trait]
 impl DirPolicyService for DirPolicyServiceImpl {
     async fn get_dir_policy(&self, _: Request<grpc_gateway::common::Empty>) -> Result<Response<DirPolicy>, Status> {
-        Ok(Response::new(DirPolicy { rules: vec![] }))
+        let rules = self.data_hub.get_cached_dir_policy();
+        Ok(Response::new(DirPolicy { rules }))
     }
-    async fn update_dir_policy(&self, _: Request<DirPolicy>) -> Result<Response<SimpleResponse>, Status> {
+
+    async fn update_dir_policy(&self, req: Request<DirPolicy>) -> Result<Response<SimpleResponse>, Status> {
         require_offline()?;
-        Err(Status::unimplemented("dir_policy requires pattern_mgr (BootManager)"))
+        let rules = req.into_inner().rules;
+
+        // Convert proto DirectionScanRule to POLICY_PROTECT_DIR
+        let protect_dirs: Vec<pattern::pattern_rules_mgr::POLICY_PROTECT_DIR> = rules
+            .iter()
+            .map(|r| pattern::pattern_rules_mgr::POLICY_PROTECT_DIR {
+                id: 0,
+                dir: r.dir.clone(),
+                protect_rw: 0,
+                typ: r.typ as u8,
+                is_extend: 0,
+                include_file: String::new(),
+                file_ext: String::new(),
+                is_white: String::new(),
+                white_hash: String::new(),
+            })
+            .collect();
+
+        // Write to pattern_mgr (→ /proc/osec/)
+        self.pattern_mgr.lock().unwrap().set_protect_dir(protect_dirs);
+
+        // Update cache for subsequent GetDirPolicy calls
+        self.data_hub.set_cached_dir_policy(rules);
+
+        Ok(Response::new(SimpleResponse { success: true, message: "目录保护策略已更新".into() }))
     }
 }
 
@@ -49,16 +74,43 @@ impl DirPolicyService for DirPolicyServiceImpl {
 
 pub struct ExtortPolicyServiceImpl {
     pub data_hub: Arc<AgentDataHub>,
+    pub pattern_mgr: Arc<Mutex<pattern::pattern_rules_mgr::PatternRulesMgr>>,
 }
 
 #[tonic::async_trait]
 impl ExtortPolicyService for ExtortPolicyServiceImpl {
     async fn get_extort_policy(&self, _: Request<grpc_gateway::common::Empty>) -> Result<Response<ExtortPolicy>, Status> {
-        Ok(Response::new(ExtortPolicy { rules: vec![] }))
+        let rules = self.data_hub.get_cached_extort_policy();
+        Ok(Response::new(ExtortPolicy { rules }))
     }
-    async fn update_extort_policy(&self, _: Request<ExtortPolicy>) -> Result<Response<SimpleResponse>, Status> {
+
+    async fn update_extort_policy(&self, req: Request<ExtortPolicy>) -> Result<Response<SimpleResponse>, Status> {
         require_offline()?;
-        Err(Status::unimplemented("extort_policy requires pattern_mgr (BootManager)"))
+        let rules = req.into_inner().rules;
+
+        // Convert proto ExtortProtectRule to POLICY_EXIPOR_PROTECT
+        let extort_rules: Vec<pattern::pattern_rules_mgr::POLICY_EXIPOR_PROTECT> = rules
+            .iter()
+            .map(|r| {
+                let mut map_comm = std::collections::HashMap::new();
+                for (k, v) in &r.map_comm {
+                    map_comm.insert(k.clone(), v.clone());
+                }
+                pattern::pattern_rules_mgr::POLICY_EXIPOR_PROTECT {
+                    file_type: r.file_type.clone(),
+                    typ: r.typ as u8,
+                    map_comm,
+                }
+            })
+            .collect();
+
+        // Write to pattern_mgr (→ /proc/osec/)
+        self.pattern_mgr.lock().unwrap().set_exiport_dir(extort_rules);
+
+        // Update cache
+        self.data_hub.set_cached_extort_policy(rules);
+
+        Ok(Response::new(SimpleResponse { success: true, message: "勒索保护策略已更新".into() }))
     }
 }
 

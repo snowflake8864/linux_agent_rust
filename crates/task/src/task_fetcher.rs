@@ -40,7 +40,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
-use grpc_gateway::notify::{notify_policy_change, init_local_task_rx};
+use grpc_gateway::notify::{notify_policy_change, init_local_task_rx, DIR_POLICY_CACHE, EXTORT_POLICY_CACHE};
 use grpc_gateway::policy_watch::PolicyChangeType;
 
 static AUTO_IP_JUMP_DAEMON_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -1064,6 +1064,22 @@ async fn task_down_dir_policy(&self, task_type: u64) -> Result<(), String> {
                     let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
                     pattern_mgr.set_protect_dir(rules);
                 }
+
+                // Update gRPC cache
+                if let Some(data) = parsed["data"].as_array() {
+                    let proto_rules: Vec<grpc_gateway::dir_policy::DirectionScanRule> = data
+                        .iter()
+                        .filter_map(|v| {
+                            Some(grpc_gateway::dir_policy::DirectionScanRule {
+                                dir: v.get("dir")?.as_str()?.to_string(),
+                                pid: 0,
+                                typ: v.get("type")?.as_u64()? as u32,
+                            })
+                        })
+                        .collect();
+                    *grpc_gateway::notify::DIR_POLICY_CACHE.lock().unwrap() = proto_rules;
+                    notify_policy_change(PolicyChangeType::DirPolicyChanged);
+                }
             } else {
                 eprintln!("Error: Invalid response code: {}", parsed["code"]);
                 return Err("Invalid response code.".to_string());
@@ -1071,7 +1087,6 @@ async fn task_down_dir_policy(&self, task_type: u64) -> Result<(), String> {
         }
         Err(err) => {
             eprintln!("Error fetching task: {}", err);
-            // 返回错误的 Result 类型
             return Err(err);
         }
     }
@@ -1534,6 +1549,29 @@ async fn task_down_extort(&self, task_type: u64) -> Result<(), String> {
                 let rules = pattern_rules_mgr::PatternRulesMgr::parse_exipor_policy_from_json(&parsed["data"])?;
                 let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
                 pattern_mgr.set_exiport_dir(rules);
+
+                // Update gRPC cache
+                if let Some(data) = parsed["data"].as_array() {
+                    let proto_rules: Vec<grpc_gateway::extort_policy::ExtortProtectRule> = data
+                        .iter()
+                        .filter_map(|v| {
+                            let process_arr = v.get("process")?.as_array()?;
+                            let mut map_comm = std::collections::HashMap::new();
+                            for p in process_arr {
+                                if let (Some(h), Some(n)) = (p.get("hash")?.as_str(), p.get("name")?.as_str()) {
+                                    map_comm.insert(h.to_string(), n.to_string());
+                                }
+                            }
+                            Some(grpc_gateway::extort_policy::ExtortProtectRule {
+                                file_type: v.get("file_suffix")?.as_str()?.to_string(),
+                                typ: v.get("type")?.as_u64()? as u32,
+                                map_comm,
+                            })
+                        })
+                        .collect();
+                    *grpc_gateway::notify::EXTORT_POLICY_CACHE.lock().unwrap() = proto_rules;
+                    notify_policy_change(PolicyChangeType::ExtortPolicyChanged);
+                }
 
             } else {
                 eprintln!("Error: Invalid response code: {}", parsed["code"]);

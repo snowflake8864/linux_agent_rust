@@ -68,3 +68,15 @@ pub fn submit_local_task(task_id: i32) -> bool {
         None => false,
     }
 }
+
+// ============================================================================
+// DirPolicy / ExtortPolicy caches (populated by task_fetcher, read by gRPC)
+// ============================================================================
+
+use std::sync::Mutex;
+
+pub static DIR_POLICY_CACHE: LazyLock<Mutex<Vec<crate::dir_policy::DirectionScanRule>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+pub static EXTORT_POLICY_CACHE: LazyLock<Mutex<Vec<crate::extort_policy::ExtortProtectRule>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
