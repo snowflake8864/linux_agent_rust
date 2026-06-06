@@ -107,6 +107,25 @@ impl SshLoginCollector {
                 ).await {
                     Ok(response) => {
                         log_info!("SSH登录日志上报成功: {}条, 服务器响应: {}", new_logs.len(), response);
+                        // 广播到 gRPC AlertService
+                        for log in &new_logs {
+                            use grpc_gateway::alert::AlertEvent;
+                            use grpc_gateway::notify::broadcast_alert;
+                            broadcast_alert(AlertEvent {
+                                alert_id: uuid::Uuid::new_v4().to_string(),
+                                r#type: 0, // ALERT_UNKNOWN / 登录事件
+                                level: if log.status == 0 { 1 } else { 2 },
+                                timestamp: log.time as u64,
+                                file_path: String::new(),
+                                process_name: format!("ssh:{}", log.username),
+                                md5: String::new(),
+                                remark: format!("IP:{} type:{}", log.ip, log.login_type),
+                                peripheral_name: String::new(),
+                                peripheral_eid: String::new(),
+                                rename_dir: String::new(),
+                                p_param: String::new(),
+                            });
+                        }
                         // 更新去重记录
                         self.update_last_records(new_logs).await;
                     }
