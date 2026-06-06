@@ -116,6 +116,10 @@ impl StartVirusScanGrpcService for BootManager {
 
             let grpc_service = crate::VirusScanGrpcService::new(task_mgr);
 
+            // Shared data hub for all local gRPC services
+            let data_hub = Arc::new(AgentDataHub::new());
+            let pattern_mgr = self.pattern_mgr();
+
             let addr: std::net::SocketAddr = match virus_scan_grpc_addr.parse() {
                 Ok(a) => a,
                 Err(e) => {
@@ -139,83 +143,89 @@ impl StartVirusScanGrpcService for BootManager {
                 // ============================================================
                 .add_service(
                     grpc_gateway::agent_status::agent_status_service_server::AgentStatusServiceServer::new(
-                        AgentStatusServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        AgentStatusServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
                 .add_service(
                     grpc_gateway::alert::alert_service_server::AlertServiceServer::new(
-                        AlertServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        AlertServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
                 .add_service(
                     grpc_gateway::config::config_service_server::ConfigServiceServer::new(
-                        ConfigServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        ConfigServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
                 .add_service(
                     grpc_gateway::task_local::local_task_service_server::LocalTaskServiceServer::new(
-                        LocalTaskServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        LocalTaskServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
                 .add_service(
                     grpc_gateway::process_policy::process_policy_service_server::ProcessPolicyServiceServer::new(
-                        ProcessPolicyServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        ProcessPolicyServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
                 .add_service(
                     grpc_gateway::peripheral_policy::peripheral_policy_service_server::PeripheralPolicyServiceServer::new(
-                        PeripheralPolicyServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        PeripheralPolicyServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
                 .add_service(
                     grpc_gateway::ip_policy::ip_policy_service_server::IpPolicyServiceServer::new(
-                        IpPolicyServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        IpPolicyServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
                 .add_service(
                     grpc_gateway::data_query::data_query_service_server::DataQueryServiceServer::new(
-                        DataQueryServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        DataQueryServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
                 .add_service(
                     grpc_gateway::outreach_detect::outreach_detect_service_server::OutreachDetectServiceServer::new(
-                        OutreachDetectServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        OutreachDetectServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
                 .add_service(
                     grpc_gateway::policy_watch::policy_watch_service_server::PolicyWatchServiceServer::new(
-                        PolicyWatchServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        PolicyWatchServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
                 // Stub services
                 .add_service(
                     grpc_gateway::dir_policy::dir_policy_service_server::DirPolicyServiceServer::new(
-                        DirPolicyServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        DirPolicyServiceImpl {
+                            data_hub: data_hub.clone(),
+                            pattern_mgr: pattern_mgr.clone(),
+                        },
                     )
                 )
                 .add_service(
                     grpc_gateway::extort_policy::extort_policy_service_server::ExtortPolicyServiceServer::new(
-                        ExtortPolicyServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        ExtortPolicyServiceImpl {
+                            data_hub: data_hub.clone(),
+                            pattern_mgr: pattern_mgr.clone(),
+                        },
                     )
                 )
                 .add_service(
                     grpc_gateway::jump::jump_service_server::JumpServiceServer::new(
-                        JumpServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        JumpServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
                 .add_service(
                     grpc_gateway::backup::backup_service_server::BackupServiceServer::new(
-                        BackupServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        BackupServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
                 .add_service(
                     grpc_gateway::trust_dir::trust_dir_service_server::TrustDirServiceServer::new(
-                        TrustDirServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        TrustDirServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
                 .add_service(
                     grpc_gateway::virtual_port::virtual_port_service_server::VirtualPortServiceServer::new(
-                        VirtualPortServiceImpl { data_hub: Arc::new(AgentDataHub::new()) },
+                        VirtualPortServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
                 // ============================================================
