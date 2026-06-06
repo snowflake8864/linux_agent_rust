@@ -1207,7 +1207,7 @@
   | PolicyWatchService| ✅ (订阅流)        | —                   | 策略变更通知                 |
   | AlertService      | ⚠️ (订阅流)       | —                   | 待接 log_worker channel    |
   | LocalTaskService  | —                | ⚠️                  | 待接 TaskFetcher           |
-  | DirPolicyService  | ⚠️               | ⚠️                  | 需 BootManager 的 pattern_mgr |
-  | ExtortPolicyService | ⚠️             | ⚠️                  | 需 BootManager 的 pattern_mgr |
+  | DirPolicyService  | ✅                | ✅                   | 通过 pattern_mgr 读写         |
+  | ExtortPolicyService | ✅               | ✅                   | 通过 pattern_mgr 读写         |
 
 ================================================================================
