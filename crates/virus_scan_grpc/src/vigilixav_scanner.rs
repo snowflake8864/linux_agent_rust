@@ -26,7 +26,8 @@ pub struct VigilixAVConnectionPool {
 
 #[derive(Debug, Clone)]
 pub enum DispositionAction {
-    Move { quarantine_dir: String },
+    /// 移动到隔离目录（由 vigilixd.conf 配置决定目标路径，客户端无需指定）
+    Move,
     Remove,
 }
 
@@ -65,7 +66,7 @@ impl VigilixAVConnectionPool {
                         .map_err(|e| format!("TCP connect failed: {}", e))?;
 
                     let cmd = match &action {
-                        DispositionAction::Move { .. } => {
+                        DispositionAction::Move => {
                             format!("nMOVE {}\0", file_path_send)
                         }
                         DispositionAction::Remove => {
@@ -99,7 +100,7 @@ impl VigilixAVConnectionPool {
                         .map_err(|e| format!("Unix socket connect failed: {}", e))?;
 
                     let cmd = match &action {
-                        DispositionAction::Move { .. } => {
+                        DispositionAction::Move => {
                             format!("nMOVE {}\0", file_path_send)
                         }
                         DispositionAction::Remove => {

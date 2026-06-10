@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::fs;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -19,8 +19,13 @@ const SCAN_STATE_IDLE: u8 = 0;
 const SCAN_STATE_RUNNING: u8 = 1;
 const SCAN_STATE_STOPPED: u8 = 2;
 const SCAN_STATE_COMPLETED: u8 = 3;
+const SCAN_STATE_PAUSED: u8 = 4;
 
-const SYSTEM_EXCLUDES: &[&str] = &["/proc", "/sys", "/dev", "/run", "/snap", "/cgroup"];
+const SYSTEM_EXCLUDES: &[&str] = &[
+    "/proc", "/sys", "/dev", "/run", "/snap", "/cgroup",
+    "/swapfile", "/swap.img", "/var/swap", "/var/swapfile", "/lost+found",
+    "/boot/System.map", "/boot/config",
+];
 
 fn merge_excludes(user_excludes: &[String]) -> Vec<String> {
     let mut merged = user_excludes.to_vec();
@@ -93,6 +98,7 @@ pub struct ScanTask {
     pub viruses: Arc<AtomicU32>,
     pub start_time: i64,
     pub tx: mpsc::Sender<Result<ServerMessage, Status>>,
+    pub resume_notify: Arc<Notify>,
 }
 
 pub struct ScanTaskManager {
@@ -122,6 +128,7 @@ impl ScanTask {
             viruses: Arc::new(AtomicU32::new(0)),
             start_time: Utc::now().timestamp_millis(),
             tx,
+            resume_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -131,6 +138,23 @@ impl ScanTask {
 
     pub fn stop(&self) {
         self.state.store(SCAN_STATE_STOPPED, Ordering::Relaxed);
+        // 如果当前是暂停状态，需要唤醒以便退出循环
+        self.resume_notify.notify_waiters();
+    }
+
+    pub fn pause(&self) {
+        let current = self.state.load(Ordering::Relaxed);
+        if current == SCAN_STATE_RUNNING {
+            self.state.store(SCAN_STATE_PAUSED, Ordering::Relaxed);
+        }
+    }
+
+    pub fn resume(&self) {
+        let current = self.state.load(Ordering::Relaxed);
+        if current == SCAN_STATE_PAUSED {
+            self.state.store(SCAN_STATE_RUNNING, Ordering::Relaxed);
+            self.resume_notify.notify_waiters();
+        }
     }
 
     pub fn complete(&self) {
@@ -139,6 +163,17 @@ impl ScanTask {
 
     pub fn is_running(&self) -> bool {
         self.state.load(Ordering::Relaxed) == SCAN_STATE_RUNNING
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == SCAN_STATE_PAUSED
+    }
+
+    /// 等待恢复：如果当前是 PAUSED 状态，则挂起直到恢复或停止
+    pub async fn wait_if_paused(&self) {
+        while self.state.load(Ordering::Relaxed) == SCAN_STATE_PAUSED {
+            self.resume_notify.notified().await;
+        }
     }
 }
 
@@ -166,6 +201,18 @@ impl ScanTaskManager {
 
     pub fn vigilixav_scanner(&self) -> Option<Arc<VigilixAVConnectionPool>> {
         self.vigilixav_scanner.clone()
+    }
+
+    /// gRPC 连接断开时调用，清理该连接关联的已完成任务。
+    /// 避免 task 永久驻留内存。
+    pub async fn clear_completed_tasks(&self) {
+        let mut tasks = self.tasks.lock().await;
+        let before = tasks.len();
+        tasks.retain(|_id, task| task.is_running() || task.is_paused());
+        let removed = before - tasks.len();
+        if removed > 0 {
+            log_info!("[SCAN] gRPC 连接断开，清理已完成 task: {} 个", removed);
+        }
     }
 
     pub fn start_virus_report_worker(&self) {
@@ -222,10 +269,16 @@ impl ScanTaskManager {
         let merged_excludes = merge_excludes(excludes);
 
         let scan_id = Uuid::new_v4().to_string();
+        /*
         let msg = format!(
             "扫描已启动，系统目录({})已自动排除",
             SYSTEM_EXCLUDES.join(", ")
         );
+        */
+        let msg = format!(
+            "扫描已启动"
+        );
+
 
         let task = ScanTask::new(
             scan_id.clone(),
@@ -255,10 +308,46 @@ impl ScanTaskManager {
     }
 
     pub async fn stop_scan(&self, scan_id: &str) {
-        let mut tasks = self.tasks.lock().await;
+        let tasks = self.tasks.lock().await;
         if let Some(task) = tasks.get(scan_id) {
             task.stop();
             log_info!("扫描已停止: {}", scan_id);
+        }
+    }
+
+    pub async fn pause_scan(&self, scan_id: &str) -> Result<String, String> {
+        let tasks = self.tasks.lock().await;
+        if let Some(task) = tasks.get(scan_id) {
+            let current = task.state.load(Ordering::Relaxed);
+            if current == SCAN_STATE_RUNNING {
+                task.pause();
+                log_info!("扫描已暂停: {}", scan_id);
+                Ok("扫描已暂停，当前批次文件扫完后生效".to_string())
+            } else if current == SCAN_STATE_PAUSED {
+                Err("扫描已处于暂停状态".to_string())
+            } else {
+                Err(format!("扫描不在运行状态，当前状态: {}", current))
+            }
+        } else {
+            Err(format!("扫描任务不存在: {}", scan_id))
+        }
+    }
+
+    pub async fn resume_scan(&self, scan_id: &str) -> Result<String, String> {
+        let tasks = self.tasks.lock().await;
+        if let Some(task) = tasks.get(scan_id) {
+            let current = task.state.load(Ordering::Relaxed);
+            if current == SCAN_STATE_PAUSED {
+                task.resume();
+                log_info!("扫描已恢复: {}", scan_id);
+                Ok("扫描已恢复".to_string())
+            } else if current == SCAN_STATE_RUNNING {
+                Err("扫描已在运行中".to_string())
+            } else {
+                Err(format!("扫描不在暂停状态，当前状态: {}", current))
+            }
+        } else {
+            Err(format!("扫描任务不存在: {}", scan_id))
         }
     }
 
@@ -289,8 +378,11 @@ impl ScanTaskManager {
 
         self.report_virus_alerts().await;
 
-        let mut tasks = self.tasks.lock().await;
-        tasks.remove(scan_id);
+        // 扫描完成后不立即移除 task：
+        // 1. 用户可能在扫描完成后才选择病毒文件进行处置（DisposeFileRequest）
+        // 2. scan_id 需保持可查询状态，便于 Stop/Pause 等操作返回有意义的错误
+        // 3. task 清理时机改为 gRPC 连接断开时（由 clear_completed_tasks 负责）
+        log_info!("[SCAN] 扫描完成，task 保留供后续处置: scan_id={}", scan_id);
     }
 
     async fn scan_directory_recursive(
@@ -321,7 +413,11 @@ impl ScanTaskManager {
         let mut dirs_to_scan = Vec::new();
 
         for entry in all_entries {
-            if task.state.load(Ordering::Relaxed) != SCAN_STATE_RUNNING {
+            // 暂停检查：如果是 PAUSED 状态，在这里挂起等待恢复
+            task.wait_if_paused().await;
+
+            let current_state = task.state.load(Ordering::Relaxed);
+            if current_state != SCAN_STATE_RUNNING {
                 break;
             }
 
@@ -377,7 +473,11 @@ impl ScanTaskManager {
         }
 
         for handle in handles {
-            if task.state.load(Ordering::Relaxed) != SCAN_STATE_RUNNING {
+            // 暂停检查：等待已提交的任务结果时也支持暂停
+            task.wait_if_paused().await;
+
+            let current_state = task.state.load(Ordering::Relaxed);
+            if current_state != SCAN_STATE_RUNNING {
                 break;
             }
             
@@ -413,7 +513,11 @@ impl ScanTaskManager {
         }
 
         for dir_path in dirs_to_scan {
-            if task.state.load(Ordering::Relaxed) != SCAN_STATE_RUNNING {
+            // 暂停检查
+            task.wait_if_paused().await;
+
+            let current_state = task.state.load(Ordering::Relaxed);
+            if current_state != SCAN_STATE_RUNNING {
                 break;
             }
             Box::pin(self.scan_directory_recursive(&dir_path, excludes, scan_id, task, total_scanned)).await;
@@ -513,5 +617,110 @@ impl Clone for ScanTaskManager {
             boot_manager: self.boot_manager.clone(),
             scan_semaphore: Arc::new(Semaphore::new(10)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+    use std::sync::atomic::Ordering;
+
+    fn make_test_task() -> ScanTask {
+        let (tx, _rx) = mpsc::channel(16);
+        ScanTask::new(
+            "test-scan-001".to_string(),
+            "/tmp".to_string(),
+            vec![],
+            tx,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_pause_and_resume_state_transitions() {
+        let task = make_test_task();
+
+        // 初始状态 IDLE
+        assert_eq!(task.state.load(Ordering::Relaxed), SCAN_STATE_IDLE);
+
+        // start -> RUNNING
+        task.start();
+        assert_eq!(task.state.load(Ordering::Relaxed), SCAN_STATE_RUNNING);
+        assert!(task.is_running());
+        assert!(!task.is_paused());
+
+        // pause -> PAUSED
+        task.pause();
+        assert_eq!(task.state.load(Ordering::Relaxed), SCAN_STATE_PAUSED);
+        assert!(!task.is_running());
+        assert!(task.is_paused());
+
+        // resume -> RUNNING
+        task.resume();
+        assert_eq!(task.state.load(Ordering::Relaxed), SCAN_STATE_RUNNING);
+        assert!(task.is_running());
+        assert!(!task.is_paused());
+    }
+
+    #[tokio::test]
+    async fn test_pause_only_works_in_running_state() {
+        let task = make_test_task();
+
+        // 在 IDLE 状态 pause 不应该变化
+        task.pause();
+        assert_eq!(task.state.load(Ordering::Relaxed), SCAN_STATE_IDLE);
+
+        // 在 STOPPED 状态 pause 不应该变化
+        task.start();
+        task.stop();
+        task.pause();
+        assert_eq!(task.state.load(Ordering::Relaxed), SCAN_STATE_STOPPED);
+    }
+
+    #[tokio::test]
+    async fn test_resume_only_works_in_paused_state() {
+        let task = make_test_task();
+
+        // 在 RUNNING 状态 resume 不应该变化
+        task.start();
+        task.resume();
+        assert_eq!(task.state.load(Ordering::Relaxed), SCAN_STATE_RUNNING);
+    }
+
+    #[tokio::test]
+    async fn test_stop_wakes_paused_task() {
+        let task = make_test_task();
+        task.start();
+        task.pause();
+
+        let task_clone = task.clone();
+
+        // 在另一个任务中等待恢复
+        let handle = tokio::spawn(async move {
+            task_clone.wait_if_paused().await;
+            task_clone.state.load(Ordering::Relaxed)
+        });
+
+        // 给一点时间确保 spawn 的任务已经开始等待
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // stop 应该唤醒暂停中的任务
+        task.stop();
+
+        let final_state = handle.await.unwrap();
+        assert_eq!(final_state, SCAN_STATE_STOPPED);
+    }
+
+    #[tokio::test]
+    async fn test_wait_if_paused_returns_immediately_when_running() {
+        let task = make_test_task();
+        task.start();
+
+        // 不应该阻塞
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            task.wait_if_paused()
+        ).await;
+        assert!(result.is_ok(), "wait_if_paused should return immediately when RUNNING");
     }
 }

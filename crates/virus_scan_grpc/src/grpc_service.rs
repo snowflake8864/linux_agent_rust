@@ -103,15 +103,16 @@ impl VirusScanService for VirusScanGrpcService {
                                 }
 
                                 crate::proto::client_message::Cmd::DisposeFile(req) => {
+                                    // scan_id 仅用于审计日志关联，不做强校验。
+                                    // 处置操作直接对 file_path 执行，不依赖扫描任务是否存在。
                                     log_info!("[gRPC] 收到处置请求: scan_id={}, file={}, action={:?}",
                                         req.scan_id, req.file_path, req.action);
                                     let scanner = task_mgr.vigilixav_scanner();
                                     match scanner {
                                         Some(scanner) => {
+                                            // quarantine_dir 由 vigilixd.conf 控制，忽略客户端传入值
                                             let action = if req.action == 1 {
-                                                crate::vigilixav_scanner::DispositionAction::Move {
-                                                    quarantine_dir: req.quarantine_dir.clone(),
-                                                }
+                                                crate::vigilixav_scanner::DispositionAction::Move
                                             } else {
                                                 crate::vigilixav_scanner::DispositionAction::Remove
                                             };
@@ -157,6 +158,44 @@ impl VirusScanService for VirusScanGrpcService {
                                     }
                                 }
 
+                                crate::proto::client_message::Cmd::PauseScan(req) => {
+                                    log_info!("[gRPC] 收到暂停扫描请求: scan_id={}", req.scan_id);
+                                    let (success, message) = match task_mgr.pause_scan(&req.scan_id).await {
+                                        Ok(msg) => (true, msg),
+                                        Err(e) => (false, e),
+                                    };
+                                    let _ = tx.send(Ok(ServerMessage {
+                                        event: Some(
+                                            crate::proto::server_message::Event::PauseResponse(
+                                                crate::proto::PauseScanResponse {
+                                                    scan_id: req.scan_id,
+                                                    success,
+                                                    message,
+                                                },
+                                            ),
+                                        ),
+                                    })).await;
+                                }
+
+                                crate::proto::client_message::Cmd::ResumeScan(req) => {
+                                    log_info!("[gRPC] 收到恢复扫描请求: scan_id={}", req.scan_id);
+                                    let (success, message) = match task_mgr.resume_scan(&req.scan_id).await {
+                                        Ok(msg) => (true, msg),
+                                        Err(e) => (false, e),
+                                    };
+                                    let _ = tx.send(Ok(ServerMessage {
+                                        event: Some(
+                                            crate::proto::server_message::Event::ResumeResponse(
+                                                crate::proto::ResumeScanResponse {
+                                                    scan_id: req.scan_id,
+                                                    success,
+                                                    message,
+                                                },
+                                            ),
+                                        ),
+                                    })).await;
+                                }
+
                                 _ => {}
                             }
                         }
@@ -167,6 +206,8 @@ impl VirusScanService for VirusScanGrpcService {
                     }
                 }
             }
+            // 连接断开，清理该连接的已完成任务，释放内存
+            task_mgr.clear_completed_tasks().await;
         });
 
         Ok(Response::new(Box::pin(rx) as GrpcStream))

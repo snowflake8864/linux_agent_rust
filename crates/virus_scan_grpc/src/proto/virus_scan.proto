@@ -15,6 +15,8 @@ service VirusScanService {
     // 客户端（终端 A）可以发送:
     //   - StartScanRequest: 启动扫描任务
     //   - StopScanRequest: 停止正在运行的扫描
+    //   - PauseScanRequest: 暂停正在运行的扫描
+    //   - ResumeScanRequest: 恢复已暂停的扫描
     //   - Ping: 心跳检测
     //   - DisposeFileRequest: 处置感染文件（隔离/删除）
     //
@@ -26,6 +28,8 @@ service VirusScanService {
     //   - ScanError: 错误信息
     //   - Pong: 心跳响应
     //   - DisposeFileResponse: 处置操作结果
+    //   - PauseScanResponse: 暂停操作结果
+    //   - ResumeScanResponse: 恢复操作结果
     rpc StreamControl(stream ClientMessage) returns (stream ServerMessage);
 }
 
@@ -38,6 +42,8 @@ message ClientMessage {
         StopScanRequest stop_scan = 2;    // 停止扫描任务
         Ping ping = 3;                     // 心跳检测
         DisposeFileRequest dispose_file = 4; // 处置感染文件（隔离/删除）
+        PauseScanRequest pause_scan = 5;   // 暂停扫描任务
+        ResumeScanRequest resume_scan = 6; // 恢复扫描任务
     }
 }
 
@@ -54,6 +60,8 @@ message ServerMessage {
         Pong pong = 6;                         // 心跳响应
         FileScanResult file_scan_result = 7;   // 单个文件扫描结果（实时推送）
         DisposeFileResponse dispose_result = 8; // 处置操作结果
+        PauseScanResponse pause_response = 9;  // 暂停操作结果
+        ResumeScanResponse resume_response = 10; // 恢复操作结果
     }
 }
 
@@ -81,6 +89,39 @@ message StartScanResponse {
 // ============================================================================
 message StopScanRequest {
     string scan_id = 1;    // 要停止的扫描任务 ID
+}
+
+// ============================================================================
+// 暂停扫描请求（由终端 A 发起）
+// ============================================================================
+// 暂停后，当前正在扫描的文件会扫完，后续文件暂不提交给引擎
+message PauseScanRequest {
+    string scan_id = 1;    // 要暂停的扫描任务 ID
+}
+
+// ============================================================================
+// 暂停扫描响应（Agent 返回）
+// ============================================================================
+message PauseScanResponse {
+    string scan_id = 1;    // 扫描任务 ID
+    bool success = 2;      // 是否成功暂停
+    string message = 3;    // 响应消息
+}
+
+// ============================================================================
+// 恢复扫描请求（由终端 A 发起）
+// ============================================================================
+message ResumeScanRequest {
+    string scan_id = 1;    // 要恢复的扫描任务 ID
+}
+
+// ============================================================================
+// 恢复扫描响应（Agent 返回）
+// ============================================================================
+message ResumeScanResponse {
+    string scan_id = 1;    // 扫描任务 ID
+    bool success = 2;      // 是否成功恢复
+    string message = 3;    // 响应消息
 }
 
 // ============================================================================
