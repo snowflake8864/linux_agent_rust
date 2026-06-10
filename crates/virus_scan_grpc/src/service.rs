@@ -22,6 +22,35 @@ impl VirusScanServiceImpl {
     }
 }
 
+/// 重启 vigilixav.service，并等待端口可用。
+/// 仅在 vigilixav_enabled=true 时调用。
+async fn restart_vigilixav_service() {
+    log_info!("[VigilixAV] 正在重启 vigilixav.service...");
+    let output = tokio::process::Command::new("systemctl")
+        .args(["restart", "vigilixav.service"])
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            log_info!("[VigilixAV] vigilixav.service 重启完成，等待守护进程就绪...");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            log_warn!(
+                "[VigilixAV] systemctl restart vigilixav.service 失败 (exit={:?}): {}",
+                o.status.code(), stderr.trim()
+            );
+        }
+        Err(e) => {
+            log_warn!("[VigilixAV] 无法执行 systemctl: {}", e);
+        }
+    }
+
+    // 守护进程加载病毒库需要数秒，给一个上限的等待
+    tokio::time::sleep(Duration::from_secs(2)).await;
+}
+
 impl StartVirusScanGrpcService for BootManager {
     fn start_virus_scan_grpc_service(
         &mut self,
@@ -56,6 +85,9 @@ impl StartVirusScanGrpcService for BootManager {
             
             // 检查 VigilixAV 是否启用
             let scanner = if vigilixav_enabled {
+                // 启动前先重启 vigilixav.service，确保 vigilixd 处于干净可用状态
+                restart_vigilixav_service().await;
+
                 let timeout = Duration::from_secs(vigilixav_timeout_secs);
                 
                 let connection = match vigilixav_connection_type.to_lowercase().as_str() {
@@ -71,15 +103,26 @@ impl StartVirusScanGrpcService for BootManager {
                 
                 let pool = Arc::new(VigilixAVConnectionPool::new(connection, timeout, vigilixav_pool_size));
                 
-                match pool.ping().await {
-                    Ok(_) => {
-                        log_info!("VigilixAV 连接池创建成功，大小={}", vigilixav_pool_size);
-                        Some(pool)
+                // 首次 ping 可能因 vigilixd 还在加载病毒库而失败，重试多次（总计约 30s）
+                let mut last_err = String::new();
+                let mut connected = false;
+                for attempt in 1..=10u32 {
+                    match pool.ping().await {
+                        Ok(_) => {
+                            log_info!("VigilixAV 连接池创建成功，大小={} (尝试次数={})", vigilixav_pool_size, attempt);
+                            connected = true;
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = e.to_string();
+                            log_warn!("[VigilixAV] ping 失败 (第 {} 次): {}，3 秒后重试", attempt, last_err);
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                        }
                     }
-                    Err(e) => {
-                        log_warn!("VigilixAV 连接失败: {}，病毒扫描功能不可用", e);
-                        None
-                    }
+                }
+                if connected { Some(pool) } else {
+                    log_warn!("VigilixAV 连接失败: {}，病毒扫描功能不可用", last_err);
+                    None
                 }
             } else {
                 log_warn!("VigilixAV 未启用，病毒扫描功能不可用");
