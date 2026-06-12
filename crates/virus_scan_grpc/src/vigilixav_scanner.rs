@@ -19,6 +19,19 @@ pub enum ScanResult {
     Error { message: String },
 }
 
+#[derive(Debug, Clone)]
+pub enum DispositionAction {
+    /// 移动到隔离目录（由 vigilixd.conf 配置决定目标路径，客户端无需指定）
+    Move,
+    Remove,
+}
+
+#[derive(Debug, Clone)]
+pub enum DispositionResult {
+    Success { message: String },
+    Error { message: String },
+}
+
 pub struct VigilixAVConnectionPool {
     connection_info: VigilixAVConnection,
     timeout: Duration,
@@ -133,6 +146,107 @@ impl VigilixAVConnectionPool {
                 }
             }
             Err(e) => Ok(ScanResult::Error { message: e }),
+        }
+    }
+
+    pub async fn dispose_file(&self, file_path: &str, action: DispositionAction) -> DispositionResult {
+        let timeout_duration = self.timeout;
+        let connection_info = self.connection_info.clone();
+        let file_path_send = file_path.to_string();
+
+        let result = timeout(timeout_duration, async move {
+            match &connection_info {
+                VigilixAVConnection::Tcp { host, port } => {
+                    let addr = format!("{}:{}", host, port);
+                    let mut stream = tokio::net::TcpStream::connect(&addr).await
+                        .map_err(|e| format!("TCP connect failed: {}", e))?;
+
+                    let cmd = match &action {
+                        DispositionAction::Move => {
+                            format!("nMOVE {}\0", file_path_send)
+                        }
+                        DispositionAction::Remove => {
+                            format!("nREMOVE {}\0", file_path_send)
+                        }
+                    };
+                    stream.write_all(cmd.as_bytes()).await
+                        .map_err(|e| format!("Write failed: {}", e))?;
+                    stream.flush().await
+                        .map_err(|e| format!("Flush failed: {}", e))?;
+
+                    let mut response = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    timeout(timeout_duration, async {
+                        loop {
+                            let n = stream.read(&mut buf).await
+                                .map_err(|e| format!("Read failed: {}", e))?;
+                            if n == 0 { break; }
+                            response.extend_from_slice(&buf[..n]);
+                            if response.contains(&b'\0') || response.contains(&b'\n') {
+                                break;
+                            }
+                        }
+                        Ok::<_, String>(response)
+                    }).await
+                        .map_err(|_| "Read timeout".to_string())?
+                }
+                VigilixAVConnection::Unix { socket_path } => {
+                    use tokio::net::UnixStream;
+                    let mut stream = UnixStream::connect(socket_path).await
+                        .map_err(|e| format!("Unix socket connect failed: {}", e))?;
+
+                    let cmd = match &action {
+                        DispositionAction::Move => {
+                            format!("nMOVE {}\0", file_path_send)
+                        }
+                        DispositionAction::Remove => {
+                            format!("nREMOVE {}\0", file_path_send)
+                        }
+                    };
+                    stream.write_all(cmd.as_bytes()).await
+                        .map_err(|e| format!("Write failed: {}", e))?;
+                    stream.flush().await
+                        .map_err(|e| format!("Flush failed: {}", e))?;
+
+                    let mut response = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    timeout(timeout_duration, async {
+                        loop {
+                            let n = stream.read(&mut buf).await
+                                .map_err(|e| format!("Read failed: {}", e))?;
+                            if n == 0 { break; }
+                            response.extend_from_slice(&buf[..n]);
+                            if response.contains(&b'\0') || response.contains(&b'\n') {
+                                break;
+                            }
+                        }
+                        Ok::<_, String>(response)
+                    }).await
+                        .map_err(|_| "Read timeout".to_string())?
+                }
+            }
+        }).await;
+
+        match result {
+            Ok(Ok(data)) => {
+                let resp_str = String::from_utf8_lossy(&data);
+                let resp_trimmed = resp_str.trim_matches(|c: char| c == '\0' || c == '\n').trim();
+                if resp_trimmed.contains("OK") {
+                    log_info!("VigilixAV: 处置成功 - {} - {}", file_path, resp_trimmed);
+                    DispositionResult::Success { message: resp_trimmed.to_string() }
+                } else {
+                    log_error!("VigilixAV: 处置失败 - {} - {}", file_path, resp_trimmed);
+                    DispositionResult::Error { message: resp_trimmed.to_string() }
+                }
+            }
+            Ok(Err(e)) => {
+                log_error!("VigilixAV: 处置失败 - {} - {}", file_path, e);
+                DispositionResult::Error { message: e }
+            }
+            Err(_) => {
+                log_error!("VigilixAV: 处置超时 - {}", file_path);
+                DispositionResult::Error { message: "VigilixAV: 处置超时".to_string() }
+            }
         }
     }
 

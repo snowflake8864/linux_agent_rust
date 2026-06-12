@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::fs;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -19,6 +19,7 @@ const SCAN_STATE_IDLE: u8 = 0;
 const SCAN_STATE_RUNNING: u8 = 1;
 const SCAN_STATE_STOPPED: u8 = 2;
 const SCAN_STATE_COMPLETED: u8 = 3;
+const SCAN_STATE_PAUSED: u8 = 4;
 
 const SYSTEM_EXCLUDES: &[&str] = &[
     "/proc", "/sys", "/dev", "/run", "/snap", "/cgroup",
@@ -97,6 +98,7 @@ pub struct ScanTask {
     pub viruses: Arc<AtomicU32>,
     pub start_time: i64,
     pub tx: mpsc::Sender<Result<ServerMessage, Status>>,
+    pub resume_notify: Arc<Notify>,
 }
 
 pub struct ScanTaskManager {
@@ -126,6 +128,7 @@ impl ScanTask {
             viruses: Arc::new(AtomicU32::new(0)),
             start_time: Utc::now().timestamp_millis(),
             tx,
+            resume_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -135,6 +138,23 @@ impl ScanTask {
 
     pub fn stop(&self) {
         self.state.store(SCAN_STATE_STOPPED, Ordering::Relaxed);
+        // 如果当前是暂停状态，需要唤醒以便退出循环
+        self.resume_notify.notify_waiters();
+    }
+
+    pub fn pause(&self) {
+        let current = self.state.load(Ordering::Relaxed);
+        if current == SCAN_STATE_RUNNING {
+            self.state.store(SCAN_STATE_PAUSED, Ordering::Relaxed);
+        }
+    }
+
+    pub fn resume(&self) {
+        let current = self.state.load(Ordering::Relaxed);
+        if current == SCAN_STATE_PAUSED {
+            self.state.store(SCAN_STATE_RUNNING, Ordering::Relaxed);
+            self.resume_notify.notify_waiters();
+        }
     }
 
     pub fn complete(&self) {
@@ -143,6 +163,17 @@ impl ScanTask {
 
     pub fn is_running(&self) -> bool {
         self.state.load(Ordering::Relaxed) == SCAN_STATE_RUNNING
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == SCAN_STATE_PAUSED
+    }
+
+    /// 等待恢复：如果当前是 PAUSED 状态，则挂起直到恢复或停止
+    pub async fn wait_if_paused(&self) {
+        while self.state.load(Ordering::Relaxed) == SCAN_STATE_PAUSED {
+            self.resume_notify.notified().await;
+        }
     }
 }
 
@@ -165,6 +196,22 @@ impl ScanTaskManager {
             virus_rx: Arc::new(Mutex::new(virus_rx)),
             boot_manager,
             scan_semaphore: Arc::new(Semaphore::new(concurrency)),
+        }
+    }
+
+    pub fn vigilixav_scanner(&self) -> Option<Arc<VigilixAVConnectionPool>> {
+        self.vigilixav_scanner.clone()
+    }
+
+    /// gRPC 连接断开时调用，清理该连接关联的已完成任务。
+    /// 避免 task 永久驻留内存。
+    pub async fn clear_completed_tasks(&self) {
+        let mut tasks = self.tasks.lock().await;
+        let before = tasks.len();
+        tasks.retain(|_id, task| task.is_running() || task.is_paused());
+        let removed = before - tasks.len();
+        if removed > 0 {
+            log_info!("[SCAN] gRPC 连接断开，清理已完成 task: {} 个", removed);
         }
     }
 
@@ -251,10 +298,46 @@ impl ScanTaskManager {
     }
 
     pub async fn stop_scan(&self, scan_id: &str) {
-        let mut tasks = self.tasks.lock().await;
+        let tasks = self.tasks.lock().await;
         if let Some(task) = tasks.get(scan_id) {
             task.stop();
             log_info!("扫描已停止: {}", scan_id);
+        }
+    }
+
+    pub async fn pause_scan(&self, scan_id: &str) -> Result<String, String> {
+        let tasks = self.tasks.lock().await;
+        if let Some(task) = tasks.get(scan_id) {
+            let current = task.state.load(Ordering::Relaxed);
+            if current == SCAN_STATE_RUNNING {
+                task.pause();
+                log_info!("扫描已暂停: {}", scan_id);
+                Ok("扫描已暂停，当前批次文件扫完后生效".to_string())
+            } else if current == SCAN_STATE_PAUSED {
+                Err("扫描已处于暂停状态".to_string())
+            } else {
+                Err(format!("扫描不在运行状态，当前状态: {}", current))
+            }
+        } else {
+            Err(format!("扫描任务不存在: {}", scan_id))
+        }
+    }
+
+    pub async fn resume_scan(&self, scan_id: &str) -> Result<String, String> {
+        let tasks = self.tasks.lock().await;
+        if let Some(task) = tasks.get(scan_id) {
+            let current = task.state.load(Ordering::Relaxed);
+            if current == SCAN_STATE_PAUSED {
+                task.resume();
+                log_info!("扫描已恢复: {}", scan_id);
+                Ok("扫描已恢复".to_string())
+            } else if current == SCAN_STATE_RUNNING {
+                Err("扫描已在运行中".to_string())
+            } else {
+                Err(format!("扫描不在暂停状态，当前状态: {}", current))
+            }
+        } else {
+            Err(format!("扫描任务不存在: {}", scan_id))
         }
     }
 
@@ -285,8 +368,11 @@ impl ScanTaskManager {
 
         self.report_virus_alerts().await;
 
-        let mut tasks = self.tasks.lock().await;
-        tasks.remove(scan_id);
+        // 扫描完成后不立即移除 task：
+        // 1. 用户可能在扫描完成后才选择病毒文件进行处置（DisposeFileRequest）
+        // 2. scan_id 需保持可查询状态，便于 Stop/Pause 等操作返回有意义的错误
+        // 3. task 清理时机改为 gRPC 连接断开时（由 clear_completed_tasks 负责）
+        log_info!("[SCAN] 扫描完成，task 保留供后续处置: scan_id={}", scan_id);
     }
 
     async fn scan_directory_recursive(
@@ -317,7 +403,11 @@ impl ScanTaskManager {
         let mut dirs_to_scan = Vec::new();
 
         for entry in all_entries {
-            if task.state.load(Ordering::Relaxed) != SCAN_STATE_RUNNING {
+            // 暂停检查：如果是 PAUSED 状态，在这里挂起等待恢复
+            task.wait_if_paused().await;
+
+            let current_state = task.state.load(Ordering::Relaxed);
+            if current_state != SCAN_STATE_RUNNING {
                 break;
             }
 
@@ -373,7 +463,11 @@ impl ScanTaskManager {
         }
 
         for handle in handles {
-            if task.state.load(Ordering::Relaxed) != SCAN_STATE_RUNNING {
+            // 暂停检查：等待已提交的任务结果时也支持暂停
+            task.wait_if_paused().await;
+
+            let current_state = task.state.load(Ordering::Relaxed);
+            if current_state != SCAN_STATE_RUNNING {
                 break;
             }
             
@@ -409,7 +503,11 @@ impl ScanTaskManager {
         }
 
         for dir_path in dirs_to_scan {
-            if task.state.load(Ordering::Relaxed) != SCAN_STATE_RUNNING {
+            // 暂停检查
+            task.wait_if_paused().await;
+
+            let current_state = task.state.load(Ordering::Relaxed);
+            if current_state != SCAN_STATE_RUNNING {
                 break;
             }
             Box::pin(self.scan_directory_recursive(&dir_path, excludes, scan_id, task, total_scanned)).await;
