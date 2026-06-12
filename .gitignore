@@ -1,0 +1,26 @@
+# IDE / Editor
+.qoder/
+.vscode/
+
+# Claude
+.claude/
+
+# Python
+__pycache__/
+
+# Build output
+target/
+output/
+
+# Package artifacts
+package/
+*.tar.bz2
+*.tar.xz
+*.deb
+
+# Misc
+tags
+cscope.*
+*.swp
+*.swo
+*.bak
