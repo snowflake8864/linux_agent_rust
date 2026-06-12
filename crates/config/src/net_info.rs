@@ -76,6 +76,7 @@ pub struct NetInfoConfig {
     pub clamav_pool_size: usize,
     pub clamav_connection_type: String,
     pub clamav_socket_path: String,
+    pub install_time: i64,
 }
 
 enum NetRule<'a> {
@@ -316,6 +317,10 @@ impl NetInfoConfig {
             config.outreach_time = value.parse().unwrap_or_default();
         }
 
+        if let Some(value) = ini.get("SERVERINFO", "INSTALL_TIME") {
+            config.install_time = value.parse().unwrap_or_default();
+        }
+
         if let Some(value) = ini.get("HOSTINFO", "DEV_UID") {
             config.dev_uid = value;
         }
@@ -461,6 +466,7 @@ impl NetInfoConfig {
         writeln!(file, "HARDWARE_TIME={}", self.hardware_time)?;
         writeln!(file, "OUTREACH_SWITCH={}", self.outreach_switch as u8)?;
         writeln!(file, "OUTREACH_TIME={}", self.outreach_time)?;
+        writeln!(file, "INSTALL_TIME={}", self.install_time)?;
         writeln!(file, "VERSION={}", self.ver)?;
         writeln!(file, "[HOSTINFO]")?;
         writeln!(file, "DEV_UID={}", self.dev_uid)?;

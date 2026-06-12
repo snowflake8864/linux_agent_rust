@@ -12,6 +12,7 @@ use netlink::netlink::NlSockInfo;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use config::net_info::NETINFO_CONFIG;
+use grpc_gateway::agent_mode::{set_online, set_offline};
 use udisk::{StartUsbService, StartUsbHotplugHandler};
 use docker::StartDockerMonitor;
 use virus_scan_grpc::StartVirusScanGrpcService;
@@ -94,6 +95,11 @@ async fn main() -> std::io::Result<()> {
 
     // 检查是否为离线模式
     let is_offline = NETINFO_CONFIG.lock().unwrap().is_offline_mode;
+    if is_offline {
+        set_offline();
+    } else {
+        set_online();
+    }
     log_info!("当前模式: {}", if is_offline { "离线" } else { "在线" });
 
     // 创建 Netlink 套接字（在离线模式下仍尝试创建，供内核事件使用）

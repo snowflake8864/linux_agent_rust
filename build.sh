@@ -297,6 +297,7 @@ if [[ "\$MODE" == "install" ]]; then
         sed -i "s|^[[:space:]]*SERVER_PORT[[:space:]]*=.*|SERVER_PORT=\$NEW_PORT|" "\$TARGET_FILE"
         sed -i "s|^[[:space:]]*USER_ID[[:space:]]*=.*|USER_ID=\$NEW_USERID|" "\$TARGET_FILE"
         sed -i "s|^[[:space:]]*SERVERIPPORT[[:space:]]*=.*|SERVERIPPORT=https://\$NEW_IP:\$NEW_PORT|" "\$TARGET_FILE"
+        sed -i "s|^[[:space:]]*INSTALL_TIME[[:space:]]*=.*|INSTALL_TIME=\$(date +%s)|" "\$TARGET_FILE"
         sed -i '/^[[:space:]]*VERSION[[:space:]]*=/d' "\$TARGET_FILE"
         sed -i "/\\[SERVERINFO\\]/a VERSION=\$OSEC_VERSION" "\$TARGET_FILE"
         echo "net_info.ini updated."

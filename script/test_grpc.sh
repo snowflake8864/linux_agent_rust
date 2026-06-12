@@ -34,7 +34,7 @@ grpc_call() {
 
     echo -ne "${CYAN}[TEST]${NC} $desc ... "
     local output
-    if output=$(grpcurl -plaintext \
+    if output=$(grpcurl -plaintext -emit-defaults \
         -import-path "$PROTO_DIR" \
         $proto_args \
         -d "$data" \
@@ -60,7 +60,7 @@ grpc_call_raw() {
     for p in $all_protos; do
         [ -n "$p" ] && proto_args="$proto_args -proto $p"
     done
-    grpcurl -plaintext \
+    grpcurl -plaintext -emit-defaults \
         -import-path "$PROTO_DIR" \
         $proto_args \
         -d "$data" \
@@ -78,7 +78,7 @@ grpc_expect_perm_denied() {
 
     echo -ne "${CYAN}[TEST]${NC} $desc ... "
     local output
-    if output=$(grpcurl -plaintext \
+    if output=$(grpcurl -plaintext -emit-defaults \
         -import-path "$PROTO_DIR" \
         $proto_args \
         -d "$data" \
@@ -111,7 +111,7 @@ stream_test() {
 
     echo -ne "${CYAN}[TEST]${NC} $desc (流, ${duration}s) ... "
     local output exit_code
-    output=$(timeout "$duration" grpcurl -plaintext \
+    output=$(timeout "$duration" grpcurl -plaintext -emit-defaults \
         -import-path "$PROTO_DIR" \
         $proto_args \
         -d "$data" \
@@ -144,7 +144,7 @@ print_result() {
 
 # ── test groups ────────────────────────────────────────────────────────
 
-test_01() { grpc_call "Agent状态" \
+test_01() { grpc_call "Agent状态(含is_online/protection_days)" \
     agent_status.proto agent_status.AgentStatusService GetAgentStatus; }
 
 test_02() { grpc_call "当前配置" \
@@ -300,7 +300,7 @@ show_menu() {
 case "${1:-menu}" in
     menu|"")
         # Check connectivity
-        if ! grpcurl -plaintext -import-path "$PROTO_DIR" \
+        if ! grpcurl -plaintext -emit-defaults -import-path "$PROTO_DIR" \
             -proto common.proto -proto agent_status.proto \
             -d '{}' -connect-timeout 2 -max-time 3 \
             "$GRPC_ADDR" agent_status.AgentStatusService/GetAgentStatus >/dev/null 2>&1; then
@@ -362,7 +362,7 @@ case "${1:-menu}" in
                     local secs=300
                     [[ "$choice" =~ listen[[:space:]]+([0-9]+) ]] && secs="${BASH_REMATCH[1]}"
                     echo -e "\n${YELLOW}── 监听告警流 ${secs}秒 (Ctrl+C 停止) ──${NC}"
-                    timeout "$secs" grpcurl -plaintext \
+                    timeout "$secs" grpcurl -plaintext -emit-defaults \
                         -import-path "$PROTO_DIR" \
                         -proto common.proto -proto alert.proto \
                         -d '{"type": 0}' \
@@ -397,7 +397,7 @@ case "${1:-menu}" in
         ;;
     listen)
         echo -e "${YELLOW}监听告警流 ${2:-300}秒 (Ctrl+C 停止)${NC}"
-        timeout "${2:-300}" grpcurl -plaintext \
+        timeout "${2:-300}" grpcurl -plaintext -emit-defaults \
             -import-path "$PROTO_DIR" \
             -proto common.proto -proto alert.proto \
             -d '{"type": 0}' \

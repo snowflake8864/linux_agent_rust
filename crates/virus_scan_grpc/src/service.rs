@@ -12,7 +12,7 @@ use agent_local_svc::{
     ConfigServiceImpl, ProcessPolicyServiceImpl, PeripheralPolicyServiceImpl,
     IpPolicyServiceImpl, DataQueryServiceImpl, OutreachDetectServiceImpl,
     AgentStatusServiceImpl, AlertServiceImpl, LocalTaskServiceImpl,
-    PolicyWatchServiceImpl,
+    PolicyWatchServiceImpl, ProcessDefenseServiceImpl, PeripheralDefenseServiceImpl,
 };
 use agent_local_svc::stub_handlers::{
     DirPolicyServiceImpl, ExtortPolicyServiceImpl, JumpServiceImpl,
@@ -146,6 +146,9 @@ impl StartVirusScanGrpcService for BootManager {
                         AgentStatusServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
+                // ============================================================
+                // 本地管理 gRPC 服务（在线只读，离线读写）
+                // ============================================================
                 .add_service(
                     grpc_gateway::alert::alert_service_server::AlertServiceServer::new(
                         AlertServiceImpl { data_hub: data_hub.clone() },
@@ -226,6 +229,16 @@ impl StartVirusScanGrpcService for BootManager {
                 .add_service(
                     grpc_gateway::virtual_port::virtual_port_service_server::VirtualPortServiceServer::new(
                         VirtualPortServiceImpl { data_hub: data_hub.clone() },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::protection_mode::process_defense_service_server::ProcessDefenseServiceServer::new(
+                        ProcessDefenseServiceImpl { data_hub: data_hub.clone() },
+                    )
+                )
+                .add_service(
+                    grpc_gateway::protection_mode::peripheral_defense_service_server::PeripheralDefenseServiceServer::new(
+                        PeripheralDefenseServiceImpl { data_hub: data_hub.clone() },
                     )
                 )
                 // ============================================================

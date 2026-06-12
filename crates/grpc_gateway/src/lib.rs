@@ -21,5 +21,8 @@ pub mod trust_dir { tonic::include_proto!("trust_dir"); }
 pub mod virtual_port { tonic::include_proto!("virtual_port"); }
 pub mod data_query { tonic::include_proto!("data_query"); }
 pub mod policy_watch { tonic::include_proto!("policy_watch"); }
+pub mod protection_mode { tonic::include_proto!("protection_mode"); }
 
 pub mod notify;
+
+pub mod agent_mode;
