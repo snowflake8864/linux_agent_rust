@@ -20,6 +20,23 @@ const SCAN_STATE_RUNNING: u8 = 1;
 const SCAN_STATE_STOPPED: u8 = 2;
 const SCAN_STATE_COMPLETED: u8 = 3;
 
+const SYSTEM_EXCLUDES: &[&str] = &[
+    "/proc", "/sys", "/dev", "/run", "/snap", "/cgroup",
+    "/swapfile", "/swap.img", "/var/swap", "/var/swapfile", "/lost+found",
+    "/boot/System.map", "/boot/config",
+];
+
+fn merge_excludes(user_excludes: &[String]) -> Vec<String> {
+    let mut merged = user_excludes.to_vec();
+    for sys_excl in SYSTEM_EXCLUDES {
+        let s = sys_excl.to_string();
+        if !merged.iter().any(|e| e == &s) {
+            merged.push(s);
+        }
+    }
+    merged
+}
+
 enum ScanAction {
     Virus(String),
     Clean,
@@ -202,12 +219,14 @@ impl ScanTaskManager {
             return Err("扫描目标必须是目录".to_string());
         }
 
+        let merged_excludes = merge_excludes(excludes);
+
         let scan_id = Uuid::new_v4().to_string();
 
         let task = ScanTask::new(
             scan_id.clone(),
             target.to_string(),
-            excludes.to_vec(),
+            merged_excludes.clone(),
             tx,
         );
         task.start();
@@ -216,16 +235,15 @@ impl ScanTaskManager {
         tasks.insert(scan_id.clone(), task.clone());
         drop(tasks);
 
-        log_info!("开始扫描: scan_id={}, target={}", scan_id, target);
+        log_info!("开始扫描: scan_id={}, target={}, excludes={:?}", scan_id, target, merged_excludes);
 
         let self_clone = self.clone();
         let target = target.to_string();
-        let excludes = excludes.to_vec();
         let scan_id_clone = scan_id.clone();
 
         tokio::spawn(async move {
             self_clone
-                .execute_scan(&scan_id_clone, &target, &excludes, &task)
+                .execute_scan(&scan_id_clone, &target, &merged_excludes, &task)
                 .await;
         });
 
