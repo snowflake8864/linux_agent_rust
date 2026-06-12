@@ -1,4 +1,4 @@
-// crates/virus_scan_grpc/src/clamav_scanner.rs
+// crates/virus_scan_grpc/src/vigilixav_scanner.rs
 use logging::{log_error, log_info};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -7,7 +7,7 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 #[derive(Debug, Clone)]
-pub enum ClamAVConnection {
+pub enum VigilixAVConnection {
     Tcp { host: String, port: u16 },
     Unix { socket_path: String },
 }
@@ -19,16 +19,16 @@ pub enum ScanResult {
     Error { message: String },
 }
 
-pub struct ClamAVConnectionPool {
-    connection_info: ClamAVConnection,
+pub struct VigilixAVConnectionPool {
+    connection_info: VigilixAVConnection,
     timeout: Duration,
     semaphore: tokio::sync::Semaphore,
     pool_size: usize,
 }
 
-impl ClamAVConnectionPool {
-    pub fn new(connection: ClamAVConnection, timeout: Duration, pool_size: usize) -> Self {
-        log_info!("ClamAV: 创建连接池(完全异步模式)，大小={}", pool_size);
+impl VigilixAVConnectionPool {
+    pub fn new(connection: VigilixAVConnection, timeout: Duration, pool_size: usize) -> Self {
+        log_info!("VigilixAV: 创建连接池(完全异步模式)，大小={}", pool_size);
         Self {
             connection_info: connection,
             timeout,
@@ -38,13 +38,13 @@ impl ClamAVConnectionPool {
     }
 
     pub async fn init(&self) -> Result<(), String> {
-        log_info!("ClamAV: 连接池初始化完成");
+        log_info!("VigilixAV: 连接池初始化完成");
         Ok(())
     }
 
     pub async fn scan_file(&self, path: &str) -> Result<ScanResult, String> {
         let permits = self.semaphore.available_permits();
-        //log_info!("ClamAV: 获取连接，并发数={}, 路径={}", self.pool_size - permits, path);
+        //log_info!("VigilixAV: 获取连接，并发数={}, 路径={}", self.pool_size - permits, path);
         let _permit = self.semaphore.acquire().await.map_err(|e| format!("Semaphore error: {}", e))?;
         
         let path_owned = path.to_string();
@@ -53,7 +53,7 @@ impl ClamAVConnectionPool {
 
         let response = async move {
             match &connection_info {
-                ClamAVConnection::Tcp { host, port } => {
+                VigilixAVConnection::Tcp { host, port } => {
                     let addr = format!("{}:{}", host, port);
                     let mut stream = timeout(timeout_duration, TcpStream::connect(&addr)).await
                         .map_err(|_| "TCP connect timeout")?
@@ -79,7 +79,7 @@ impl ClamAVConnectionPool {
                         .map_err(|e| format!("Read failed: {}", e))?;
                     Ok(response)
                 }
-                ClamAVConnection::Unix { socket_path } => {
+                VigilixAVConnection::Unix { socket_path } => {
                     use tokio::net::UnixStream;
                     let mut stream = timeout(timeout_duration, UnixStream::connect(socket_path)).await
                         .map_err(|_| "Unix connect timeout")?
@@ -109,7 +109,7 @@ impl ClamAVConnectionPool {
         }.await;
 
         let permits = self.semaphore.available_permits();
-        //log_info!("ClamAV: 释放连接，并发数={}", self.pool_size - permits);
+        //log_info!("VigilixAV: 释放连接，并发数={}", self.pool_size - permits);
 
         match response {
             Ok(resp) => {
@@ -123,12 +123,12 @@ impl ClamAVConnectionPool {
                         .unwrap_or("")
                         .trim()
                         .to_string();
-                    log_info!("🚨 ClamAV: 检测到病毒 {} - {}", path, virus_name);
+                    log_info!("🚨 VigilixAV: 检测到病毒 {} - {}", path, virus_name);
                     Ok(ScanResult::Virus { name: virus_name })
                 } else if resp.contains("OK") {
                     Ok(ScanResult::Clean)
                 } else {
-                    log_error!("⚠️ ClamAV: 扫描结果异常 '{}'", resp);
+                    log_error!("⚠️ VigilixAV: 扫描结果异常 '{}'", resp);
                     Ok(ScanResult::Error { message: resp })
                 }
             }
@@ -142,7 +142,7 @@ impl ClamAVConnectionPool {
 
         async move {
             match &connection_info {
-                ClamAVConnection::Tcp { host, port } => {
+                VigilixAVConnection::Tcp { host, port } => {
                     let addr = format!("{}:{}", host, port);
                     let mut stream = timeout(timeout_duration, TcpStream::connect(&addr)).await
                         .map_err(|_| "TCP connect timeout")?
@@ -159,7 +159,7 @@ impl ClamAVConnectionPool {
                         Err(format!("Unexpected PING response: {}", response))
                     }
                 }
-                ClamAVConnection::Unix { socket_path } => {
+                VigilixAVConnection::Unix { socket_path } => {
                     use tokio::net::UnixStream;
                     let mut stream = timeout(timeout_duration, UnixStream::connect(socket_path)).await
                         .map_err(|_| "Unix connect timeout")?
@@ -182,7 +182,7 @@ impl ClamAVConnectionPool {
 }
 
 #[derive(Debug, Clone)]
-pub struct ClamAVConfig {
+pub struct VigilixAVConfig {
     pub host: String,
     pub port: u16,
     pub timeout_secs: u64,
