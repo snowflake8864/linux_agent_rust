@@ -64,11 +64,11 @@ pub struct NetInfoConfig {
     pub mod_ver: String,
     pub arch_type: u8,
     pub is_offline_mode: bool,
-    pub virus_scan_enabled: bool,
-    pub virus_scan_dev_mode: bool,
-    pub virus_scan_grpc_addr: String,
-    pub virus_scan_dev_grpc_addr: String,
-    pub virus_scan_batch_size: usize,
+    pub grpc_enabled: bool,
+    pub grpc_dev_mode: bool,
+    pub grpc_addr: String,
+    pub grpc_dev_addr: String,
+    pub grpc_batch_size: usize,
     pub clamav_enabled: bool,
     pub clamav_host: String,
     pub clamav_port: u16,
@@ -349,51 +349,53 @@ impl NetInfoConfig {
             config.host_name = value;
         }
 
-        if let Some(value) = ini.get("VIRUS_SCAN", "ENABLED") {
-            config.virus_scan_enabled = matches!(value.trim(), "1");
+        // [GRPC] — gRPC 服务通用配置
+        if let Some(value) = ini.get("GRPC", "ENABLED") {
+            config.grpc_enabled = matches!(value.trim(), "1");
         }
-        if let Some(value) = ini.get("VIRUS_SCAN", "DEV_MODE") {
-            config.virus_scan_dev_mode = matches!(value.trim(), "1");
+        if let Some(value) = ini.get("GRPC", "DEV_MODE") {
+            config.grpc_dev_mode = matches!(value.trim(), "1");
         }
-        config.virus_scan_grpc_addr = ini
-            .get("VIRUS_SCAN", "GRPC_ADDR")
+        config.grpc_addr = ini
+            .get("GRPC", "GRPC_ADDR")
             .unwrap_or_else(|| "127.0.0.1:50051".to_string());
-        config.virus_scan_dev_grpc_addr = ini
-            .get("VIRUS_SCAN", "DEV_GRPC_ADDR")
+        config.grpc_dev_addr = ini
+            .get("GRPC", "DEV_GRPC_ADDR")
             .unwrap_or_else(|| "0.0.0.0:50051".to_string());
-        if let Some(value) = ini.get("VIRUS_SCAN", "BATCH_SIZE") {
-            config.virus_scan_batch_size = value.parse().unwrap_or(100);
+        if let Some(value) = ini.get("GRPC", "BATCH_SIZE") {
+            config.grpc_batch_size = value.parse().unwrap_or(100);
         } else {
-            config.virus_scan_batch_size = 100;
+            config.grpc_batch_size = 100;
         }
 
-        if let Some(value) = ini.get("VIRUS_SCAN", "CLAMAV_ENABLED") {
+        // [CLAMAV] — ClamAV 病毒扫描配置
+        if let Some(value) = ini.get("CLAMAV", "ENABLED") {
             config.clamav_enabled = matches!(value.trim(), "1");
         }
         config.clamav_host = ini
-            .get("VIRUS_SCAN", "CLAMAV_HOST")
+            .get("CLAMAV", "HOST")
             .unwrap_or_else(|| "127.0.0.1".to_string());
-        if let Some(value) = ini.get("VIRUS_SCAN", "CLAMAV_PORT") {
+        if let Some(value) = ini.get("CLAMAV", "PORT") {
             config.clamav_port = value.parse().unwrap_or(3310);
         } else {
             config.clamav_port = 3310;
         }
-        if let Some(value) = ini.get("VIRUS_SCAN", "CLAMAV_TIMEOUT") {
+        if let Some(value) = ini.get("CLAMAV", "TIMEOUT") {
             config.clamav_timeout_secs = value.parse().unwrap_or(60);
         } else {
             config.clamav_timeout_secs = 60;
         }
-        if let Some(value) = ini.get("VIRUS_SCAN", "CLAMAV_POOL_SIZE") {
+        if let Some(value) = ini.get("CLAMAV", "POOL_SIZE") {
             config.clamav_pool_size = value.parse().unwrap_or(10);
         } else {
             config.clamav_pool_size = 10;
         }
 
         config.clamav_connection_type = ini
-            .get("VIRUS_SCAN", "CLAMAV_CONNECTION_TYPE")
+            .get("CLAMAV", "CONNECTION_TYPE")
             .unwrap_or_else(|| "tcp".to_string());
         config.clamav_socket_path = ini
-            .get("VIRUS_SCAN", "CLAMAV_SOCKET_PATH")
+            .get("CLAMAV", "SOCKET_PATH")
             .unwrap_or_else(|| "/opt/clamav/var/run/clamd.sock".to_string());
 
         config
@@ -479,25 +481,26 @@ impl NetInfoConfig {
         //writeln!(file, "HDSIZE={}", self.hdsize)?;
         writeln!(file, "AUTH={}", self.auth)?;
         writeln!(file, "HOSTNAME={}", self.host_name)?;
-        writeln!(file, "[VIRUS_SCAN]")?;
-        writeln!(file, "ENABLED={}", self.virus_scan_enabled as u8)?;
-        writeln!(file, "DEV_MODE={}", self.virus_scan_dev_mode as u8)?;
-        writeln!(file, "GRPC_ADDR={}", self.virus_scan_grpc_addr)?;
-        writeln!(file, "DEV_GRPC_ADDR={}", self.virus_scan_dev_grpc_addr)?;
-        writeln!(file, "BATCH_SIZE={}", self.virus_scan_batch_size)?;
-        writeln!(file, "CLAMAV_ENABLED={}", self.clamav_enabled as u8)?;
-        writeln!(file, "CLAMAV_HOST={}", self.clamav_host)?;
-        writeln!(file, "CLAMAV_PORT={}", self.clamav_port)?;
-        writeln!(file, "CLAMAV_TIMEOUT={}", self.clamav_timeout_secs)?;
-        writeln!(file, "CLAMAV_POOL_SIZE={}", self.clamav_pool_size)?;
+        writeln!(file, "[GRPC]")?;
+        writeln!(file, "ENABLED={}", self.grpc_enabled as u8)?;
+        writeln!(file, "DEV_MODE={}", self.grpc_dev_mode as u8)?;
+        writeln!(file, "GRPC_ADDR={}", self.grpc_addr)?;
+        writeln!(file, "DEV_GRPC_ADDR={}", self.grpc_dev_addr)?;
+        writeln!(file, "BATCH_SIZE={}", self.grpc_batch_size)?;
+        writeln!(file, "[CLAMAV]")?;
+        writeln!(file, "ENABLED={}", self.clamav_enabled as u8)?;
+        writeln!(file, "HOST={}", self.clamav_host)?;
+        writeln!(file, "PORT={}", self.clamav_port)?;
+        writeln!(file, "TIMEOUT={}", self.clamav_timeout_secs)?;
+        writeln!(file, "POOL_SIZE={}", self.clamav_pool_size)?;
         writeln!(
             file,
-            "CLAMAV_CONNECTION_TYPE={}",
+            "CONNECTION_TYPE={}",
             self.clamav_connection_type
         )?;
-        writeln!(file, "CLAMAV_SOCKET_PATH={}", self.clamav_socket_path)?;
+        writeln!(file, "SOCKET_PATH={}", self.clamav_socket_path)?;
         if self.clamav_socket_path.is_empty() {
-            writeln!(file, "CLAMAV_SOCKET_PATH=/opt/clamav/var/run/clamd.sock")?;
+            writeln!(file, "SOCKET_PATH=/opt/clamav/var/run/clamd.sock")?;
         }
         Ok(())
     }

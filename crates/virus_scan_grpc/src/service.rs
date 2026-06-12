@@ -38,13 +38,13 @@ impl StartVirusScanGrpcService for BootManager {
         &mut self,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
-            let (virus_scan_enabled, virus_scan_dev_mode, virus_scan_grpc_addr, virus_scan_dev_grpc_addr, clamav_enabled, clamav_host, clamav_port, clamav_timeout_secs, clamav_pool_size, clamav_connection_type, clamav_socket_path) = {
+            let (grpc_enabled, grpc_dev_mode, grpc_addr, grpc_dev_addr, clamav_enabled, clamav_host, clamav_port, clamav_timeout_secs, clamav_pool_size, clamav_connection_type, clamav_socket_path) = {
                 let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
                 (
-                    cfg.virus_scan_enabled,
-                    cfg.virus_scan_dev_mode,
-                    cfg.virus_scan_grpc_addr.clone(),
-                    cfg.virus_scan_dev_grpc_addr.clone(),
+                    cfg.grpc_enabled,
+                    cfg.grpc_dev_mode,
+                    cfg.grpc_addr.clone(),
+                    cfg.grpc_dev_addr.clone(),
                     cfg.clamav_enabled,
                     cfg.clamav_host.clone(),
                     cfg.clamav_port,
@@ -54,15 +54,15 @@ impl StartVirusScanGrpcService for BootManager {
                     cfg.clamav_socket_path.clone(),
                 )
             };
-            
-            if !virus_scan_enabled {
-                return Ok("病毒扫描服务未启用".to_string());
+
+            if !grpc_enabled {
+                return Ok("gRPC 服务未启用".to_string());
             }
 
-            let virus_scan_grpc_addr = if virus_scan_dev_mode {
-                virus_scan_dev_grpc_addr
+            let grpc_listen_addr = if grpc_dev_mode {
+                grpc_dev_addr
             } else {
-                virus_scan_grpc_addr
+                grpc_addr
             };
             
             // 检查 ClamAV 是否启用
@@ -120,7 +120,7 @@ impl StartVirusScanGrpcService for BootManager {
             let data_hub = Arc::new(AgentDataHub::new());
             let pattern_mgr = self.pattern_mgr();
 
-            let addr: std::net::SocketAddr = match virus_scan_grpc_addr.parse() {
+            let addr: std::net::SocketAddr = match grpc_listen_addr.parse() {
                 Ok(a) => a,
                 Err(e) => {
                     log_error!("地址解析失败: {}", e);
