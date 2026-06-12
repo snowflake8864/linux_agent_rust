@@ -43,7 +43,19 @@ message PwJumpResponse {
 }
 
 message JumpStatus {
-    string current_ip = 1;
-    string last_ip_jump_time = 2;
-    string last_pw_jump_time = 3;
+    // IP 跳变状态
+    string current_ip = 1;              // 当前主 IP
+    bool   ip_jump_active = 2;          // 是否正在周期跳变
+    uint32 active_time = 3;             // 周期间隔（秒），0=单次已完成
+    uint32 aging_time = 4;              // 老化时间（分钟）
+    uint32 mode = 5;                    // 1=Keep，2=Replace
+    string source_ip = 6;              // 跳变源 IP
+    string target_ip = 7;              // 跳变目标 IP/CIDR
+    string gateway = 8;                 // 网关
+    string last_ip_jump_time = 9;       // 上次 IP 跳变时间
+
+    // 密码跳变状态
+    string current_password = 10;       // 跳变后的新密码
+    string last_pw_jump_user = 11;      // 被修改密码的用户名
+    string last_pw_jump_time = 12;      // 上次密码跳变时间
 }

@@ -19,6 +19,13 @@ impl AgentStatusService for AgentStatusServiceImpl {
         let is_online = AGENT_MODE.load(std::sync::atomic::Ordering::Relaxed) == AgentMode::Online as u8;
         let cfg = self.data_hub.get_config();
 
+        let protection_days = if cfg.install_time > 0 {
+            let now = chrono::Utc::now().timestamp();
+            ((now - cfg.install_time) / 86400) as i32
+        } else {
+            0
+        };
+
         let modules = vec![
             ModuleStatus { name: "file_protect".into(), enabled: cfg.file_switch, status: if cfg.file_switch { "运行中".into() } else { "未启用".into() } },
             ModuleStatus { name: "proc_protect".into(), enabled: cfg.proc_switch, status: if cfg.proc_switch { "运行中".into() } else { "未启用".into() } },
@@ -31,7 +38,7 @@ impl AgentStatusService for AgentStatusServiceImpl {
             is_online,
             agent_version: cfg.ver,
             os_info: cfg.os,
-            protection_days: 0,
+            protection_days,
             cpu_mem: Some(CpuMemInfo {
                 cpu_usage: String::new(),
                 mem_usage: String::new(),

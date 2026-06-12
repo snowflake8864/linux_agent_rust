@@ -123,8 +123,8 @@ pub struct JumpServiceImpl {
 #[tonic::async_trait]
 impl JumpService for JumpServiceImpl {
     async fn get_jump_status(&self, _: Request<grpc_gateway::common::Empty>) -> Result<Response<JumpStatus>, Status> {
-        // TODO: track last jump time in a global
-        Ok(Response::new(JumpStatus::default()))
+        let status = crate::data_hub::JUMP_STATUS.lock().unwrap().clone();
+        Ok(Response::new(status))
     }
 
     async fn execute_ip_jump(&self, req: Request<IpJumpRequest>) -> Result<Response<IpJumpResponse>, Status> {

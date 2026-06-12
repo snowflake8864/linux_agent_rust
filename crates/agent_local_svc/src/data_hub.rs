@@ -1,30 +1,15 @@
-use std::sync::atomic::{AtomicU8, Ordering};
-use tonic::Status;
+use std::sync::{Mutex, LazyLock};
 
 use grpc_gateway::policy_watch::PolicyChangeType;
 use grpc_gateway::dir_policy::DirectionScanRule;
 use grpc_gateway::extort_policy::ExtortProtectRule;
+use grpc_gateway::jump::JumpStatus;
 
-/// Agent operation mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum AgentMode {
-    Online = 0,
-    Offline = 1,
-}
+// Re-export from grpc_gateway so downstream code keeps working
+pub use grpc_gateway::agent_mode::{AgentMode, AGENT_MODE, require_offline, set_online, set_offline};
 
-/// Global agent mode, writable from online/task_fetcher, readable from gRPC handlers.
-pub static AGENT_MODE: AtomicU8 = AtomicU8::new(AgentMode::Online as u8);
-
-/// Check if we are in offline mode. If online, return PERMISSION_DENIED.
-pub fn require_offline() -> Result<(), Status> {
-    if AGENT_MODE.load(Ordering::Relaxed) == AgentMode::Online as u8 {
-        return Err(Status::permission_denied(
-            "在线模式下不允许此操作，请通过管理平台执行"
-        ));
-    }
-    Ok(())
-}
+/// Global jump status — updated by execute_ip_jump / execute_pw_jump.
+pub static JUMP_STATUS: LazyLock<Mutex<JumpStatus>> = LazyLock::new(|| Mutex::new(JumpStatus::default()));
 
 /// Central data access hub for gRPC handlers.
 /// Wraps existing global variables and provides change notification.
@@ -189,6 +174,30 @@ impl AgentDataHub {
         Ok(())
     }
 
+    /// Update only two protection-related config fields (proc/usb switch + protect).
+    pub fn update_config_fields_protection(
+        &self,
+        switch_key: &str,
+        switch_val: bool,
+        protect_key: &str,
+        protect_val: bool,
+    ) -> Result<(), String> {
+        let mut guard = config::net_info::NETINFO_CONFIG.lock().unwrap();
+        match switch_key {
+            "proc_switch" => guard.proc_switch = switch_val,
+            "usb_switch" => guard.usb_switch = switch_val,
+            _ => {}
+        }
+        match protect_key {
+            "proc_protect" => guard.proc_protect = protect_val,
+            "usb_protect" => guard.usb_protect = protect_val,
+            _ => {}
+        }
+        let _ = guard.to_ini(&format!("{}/net_info.ini", guard.app_path));
+        self.notify(PolicyChangeType::ConfigChanged);
+        Ok(())
+    }
+
     /// Update process policy (white/black list).
     pub fn update_process_policy(
         &self,
@@ -277,6 +286,19 @@ impl AgentDataHub {
                 info.reason = e.to_string();
             }
         }
+
+        // Update global jump status
+        if info.status == 1 {
+            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let mut js = JUMP_STATUS.lock().unwrap();
+            js.current_ip = info.target_ip.clone();
+            js.source_ip = info.source_ip.clone();
+            js.target_ip = info.target_ip.clone();
+            js.gateway = info.gateway.clone();
+            js.mode = mode;
+            js.last_ip_jump_time = now;
+        }
+
         self.notify(PolicyChangeType::JumpStatusChanged);
         Ok((info.source_ip, info.target_ip, info.gateway, info.status, info.reason))
     }
@@ -454,6 +476,16 @@ impl AgentDataHub {
                 info.reason = e.to_string();
             }
         }
+
+        // Update global jump status
+        if info.status == 1 {
+            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let mut js = JUMP_STATUS.lock().unwrap();
+            js.current_password = new_password.to_string();
+            js.last_pw_jump_user = info.user.clone();
+            js.last_pw_jump_time = now;
+        }
+
         self.notify(PolicyChangeType::JumpStatusChanged);
         Ok((info.status, info.reason))
     }

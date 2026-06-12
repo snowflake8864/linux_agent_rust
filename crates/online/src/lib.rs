@@ -10,6 +10,7 @@ use std::fs;
 use chrono::Utc;
 use logging::log_info;
 use config::net_info::NETINFO_CONFIG;
+use grpc_gateway::agent_mode::{set_online, set_offline};
 #[derive(Deserialize)]
 #[allow(dead_code)]
 struct AuthResponse {
@@ -159,6 +160,7 @@ impl StartOnline for BootManager {
                             continue;
                         }
                         self.set_token(token.clone()).await;
+                        set_online(); // 服务器连通，切换为在线模式
                         log_info!("Token 已成功发送！");
                         log_info!("开始监听 host_is_offline 信号和系统资源...");
 
@@ -174,7 +176,10 @@ impl StartOnline for BootManager {
                                     Some(token)
                                 ).await {
                                     Ok(resp) => log_info!("hardware upload response: {}", resp),
-                                    Err(err) => eprintln!("发送指标失败: {}", err),
+                                    Err(err) => {
+                                        eprintln!("发送指标失败: {}", err);
+                                        set_offline(); // 服务器不可达，切换为离线模式
+                                    }
                                 }
                             } else {
                                 eprintln!("获取系统指标失败");
@@ -221,7 +226,10 @@ impl StartOnline for BootManager {
                                             Some(&token)
                                         ).await {
                                             Ok(response) => {/*log_info!("hardware upload response:{}",response)*/},
-                                            Err(err) => eprintln!("发送指标失败: {}", err),
+                                            Err(err) => {
+                                                eprintln!("发送指标失败: {}", err);
+                                                set_offline(); // 服务器不可达，切换为离线模式
+                                            }
                                         }
                                     } else {
                                         eprintln!("获取系统指标失败");
@@ -231,6 +239,7 @@ impl StartOnline for BootManager {
                                 result = host_is_offline_rx.recv() => {
                                     match result {
                                         Some(true) => {
+                                            set_offline(); // 服务器断连，切换为离线模式
                                             log_info!("收到 host_is_offline 为 true 的信号，重新获取 token...");
                                             break;
                                         }
@@ -248,6 +257,7 @@ impl StartOnline for BootManager {
                     }
                     Err(err) => {
                         eprintln!("获取 token 时发生错误: {}", err);
+                        set_offline(); // 无法获取 token，服务器不可达
                         continue;
                     }
                 }

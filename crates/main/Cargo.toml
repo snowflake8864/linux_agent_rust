@@ -38,6 +38,7 @@ kernel_module = { path = "../kernel_module" }
 docker = { path = "../docker"}
 virus_scan_grpc = { path = "../virus_scan_grpc" }
 net_client = { path = "../net_client" }
+grpc_gateway = { path = "../grpc_gateway" }
 tonic = "0.14"
 prost = "0.14"
 #[CKlibm]

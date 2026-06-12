@@ -31,6 +31,7 @@ use tokio::net::UnixStream;
 use zip::ZipArchive;
 use snapman::{create_snapshot, restore_snapshot};
 use rules_jump_mgr::{IpJumpManager, PasswordManager, IpJumpConfig, PutIpJumpInfo, PutPwJumpInfo};
+use grpc_gateway::agent_mode::{set_online, set_offline};
 use chrono::{Utc, Datelike};
 use std::io::{Read, Write};
 use tokio::process::Command;
@@ -643,6 +644,7 @@ pub async fn run(
                 let url = format!("{}/v1/gettask", task_fetcher.base_url);
                 match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
                     Ok(response) => {
+                        set_online(); // 服务器连通，切换为在线模式
                         let parsed: Value = match serde_json::from_str(&response) {
                             Ok(parsed) => parsed,
                             Err(e) => {
@@ -685,6 +687,7 @@ pub async fn run(
                     Err(err) => {
                         eprintln!("Error fetching task: {}", err);
                         log_info!("服务器离线或网络错误: {}", err);
+                        set_offline(); // 服务器不可达，切换为离线模式
                     }
                 }
             }
@@ -2768,6 +2771,7 @@ impl TaskService for BootManager {
                         }
                         Err(err) => {
                             eprintln!("任务处理失败或服务器离线: {}", err);
+                            set_offline(); // 服务器不可达，切换为离线模式
 
                             // 发送离线信号，通知重新获取 token
                             if let Err(e) = host_is_offline_tx.send(true).await {
