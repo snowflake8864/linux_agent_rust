@@ -3,7 +3,7 @@ set -e
 
 echo "Start packaging osec..."
 
-VERSION="3.0.1_T13"
+VERSION="1.1.26"
 OUTPUT_DIR="output"
 INSTALLER_NAME="${OUTPUT_DIR}/osec-installer-${VERSION}.sh"
 
@@ -35,10 +35,10 @@ cp target/loongarch64-unknown-linux-musl/release/MagicArmorAgent package/opt/ose
 # ====== 3. Copy architecture-specific kernel modules ======
 echo "Copying kernel modules..."
 
-cp driver/x86_64-unknown-linux-musl/osec_base.ko* package/opt/osec/x86_64-unknown-linux-musl/ 2>/dev/null || true
-cp driver/aarch64-unknown-linux-musl/osec_base.ko* package/opt/osec/aarch64-unknown-linux-musl/ 2>/dev/null || true
-cp driver/mips64el-unknown-linux-gnuabi64/osec_base.ko* package/opt/osec/mips64el-unknown-linux-gnuabi64/ 2>/dev/null || true
-cp driver/loongarch64-unknown-linux-musl/osec_base.ko* package/opt/osec/loongarch64-unknown-linux-musl/ 2>/dev/null || true
+cp driver.greatwall-guard/x86_64-unknown-linux-musl/osec_base.ko* package/opt/osec/x86_64-unknown-linux-musl/ 2>/dev/null || true
+cp driver.greatwall-guard/aarch64-unknown-linux-musl/osec_base.ko* package/opt/osec/aarch64-unknown-linux-musl/ 2>/dev/null || true
+cp driver.greatwall-guard/mips64el-unknown-linux-gnuabi64/osec_base.ko* package/opt/osec/mips64el-unknown-linux-gnuabi64/ 2>/dev/null || true
+cp driver.greatwall-guard/loongarch64-unknown-linux-musl/osec_base.ko* package/opt/osec/loongarch64-unknown-linux-musl/ 2>/dev/null || true
 
 # ====== 4. Copy common files ======
 cp -f script/net_info.ini package/opt/osec/
