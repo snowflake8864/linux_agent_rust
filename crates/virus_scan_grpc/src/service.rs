@@ -42,6 +42,7 @@ use agent_local_svc::{
     IpPolicyServiceImpl, DataQueryServiceImpl, OutreachDetectServiceImpl,
     AgentStatusServiceImpl, AlertServiceImpl, LocalTaskServiceImpl,
     PolicyWatchServiceImpl, ProcessDefenseServiceImpl, PeripheralDefenseServiceImpl,
+    AdmissionServiceImpl,
 };
 use agent_local_svc::stub_handlers::{
     DirPolicyServiceImpl, ExtortPolicyServiceImpl, JumpServiceImpl,
@@ -173,7 +174,7 @@ impl StartVirusScanGrpcService for BootManager {
 
             log_info!("病毒扫描 gRPC 服务正在启动: {}", addr);
 
-            Server::builder()
+            let mut builder = Server::builder()
                 .http2_keepalive_interval(Some(Duration::from_secs(30)))
                 .http2_keepalive_timeout(Some(Duration::from_secs(15)))
                 .add_service(grpc_gateway::virus_scan::virus_scan_service_server::VirusScanServiceServer::new(grpc_service))
@@ -285,9 +286,26 @@ impl StartVirusScanGrpcService for BootManager {
                     grpc_gateway::protection_mode::peripheral_defense_service_server::PeripheralDefenseServiceServer::new(
                         PeripheralDefenseServiceImpl { data_hub: data_hub.clone() },
                     )
-                )
+                );
+
+                // 准入服务：仅在 ENABLED=1 时注册
+                let admission_enabled = {
+                    let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
+                    cfg.admission.enabled
+                };
+                if admission_enabled {
+                    builder = builder.add_service(
+                        grpc_gateway::admission::admission_service_server::AdmissionServiceServer::new(
+                            AdmissionServiceImpl { data_hub: data_hub.clone() },
+                        )
+                    );
+                    log_info!("[gRPC] AdmissionService 已注册");
+                } else {
+                    log_info!("[gRPC] AdmissionService 未启用（ENABLED=0），跳过注册");
+                }
+
                 // ============================================================
-                .serve(addr)
+                builder.serve(addr)
                 .await
                 .map_err(|e| {
                     log_error!("病毒扫描 gRPC 服务错误: {}", e);

@@ -1,0 +1,72 @@
+syntax = "proto3";
+package admission;
+
+// ==============================================================================
+// 准入控制服务 (AdmissionService) 接口说明
+// ==============================================================================
+//
+// 概述：
+//   管理网络准入功能，控制终端是否需要通过准入才能访问网络。
+//   - 开启准入：未通过准入的终端无法访问网络
+//   - 关闭准入：所有终端可正常访问网络
+//   - 自动检测：自动判断应开启还是关闭准入
+//
+// 注意：
+//   - 本服务与在线/离线模式无关，任何状态下均可调用
+//   - 本服务依赖配置 ENABLED=1 才会注册，未启用时调用返回"未找到服务"
+//   - 本文件自包含，不依赖其他 proto
+//
+// AUTO 模式行为：
+//   当设置 mode=AUTO 时，Agent 自动检测应开启还是关闭准入：
+//   1. 先尝试关闭准入，等待几秒后检测服务器连通性
+//      - 连接成功 → effective=false，保持关准入
+//      - 连接失败 → 继续下一步
+//   2. 再尝试开启准入，等待几秒后检测服务器连通性
+//      - 连接成功 → effective=true，保持开准入
+//      - 连接失败 → 标记网络异常(network_anomaly=true)，等待后重试
+//   3. 网络异常后持续重试，直到确定准入状态或客户端手动设置 OFF/ON
+//   4. 运行中连接断开时，AUTO 模式会自动重新开始检测
+//
+//   客户端可通过 GetAdmissionSwitch 轮询 detecting 字段判断检测是否完成，
+//   检测完成后 effective 字段即为当前生效的准入值。
+// ==============================================================================
+
+// 准入模式
+enum AdmissionMode {
+    ADMISSION_OFF  = 0;  // 关闭准入，所有终端可正常访问网络
+    ADMISSION_ON   = 1;  // 开启准入，未通过准入的终端无法访问网络
+    ADMISSION_AUTO = 2;  // 自动检测，自动判断应开启还是关闭准入
+}
+
+// 准入控制服务
+service AdmissionService {
+    // 查询当前准入状态
+    rpc GetAdmissionSwitch(Empty) returns (AdmissionSwitchStatus);
+    // 设置准入模式
+    rpc UpdateAdmissionSwitch(AdmissionSwitchRequest) returns (AdmissionSwitchResponse);
+}
+
+message Empty {}
+
+message AdmissionSwitchStatus {
+    AdmissionMode mode           = 1;  // 当前模式: OFF(0) / ON(1) / AUTO(2)
+    bool effective               = 2;  // 当前生效值: true=开准入, false=关准入
+                                       //   OFF模式 → 固定 false
+                                       //   ON模式  → 固定 true
+                                       //   AUTO模式 → 当前用哪个值连上的服务器
+    bool detecting               = 3;  // 是否正在自动检测中（仅 AUTO 模式下为 true）
+    bool network_anomaly         = 4;  // 网络是否异常（AUTO模式下两种准入都连不上服务器时为 true）
+    string message               = 5;  // 状态描述，如: "准入关闭" / "准入开启" /
+                                       //   "自动检测(当前:准入关闭)" / "正在自动检测中" /
+                                       //   "网络异常，等待重试" / "准入功能未启用"
+    bool enabled                 = 6;  // 准入功能是否启用
+}
+
+message AdmissionSwitchRequest {
+    AdmissionMode mode = 1;  // 目标模式: OFF(0) / ON(1) / AUTO(2)
+}
+
+message AdmissionSwitchResponse {
+    bool success   = 1;  // 是否设置成功
+    string message = 2;  // 结果描述，如 "准入模式已设置为: AUTO"
+}

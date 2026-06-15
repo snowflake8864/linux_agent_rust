@@ -73,11 +73,15 @@ pub async fn run_agent_manager(mut cmd_rx: Receiver<AgentCommand>) {
                 }
 
                 tokio::spawn(async {
-                    if let Some(script_path) = find_upgrade_script("/tmp/osec_update") {
-                        log_info!("[agent_manager] 找到升级脚本: {:?}", script_path);
-                        run_script_and_cleanup(script_path, "/tmp/osec_update").await;
+                    let scripts = find_upgrade_scripts("/tmp/osec_update");
+                    if scripts.is_empty() {
+                        log_error!("[agent_manager] 未找到升级脚本 (至少需要 osec-installer*.sh)");
                     } else {
-                        log_error!("[agent_manager] 未找到升级脚本 (osec-installer*.sh)");
+                        log_info!("[agent_manager] 找到 {} 个升级脚本", scripts.len());
+                        for s in &scripts {
+                            log_info!("[agent_manager]   - {:?}", s.file_name());
+                        }
+                        run_scripts_and_cleanup(scripts, "/tmp/osec_update").await;
                     }
                 });
             }
@@ -303,91 +307,128 @@ async fn stop_osec_services() -> Result<(), String> {
     Ok(())
 }
 
-async fn run_script_and_cleanup(script_path: PathBuf, cleanup_dir: &str) {
-    log_info!("[agent_manager] 开始执行升级脚本: {:?}", script_path);
+async fn run_scripts_and_cleanup(script_paths: Vec<PathBuf>, cleanup_dir: &str) {
+    for script_path in &script_paths {
+        log_info!("[agent_manager] 开始执行升级脚本: {:?}", script_path);
 
-    let _ = Command::new("chmod").arg("+x").arg(&script_path).status().await;
+        let _ = Command::new("chmod").arg("+x").arg(script_path).status().await;
 
-    // 创建日志文件记录升级输出
-    let log_file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(true)
-        .open("/var/log/osec_upgrade.log")
-        .ok();
-
-    let result = if let Some(file) = log_file {
-        let stdout = Stdio::from(file);
-        // 需要再次打开文件用于 stderr
-        let stderr_file = fs::OpenOptions::new()
+        // 创建日志文件记录升级输出
+        let log_file = fs::OpenOptions::new()
             .create(true)
             .write(true)
             .append(true)
             .open("/var/log/osec_upgrade.log")
             .ok();
-        let stderr = if let Some(f) = stderr_file {
-            Stdio::from(f)
-        } else {
-            Stdio::inherit()
-        };
-        Command::new("/bin/bash")
-            .arg(&script_path)
-            .arg("--upgrade")
-            .stdout(stdout)
-            .stderr(stderr)
-            .status()
-            .await
-    } else {
-        // 回退到 inherit
-        Command::new("/bin/bash")
-            .arg(&script_path)
-            .arg("--upgrade")
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .await
-    };
 
-    match result {
-        Ok(status) => {
-            if status.success() {
-                log_info!("[agent_manager] 升级脚本执行成功 (exit code 0)");
-                if fs::remove_dir_all(cleanup_dir).is_ok() {
-                    log_info!("[agent_manager] 已清理临时目录: {}", cleanup_dir);
-                } else {
-                    log_error!("[agent_manager] 清理临时目录失败: {}", cleanup_dir);
-                }
+        let result = if let Some(file) = log_file {
+            let stdout = Stdio::from(file);
+            let stderr_file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open("/var/log/osec_upgrade.log")
+                .ok();
+            let stderr = if let Some(f) = stderr_file {
+                Stdio::from(f)
             } else {
-                log_error!("[agent_manager] 升级脚本执行失败，退出码: {:?}", status.code());
-                log_error!("[agent_manager] 请查看 /var/log/osec_upgrade.log 获取详细错误信息");
+                Stdio::inherit()
+            };
+            Command::new("/bin/bash")
+                .arg(script_path)
+                .arg("--upgrade")
+                .stdout(stdout)
+                .stderr(stderr)
+                .status()
+                .await
+        } else {
+            Command::new("/bin/bash")
+                .arg(script_path)
+                .arg("--upgrade")
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status()
+                .await
+        };
+
+        match result {
+            Ok(status) => {
+                if status.success() {
+                    log_info!("[agent_manager] 升级脚本 {:?} 执行成功 (exit code 0)", script_path.file_name());
+                } else {
+                    log_error!(
+                        "[agent_manager] 升级脚本 {:?} 执行失败，退出码: {:?}",
+                        script_path.file_name(),
+                        status.code()
+                    );
+                }
+            }
+            Err(e) => {
+                log_error!("[agent_manager] 启动升级脚本 {:?} 失败: {}", script_path.file_name(), e);
             }
         }
-        Err(e) => {
-            log_error!("[agent_manager] 启动升级脚本失败: {}", e);
-        }
+    }
+
+    // 所有脚本执行完毕后清理临时目录
+    if fs::remove_dir_all(cleanup_dir).is_ok() {
+        log_info!("[agent_manager] 已清理临时目录: {}", cleanup_dir);
+    } else {
+        log_error!("[agent_manager] 清理临时目录失败: {}", cleanup_dir);
     }
 }
 
-fn find_upgrade_script(dir: &str) -> Option<PathBuf> {
-    match fs::read_dir(dir) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with("osec-installer") && name.ends_with(".sh") {
-                        log_info!("[agent_manager] 找到升级脚本: {:?}", path);
-                        return Some(path);
-                    }
-                }
-            }
-            log_info!("[agent_manager] 在 {} 中未找到 osec-upgrade*.sh 脚本", dir);
-            None
-        }
+/// 查找升级脚本
+/// 规则：
+///   - osec-installer*.sh 一定有（没有则返回空）
+///   - 可能有一个其他脚本（名字不限）
+///   - 最多 2 个
+///   - osec-installer 必须最后执行
+fn find_upgrade_scripts(dir: &str) -> Vec<PathBuf> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
         Err(e) => {
             log_error!("[agent_manager] 读取升级目录 {} 失败: {}", dir, e);
-            None
+            return Vec::new();
+        }
+    };
+
+    let mut osec_scripts: Vec<PathBuf> = Vec::new();
+    let mut other_scripts: Vec<PathBuf> = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if !name.ends_with(".sh") {
+                continue;
+            }
+            if name.starts_with("osec-installer") {
+                log_info!("[agent_manager] 找到 osec 升级脚本: {:?}", path);
+                osec_scripts.push(path);
+            } else {
+                log_info!("[agent_manager] 找到其他升级脚本: {:?}", path);
+                other_scripts.push(path);
+            }
         }
     }
+
+    // osec-installer 至少要有一个
+    if osec_scripts.is_empty() {
+        log_error!("[agent_manager] 在 {} 中未找到 osec-installer*.sh 脚本", dir);
+        return Vec::new();
+    }
+
+    // 其他脚本最多取 1 个
+    other_scripts.truncate(1);
+
+    // 合并：其他脚本在前，osec 在后（确保 osec 最后执行）
+    let mut result = other_scripts;
+    result.push(osec_scripts.remove(0)); // 取第一个 osec-installer
+
+    log_info!("[agent_manager] 升级脚本执行顺序: {:?}",
+        result.iter().filter_map(|p| p.file_name().and_then(|n| n.to_str())).collect::<Vec<_>>()
+    );
+
+    result
 }
 
 async fn uninstall_all() {

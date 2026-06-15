@@ -31,6 +31,7 @@ dependencies = [
  "hostinfo",
  "log 0.4.29",
  "logging",
+ "net_client",
  "netblock",
  "pattern",
  "process_mgr",
@@ -1383,6 +1384,7 @@ dependencies = [
 name = "linux-agent"
 version = "0.10.6"
 dependencies = [
+ "agent_local_svc",
  "common",
  "config",
  "docker",
@@ -1642,6 +1644,7 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 name = "online"
 version = "0.10.6"
 dependencies = [
+ "agent_local_svc",
  "chrono",
  "common",
  "config",

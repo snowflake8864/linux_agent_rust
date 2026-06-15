@@ -43,6 +43,7 @@ pub struct NetInfoConfig {
     pub syslog_process_switch: bool,
     pub syslog_login_switch: bool,
     pub internet_switch: bool,
+        pub admission_switch: bool,
     pub baseline_switch: bool,
     pub baseline_time: u32,
     pub outreach_switch: bool,
@@ -77,6 +78,29 @@ pub struct NetInfoConfig {
     pub vigilixav_connection_type: String,
     pub vigilixav_socket_path: String,
     pub install_time: i64,
+    // 准入功能配置
+    pub admission: AdmissionConfig,
+}
+
+/// 准入功能配置，对应 ini 中的 [ADMISSION] 段
+/// 如果 ini 中没有 [ADMISSION] 段，所有字段取默认值（ENABLED=0，即不启用）
+#[derive(Debug, Clone)]
+pub struct AdmissionConfig {
+    pub enabled: bool,           // 是否启用准入功能
+    pub mode: u8,                // 0=关准入, 1=开准入, 2=自动检测
+    pub retry_interval: u64,     // 自动检测网络异常时重试间隔（秒）
+    pub max_retries: u32,        // 每轮最多重试次数
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        AdmissionConfig {
+            enabled: false,       // 默认不启用
+            mode: 2,              // 默认自动检测
+            retry_interval: 60,   // 默认60秒重试
+            max_retries: 3,       // 默认3次
+        }
+    }
 }
 
 enum NetRule<'a> {
@@ -283,6 +307,9 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("SERVERINFO", "INTERNET_SWITCH") {
             config.internet_switch = matches!(value.trim(), "1");
         }
+        if let Some(value) = ini.get("SERVERINFO", "ADMISSION_SWITCH") {
+            config.admission_switch = matches!(value.trim(), "1");
+        }
         if let Some(value) = ini.get("SERVERINFO", "OFFLINE_MODE") {
             config.is_offline_mode = matches!(value.trim(), "1");
         }
@@ -398,6 +425,20 @@ impl NetInfoConfig {
             .get("VIGILIXAV", "SOCKET_PATH")
             .unwrap_or_else(|| "/opt/clamav/var/run/clamd.sock".to_string());
 
+        // [ADMISSION] 段 — 没有此段则全部默认（enabled=false）
+        if let Some(value) = ini.get("ADMISSION", "ENABLED") {
+            config.admission.enabled = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("ADMISSION", "MODE") {
+            config.admission.mode = value.trim().parse().unwrap_or(0);
+        }
+        if let Some(value) = ini.get("ADMISSION", "RETRY_INTERVAL") {
+            config.admission.retry_interval = value.trim().parse().unwrap_or(60);
+        }
+        if let Some(value) = ini.get("ADMISSION", "MAX_RETRIES") {
+            config.admission.max_retries = value.trim().parse().unwrap_or(3);
+        }
+
         config
     }
 
@@ -461,6 +502,7 @@ impl NetInfoConfig {
             self.syslog_login_switch as u8
         )?;
         writeln!(file, "INTERNET_SWITCH={}", self.internet_switch as u8)?;
+                writeln!(file, "ADMISSION_SWITCH={}", self.admission_switch as u8)?;
         writeln!(file, "OFFLINE_MODE={}", self.is_offline_mode as u8)?;
         writeln!(file, "BASELINE_SWITCH={}", self.baseline_switch as u8)?;
         writeln!(file, "BASELINE_TIME={}", self.baseline_time)?;
@@ -502,6 +544,14 @@ impl NetInfoConfig {
         if self.vigilixav_socket_path.is_empty() {
             writeln!(file, "SOCKET_PATH=/opt/clamav/var/run/clamd.sock")?;
         }
+
+        // [ADMISSION] 段
+        writeln!(file, "[ADMISSION]")?;
+        writeln!(file, "ENABLED={}", self.admission.enabled as u8)?;
+        writeln!(file, "MODE={}", self.admission.mode)?;
+        writeln!(file, "RETRY_INTERVAL={}", self.admission.retry_interval)?;
+        writeln!(file, "MAX_RETRIES={}", self.admission.max_retries)?;
+
         Ok(())
     }
 
