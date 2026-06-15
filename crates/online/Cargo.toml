@@ -21,3 +21,4 @@ logging = { path = "../logging" }
 log = "0.4"
 chrono = "0.4"
 grpc_gateway = { path = "../grpc_gateway" }
+agent_local_svc = { path = "../agent_local_svc" }

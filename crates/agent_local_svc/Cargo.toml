@@ -28,3 +28,4 @@ procinfo = { path = "../procinfo" }
 logging = { path = "../logging" }
 common = { path = "../common" }
 udisk = { path = "../udisk" }
+net_client = { path = "../net_client" }

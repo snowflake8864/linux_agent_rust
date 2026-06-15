@@ -91,6 +91,49 @@ async fn main() -> std::io::Result<()> {
         if !cfg.mod_ver.is_empty() {
             ensure_kernel_hold();
         }
+
+        // 驱动加载成功后，同步 admission 到 /proc/osec/tcp_force_ecn
+        let admission_enabled = cfg.admission.enabled;
+        let admission_mode = cfg.admission.mode;
+        let admission_switch = cfg.admission_switch;
+        let admission_on = !cfg.mod_ver.is_empty();
+        drop(cfg); // 释放锁
+        if admission_enabled && admission_on {
+            let proc_path = "/proc/osec/tcp_force_ecn";
+            if std::path::Path::new(proc_path).exists() {
+                let val = match admission_mode {
+                    0 => "0",  // OFF
+                    1 => "1",  // ON
+                    2 => "0",  // AUTO — 初始先关，等自动检测逻辑来切换
+                    _ => "0",
+                };
+                if let Err(e) = std::fs::write(proc_path, val) {
+                    log_error!("写入 {} 失败: {}", proc_path, e);
+                } else {
+                    log_info!("准入开关同步: {} = {}", proc_path, val);
+                }
+            } else {
+                log_info!("{} 不存在，跳过准入同步（驱动未提供该接口）", proc_path);
+            }
+
+            // 初始化全局 ADMISSION_MODE 和 ADMISSION_EFFECTIVE
+            agent_local_svc::ADMISSION_MODE.store(admission_mode, std::sync::atomic::Ordering::Relaxed);
+            if admission_mode == 2 {
+                // AUTO 模式：effective 初始按 ini 里的 admission_switch 来
+                let eff = admission_switch as u8;
+                agent_local_svc::ADMISSION_EFFECTIVE.store(eff, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                agent_local_svc::ADMISSION_EFFECTIVE.store(admission_mode, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            // 如果是 AUTO 模式，启动自动检测
+            if admission_mode == 2 {
+                let hub = agent_local_svc::AgentDataHub::new();
+                hub.start_auto_detect();
+            }
+        } else if !admission_enabled {
+            log_info!("准入功能未启用（ENABLED=0），跳过");
+        }
     }
 
     // 检查是否为离线模式

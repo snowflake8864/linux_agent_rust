@@ -10,7 +10,8 @@ use std::fs;
 use chrono::Utc;
 use logging::log_info;
 use config::net_info::NETINFO_CONFIG;
-use grpc_gateway::agent_mode::{set_online, set_offline};
+use grpc_gateway::agent_mode::set_online;
+use agent_local_svc::set_offline_and_check_admission;
 #[derive(Deserialize)]
 #[allow(dead_code)]
 struct AuthResponse {
@@ -178,7 +179,7 @@ impl StartOnline for BootManager {
                                     Ok(resp) => log_info!("hardware upload response: {}", resp),
                                     Err(err) => {
                                         eprintln!("发送指标失败: {}", err);
-                                        set_offline(); // 服务器不可达，切换为离线模式
+                                        set_offline_and_check_admission(); // 服务器不可达，切换为离线模式+检查准入
                                     }
                                 }
                             } else {
@@ -228,7 +229,7 @@ impl StartOnline for BootManager {
                                             Ok(response) => {/*log_info!("hardware upload response:{}",response)*/},
                                             Err(err) => {
                                                 eprintln!("发送指标失败: {}", err);
-                                                set_offline(); // 服务器不可达，切换为离线模式
+                                                set_offline_and_check_admission(); // 服务器不可达，切换为离线模式+检查准入
                                             }
                                         }
                                     } else {
@@ -239,7 +240,7 @@ impl StartOnline for BootManager {
                                 result = host_is_offline_rx.recv() => {
                                     match result {
                                         Some(true) => {
-                                            set_offline(); // 服务器断连，切换为离线模式
+                                            set_offline_and_check_admission(); // 服务器断连，切换为离线模式+检查准入
                                             log_info!("收到 host_is_offline 为 true 的信号，重新获取 token...");
                                             break;
                                         }
@@ -257,7 +258,7 @@ impl StartOnline for BootManager {
                     }
                     Err(err) => {
                         eprintln!("获取 token 时发生错误: {}", err);
-                        set_offline(); // 无法获取 token，服务器不可达
+                        set_offline_and_check_admission(); // 无法获取 token，服务器不可达+检查准入
                         continue;
                     }
                 }

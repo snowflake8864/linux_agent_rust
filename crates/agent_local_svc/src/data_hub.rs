@@ -1,5 +1,6 @@
-use std::sync::{Mutex, LazyLock};
+use std::sync::{Mutex, LazyLock, atomic::{AtomicBool, AtomicU8, Ordering}};
 
+use logging::{log_info, log_error};
 use grpc_gateway::policy_watch::PolicyChangeType;
 use grpc_gateway::dir_policy::DirectionScanRule;
 use grpc_gateway::extort_policy::ExtortProtectRule;
@@ -7,6 +8,59 @@ use grpc_gateway::jump::JumpStatus;
 
 // Re-export from grpc_gateway so downstream code keeps working
 pub use grpc_gateway::agent_mode::{AgentMode, AGENT_MODE, require_offline, set_online, set_offline};
+
+/// 断线时调用：设置离线 + 如果准入模式是 AUTO 则重新触发自动检测
+pub fn set_offline_and_check_admission() {
+    set_offline();
+    let admission_enabled = {
+        let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
+        cfg.admission.enabled
+    };
+    if admission_enabled && ADMISSION_MODE.load(Ordering::Relaxed) == 2 && !ADMISSION_DETECTING.load(Ordering::Relaxed) {
+        log_info!("[admission] 断线且 AUTO 模式，重新启动自动检测");
+        let hub = AgentDataHub::new();
+        hub.start_auto_detect();
+    }
+}
+
+/// 检测服务器是否可达：向 /v1/auth 发送认证请求
+async fn check_server_reachable() -> bool {
+    let (base_url, body) = {
+        let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
+        let base_url = format!("https://{}:{}", cfg.server_ip, cfg.server_port);
+        let body = format!(
+            r#"{{\"uid\":\"{}\",\"macid\":\"{}\",\"ip\":\"{}\",\"ver\":\"{}\",\"type\":1,\"os\":\"{}\",\"memsize\":\"{}\",\"cpu\":\"{}\",\"hdsize\":\"{}\",\"asstarttime\":\"0\",\"osstarttime\":\"0\",\"auth\":\"{}\",\"userid\":\"{}\",\"host_name\":\"{}\",\"mod_ver\":\"{}\",\"arch_type\":{}}}"#,
+            cfg.dev_uid, cfg.macid, cfg.ips, cfg.ver, cfg.os, cfg.memsize, cfg.cpu, cfg.hdsize,
+            cfg.auth, cfg.user_id, cfg.host_name, cfg.mod_ver, cfg.arch_type
+        );
+        (base_url, body)
+    }; // cfg dropped here, before any .await
+
+    let net_client = match net_client::core::NetClient::new(Some(base_url.clone()), true) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let url = format!("{}/v1/auth", base_url);
+    match net_client.post_data_async(&url, &body, tokio::time::Duration::from_secs(10), None).await {
+        Ok(_) => true,
+        Err(e) => {
+            log_info!("[admission] 服务器不可达: {}", e);
+            false
+        }
+    }
+}
+
+// ── 准入检测全局状态 ──
+/// 当前准入模式: 0=OFF, 1=ON, 2=AUTO
+pub static ADMISSION_MODE: AtomicU8 = AtomicU8::new(0);
+/// 当前准入生效值: 0=关准入(tcp_force_ecn=0), 1=开准入(tcp_force_ecn=1)
+/// 仅当 ADMISSION_MODE=2(AUTO) 时才有意义
+pub static ADMISSION_EFFECTIVE: AtomicU8 = AtomicU8::new(0);
+/// 是否正在自动检测中
+pub static ADMISSION_DETECTING: AtomicBool = AtomicBool::new(false);
+/// 网络是否异常
+pub static ADMISSION_NETWORK_ANOMALY: AtomicBool = AtomicBool::new(false);
 
 /// Global jump status — updated by execute_ip_jump / execute_pw_jump.
 pub static JUMP_STATUS: LazyLock<Mutex<JumpStatus>> = LazyLock::new(|| Mutex::new(JumpStatus::default()));
@@ -196,6 +250,152 @@ impl AgentDataHub {
         let _ = guard.to_ini(&format!("{}/net_info.ini", guard.app_path));
         self.notify(PolicyChangeType::ConfigChanged);
         Ok(())
+    }
+
+    /// Update admission mode and persist to ini.
+    /// Also writes to /proc/osec/tcp_force_ecn if the driver is loaded.
+    /// mode: 0=OFF, 1=ON, 2=AUTO
+    pub fn update_admission_mode(
+        &self,
+        mode: u8,
+    ) -> Result<(), String> {
+        // 检查功能是否启用
+        let enabled = {
+            let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
+            cfg.admission.enabled
+        };
+        if !enabled {
+            return Err("准入功能未启用".to_string());
+        }
+
+        // 停止自动检测（如果正在运行）
+        ADMISSION_DETECTING.store(false, Ordering::Relaxed);
+        ADMISSION_NETWORK_ANOMALY.store(false, Ordering::Relaxed);
+
+        match mode {
+            0 => { // OFF
+                ADMISSION_MODE.store(0, Ordering::Relaxed);
+                ADMISSION_EFFECTIVE.store(0, Ordering::Relaxed);
+                self.write_admission_proc(false)?;
+                self.persist_admission_mode(0, false)?;
+            }
+            1 => { // ON
+                ADMISSION_MODE.store(1, Ordering::Relaxed);
+                ADMISSION_EFFECTIVE.store(1, Ordering::Relaxed);
+                self.write_admission_proc(true)?;
+                self.persist_admission_mode(1, true)?;
+            }
+            2 => { // AUTO
+                ADMISSION_MODE.store(2, Ordering::Relaxed);
+                self.persist_admission_mode(2, false)?;
+                // 启动自动检测（异步）
+                self.start_auto_detect();
+            }
+            _ => return Err(format!("无效的准入模式: {}", mode)),
+        }
+
+        self.notify(PolicyChangeType::ConfigChanged);
+        Ok(())
+    }
+
+    /// 写入 /proc/osec/tcp_force_ecn
+    fn write_admission_proc(&self, enable: bool) -> Result<(), String> {
+        let proc_path = "/proc/osec/tcp_force_ecn";
+        if std::path::Path::new(proc_path).exists() {
+            let val = if enable { "1" } else { "0" };
+            if let Err(e) = std::fs::write(proc_path, val) {
+                log_error!("[admission] 写入 {} 失败: {}", proc_path, e);
+                Err(format!("写入 {} 失败: {}", proc_path, e))
+            } else {
+                log_info!("[admission] 已写入 {} = {}", proc_path, val);
+                Ok(())
+            }
+        } else {
+            log_info!("[admission] {} 不存在，跳过写入（驱动未加载）", proc_path);
+            Ok(())
+        }
+    }
+
+    /// 持久化准入模式到 ini
+    /// mode: 0=OFF, 1=ON, 2=AUTO
+    /// effective: 当前 tcp_force_ecn 的生效值 (true=1, false=0)
+    fn persist_admission_mode(&self, mode: u8, effective: bool) -> Result<(), String> {
+        let mut guard = config::net_info::NETINFO_CONFIG.lock().unwrap();
+        guard.admission.mode = mode;
+        guard.admission_switch = effective;
+        let _ = guard.to_ini(&format!("{}/net_info.ini", guard.app_path));
+        Ok(())
+    }
+
+    /// 启动自动检测（spawn 异步任务）
+    pub fn start_auto_detect(&self) {
+        ADMISSION_DETECTING.store(true, Ordering::Relaxed);
+        ADMISSION_NETWORK_ANOMALY.store(false, Ordering::Relaxed);
+        log_info!("[admission] 启动自动检测");
+
+        let data_hub = AgentDataHub::new();
+        tokio::spawn(async move {
+            let (retry_interval, max_retries) = {
+                let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
+                (cfg.admission.retry_interval, cfg.admission.max_retries)
+            }; // cfg dropped here
+
+            let mut round = 0u32;
+            loop {
+                if !ADMISSION_DETECTING.load(Ordering::Relaxed) {
+                    log_info!("[admission] 自动检测已停止");
+                    return;
+                }
+
+                round += 1;
+                log_info!("[admission] 第 {} 轮自动检测", round);
+
+                // 1. 尝试关准入
+                let _ = data_hub.write_admission_proc(false);
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                if check_server_reachable().await {
+                    log_info!("[admission] 关准入可上线，设置 effective=OFF");
+                    ADMISSION_EFFECTIVE.store(0, Ordering::Relaxed);
+                    let _ = data_hub.persist_admission_mode(2, false);
+                    // ADMISSION_MODE 保持 AUTO(2)，不改变
+                    ADMISSION_DETECTING.store(false, Ordering::Relaxed);
+                    ADMISSION_NETWORK_ANOMALY.store(false, Ordering::Relaxed);
+                    data_hub.notify(PolicyChangeType::ConfigChanged);
+                    return;
+                }
+
+                if !ADMISSION_DETECTING.load(Ordering::Relaxed) { return; }
+
+                // 2. 尝试开准入
+                let _ = data_hub.write_admission_proc(true);
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                if check_server_reachable().await {
+                    log_info!("[admission] 开准入可上线，设置 effective=ON");
+                    ADMISSION_EFFECTIVE.store(1, Ordering::Relaxed);
+                    let _ = data_hub.persist_admission_mode(2, true);
+                    // ADMISSION_MODE 保持 AUTO(2)，不改变
+                    ADMISSION_DETECTING.store(false, Ordering::Relaxed);
+                    ADMISSION_NETWORK_ANOMALY.store(false, Ordering::Relaxed);
+                    data_hub.notify(PolicyChangeType::ConfigChanged);
+                    return;
+                }
+
+                if !ADMISSION_DETECTING.load(Ordering::Relaxed) { return; }
+
+                // 3. 两种都不行
+                if round < max_retries {
+                    log_info!("[admission] 第 {} 轮检测失败，{} 秒后重试", round, retry_interval);
+                    ADMISSION_NETWORK_ANOMALY.store(true, Ordering::Relaxed);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(retry_interval)).await;
+                } else {
+                    log_error!("[admission] {} 轮检测均失败，网络异常", max_retries);
+                    ADMISSION_NETWORK_ANOMALY.store(true, Ordering::Relaxed);
+                    // 继续循环，无限重试直到网络恢复或被手动停止
+                    tokio::time::sleep(tokio::time::Duration::from_secs(retry_interval)).await;
+                    round = 0; // 重置轮次，继续无限重试
+                }
+            }
+        });
     }
 
     /// Update process policy (white/black list).

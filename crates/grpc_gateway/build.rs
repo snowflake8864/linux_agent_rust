@@ -22,6 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "src/proto/data_query.proto",
                 "src/proto/policy_watch.proto",
                 "src/proto/protection_mode.proto",
+                "src/proto/admission.proto",
             ],
             &["src/proto"],
         )
