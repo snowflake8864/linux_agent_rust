@@ -210,16 +210,58 @@ elif [[ "\$MODE" == "upgrade" ]]; then
     PAYLOAD_LINE=\$(awk '/^__PAYLOAD_BELOW__/ {print NR + 1; exit}' "\$0")
     tail -n+\$PAYLOAD_LINE "\$0" | tar -xzf - -C /tmp || { echo "Extraction failed"; exit 1; }
 
+    # 升级前备份旧配置
+    BAK="\$INSTALL_DIR/net_info.ini.bak"
     if [ -f "\$INSTALL_DIR/net_info.ini" ]; then
-        cp "\$INSTALL_DIR/net_info.ini" "\$INSTALL_DIR/net_info.ini.bak"
+        cp "\$INSTALL_DIR/net_info.ini" "\$BAK"
     fi
+
+    # 解压新包（新文件覆盖，包含新增的功能段）
     cp -rf /tmp/opt/osec/* "\$INSTALL_DIR/"
-    if [ -f "\$INSTALL_DIR/net_info.ini.bak" ]; then
-        mv "\$INSTALL_DIR/net_info.ini.bak" "\$INSTALL_DIR/net_info.ini"
-    fi
-    if [ -f "\$INSTALL_DIR/net_info.ini" ]; then
+
+    # 将旧配置中的关键字段回填到新文件
+    # 策略：[CLIENTINFO] 全部、[SERVERINFO] 除 VERSION 外全部、[HOSTINFO] 全部用旧值
+    #       其余段（[VIRUS_SCAN]/[ADMISSION] 等）保留新包的值
+    if [ -f "\$BAK" ] && [ -f "\$INSTALL_DIR/net_info.ini" ]; then
+        # 回填 [CLIENTINFO] 所有 key
+        while IFS='=' read -r key val; do
+            [[ -z "\$key" || "\$key" =~ ^# ]] && continue
+            key=\$(echo "\$key" | tr -d ' ')
+            val=\$(echo "\$val" | tr -d '\r')
+            sed -i "s|^[[:space:]]*\${key}[[:space:]]*=.*|\${key}=\${val}|" "\$INSTALL_DIR/net_info.ini"
+        done < <(awk '/^\[CLIENTINFO\]/{f=1;next} /^\[/{f=0} f && /=/' "\$BAK")
+
+        # 回填 [SERVERINFO] 所有 key（VERSION 除外，后面单独写新版本号）
+        while IFS='=' read -r key val; do
+            [[ -z "\$key" || "\$key" =~ ^# ]] && continue
+            key=\$(echo "\$key" | tr -d ' ')
+            [[ "\$key" == "VERSION" ]] && continue
+            val=\$(echo "\$val" | tr -d '\r')
+            if grep -q "^[[:space:]]*\${key}[[:space:]]*=" "\$INSTALL_DIR/net_info.ini"; then
+                sed -i "s|^[[:space:]]*\${key}[[:space:]]*=.*|\${key}=\${val}|" "\$INSTALL_DIR/net_info.ini"
+            else
+                sed -i "/^\\[SERVERINFO\\]/a \${key}=\${val}" "\$INSTALL_DIR/net_info.ini"
+            fi
+        done < <(awk '/^\[SERVERINFO\]/{f=1;next} /^\[/{f=0} f && /=/' "\$BAK")
+
+        # 回填 [HOSTINFO] 所有 key
+        while IFS='=' read -r key val; do
+            [[ -z "\$key" || "\$key" =~ ^# ]] && continue
+            key=\$(echo "\$key" | tr -d ' ')
+            val=\$(echo "\$val" | tr -d '\r')
+            if grep -q "^[[:space:]]*\${key}[[:space:]]*=" "\$INSTALL_DIR/net_info.ini"; then
+                sed -i "s|^[[:space:]]*\${key}[[:space:]]*=.*|\${key}=\${val}|" "\$INSTALL_DIR/net_info.ini"
+            else
+                sed -i "/^\\[HOSTINFO\\]/a \${key}=\${val}" "\$INSTALL_DIR/net_info.ini"
+            fi
+        done < <(awk '/^\[HOSTINFO\]/{f=1;next} /^\[/{f=0} f && /=/' "\$BAK")
+
+        # 写入新版本号
         sed -i '/^[[:space:]]*VERSION[[:space:]]*=/d' "\$INSTALL_DIR/net_info.ini"
-        sed -i "/\\[SERVERINFO\\]/a VERSION=\$OSEC_VERSION" "\$INSTALL_DIR/net_info.ini"
+        sed -i "/^\\[SERVERINFO\\]/a VERSION=\$OSEC_VERSION" "\$INSTALL_DIR/net_info.ini"
+
+        rm -f "\$BAK"
+        echo "net_info.ini 升级完成：关键配置已保留，新功能段已更新"
     fi
 fi
 
