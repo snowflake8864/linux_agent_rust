@@ -425,10 +425,15 @@ if [ -d /run/systemd/system ]; then
 
         echo "osec and agent_manager services started successfully (systemd)."
     else
-        # 升级模式：重启 osec 和 agent_manager
+        # 升级模式：复制新 service 文件、reload、enable、重启
+        [ -f "\$UNIT_DIR/osec.service" ] && cp -f "\$INSTALL_DIR/osec.service" "\$UNIT_DIR/" && chmod 644 "\$UNIT_DIR/osec.service"
+        [ -f "\$UNIT_DIR/agent_manager.service" ] && cp -f "\$INSTALL_DIR/agent_manager.service" "\$UNIT_DIR/" && chmod 644 "\$UNIT_DIR/agent_manager.service"
+        systemctl daemon-reload 2>/dev/null || true
+        [ -f "\$UNIT_DIR/osec.service" ] && systemctl enable osec 2>/dev/null || true
+        [ -f "\$UNIT_DIR/agent_manager.service" ] && systemctl enable agent_manager 2>/dev/null || true
         [ -f "\$UNIT_DIR/osec.service" ] && systemctl restart osec 2>/dev/null || true
         [ -f "\$UNIT_DIR/agent_manager.service" ] && systemctl restart agent_manager 2>/dev/null || true
-        echo "osec and agent_manager services restarted successfully (systemd)."
+        echo "osec and agent_manager services enabled and restarted successfully (systemd)."
     fi
     else
         # 使用 init.d + monitor 脚本
