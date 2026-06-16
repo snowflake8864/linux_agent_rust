@@ -866,31 +866,55 @@ pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
     archive.extract(temp_dir).map_err(|e| e.to_string())?;
     log_info!("✅ 更新包已解压到: {}", temp_dir);
 
-    let mut script_path: Option<PathBuf> = None;
-    for entry in fs::read_dir(temp_dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-            if name.starts_with("osec-installer") && name.ends_with(".sh") {
-                script_path = Some(path);
-                break;
-            }
-        }
-    }
+    // 前置校验：确认升级包里有可执行脚本
+    // 优先检查 upgrade.conf，没有则退回找含 "installer-" 的 .sh
+    let conf_path = format!("{}/upgrade.conf", temp_dir);
+    let script_path_ref: PathBuf;
+    let _script_owned: PathBuf; // 持有所有权
 
-    let script_path_ref = script_path.as_ref().ok_or_else(|| {
-        let mut files = vec![];
-        if let Ok(entries) = fs::read_dir(temp_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    files.push(name.to_string());
-                } else {
-                    files.push("<非UTF8文件名>".to_string());
+    if Path::new(&conf_path).exists() {
+        // 有 upgrade.conf：只需确认配置文件可读、至少有一行有效脚本名
+        log_info!("升级包包含 upgrade.conf，将按配置文件执行");
+        let content = fs::read_to_string(&conf_path)
+            .map_err(|e| format!("读取 upgrade.conf 失败: {}", e))?;
+        let first_script = content
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .ok_or_else(|| "升级包里的 upgrade.conf 没有列出任何脚本".to_string())?;
+        _script_owned = PathBuf::from(temp_dir).join(first_script);
+        if !_script_owned.exists() {
+            return Err(format!("upgrade.conf 中第一个脚本不存在: {:?}", _script_owned));
+        }
+        script_path_ref = _script_owned.clone();
+    } else {
+        // 无 upgrade.conf：退回找含 "installer-" 的 .sh
+        let mut found: Option<PathBuf> = None;
+        for entry in fs::read_dir(temp_dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                if name.contains("installer-") && name.ends_with(".sh") {
+                    found = Some(path);
+                    break;
                 }
             }
         }
-        format!("未找到以 'osec-installer' 开头的脚本文件，临时目录文件列表: {:?}", files)
-    })?;
+        _script_owned = found.ok_or_else(|| {
+            let mut files = vec![];
+            if let Ok(entries) = fs::read_dir(temp_dir) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        files.push(name.to_string());
+                    } else {
+                        files.push("<非UTF8文件名>".to_string());
+                    }
+                }
+            }
+            format!("升级包里既无 upgrade.conf 也无含 'installer-' 的脚本，目录文件: {:?}", files)
+        })?;
+        script_path_ref = _script_owned.clone();
+    }
 
     log_info!("✅ 找到升级脚本: {:?}", script_path_ref);
 

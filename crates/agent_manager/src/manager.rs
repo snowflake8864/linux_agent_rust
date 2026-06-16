@@ -377,13 +377,58 @@ async fn run_scripts_and_cleanup(script_paths: Vec<PathBuf>, cleanup_dir: &str) 
     }
 }
 
-/// 查找升级脚本
-/// 规则：
-///   - osec-installer*.sh 一定有（没有则返回空）
-///   - 可能有一个其他脚本（名字不限）
-///   - 最多 2 个
-///   - osec-installer 必须最后执行
+/// 查找升级脚本列表，按执行顺序返回。
+///
+/// 优先使用 upgrade.conf（升级包内的配置文件），格式为每行一个脚本名：
+///   ```
+///   # 按行顺序执行
+///   driver-installer-1.0.sh
+///   osec-installer-1.1.26T.sh
+///   ```
+/// 如果没有 upgrade.conf，退回已有逻辑：
+///   - 文件名含 "installer-" 的 .sh 才参与执行（install.sh 等不含 "installer-" 的被跳过）
+///   - osec-installer*.sh 必须最后执行
 fn find_upgrade_scripts(dir: &str) -> Vec<PathBuf> {
+    let conf_path = format!("{}/upgrade.conf", dir);
+
+    // 优先读取 upgrade.conf
+    if Path::new(&conf_path).exists() {
+        log_info!("[agent_manager] 检测到 upgrade.conf，按配置文件执行升级脚本");
+        let content = match fs::read_to_string(&conf_path) {
+            Ok(c) => c,
+            Err(e) => {
+                log_error!("[agent_manager] 读取 upgrade.conf 失败: {}", e);
+                return Vec::new();
+            }
+        };
+        let scripts: Vec<PathBuf> = content
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|name| PathBuf::from(dir).join(name))
+            .filter(|p| {
+                if p.exists() {
+                    true
+                } else {
+                    log_error!("[agent_manager] upgrade.conf 列出的脚本不存在: {:?}", p);
+                    false
+                }
+            })
+            .collect();
+
+        if scripts.is_empty() {
+            log_error!("[agent_manager] upgrade.conf 中未找到可执行脚本");
+            return Vec::new();
+        }
+
+        log_info!("[agent_manager] upgrade.conf 指定执行顺序: {:?}",
+            scripts.iter().filter_map(|p| p.file_name().and_then(|n| n.to_str())).collect::<Vec<_>>()
+        );
+        return scripts;
+    }
+
+    // 无 upgrade.conf，退回原有逻辑
+    log_info!("[agent_manager] 未找到 upgrade.conf，退回默认升级脚本查找逻辑");
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -398,7 +443,8 @@ fn find_upgrade_scripts(dir: &str) -> Vec<PathBuf> {
     for entry in entries.flatten() {
         let path = entry.path();
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if !name.ends_with(".sh") {
+            // 不含 "installer-" 的 .sh 文件（如 install.sh）不参与升级执行
+            if !name.ends_with(".sh") || !name.contains("installer-") {
                 continue;
             }
             if name.starts_with("osec-installer") {
@@ -422,7 +468,7 @@ fn find_upgrade_scripts(dir: &str) -> Vec<PathBuf> {
 
     // 合并：其他脚本在前，osec 在后（确保 osec 最后执行）
     let mut result = other_scripts;
-    result.push(osec_scripts.remove(0)); // 取第一个 osec-installer
+    result.push(osec_scripts.remove(0));
 
     log_info!("[agent_manager] 升级脚本执行顺序: {:?}",
         result.iter().filter_map(|p| p.file_name().and_then(|n| n.to_str())).collect::<Vec<_>>()
