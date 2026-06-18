@@ -5,6 +5,7 @@
 #   ./test_grpc.sh              # 交互式菜单选择
 #   ./test_grpc.sh <编号>        # 直接测试指定接口
 #   ./test_grpc.sh all           # 测试全部只读接口
+#   ./test_grpc.sh 22             # 设置准入-AUTO
 #   ./test_grpc.sh write         # 测试写接口（需离线模式）
 #   ./test_grpc.sh stream        # 测试流式接口
 # ============================================================================
@@ -208,9 +209,18 @@ test_19() { grpc_call "查询准入开关" \
     admission.proto admission.AdmissionService GetAdmissionSwitch \
     '{}' ''; }
 
-test_20() { grpc_call "设置准入开关(开启)" \
+# 准入设置: 20=关闭, 21=开启, 22=自动
+test_20() { grpc_call "设置准入(关闭/OFF)" \
     admission.proto admission.AdmissionService UpdateAdmissionSwitch \
-    '{"enabled": true}' ''; }
+    '{"mode": 0}' ''; }
+
+test_21() { grpc_call "设置准入(开启/ON)" \
+    admission.proto admission.AdmissionService UpdateAdmissionSwitch \
+    '{"mode": 1}' ''; }
+
+test_22() { grpc_call "设置准入(自动/AUTO)" \
+    admission.proto admission.AdmissionService UpdateAdmissionSwitch \
+    '{"mode": 2}' ''; }
 
 # ── write tests (should be denied in online mode) ──────────────────────
 
@@ -277,10 +287,10 @@ show_menu() {
     echo -e "${CYAN}║${NC}  ${YELLOW}只读接口（始终可用）${NC}                                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   1) AgentStatus      9)  ExtortPolicy    17) PolicyWatch(流)${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   2) Config          10)  TrustDir       18) Alert(流)       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   3) ProcessPolicy   11)  VirtualPort    19) AdmissionSwitch ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   4) PeripheralPolicy 12) BackupList     20) UpdateAdmission ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   5) IpBlockPolicy   13)  JumpStatus                       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   6) IpBlackPolicy   14)  ProcessList                      ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   3) ProcessPolicy   11)  VirtualPort    19) 查询准入        ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   4) PeripheralPolicy 12) BackupList     20) 准入-OFF        ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   5) IpBlockPolicy   13)  JumpStatus     21) 准入-ON         ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   6) IpBlackPolicy   14)  ProcessList    22) 准入-AUTO       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   7) OutreachRules   15)  PortList                         ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   8) DirPolicy       16)  UsbDeviceList                    ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
@@ -342,6 +352,8 @@ case "${1:-menu}" in
                 18) test_18 ;;
                 19) test_19 ;;
                 20) test_20 ;;
+                21) test_21 ;;
+                22) test_22 ;;
                 w1) test_w1 ;;
                 w2) test_w2 ;;
                 w3) test_w3 ;;
@@ -355,7 +367,7 @@ case "${1:-menu}" in
                 w11) test_w11 ;; w12) test_w12 ;; w13) test_w13 ;;
                 all)
                     echo -e "\n${GREEN}── 测试全部只读接口 ──${NC}"
-                    for i in $(seq 1 20); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
+                    for i in $(seq 1 22); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
                     print_result
                     ;;
                 write)
@@ -381,20 +393,50 @@ case "${1:-menu}" in
                     ;;
                 full)
                     echo -e "\n${GREEN}── 测试全部接口 ──${NC}"
-                    for i in $(seq 1 20); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
+                    for i in $(seq 1 22); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
                     test_17; test_18
                     test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11; test_w12; test_w13
                     print_result
                     ;;
+	                \?|h|help)
+	                    echo ""
+	                    echo -e "${CYAN}── 只读接口 ──${NC}"
+	                    echo "   1) AgentStatus       2) Config"
+	                    echo "   3) ProcessPolicy     4) PeripheralPolicy"
+	                    echo "   5) IpBlockPolicy     6) IpBlackPolicy"
+	                    echo "   7) OutreachRules     8) DirPolicy"
+	                    echo "   9) ExtortPolicy     10) TrustDir"
+	                    echo "  11) VirtualPort      12) BackupList"
+	                    echo "  13) JumpStatus       14) ProcessList"
+	                    echo "  15) PortList         16) UsbDeviceList"
+	                    echo "  17) PolicyWatch(流)  18) Alert(流)"
+	                    echo "  19) 查询准入         20) 准入-OFF"
+	                    echo "  21) 准入-ON          22) 准入-AUTO"
+	                    echo ""
+	                    echo -e "${CYAN}── 写接口（仅离线可用）──${NC}"
+	                    echo "  w1) UpdateConfig       w2) UpdateProcessPolicy"
+	                    echo "  w3) UpdatePeripheral   w4) UpdateIpBlockPolicy"
+	                    echo "  w5) SubmitTask         w6) ExecuteIpJump"
+	                    echo "  w7) ExecutePwJump      w8) CreateBackup"
+	                    echo "  w9) RestoreBackup    w10) UpdateTrustDir"
+	                    echo "  w11) UpdateVirtualPort  w12) UpdateDirPolicy"
+	                    echo "  w13) UpdateExtortPolicy"
+	                    echo ""
+	                    echo -e "${CYAN}── 快捷命令 ──${NC}"
+	                    echo "  all    测试全部只读    write   测试全部写"
+	                    echo "  stream 测试全部流式    full    测试全部"
+	                    echo "  ?|h    显示此帮助     q       退出"
+	                    echo ""
+	                    ;;
                 q|Q|quit|exit) echo "退出"; break ;;
-                *) echo -e "${RED}无效选择: $choice${NC}" ;;
+		*) echo -e "${RED}无效选择: $choice${NC} (输入 ? 查看帮助)" ;;
             esac
         done
         ;;
 
     # Direct invocation mode
     all)
-        for i in $(seq 1 20); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
+        for i in $(seq 1 22); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
         print_result
         ;;
     write)
@@ -415,28 +457,47 @@ case "${1:-menu}" in
         echo -e "${GREEN}监听结束${NC}"
         ;;
     full)
-        for i in $(seq 1 20); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
+        for i in $(seq 1 22); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
         test_17; test_18
         test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11; test_w12; test_w13
         print_result
         ;;
+    ?|help|-h|--help)
+        echo "用法: $0 [选项]"
+        echo ""
+        echo "  无参数          交互式菜单"
+        echo "  ?|help|-h      显示此帮助"
+        echo "  all            测试全部只读接口 (1-22)"
+        echo "  write          测试全部写接口 (w1-w13, 需离线模式)"
+        echo "  stream          测试流式接口 (17-18)"
+        echo "  full            测试全部接口（读写+流）"
+        echo "  listen [秒]     监听告警流（默认300秒, Ctrl+C停止）"
+        echo "  1-22            测试指定编号的接口"
+        echo "  w1-w13          测试指定编号的写接口"
+        echo "  menu            显示交互式菜单"
+        echo ""
+        echo "示例:"
+        echo "  $0              进入交互式菜单"
+        echo "  $0 1            直接测试 AgentStatus"
+        echo "  $0 all          测试全部只读接口"
+        echo "  $0 write        测试全部写接口"
+        echo "  $0 listen 60    监听告警流60秒"
+        echo ""
+        echo "配置:"
+        echo "  GRPC_ADDR        目标地址（默认 127.0.0.1:50051）"
+        echo "  PROTO_DIR        proto 文件目录（自动检测）"
+        ;;
+
     *)
         # Treat as a number: run that specific test
         if [[ "$choice" =~ ^w[1-9]$ ]] || [[ "$choice" =~ ^w1[0-3]$ ]]; then
             "test_$choice"
-        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le 20 ]; then
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le 22 ]; then
             "test_$(printf '%02d' "$choice")"
         else
-            echo "用法: $0 [all|write|stream|full|<1-18>|w1-w5|menu]"
-            echo ""
-            echo "  无参数    交互式菜单"
-            echo "  all      测试全部只读接口 (1-20)"
-            echo "  write    测试全部写接口 (w1-w13)"
-            echo "  stream   测试流式接口 (17-18)"
-            echo "  full     测试全部接口"
-            echo "  1-20     测试指定编号的只读接口"
-            echo "  w1-w13   测试指定编号的写接口"
-            echo "  menu     显示交互式菜单"
+            echo "无效参数: $1"
+            echo "用法: $0 [?|help|all|write|stream|full|listen|<1-22>|w1-w13|menu]"
+            echo "试试: $0 ?  查看完整帮助"
             exit 1
         fi
         print_result

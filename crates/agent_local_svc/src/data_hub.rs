@@ -9,6 +9,14 @@ use grpc_gateway::jump::JumpStatus;
 // Re-export from grpc_gateway so downstream code keeps working
 pub use grpc_gateway::agent_mode::{AgentMode, AGENT_MODE, ADMISSION_NETWORK_ANOMALY, require_offline, set_online, set_offline};
 
+/// 全局 token 缓存，token 获取时由 online 模块更新，check_server_reachable 读取。
+static CURRENT_TOKEN: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+
+/// 由 online 模块在获取到 token 时调用，供 check_server_reachable 使用。
+pub fn update_token(token: String) {
+    *CURRENT_TOKEN.lock().unwrap() = Some(token);
+}
+
 /// 断线时调用：尝试切离线 + 如果真正切了且准入模式是 AUTO 则重新触发自动检测。
 /// 调用方不需要关心阈值——set_offline 内部会累计失败次数。
 pub fn set_offline_and_check_admission() {
@@ -26,80 +34,64 @@ pub fn set_offline_and_check_admission() {
     }
 }
 
-/// 检测服务器是否可达：向 /v1/auth 发送认证请求。
-/// 统一的连通性探测，被自动检测和连通性探针共用。
+/// 检测服务器是否可达：向 /v1/getinfo 发送空请求，验证返回 code=="000000"。
+/// 统一的连通性探测，被 gRPC handler 和 admission 自动检测共用。
 pub async fn check_server_reachable() -> bool {
-    let (base_url, body) = {
+    let base_url = {
         let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
-        let base_url = format!("https://{}:{}", cfg.server_ip, cfg.server_port);
-        let body = format!(
-            r#"{{\"uid\":\"{}\",\"macid\":\"{}\",\"ip\":\"{}\",\"ver\":\"{}\",\"type\":1,\"os\":\"{}\",\"memsize\":\"{}\",\"cpu\":\"{}\",\"hdsize\":\"{}\",\"asstarttime\":\"0\",\"osstarttime\":\"0\",\"auth\":\"{}\",\"userid\":\"{}\",\"host_name\":\"{}\",\"mod_ver\":\"{}\",\"arch_type\":{}}}"#,
-            cfg.dev_uid, cfg.macid, cfg.ips, cfg.ver, cfg.os, cfg.memsize, cfg.cpu, cfg.hdsize,
-            cfg.auth, cfg.user_id, cfg.host_name, cfg.mod_ver, cfg.arch_type
-        );
-        (base_url, body)
-    }; // cfg dropped here, before any .await
+        format!("https://{}:{}", cfg.server_ip, cfg.server_port)
+    };
 
     let net_client = match net_client::core::NetClient::new(Some(base_url.clone()), true) {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(e) => {
+            log_info!("[connectivity] 创建 NetClient 失败: {}", e);
+            return false;
+        }
     };
 
-    let url = format!("{}/v1/auth", base_url);
-    match net_client.post_data_async(&url, &body, tokio::time::Duration::from_secs(10), None).await {
-        Ok(_) => true,
+    let token = CURRENT_TOKEN.lock().unwrap().clone();
+    let token_str = token.as_deref();
+
+    let url = format!("{}/v1/getinfo", base_url);
+    log_info!("[connectivity] 探测 {} (token={})", url, if token_str.is_some() { "有" } else { "无" });
+
+    match net_client.post_data_async(&url, "", tokio::time::Duration::from_secs(2), token_str).await {
+        Ok(resp) => {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp) {
+                let reachable = parsed["code"].as_str() == Some("000000");
+                log_info!("[connectivity] 探测结果: {} (code={})",
+                    if reachable { "可达" } else { "不可达" },
+                    parsed["code"].as_str().unwrap_or("?"));
+                reachable
+            } else {
+                log_info!("[connectivity] /v1/getinfo 响应解析失败: {}", &resp[..resp.len().min(200)]);
+                false
+            }
+        }
         Err(e) => {
-            log_info!("[connectivity] 服务器不可达: {}", e);
+            log_info!("[connectivity] {} 不可达: {}", url, e);
             false
         }
     }
 }
 
-/// 启动统一的连通性探针（短间隔主动探测，驱动在线/离线/网络异常状态）。
-/// 应在 main 启动时调用一次。仅在 [GRPC] ENABLED=1 时生效。
-pub fn start_connectivity_monitor() {
-    let grpc_enabled = {
-        let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
-        cfg.grpc_enabled
-    };
-    if !grpc_enabled {
-        log_info!("[connectivity] [GRPC] ENABLED != 1，跳过连通性探针");
-        return;
+/// 后台探测防重入标记：确保同一时刻只有一个探测任务在跑。
+static PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 由 gRPC handler 调用：触发后台连通性探测（不阻塞，立即返回）。
+/// handler 读 AGENT_MODE / ADMISSION_NETWORK_ANOMALY 缓存值，响应零延迟。
+pub fn trigger_connectivity_probe() {
+    if PROBE_RUNNING.swap(true, Ordering::Relaxed) {
+        return; // 已有探测在跑，跳过
     }
-
     tokio::spawn(async move {
-        // 启动后稍等，让系统先完成初始化
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-        let probe_interval = {
-            let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
-            // 如果配置了 retry_interval 就用它，否则默认 10 秒
-            let interval = cfg.admission.retry_interval;
-            if interval > 0 { interval } else { 10 }
-        };
-
-        log_info!("[connectivity] 连通性探针已启动，探测间隔 {} 秒", probe_interval);
-
-        loop {
-            if check_server_reachable().await {
-                set_online();
-            } else if set_offline() {
-                // 真正触发了切离线（连续失败达阈值），检查是否需要触发准入自动检测
-                let admission_enabled = {
-                    let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
-                    cfg.admission.enabled
-                };
-                if admission_enabled
-                    && ADMISSION_MODE.load(Ordering::Relaxed) == 2
-                    && !ADMISSION_DETECTING.load(Ordering::Relaxed)
-                {
-                    log_info!("[connectivity] 断线且 AUTO 模式，启动自动检测");
-                    let hub = AgentDataHub::new();
-                    hub.start_auto_detect();
-                }
-            }
-            tokio::time::sleep(tokio::time::Duration::from_secs(probe_interval as u64)).await;
+        if check_server_reachable().await {
+            set_online();
+        } else {
+            let _ = set_offline();
         }
+        PROBE_RUNNING.store(false, Ordering::Relaxed);
     });
 }
 

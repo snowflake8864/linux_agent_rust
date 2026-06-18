@@ -11,7 +11,7 @@ use chrono::Utc;
 use logging::log_info;
 use config::net_info::NETINFO_CONFIG;
 use grpc_gateway::agent_mode::set_online;
-use agent_local_svc::set_offline_and_check_admission;
+use agent_local_svc::{set_offline_and_check_admission, update_token};
 #[derive(Deserialize)]
 #[allow(dead_code)]
 struct AuthResponse {
@@ -161,6 +161,7 @@ impl StartOnline for BootManager {
                             continue;
                         }
                         self.set_token(token.clone()).await;
+                        update_token(token.clone()); // 同步到全局缓存，供 check_server_reachable 使用
                         set_online(); // 服务器连通，切换为在线模式
                         log_info!("Token 已成功发送！");
                         log_info!("开始监听 host_is_offline 信号和系统资源...");
