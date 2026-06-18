@@ -146,9 +146,6 @@ async fn main() -> std::io::Result<()> {
     }
     log_info!("当前模式: {}", if is_offline { "离线" } else { "在线" });
 
-    // 启动统一的连通性探针（主动探测，驱动在线/离线/网络异常）
-    agent_local_svc::start_connectivity_monitor();
-
     // 创建 Netlink 套接字（在离线模式下仍尝试创建，供内核事件使用）
     let nl_sock = NlSockInfo::create_socket()
         .map_err(|e| {

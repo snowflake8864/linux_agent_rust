@@ -4,7 +4,7 @@ use tonic::{Request, Response, Status};
 use grpc_gateway::agent_status::{
     agent_status_service_server::AgentStatusService, AgentStatus, CpuMemInfo, ModuleStatus,
 };
-use crate::data_hub::{AgentDataHub, AGENT_MODE, AgentMode};
+use crate::data_hub::{AgentDataHub, AGENT_MODE, AgentMode, trigger_connectivity_probe};
 
 pub struct AgentStatusServiceImpl {
     pub data_hub: Arc<AgentDataHub>,
@@ -16,6 +16,8 @@ impl AgentStatusService for AgentStatusServiceImpl {
         &self,
         _: Request<grpc_gateway::common::Empty>,
     ) -> Result<Response<AgentStatus>, Status> {
+        // 触发后台探测（不阻塞），读缓存立即返回
+        trigger_connectivity_probe();
         let is_online = AGENT_MODE.load(std::sync::atomic::Ordering::Relaxed) == AgentMode::Online as u8;
         let cfg = self.data_hub.get_config();
 

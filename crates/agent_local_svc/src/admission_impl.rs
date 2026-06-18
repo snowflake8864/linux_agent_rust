@@ -5,7 +5,7 @@ use grpc_gateway::admission::{
     admission_service_server::AdmissionService,
     Empty, AdmissionMode, AdmissionSwitchStatus, AdmissionSwitchRequest, AdmissionSwitchResponse,
 };
-use crate::data_hub::{AgentDataHub, ADMISSION_MODE, ADMISSION_EFFECTIVE, ADMISSION_DETECTING, ADMISSION_NETWORK_ANOMALY};
+use crate::data_hub::{AgentDataHub, ADMISSION_MODE, ADMISSION_EFFECTIVE, ADMISSION_DETECTING, ADMISSION_NETWORK_ANOMALY, trigger_connectivity_probe};
 
 pub struct AdmissionServiceImpl {
     pub data_hub: Arc<AgentDataHub>,
@@ -18,6 +18,9 @@ impl AdmissionService for AdmissionServiceImpl {
         &self,
         _: Request<Empty>,
     ) -> Result<Response<AdmissionSwitchStatus>, Status> {
+        // 触发后台探测（不阻塞），读缓存立即返回
+        trigger_connectivity_probe();
+
         let cfg = self.data_hub.get_config();
         let enabled = cfg.admission.enabled;
         let mode = ADMISSION_MODE.load(std::sync::atomic::Ordering::Relaxed);
