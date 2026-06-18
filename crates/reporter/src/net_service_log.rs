@@ -337,7 +337,7 @@ impl NetServiceLogHandler {
                         Duration::from_secs(10),
                         self.boot_manager.get_token().await.as_deref(),
                     ).await {
-                        Ok(response) => { for log in &vec_net_log { crate::broadcast_net_log(log); } },
+                        Ok(response) => { /* net log 不广播到 gRPC alert stream */ },
                         Err(err) => eprintln!("发送指标失败: {}", err),
                     }
 
@@ -562,7 +562,7 @@ impl NetServiceLogHandler {
                         Duration::from_secs(10),
                         self.boot_manager.get_token().await.as_deref(),
                     ).await {
-                        Ok(response) => { for log in &vec_net_log { crate::broadcast_net_log(log); } },
+                        Ok(response) => { /* net log 不广播到 gRPC alert stream */ },
                         Err(err) => eprintln!("发送指标失败: {}", err),
                     }
 

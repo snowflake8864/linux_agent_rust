@@ -49,12 +49,22 @@ pub struct AuditLogInfo {
 }
 
 /// Convert AuditLogInfo to AlertEvent and broadcast to gRPC AlertService.
-/// n_type mapping: 9003-9006→DEVICE, 4001/4003→PROCESS, rest→UNKNOWN.
+/// 只广播三类：进程告警、文件审计、USB插拔。其余 n_type 不推 gRPC。
+/// SSH 登录由 broadcast_ssh_log 单独处理。
 pub fn broadcast_audit_log(log: &AuditLogInfo) {
     let alert_type = match log.n_type {
-        9003 | 9004 | 9005 | 9006 => 3, // DEVICE_ALERT
-        4001 | 4003 => 1,               // PROCESS_ALERT
-        _ => 0,                          // ALERT_UNKNOWN
+        // 进程告警
+        1001..=1002 | 1101..=1104 => 1, // PROCESS_ALERT
+        // 模块告警
+        1201..=1202 | 1301..=1302 => 1, // PROCESS_ALERT
+        // 防篡改-文件夹
+        2001..=2105 => 2, // FILE_ALERT
+        // 防篡改-文件
+        3001..=3105 => 2, // FILE_ALERT
+        // 外设告警
+        9003..=9008 => 3, // DEVICE_ALERT
+        // 不在白名单内的不推 gRPC
+        _ => return,
     };
     grpc_gateway::notify::broadcast_alert(grpc_gateway::alert::AlertEvent {
         alert_id: uuid::Uuid::new_v4().to_string(),
