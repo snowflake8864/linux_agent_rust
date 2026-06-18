@@ -7,11 +7,14 @@ use grpc_gateway::extort_policy::ExtortProtectRule;
 use grpc_gateway::jump::JumpStatus;
 
 // Re-export from grpc_gateway so downstream code keeps working
-pub use grpc_gateway::agent_mode::{AgentMode, AGENT_MODE, require_offline, set_online, set_offline};
+pub use grpc_gateway::agent_mode::{AgentMode, AGENT_MODE, ADMISSION_NETWORK_ANOMALY, require_offline, set_online, set_offline};
 
-/// 断线时调用：设置离线 + 如果准入模式是 AUTO 则重新触发自动检测
+/// 断线时调用：尝试切离线 + 如果真正切了且准入模式是 AUTO 则重新触发自动检测。
+/// 调用方不需要关心阈值——set_offline 内部会累计失败次数。
 pub fn set_offline_and_check_admission() {
-    set_offline();
+    if !set_offline() {
+        return; // 还没到阈值，未真正切离线
+    }
     let admission_enabled = {
         let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
         cfg.admission.enabled
@@ -23,8 +26,9 @@ pub fn set_offline_and_check_admission() {
     }
 }
 
-/// 检测服务器是否可达：向 /v1/auth 发送认证请求
-async fn check_server_reachable() -> bool {
+/// 检测服务器是否可达：向 /v1/auth 发送认证请求。
+/// 统一的连通性探测，被自动检测和连通性探针共用。
+pub async fn check_server_reachable() -> bool {
     let (base_url, body) = {
         let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
         let base_url = format!("https://{}:{}", cfg.server_ip, cfg.server_port);
@@ -45,10 +49,58 @@ async fn check_server_reachable() -> bool {
     match net_client.post_data_async(&url, &body, tokio::time::Duration::from_secs(10), None).await {
         Ok(_) => true,
         Err(e) => {
-            log_info!("[admission] 服务器不可达: {}", e);
+            log_info!("[connectivity] 服务器不可达: {}", e);
             false
         }
     }
+}
+
+/// 启动统一的连通性探针（短间隔主动探测，驱动在线/离线/网络异常状态）。
+/// 应在 main 启动时调用一次。仅在 [GRPC] ENABLED=1 时生效。
+pub fn start_connectivity_monitor() {
+    let grpc_enabled = {
+        let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
+        cfg.grpc_enabled
+    };
+    if !grpc_enabled {
+        log_info!("[connectivity] [GRPC] ENABLED != 1，跳过连通性探针");
+        return;
+    }
+
+    tokio::spawn(async move {
+        // 启动后稍等，让系统先完成初始化
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+        let probe_interval = {
+            let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
+            // 如果配置了 retry_interval 就用它，否则默认 10 秒
+            let interval = cfg.admission.retry_interval;
+            if interval > 0 { interval } else { 10 }
+        };
+
+        log_info!("[connectivity] 连通性探针已启动，探测间隔 {} 秒", probe_interval);
+
+        loop {
+            if check_server_reachable().await {
+                set_online();
+            } else if set_offline() {
+                // 真正触发了切离线（连续失败达阈值），检查是否需要触发准入自动检测
+                let admission_enabled = {
+                    let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
+                    cfg.admission.enabled
+                };
+                if admission_enabled
+                    && ADMISSION_MODE.load(Ordering::Relaxed) == 2
+                    && !ADMISSION_DETECTING.load(Ordering::Relaxed)
+                {
+                    log_info!("[connectivity] 断线且 AUTO 模式，启动自动检测");
+                    let hub = AgentDataHub::new();
+                    hub.start_auto_detect();
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(probe_interval as u64)).await;
+        }
+    });
 }
 
 // ── 准入检测全局状态 ──
@@ -59,8 +111,7 @@ pub static ADMISSION_MODE: AtomicU8 = AtomicU8::new(0);
 pub static ADMISSION_EFFECTIVE: AtomicU8 = AtomicU8::new(0);
 /// 是否正在自动检测中
 pub static ADMISSION_DETECTING: AtomicBool = AtomicBool::new(false);
-/// 网络是否异常
-pub static ADMISSION_NETWORK_ANOMALY: AtomicBool = AtomicBool::new(false);
+/// 网络是否异常 — 由 grpc_gateway::agent_mode::ADMISSION_NETWORK_ANOMALY 统一管理，这里 re-export
 
 /// Global jump status — updated by execute_ip_jump / execute_pw_jump.
 pub static JUMP_STATUS: LazyLock<Mutex<JumpStatus>> = LazyLock::new(|| Mutex::new(JumpStatus::default()));

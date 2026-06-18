@@ -19,7 +19,7 @@ pub mod stub_handlers;
 
 // Re-exports
 pub use data_hub::{AgentDataHub, AgentMode, AGENT_MODE, require_offline, set_online, set_offline,
-    set_offline_and_check_admission,
+    set_offline_and_check_admission, start_connectivity_monitor, check_server_reachable,
     ADMISSION_MODE, ADMISSION_EFFECTIVE, ADMISSION_DETECTING, ADMISSION_NETWORK_ANOMALY};
 pub use config_impl::ConfigServiceImpl;
 pub use process_policy_impl::ProcessPolicyServiceImpl;

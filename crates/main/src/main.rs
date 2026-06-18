@@ -12,7 +12,7 @@ use netlink::netlink::NlSockInfo;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use config::net_info::NETINFO_CONFIG;
-use grpc_gateway::agent_mode::{set_online, set_offline};
+use grpc_gateway::agent_mode::{AgentMode, AGENT_MODE, ADMISSION_NETWORK_ANOMALY};
 use udisk::{StartUsbService, StartUsbHotplugHandler};
 use docker::StartDockerMonitor;
 use virus_scan_grpc::StartVirusScanGrpcService;
@@ -136,14 +136,18 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    // 检查是否为离线模式
+    // 检查是否为离线模式（配置指定，直接设置，不经过阈值）
     let is_offline = NETINFO_CONFIG.lock().unwrap().is_offline_mode;
     if is_offline {
-        set_offline();
+        AGENT_MODE.store(AgentMode::Offline as u8, std::sync::atomic::Ordering::Relaxed);
+        ADMISSION_NETWORK_ANOMALY.store(true, std::sync::atomic::Ordering::Relaxed);
     } else {
-        set_online();
+        AGENT_MODE.store(AgentMode::Online as u8, std::sync::atomic::Ordering::Relaxed);
     }
     log_info!("当前模式: {}", if is_offline { "离线" } else { "在线" });
+
+    // 启动统一的连通性探针（主动探测，驱动在线/离线/网络异常）
+    agent_local_svc::start_connectivity_monitor();
 
     // 创建 Netlink 套接字（在离线模式下仍尝试创建，供内核事件使用）
     let nl_sock = NlSockInfo::create_socket()

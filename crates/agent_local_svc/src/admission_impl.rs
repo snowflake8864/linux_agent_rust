@@ -27,6 +27,8 @@ impl AdmissionService for AdmissionServiceImpl {
 
         let message = if !enabled {
             "准入功能未启用".to_string()
+        } else if detecting && network_anomaly {
+            "网络异常，等待重试".to_string()
         } else if detecting {
             "正在自动检测中".to_string()
         } else if network_anomaly {
