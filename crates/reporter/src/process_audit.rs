@@ -255,12 +255,42 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
         }
 
         let flags = proc_info.flags_parsed();
-        if flags.level > 0  && proc_info.type_ > 0 {
+
+        // 应用层策略-内核模式一致性校验与补偿
+        // 策略由应用层下发给内核，上报时应以应用层配置为准
+        let mut n_type = proc_info.type_ as u16;
+        let mut n_level = flags.level as u32;
+
+        if cfg.proc_protect {
+            // 保护模式下，内核应返回 level=3, type∈{1101,1102}
+            if n_level == 2 || n_type == 1001 || n_type == 1002 {
+                log_error!(
+                    "策略不一致: 应用层保护模式(proc_protect=true), 但内核返回 type={}, level={}, path={}",
+                    n_type, n_level, p_dir
+                );
+                if n_type == 1001 { n_type = 1101; }
+                else if n_type == 1002 { n_type = 1102; }
+                n_level = 3;
+            }
+        } else {
+            // 监控模式下，内核应返回 level=2, type∈{1001,1002}
+            if n_level == 3 || n_type == 1101 || n_type == 1102 {
+                log_error!(
+                    "策略不一致: 应用层监控模式(proc_protect=false), 但内核返回 type={}, level={}, path={}",
+                    n_type, n_level, p_dir
+                );
+                if n_type == 1101 { n_type = 1001; }
+                else if n_type == 1102 { n_type = 1002; }
+                n_level = 2;
+            }
+        }
+
+        if n_level > 0 && n_type > 0 {
             loginfo.push(AuditLogInfo {
                 file_path: Some(p_dir.clone()),
                 md5: Some(hash.clone()),
-                n_type: proc_info.type_ as u16,
-                n_level: flags.level as u32,
+                n_type,
+                n_level,
                 n_time: 1692760326 as u64,
                 rename_dir: None,
                 notice_remark: None,
