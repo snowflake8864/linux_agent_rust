@@ -3,11 +3,12 @@
 # gRPC 接口测试脚本 — 可手动选择要测试的接口
 # 用法:
 #   ./test_grpc.sh              # 交互式菜单选择
-#   ./test_grpc.sh <编号>        # 直接测试指定接口
-#   ./test_grpc.sh all           # 测试全部只读接口
-#   ./test_grpc.sh 22             # 设置准入-AUTO
+#   ./test_grpc.sh <编号>        # 直接测试指定接口 (1-28, s1)
+#   ./test_grpc.sh all           # 测试全部只读接口 (1-28)
 #   ./test_grpc.sh write         # 测试写接口（需离线模式）
-#   ./test_grpc.sh stream        # 测试流式接口
+#   ./test_grpc.sh stream        # 测试流式接口 (17, 18, s1)
+#   ./test_grpc.sh full          # 测试全部接口（读写+流）
+#   ./test_grpc.sh listen [秒]   # 监听告警流
 # ============================================================================
 
 GRPC_ADDR="${GRPC_ADDR:-127.0.0.1:50051}"
@@ -26,7 +27,7 @@ fail=0
 # ── helpers ────────────────────────────────────────────────────────────
 
 grpc_call() {
-    local desc="$1" proto="$2" svc="$3" method="$4" data="${5:-{\}}" extra_protos="${6:-}"
+    local desc="$1" proto="$2" svc="$3" method="$4" data="${5:-{\}}" extra_protos="${6:-}" max_time="${7:-10}"
     local all_protos="common.proto $proto $extra_protos"
     local proto_args=""
     for p in $all_protos; do
@@ -39,7 +40,7 @@ grpc_call() {
         -import-path "$PROTO_DIR" \
         $proto_args \
         -d "$data" \
-        -connect-timeout 3 -max-time 10 \
+        -connect-timeout 3 -max-time "$max_time" \
         "$GRPC_ADDR" "$svc/$method" 2>&1); then
         echo -e "${GREEN}PASS${NC}"
         echo "$output" | sed 's/^/  /'
@@ -119,7 +120,6 @@ stream_test() {
         -connect-timeout 3 \
         "$GRPC_ADDR" "$svc/$method" 2>&1) && exit_code=0 || exit_code=$?
     if [ "$exit_code" = "124" ] || [ "$exit_code" = "0" ]; then
-        # timeout (124) or clean exit (0) are both OK for streaming
         if [ -n "$output" ]; then
             echo -e "${GREEN}PASS${NC} (收到事件)"
             echo "$output" | sed 's/^/  /'
@@ -143,7 +143,7 @@ print_result() {
     echo -e "=============================================="
 }
 
-# ── test groups ────────────────────────────────────────────────────────
+# ── 只读接口测试 (1-28) ─────────────────────────────────────────────────
 
 test_01() { grpc_call "Agent状态(含is_online/protection_days)" \
     agent_status.proto agent_status.AgentStatusService GetAgentStatus; }
@@ -181,10 +181,10 @@ test_11() { grpc_call "虚拟端口规则" \
 test_12() { grpc_call "备份列表" \
     backup.proto backup.BackupService GetBackupList; }
 
-test_13() { grpc_call "跳变状态" \
+test_13() { grpc_call "跳变状态(读内存缓存,不请求服务器)" \
     jump.proto jump.JumpService GetJumpStatus; }
 
-test_14() { grpc_call "进程列表(top 10)" \
+test_14() { grpc_call "进程列表(top 10, 按PID排序)" \
     data_query.proto data_query.DataQueryService GetProcessList \
     '{"limit": 10, "sort_by": "pid"}' \
     "peripheral_policy.proto"; }
@@ -201,7 +201,7 @@ test_17() { stream_test "策略变更订阅" \
     policy_watch.proto policy_watch.PolicyWatchService SubscribePolicyChanges \
     '{}' 3; }
 
-test_18() { stream_test "告警订阅" \
+test_18() { stream_test "告警订阅(全部类型)" \
     alert.proto alert.AlertService SubscribeAlerts \
     '{"type": 0}' 3; }
 
@@ -222,7 +222,59 @@ test_22() { grpc_call "设置准入(自动/AUTO)" \
     admission.proto admission.AdmissionService UpdateAdmissionSwitch \
     '{"mode": 2}' ''; }
 
-# ── write tests (should be denied in online mode) ──────────────────────
+test_23() { grpc_call "可执行文件列表(含策略状态,MD5去重)" \
+    data_query.proto data_query.DataQueryService GetExecutableList \
+    '{}' "peripheral_policy.proto" 60; }
+
+test_24() { grpc_call "漏洞扫描上报(测试数据)" \
+    vuln_scan.proto vuln_scan.VulnScanService PutVulnScan \
+    '{"start_at":"2026-06-02 09:00:00","end_at":"2026-06-02 09:01:00","vuln_total":1,"vuln_list":[{"title":"CVE-TEST","severity":"LOW","file_path":"/usr/bin/test"}]}'; }
+
+# 历史告警日志查询(分页)：客户端初始化时调用一次补读历史，随后用 SubscribeAlerts 接收新告警
+test_25() { grpc_call "历史告警日志(全部/分页)" \
+    alert.proto alert.AlertService GetAlertLogs \
+    '{"handle_status": -1, "page": 1, "page_size": 20}'; }
+
+test_26() { grpc_call "历史告警日志(未处理)" \
+    alert.proto alert.AlertService GetAlertLogs \
+    '{"handle_status": 0, "page": 1, "page_size": 20}'; }
+
+# 告警处置：标记为已处理(handle_status=1)
+test_27() { grpc_call "告警处置(标记已处理)" \
+    alert.proto alert.AlertService HandleAlert \
+    '{"id": 1, "handle_status": 1, "handle_user": "admin"}'; }
+
+# 告警处置：标记为已忽略(handle_status=2)
+test_28() { grpc_call "告警处置(标记已忽略)" \
+    alert.proto alert.AlertService HandleAlert \
+    '{"id": 1, "handle_status": 2, "handle_user": "admin"}'; }
+
+# ── 流式接口测试 ────────────────────────────────────────────────────────
+
+# 病毒扫描双向流 — 发 StartScanRequest 并等待响应，测连通性
+test_s1() {
+    local desc="病毒扫描-启动测连通性(VirusScan/StreamControl)"
+    echo -ne "${CYAN}[TEST]${NC} $desc ... "
+    local output exit_code
+    output=$(echo '{"start_scan":{"target":"/tmp","include_script":false,"full_disk":false}}' | \
+        timeout 6 grpcurl -plaintext -emit-defaults \
+        -import-path "$PROTO_DIR" \
+        -proto common.proto -proto virus_scan.proto \
+        -d @ \
+        -connect-timeout 3 \
+        "$GRPC_ADDR" virus_scan.VirusScanService/StreamControl 2>&1) && exit_code=0 || exit_code=$?
+    if [ "$exit_code" = "124" ] || [ "$exit_code" = "0" ]; then
+        echo -e "${GREEN}PASS${NC}"
+        echo "$output" | sed 's/^/  /'
+        ((pass++))
+    else
+        echo -e "${RED}FAIL${NC} (exit=$exit_code)"
+        echo "$output" | sed 's/^/  /'
+        ((fail++))
+    fi
+}
+
+# ── 写接口测试（在线应全部返回 PERMISSION_DENIED）─────────────────────
 
 test_w1() { grpc_expect_perm_denied "更新配置（在线拒绝）" \
     config.proto config.ConfigService UpdateConfig \
@@ -244,11 +296,11 @@ test_w5() { grpc_expect_perm_denied "下发任务（在线拒绝）" \
     task_local.proto task_local.LocalTaskService SubmitTask \
     '{"task_ids": [6, 19]}'; }
 
-test_w6() { grpc_expect_perm_denied "IP跳变（在线拒绝）" \
+test_w6() { grpc_expect_perm_denied "IP跳变（在线拒绝;成功后自动刷新jump.db）" \
     jump.proto jump.JumpService ExecuteIpJump \
     '{"gateway":"192.168.1.1","source_ip":"10.0.0.5","target_ip":"10.0.0.6","mode":1}'; }
 
-test_w7() { grpc_expect_perm_denied "密码跳变（在线拒绝）" \
+test_w7() { grpc_expect_perm_denied "密码跳变（在线拒绝;成功后自动刷新jump.db）" \
     jump.proto jump.JumpService ExecutePwJump \
     '{"new_password":"test123"}'; }
 
@@ -276,7 +328,19 @@ test_w13() { grpc_expect_perm_denied "更新勒索保护策略（在线拒绝）
     extort_policy.proto extort_policy.ExtortPolicyService UpdateExtortPolicy \
     '{"rules": [{"file_type":"doc","typ":1}]}'; }
 
-# ── menu ───────────────────────────────────────────────────────────────
+test_w14() { grpc_expect_perm_denied "进程防护模式（在线拒绝）" \
+    protection_mode.proto protection_mode.ProcessDefenseService UpdateProcessDefenseMode \
+    '{"mode": 2}'; }
+
+test_w15() { grpc_expect_perm_denied "外设防护模式（在线拒绝）" \
+    protection_mode.proto protection_mode.PeripheralDefenseService UpdatePeripheralDefenseMode \
+    '{"mode": 2}'; }
+
+test_w16() { grpc_expect_perm_denied "删除备份（在线拒绝）" \
+    backup.proto backup.BackupService DeleteBackup \
+    '{"backup_id":"test_bak"}'; }
+
+# ── 菜单 ───────────────────────────────────────────────────────────────
 
 show_menu() {
     echo ""
@@ -286,38 +350,57 @@ show_menu() {
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}只读接口（始终可用）${NC}                                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   1) AgentStatus      9)  ExtortPolicy    17) PolicyWatch(流)${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   2) Config          10)  TrustDir       18) Alert(流)       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   3) ProcessPolicy   11)  VirtualPort    19) 查询准入        ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   4) PeripheralPolicy 12) BackupList     20) 准入-OFF        ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   5) IpBlockPolicy   13)  JumpStatus     21) 准入-ON         ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   6) IpBlackPolicy   14)  ProcessList    22) 准入-AUTO       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   7) OutreachRules   15)  PortList                         ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   8) DirPolicy       16)  UsbDeviceList                    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   2) Config          10)  TrustDir        18) Alert(流)       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   3) ProcessPolicy   11)  VirtualPort     19) 查询准入        ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   4) PeripheralPolicy 12) BackupList      20) 准入-OFF        ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   5) IpBlockPolicy   13)  JumpStatus      21) 准入-ON         ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   6) IpBlackPolicy   14)  ProcessList     22) 准入-AUTO       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   7) OutreachRules   15)  PortList        23) ExecutableList  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   8) DirPolicy       16)  UsbDeviceList   24) VulnScan上报    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  25) 历史告警(全部)  26) 历史告警(未处理)                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  27) 告警处置(已处理) 28) 告警处置(已忽略)                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  s1) VirusScan流(StreamControl)                              ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${RED}写接口（仅离线可用，在线应返回 PERMISSION_DENIED）${NC}       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   w1) UpdateConfig   w2) UpdateProcessPolicy              ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   w3) UpdatePeripheral w4) UpdateIpBlockPolicy            ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   w5) SubmitTask     w6) ExecuteIpJump                    ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   w7) ExecutePwJump  w8) CreateBackup                     ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   w9) RestoreBackup  w10) UpdateTrustDir                  ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   w11) UpdateVirtualPort w12) UpdateDirPolicy                ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   w13) UpdateExtortPolicy                                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   w1) UpdateConfig      w2) UpdateProcessPolicy             ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   w3) UpdatePeripheral  w4) UpdateIpBlockPolicy             ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   w5) SubmitTask        w6) ExecuteIpJump                   ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   w7) ExecutePwJump     w8) CreateBackup                    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   w9) RestoreBackup    w10) UpdateTrustDir                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  w11) UpdateVirtualPort w12) UpdateDirPolicy                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  w13) UpdateExtortPolicy w14) ProcessDefenseMode            ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  w15) PeripheralDefenseMode  w16) DeleteBackup                ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}all${NC}  测试全部只读接口                                  ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${RED}write${NC} 测试全部写接口（验证在线拒绝）                    ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}stream${NC} 测试全部流式接口                                ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}full${NC}  测试全部接口（读写+流）                          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}listen [秒]${NC} 监听告警流（默认300秒，Ctrl+C停止）    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${GREEN}all${NC}    测试全部只读接口 (1-28)                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${RED}write${NC}  测试全部写接口（验证在线拒绝）                    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}stream${NC} 测试全部流式接口 (17, 18, s1)                   ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}full${NC}   测试全部接口（读写+流）                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}listen [秒]${NC} 监听告警流（默认300秒，Ctrl+C停止）         ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  q    退出                                              ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
     echo ""
+}
+
+run_all_readonly() {
+    for i in $(seq -w 1 28); do
+        fn="test_$(printf '%02d' $((10#$i)))"
+        type "$fn" &>/dev/null && "$fn"
+    done
+}
+
+run_all_write() {
+    test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8
+    test_w9; test_w10; test_w11; test_w12; test_w13; test_w14; test_w15; test_w16
+}
+
+run_all_stream() {
+    test_17; test_18; test_s1
 }
 
 # ── main ───────────────────────────────────────────────────────────────
 
 case "${1:-menu}" in
     menu|"")
-        # Check connectivity
         if ! grpcurl -plaintext -emit-defaults -import-path "$PROTO_DIR" \
             -proto common.proto -proto agent_status.proto \
             -d '{}' -connect-timeout 2 -max-time 3 \
@@ -332,56 +415,43 @@ case "${1:-menu}" in
             echo -ne "${CYAN}选择接口编号 > ${NC}"
             read -r choice
             case "$choice" in
-                1)  test_01 ;;
-                2)  test_02 ;;
-                3)  test_03 ;;
-                4)  test_04 ;;
-                5)  test_05 ;;
-                6)  test_06 ;;
-                7)  test_07 ;;
-                8)  test_08 ;;
-                9)  test_09 ;;
-                10) test_10 ;;
-                11) test_11 ;;
-                12) test_12 ;;
-                13) test_13 ;;
-                14) test_14 ;;
-                15) test_15 ;;
-                16) test_16 ;;
-                17) test_17 ;;
-                18) test_18 ;;
-                19) test_19 ;;
-                20) test_20 ;;
-                21) test_21 ;;
-                22) test_22 ;;
-                w1) test_w1 ;;
-                w2) test_w2 ;;
-                w3) test_w3 ;;
-                w4) test_w4 ;;
-                w5) test_w5 ;;
-                w6) test_w6 ;;
-                w7) test_w7 ;;
-                w8) test_w8 ;;
-                w9) test_w9 ;;
-                w10) test_w10 ;;
-                w11) test_w11 ;; w12) test_w12 ;; w13) test_w13 ;;
+                1)  test_01 ;; 2)  test_02 ;; 3)  test_03 ;; 4)  test_04 ;;
+                5)  test_05 ;; 6)  test_06 ;; 7)  test_07 ;; 8)  test_08 ;;
+                9)  test_09 ;; 10) test_10 ;; 11) test_11 ;; 12) test_12 ;;
+                13) test_13 ;; 14) test_14 ;; 15) test_15 ;; 16) test_16 ;;
+                17) test_17 ;; 18) test_18 ;; 19) test_19 ;; 20) test_20 ;;
+                21) test_21 ;; 22) test_22 ;; 23) test_23 ;; 24) test_24 ;;
+                25) test_25 ;; 26) test_26 ;;
+                27) test_27 ;; 28) test_28 ;;
+                s1) test_s1 ;;
+                w1)  test_w1  ;; w2)  test_w2  ;; w3)  test_w3  ;; w4)  test_w4  ;;
+                w5)  test_w5  ;; w6)  test_w6  ;; w7)  test_w7  ;; w8)  test_w8  ;;
+                w9)  test_w9  ;; w10) test_w10 ;; w11) test_w11 ;; w12) test_w12 ;;
+                w13) test_w13 ;; w14) test_w14 ;; w15) test_w15 ;; w16) test_w16 ;;
                 all)
-                    echo -e "\n${GREEN}── 测试全部只读接口 ──${NC}"
-                    for i in $(seq 1 22); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
+                    echo -e "\n${GREEN}── 测试全部只读接口 (1-28) ──${NC}"
+                    run_all_readonly
                     print_result
                     ;;
                 write)
                     echo -e "\n${RED}── 测试全部写接口（预期全部 PERMISSION_DENIED）──${NC}"
-                    test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11; test_w12; test_w13
+                    run_all_write
                     print_result
                     ;;
                 stream)
                     echo -e "\n${YELLOW}── 测试全部流式接口 ──${NC}"
-                    test_17; test_18
+                    run_all_stream
+                    print_result
+                    ;;
+                full)
+                    echo -e "\n${GREEN}── 测试全部接口 ──${NC}"
+                    run_all_readonly
+                    run_all_stream
+                    run_all_write
                     print_result
                     ;;
                 listen|listen\ *)
-                    local secs=300
+                    secs=300
                     [[ "$choice" =~ listen[[:space:]]+([0-9]+) ]] && secs="${BASH_REMATCH[1]}"
                     echo -e "\n${YELLOW}── 监听告警流 ${secs}秒 (Ctrl+C 停止) ──${NC}"
                     timeout "$secs" grpcurl -plaintext -emit-defaults \
@@ -391,60 +461,67 @@ case "${1:-menu}" in
                         "$GRPC_ADDR" alert.AlertService/SubscribeAlerts 2>&1 || true
                     echo -e "${GREEN}监听结束${NC}"
                     ;;
-                full)
-                    echo -e "\n${GREEN}── 测试全部接口 ──${NC}"
-                    for i in $(seq 1 22); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
-                    test_17; test_18
-                    test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11; test_w12; test_w13
-                    print_result
+                \?|h|help)
+                    echo ""
+                    echo -e "${CYAN}── 只读接口 ──${NC}"
+                    echo "   1) AgentStatus        2) Config"
+                    echo "   3) ProcessPolicy      4) PeripheralPolicy"
+                    echo "   5) IpBlockPolicy      6) IpBlackPolicy"
+                    echo "   7) OutreachRules      8) DirPolicy"
+                    echo "   9) ExtortPolicy      10) TrustDir"
+                    echo "  11) VirtualPort        12) BackupList"
+                    echo "  13) JumpStatus         14) ProcessList"
+                    echo "  15) PortList           16) UsbDeviceList"
+                    echo "  17) PolicyWatch(流)    18) Alert(流)"
+                    echo "  19) 查询准入           20) 准入-OFF"
+                    echo "  21) 准入-ON            22) 准入-AUTO"
+                    echo "  23) ExecutableList     24) VulnScan上报"
+                    echo "  25) 历史告警(全部)   26) 历史告警(未处理)"
+                    echo "  27) 告警处置(已处理)  28) 告警处置(已忽略)"
+                    echo "  s1) VirusScan流"
+                    echo ""
+                    echo -e "${CYAN}── 写接口（仅离线可用）──${NC}"
+                    echo "   w1) UpdateConfig        w2) UpdateProcessPolicy"
+                    echo "   w3) UpdatePeripheral    w4) UpdateIpBlockPolicy"
+                    echo "   w5) SubmitTask          w6) ExecuteIpJump"
+                    echo "   w7) ExecutePwJump       w8) CreateBackup"
+                    echo "   w9) RestoreBackup      w10) UpdateTrustDir"
+                    echo "  w11) UpdateVirtualPort  w12) UpdateDirPolicy"
+                    echo "  w13) UpdateExtortPolicy w14) ProcessDefenseMode"
+                    echo "  w15) PeripheralDefenseMode  w16) DeleteBackup"
+                    echo ""
+                    echo -e "${CYAN}── 快捷命令 ──${NC}"
+                    echo "  all    测试全部只读 (1-28)"
+                    echo "  write  测试全部写 (w1-w16)"
+                    echo "  stream 测试全部流式 (17, 18, s1)"
+                    echo "  full   测试全部"
+                    echo "  listen [秒]  监听告警流"
+                    echo "  ?|h    显示此帮助     q  退出"
+                    echo ""
                     ;;
-	                \?|h|help)
-	                    echo ""
-	                    echo -e "${CYAN}── 只读接口 ──${NC}"
-	                    echo "   1) AgentStatus       2) Config"
-	                    echo "   3) ProcessPolicy     4) PeripheralPolicy"
-	                    echo "   5) IpBlockPolicy     6) IpBlackPolicy"
-	                    echo "   7) OutreachRules     8) DirPolicy"
-	                    echo "   9) ExtortPolicy     10) TrustDir"
-	                    echo "  11) VirtualPort      12) BackupList"
-	                    echo "  13) JumpStatus       14) ProcessList"
-	                    echo "  15) PortList         16) UsbDeviceList"
-	                    echo "  17) PolicyWatch(流)  18) Alert(流)"
-	                    echo "  19) 查询准入         20) 准入-OFF"
-	                    echo "  21) 准入-ON          22) 准入-AUTO"
-	                    echo ""
-	                    echo -e "${CYAN}── 写接口（仅离线可用）──${NC}"
-	                    echo "  w1) UpdateConfig       w2) UpdateProcessPolicy"
-	                    echo "  w3) UpdatePeripheral   w4) UpdateIpBlockPolicy"
-	                    echo "  w5) SubmitTask         w6) ExecuteIpJump"
-	                    echo "  w7) ExecutePwJump      w8) CreateBackup"
-	                    echo "  w9) RestoreBackup    w10) UpdateTrustDir"
-	                    echo "  w11) UpdateVirtualPort  w12) UpdateDirPolicy"
-	                    echo "  w13) UpdateExtortPolicy"
-	                    echo ""
-	                    echo -e "${CYAN}── 快捷命令 ──${NC}"
-	                    echo "  all    测试全部只读    write   测试全部写"
-	                    echo "  stream 测试全部流式    full    测试全部"
-	                    echo "  ?|h    显示此帮助     q       退出"
-	                    echo ""
-	                    ;;
                 q|Q|quit|exit) echo "退出"; break ;;
-		*) echo -e "${RED}无效选择: $choice${NC} (输入 ? 查看帮助)" ;;
+                *) echo -e "${RED}无效选择: $choice${NC} (输入 ? 查看帮助)" ;;
             esac
         done
         ;;
 
-    # Direct invocation mode
+    # 直接调用模式
     all)
-        for i in $(seq 1 22); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
+        run_all_readonly
         print_result
         ;;
     write)
-        test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11; test_w12; test_w13
+        run_all_write
         print_result
         ;;
     stream)
-        test_17; test_18
+        run_all_stream
+        print_result
+        ;;
+    full)
+        run_all_readonly
+        run_all_stream
+        run_all_write
         print_result
         ;;
     listen)
@@ -456,47 +533,46 @@ case "${1:-menu}" in
             "$GRPC_ADDR" alert.AlertService/SubscribeAlerts 2>&1 || true
         echo -e "${GREEN}监听结束${NC}"
         ;;
-    full)
-        for i in $(seq 1 22); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
-        test_17; test_18
-        test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11; test_w12; test_w13
-        print_result
-        ;;
     ?|help|-h|--help)
         echo "用法: $0 [选项]"
         echo ""
-        echo "  无参数          交互式菜单"
-        echo "  ?|help|-h      显示此帮助"
-        echo "  all            测试全部只读接口 (1-22)"
-        echo "  write          测试全部写接口 (w1-w13, 需离线模式)"
-        echo "  stream          测试流式接口 (17-18)"
+        echo "  无参数           交互式菜单"
+        echo "  ?|help|-h       显示此帮助"
+        echo "  all             测试全部只读接口 (1-28)"
+        echo "  write           测试全部写接口 (w1-w16, 需离线模式)"
+        echo "  stream          测试流式接口 (17, 18, s1)"
         echo "  full            测试全部接口（读写+流）"
         echo "  listen [秒]     监听告警流（默认300秒, Ctrl+C停止）"
-        echo "  1-22            测试指定编号的接口"
-        echo "  w1-w13          测试指定编号的写接口"
+        echo "  1-28            测试指定编号的只读接口"
+        echo "  s1              测试病毒扫描双向流"
+        echo "  w1-w16          测试指定编号的写接口"
         echo "  menu            显示交互式菜单"
         echo ""
         echo "示例:"
         echo "  $0              进入交互式菜单"
         echo "  $0 1            直接测试 AgentStatus"
+        echo "  $0 23           直接测试 GetExecutableList"
+        echo "  $0 s1           直接测试 VirusScan 双向流"
         echo "  $0 all          测试全部只读接口"
         echo "  $0 write        测试全部写接口"
         echo "  $0 listen 60    监听告警流60秒"
         echo ""
-        echo "配置:"
-        echo "  GRPC_ADDR        目标地址（默认 127.0.0.1:50051）"
-        echo "  PROTO_DIR        proto 文件目录（自动检测）"
+        echo "环境变量:"
+        echo "  GRPC_ADDR       目标地址（默认 127.0.0.1:50051）"
+        echo "  PROTO_DIR       proto 文件目录（自动检测）"
         ;;
 
+    s1) test_s1; print_result ;;
+
     *)
-        # Treat as a number: run that specific test
-        if [[ "$choice" =~ ^w[1-9]$ ]] || [[ "$choice" =~ ^w1[0-3]$ ]]; then
-            "test_$choice"
-        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le 22 ]; then
-            "test_$(printf '%02d' "$choice")"
+        arg="$1"
+        if [[ "$arg" =~ ^w[1-9]$|^w1[0-6]$ ]]; then
+            "test_$arg"
+        elif [[ "$arg" =~ ^[0-9]+$ ]] && [ "$arg" -ge 1 ] && [ "$arg" -le 28 ]; then
+            "test_$(printf '%02d' "$arg")"
         else
             echo "无效参数: $1"
-            echo "用法: $0 [?|help|all|write|stream|full|listen|<1-22>|w1-w13|menu]"
+            echo "用法: $0 [?|help|all|write|stream|full|listen|<1-28>|s1|w1-w16|menu]"
             echo "试试: $0 ?  查看完整帮助"
             exit 1
         fi
