@@ -13,6 +13,16 @@ pub struct LvInfo {
     pub origin: Option<String>,
 }
 
+/// 快照信息（GetBackupList 返回给客户端）
+#[derive(Debug, Clone)]
+pub struct SnapshotInfo {
+    pub name: String,        // 快照 LV 名，如 root_snap_跳变前_20260602_143000
+    pub vg: String,          // 卷组名
+    pub size: String,        // 快照大小，如 "3.00g"
+    pub origin: String,      // 原始卷名
+    pub created_at: String,  // 创建时间，如 "2026-06-02 14:30:00"
+}
+
 // 获取卷组名称
 pub async fn get_vg_name() -> Result<String, Box<dyn Error>> {
     let output = Command::new("vgs")
@@ -59,13 +69,16 @@ pub async fn create_snapshot(name: &str, size: &str) -> Result<String, String> {
     let mut created_any = false;
     let mut created_size = String::new();
 
+    // 时间戳作为 backup_id，附加到快照名末尾
+    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+
     for lv in lvs.iter() {
         // 跳过 swap 和已有快照
         if lv.name.contains("swap") || lv.name.contains("_snap") {
             continue;
         }
 
-        let snap_name = format!("{}_snap_{}", lv.name, name);
+        let snap_name = format!("{}_snap_{}_{}", lv.name, name, ts);
 
         /*
         let lvs_cmd_str = format!(
@@ -125,7 +138,8 @@ pub async fn create_snapshot(name: &str, size: &str) -> Result<String, String> {
         return Err("未找到可用于快照的根卷 (排除 swap 与 _snap_)".to_string());
     }
 
-    Ok(created_size)
+    // clean_snapshot 用 contains 匹配，restore_snapshot 用 ends_with 匹配
+    Ok(format!("{}_{}", name, ts))
 }
 
 async fn check_free_space(vg: &str, required_size: &str) -> Result<(), String> {
@@ -209,8 +223,7 @@ fn parse_size_to_gb(size_str: &str) -> Result<u64, String> {
     }
 }
 
-pub async fn list_snapshots() -> Result<(), Box<dyn std::error::Error>> {
-
+pub async fn list_snapshots() -> Result<Vec<SnapshotInfo>, Box<dyn std::error::Error>> {
     let output = Command::new("lvs")
         .args(&[
             "--noheadings",
@@ -221,12 +234,7 @@ pub async fn list_snapshots() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let s = String::from_utf8_lossy(&output.stdout);
-
-    log_info!("📋 当前快照列表:");
-    log_info!(
-        "{:<20} {:<8} {:<8} {:<12} {}",
-        "LV", "VG", "Size", "Origin", "Created"
-    );
+    let mut snapshots = Vec::new();
 
     for line in s.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -240,26 +248,27 @@ pub async fn list_snapshots() -> Result<(), Box<dyn std::error::Error>> {
         let origin = parts[3];
         let time_str = parts[4..].join(" ");
 
-        // 只显示名称里包含 _snap_ 的 LV，排除 swap
+        // 只返回名称里包含 _snap_ 的 LV，排除 swap
         if !lv_name.contains("_snap_") || lv_name.contains("swap") {
             continue;
         }
 
-        let dt: DateTime<Local> = DateTime::parse_from_str(&time_str, "%Y-%m-%d %H:%M:%S %z")
-            .map(|dt| dt.with_timezone(&Local))
-            .unwrap_or_else(|_| Local::now());
+        // 解析 LVM 时间，格式如 "2026-06-02 14:30:00 +0800"
+        let created_at = DateTime::parse_from_str(&time_str, "%Y-%m-%d %H:%M:%S %z")
+            .map(|dt| dt.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|_| time_str.clone());
 
-        log_info!(
-            "{:<20} {:<8} {:<8} {:<12} {}",
-            lv_name,
-            vg_name,
-            lv_size,
-            origin,
-            dt.format("%Y-%m-%d %H:%M:%S %z")
-        );
+        snapshots.push(SnapshotInfo {
+            name: lv_name.to_string(),
+            vg: vg_name.to_string(),
+            size: lv_size.to_string(),
+            origin: origin.to_string(),
+            created_at,
+        });
     }
 
-    Ok(())
+    log_info!("📋 快照列表: {} 条", snapshots.len());
+    Ok(snapshots)
 }
 
 

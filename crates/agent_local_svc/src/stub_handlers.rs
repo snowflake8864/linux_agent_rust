@@ -179,8 +179,14 @@ impl BackupService for BackupServiceImpl {
             .map_err(|e| Status::internal(format!("获取快照列表失败: {:?}", e)))?;
         let backups: Vec<BackupInfo> = snapshots.into_iter().map(|s| {
             let size_bytes = parse_lvm_size_to_bytes(&s.size);
+            // 从完整 LVM 快照名提取用于 match 的 backup_id
+            // 如 "root_snap_zebra_20260626_174753" → "zebra_20260626_174753"
+            let backup_id = s.name.split("_snap_")
+                .nth(1)
+                .unwrap_or(&s.name)
+                .to_string();
             BackupInfo {
-                backup_id: s.name.clone(),
+                backup_id,
                 name: s.name.clone(),
                 created_at: s.created_at,
                 size_bytes,
@@ -192,22 +198,33 @@ impl BackupService for BackupServiceImpl {
         require_offline()?;
         let name = req.into_inner().name;
         let id = self.data_hub.create_backup(&name).await
-            .map_err(|e| Status::internal(e))?;
+            .map_err(|e| map_backup_error(e))?;
         Ok(Response::new(CreateBackupResponse { success: true, backup_id: id, message: "备份已创建".into() }))
     }
     async fn restore_backup(&self, req: Request<RestoreBackupRequest>) -> Result<Response<RestoreBackupResponse>, Status> {
         require_offline()?;
         let id = req.into_inner().backup_id;
         self.data_hub.restore_backup(&id).await
-            .map_err(|e| Status::internal(e))?;
+            .map_err(|e| map_backup_error(e))?;
         Ok(Response::new(RestoreBackupResponse { success: true, message: "还原已执行".into() }))
     }
     async fn delete_backup(&self, req: Request<DeleteBackupRequest>) -> Result<Response<DeleteBackupResponse>, Status> {
         require_offline()?;
         let id = req.into_inner().backup_id;
         self.data_hub.delete_backup(&id).await
-            .map_err(|e| Status::internal(e))?;
+            .map_err(|e| map_backup_error(e))?;
         Ok(Response::new(DeleteBackupResponse { success: true, message: "快照已删除".into() }))
+    }
+}
+
+/// 将备份操作中的错误信息映射为合适的 gRPC 状态码。
+/// - "未找到" → NOT_FOUND
+/// - 其他 → INTERNAL
+fn map_backup_error(e: String) -> Status {
+    if e.contains("未找到") || e.contains("not found") {
+        Status::not_found(e)
+    } else {
+        Status::internal(e)
     }
 }
 

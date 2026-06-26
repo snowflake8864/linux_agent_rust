@@ -11,7 +11,7 @@
 #   ./test_grpc.sh listen [秒]   # 监听告警流
 # ============================================================================
 
-GRPC_ADDR="${GRPC_ADDR:-127.0.0.1:50051}"
+GRPC_ADDR="${GRPC_ADDR:-192.168.135.91:50051}"
 PROTO_DIR="$(dirname "$0")/../crates/grpc_gateway/src/proto"
 PROTO_DIR="$(cd "$PROTO_DIR" 2>/dev/null && pwd || echo "$PROTO_DIR")"
 
@@ -25,6 +25,158 @@ pass=0
 fail=0
 
 # ── helpers ────────────────────────────────────────────────────────────
+
+check_online_status() {
+    # 快速检查 agent 在线状态，返回 0=在线, 1=离线, 2=无法判断
+    local output
+    if output=$(grpcurl -plaintext -emit-defaults \
+        -import-path "$PROTO_DIR" \
+        -proto common.proto -proto agent_status.proto \
+        -d '{}' -connect-timeout 2 -max-time 3 \
+        "$GRPC_ADDR" agent_status.AgentStatusService/GetAgentStatus 2>&1); then
+        if echo "$output" | grep -qi '"isOnline"[[:space:]]*:[[:space:]]*true'; then
+            return 0  # 在线
+        else
+            return 1  # 离线
+        fi
+    fi
+    return 2  # 无法判断
+}
+
+show_test_help() {
+    local tid="$1"
+    echo ""
+    case "$tid" in
+        # ── 只读接口 ──
+        1|01)  echo -e "${CYAN}[1] AgentStatus${NC} — 获取 Agent 运行状态"
+               echo "    包含: 在线状态、版本号、OS信息、防护天数、CPU/内存/磁盘、模块状态、deviceUid、hostName"
+               echo "    用法: $0 1" ;;
+        2|02)  echo -e "${CYAN}[2] Config${NC} — 获取 Agent 配置信息"
+               echo "    返回当前心跳间隔(crontime)、设备标识等配置"
+               echo "    用法: $0 2" ;;
+        3|03)  echo -e "${CYAN}[3] ProcessPolicy${NC} — 获取进程黑白名单策略"
+               echo "    返回 hash_list 和 is_white 标志"
+               echo "    用法: $0 3" ;;
+        4|04)  echo -e "${CYAN}[4] PeripheralPolicy${NC} — 获取外设管控策略"
+               echo "    返回设备列表和黑白名单模式"
+               echo "    用法: $0 4" ;;
+        5|05)  echo -e "${CYAN}[5] IpBlockPolicy${NC} — 获取 IP 阻断策略"
+               echo "    用法: $0 5" ;;
+        6|06)  echo -e "${CYAN}[6] IpBlackPolicy${NC} — 获取 IP 黑名单策略"
+               echo "    用法: $0 6" ;;
+        7|07)  echo -e "${CYAN}[7] OutreachRules${NC} — 获取外联探测规则"
+               echo "    用法: $0 7" ;;
+        8|08)  echo -e "${CYAN}[8] DirPolicy${NC} — 获取目录防护策略"
+               echo "    用法: $0 8" ;;
+        9|09)  echo -e "${CYAN}[9] ExtortPolicy${NC} — 获取勒索软件防护策略"
+               echo "    用法: $0 9" ;;
+        10)    echo -e "${CYAN}[10] TrustDir${NC} — 获取信任目录列表"
+               echo "    用法: $0 10" ;;
+        11)    echo -e "${CYAN}[11] VirtualPort${NC} — 获取虚拟端口配置"
+               echo "    用法: $0 11" ;;
+        12)    echo -e "${CYAN}[12] BackupList${NC} — 获取 LVM 快照/备份列表"
+               echo "    返回: backup_id, name, created_at, size_bytes"
+               echo "    用法: $0 12" ;;
+        13)    echo -e "${CYAN}[13] JumpStatus${NC} — 获取跳变机状态"
+               echo "    用法: $0 13" ;;
+        14)    echo -e "${CYAN}[14] ProcessList${NC} — 获取进程列表"
+               echo "    用法: $0 14" ;;
+        15)    echo -e "${CYAN}[15] PortList${NC} — 获取端口列表"
+               echo "    用法: $0 15" ;;
+        16)    echo -e "${CYAN}[16] UsbDeviceList${NC} — 获取 USB 设备列表"
+               echo "    用法: $0 16" ;;
+        17)    echo -e "${CYAN}[17] PolicyWatch(流)${NC} — 订阅策略变更推送（流式）"
+               echo "    服务端持续推送策略变更事件，需流式接收"
+               echo "    用法: $0 17" ;;
+        18)    echo -e "${CYAN}[18] Alert(流)${NC} — 订阅实时告警推送（流式）"
+               echo "    服务端持续推送告警事件，type=0 订阅全部"
+               echo "    用法: $0 18" ;;
+        19)    echo -e "${CYAN}[19] 查询准入${NC} — 查询当前准入控制模式"
+               echo "    返回: mode (0=OFF, 1=ON, 2=AUTO) 及生效状态"
+               echo "    用法: $0 19" ;;
+        20)    echo -e "${CYAN}[20] 准入-OFF${NC} — 关闭准入控制"
+               echo "    用法: $0 20" ;;
+        21)    echo -e "${CYAN}[21] 准入-ON${NC} — 开启准入控制"
+               echo "    用法: $0 21" ;;
+        22)    echo -e "${CYAN}[22] 准入-AUTO${NC} — 切换准入控制为自动模式"
+               echo "    用法: $0 22" ;;
+        23)    echo -e "${CYAN}[23] ExecutableList${NC} — 获取可执行文件列表"
+               echo "    用法: $0 23" ;;
+        24)    echo -e "${CYAN}[24] VulnScan上报${NC} — 上报漏洞扫描结果"
+               echo "    用法: $0 24" ;;
+        25)    echo -e "${CYAN}[25] 历史告警(全部)${NC} — 查询所有历史告警"
+               echo "    用法: $0 25" ;;
+        26)    echo -e "${CYAN}[26] 历史告警(未处理)${NC} — 查询未处理的历史告警"
+               echo "    用法: $0 26" ;;
+        27)    echo -e "${CYAN}[27] 告警处置(已处理)${NC} — 将告警标记为已处理"
+               echo "    用法: $0 27" ;;
+        28)    echo -e "${CYAN}[28] 告警处置(已忽略)${NC} — 将告警标记为已忽略"
+               echo "    用法: $0 28" ;;
+        s1)    echo -e "${CYAN}[s1] VirusScan流${NC} — 病毒扫描双向流 (StreamControl)"
+               echo "    双向流式接口，客户端发送扫描指令，服务端返回扫描结果"
+               echo "    用法: $0 s1" ;;
+
+        # ── 写接口 ──
+        w1)    echo -e "${CYAN}[w1] UpdateConfig${NC} — 更新 Agent 配置（写）"
+               echo "    参数: {\"crontime\": 120}"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED"
+               echo "    测试: 发送更新请求，验证在线/离线状态下的正确拒绝/允许" ;;
+        w2)    echo -e "${CYAN}[w2] UpdateProcessPolicy${NC} — 更新进程黑白名单策略（写）"
+               echo "    参数: {\"hash_list\": [\"abc123\"], \"is_white\": true}"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
+        w3)    echo -e "${CYAN}[w3] UpdatePeripheral${NC} — 更新外设策略（写）"
+               echo "    参数: {\"devices\": [], \"is_white\": true}"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
+        w4)    echo -e "${CYAN}[w4] UpdateIpBlockPolicy${NC} — 更新 IP 阻断策略（写）"
+               echo "    参数: {\"ip_list\": [\"10.0.0.1\"], \"is_white\": true}"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
+        w5)    echo -e "${CYAN}[w5] SubmitTask${NC} — 下发任务（写）"
+               echo "    参数: 任务类型、目标等"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
+        w6)    echo -e "${CYAN}[w6] ExecuteIpJump${NC} — 执行 IP 跳变（写）"
+               echo "    成功后自动刷新 jump.db"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
+        w7)    echo -e "${CYAN}[w7] ExecutePwJump${NC} — 执行密码跳变（写）"
+               echo "    成功后自动刷新 jump.db"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
+        w8)    echo -e "${CYAN}[w8] CreateBackup${NC} — 创建 LVM 快照备份（写）"
+               echo "    参数: {\"name\": \"backup_name\"}"
+               echo "    实际调用 lvcreate 创建 LVM 快照"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
+        w9)    echo -e "${CYAN}[w9] RestoreBackup${NC} — 还原 LVM 快照（写）"
+               echo "    参数: {\"backup_id\": \"snap_suffix\"}"
+               echo "    实际调用 lvconvert --merge 合并快照"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED"
+               echo "    注意: 如快照不存在则返回 NOT_FOUND" ;;
+        w10)   echo -e "${CYAN}[w10] UpdateTrustDir${NC} — 更新信任目录（写）"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
+        w11)   echo -e "${CYAN}[w11] UpdateVirtualPort${NC} — 更新虚拟端口（写）"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
+        w12)   echo -e "${CYAN}[w12] UpdateDirPolicy${NC} — 更新目录防护策略（写）"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
+        w13)   echo -e "${CYAN}[w13] UpdateExtortPolicy${NC} — 更新勒索防护策略（写）"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
+        w14)   echo -e "${CYAN}[w14] ProcessDefenseMode${NC} — 进程防护模式切换（写）"
+               echo "    参数: {\"mode\": 1}"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
+        w15)   echo -e "${CYAN}[w15] PeripheralDefenseMode${NC} — 外设防护模式切换（写）"
+               echo "    参数: {\"mode\": 2}"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
+        w16)   echo -e "${CYAN}[w16] DeleteBackup${NC} — 删除 LVM 快照（写）"
+               echo "    参数: {\"backup_id\": \"snap_name_or_suffix\"}"
+               echo "    实际调用 lvremove 删除 LVM 快照"
+               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED"
+               echo "    注意: 如快照不存在则返回 NOT_FOUND"
+               echo ""
+               echo -e "    ${YELLOW}测试模式:${NC} w16        → 验证在线拒绝（固定 test_bak）"
+               echo -e "    ${GREEN}执行模式:${NC} w16 {\"backup_id\":\"root_snap_6_20260626_155713\"} → 实际删除指定快照" ;;
+
+        *)     echo -e "${RED}未知测试编号: $tid${NC}"
+               echo "有效范围: 1-28, s1, w1-w16"
+               echo "输入 ? 查看完整菜单，输入 <编号> ? 查看单项说明" ;;
+    esac
+    echo ""
+}
 
 grpc_call() {
     local desc="$1" proto="$2" svc="$3" method="$4" data="${5:-{\}}" extra_protos="${6:-}" max_time="${7:-10}"
@@ -340,6 +492,47 @@ test_w16() { grpc_expect_perm_denied "删除备份（在线拒绝）" \
     backup.proto backup.BackupService DeleteBackup \
     '{"backup_id":"test_bak"}'; }
 
+# ── 写接口实际执行（离线模式下手动操作）───────────────────────────────
+# 用法: exec_w16 '{"backup_id":"root_snap_6_20260626_155713"}'
+# 菜单用法: w16 {"backup_id":"root_snap_6_20260626_155713"}
+#
+# 注意: 因为 bash ${1:-default} 中 default 含 {} 会导致解析错误，
+# 所以改用变量 + set-default 模式。
+
+_DEF_W1='{"crontime": 120}'
+_DEF_W2='{"hash_list": ["abc123"], "is_white": true}'
+_DEF_W3='{"devices": [], "is_white": true}'
+_DEF_W4='{"items": [{"ip": "10.0.0.1", "direction": 1, "duration": 3600, "is_ipv6": false}]}'
+_DEF_W5='{"task_ids": [6, 19]}'
+_DEF_W6='{"gateway":"192.168.1.1","source_ip":"10.0.0.5","target_ip":"10.0.0.6","mode":1}'
+_DEF_W7='{"new_password":"test123"}'
+_DEF_W8='{"name":"test_bak"}'
+_DEF_W9='{"backup_id":"abc123"}'
+_DEF_W10='{"dirs": [{"dir":"/opt","type":1,"is_extend":0}]}'
+_DEF_W11='{"rules": [{"alarm_level":1,"dest_ip":"192.168.1.1","dest_port":"80","dest_port_type":0,"id":1,"protocol":"tcp","source_ip":"10.0.0.1","source_port_start":8080,"source_port_end":8080,"type":"tcp"}]}'
+_DEF_W12='{"rules": [{"dir":"/opt","pid":0,"typ":1}]}'
+_DEF_W13='{"rules": [{"file_type":"doc","typ":1}]}'
+_DEF_W14='{"mode": 2}'
+_DEF_W15='{"mode": 2}'
+_DEF_W16='{"backup_id":"test_bak"}'
+
+exec_w1()  { grpc_call "更新配置"       config.proto         config.ConfigService                UpdateConfig               "${1:-$_DEF_W1}"; }
+exec_w2()  { grpc_call "更新进程策略"    process_policy.proto process_policy.ProcessPolicyService  UpdateProcessPolicy         "${1:-$_DEF_W2}"; }
+exec_w3()  { grpc_call "更新外设策略"    peripheral_policy.proto peripheral_policy.PeripheralPolicyService UpdatePeripheralPolicy "${1:-$_DEF_W3}"; }
+exec_w4()  { grpc_call "更新IP阻断"     ip_policy.proto       ip_policy.IpPolicyService            UpdateIpBlockPolicy         "${1:-$_DEF_W4}"; }
+exec_w5()  { grpc_call "下发任务"       task_local.proto      task_local.LocalTaskService          SubmitTask                  "${1:-$_DEF_W5}"; }
+exec_w6()  { grpc_call "IP跳变"        jump.proto            jump.JumpService                     ExecuteIpJump               "${1:-$_DEF_W6}"; }
+exec_w7()  { grpc_call "密码跳变"       jump.proto            jump.JumpService                     ExecutePwJump               "${1:-$_DEF_W7}"; }
+exec_w8()  { grpc_call "创建备份"       backup.proto          backup.BackupService                 CreateBackup                "${1:-$_DEF_W8}"; }
+exec_w9()  { grpc_call "还原备份"       backup.proto          backup.BackupService                 RestoreBackup               "${1:-$_DEF_W9}"; }
+exec_w10() { grpc_call "更新信任目录"    trust_dir.proto       trust_dir.TrustDirService             UpdateTrustDir              "${1:-$_DEF_W10}"; }
+exec_w11() { grpc_call "更新虚拟端口"    virtual_port.proto    virtual_port.VirtualPortService       UpdateVirtualPort           "${1:-$_DEF_W11}"; }
+exec_w12() { grpc_call "更新目录保护策略" dir_policy.proto      dir_policy.DirPolicyService           UpdateDirPolicy             "${1:-$_DEF_W12}"; }
+exec_w13() { grpc_call "更新勒索保护策略" extort_policy.proto   extort_policy.ExtortPolicyService     UpdateExtortPolicy          "${1:-$_DEF_W13}"; }
+exec_w14() { grpc_call "进程防护模式"    protection_mode.proto protection_mode.ProcessDefenseService  UpdateProcessDefenseMode    "${1:-$_DEF_W14}"; }
+exec_w15() { grpc_call "外设防护模式"    protection_mode.proto protection_mode.PeripheralDefenseService UpdatePeripheralDefenseMode "${1:-$_DEF_W15}"; }
+exec_w16() { grpc_call "删除备份"       backup.proto          backup.BackupService                 DeleteBackup                "${1:-$_DEF_W16}"; }
+
 # ── 菜单 ───────────────────────────────────────────────────────────────
 
 show_menu() {
@@ -370,6 +563,9 @@ show_menu() {
     echo -e "${CYAN}║${NC}  w11) UpdateVirtualPort w12) UpdateDirPolicy                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  w13) UpdateExtortPolicy w14) ProcessDefenseMode            ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  w15) PeripheralDefenseMode  w16) DeleteBackup                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${GREEN}wN {json} 离线时实际执行写操作${NC}                                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  例: w16 {\"backup_id\":\"snap_name\"}  → 实际删除快照           ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}all${NC}    测试全部只读接口 (1-28)                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${RED}write${NC}  测试全部写接口（验证在线拒绝）                    ${CYAN}║${NC}"
@@ -414,6 +610,26 @@ case "${1:-menu}" in
         while true; do
             echo -ne "${CYAN}选择接口编号 > ${NC}"
             read -r choice
+
+            # ── 预检查: wN {...} 格式 → 实际执行写操作（非 PERMISSION_DENIED 测试）──
+            if [[ "$choice" =~ ^(w[0-9]+)[[:space:]]+(\{.*\})$ ]]; then
+                tid="${BASH_REMATCH[1]}"
+                json="${BASH_REMATCH[2]}"
+                if declare -f "exec_$tid" &>/dev/null; then
+                    "exec_$tid" "$json"
+                else
+                    echo -e "${RED}未知执行命令: $tid${NC}"
+                fi
+                continue
+            fi
+
+            # ── 预检查: <编号> ? 格式 → 查看详细说明 ──
+            if [[ "$choice" =~ ^(.+)\ ([\?]|help|h)$ ]]; then
+                tid="${BASH_REMATCH[1]}"
+                show_test_help "$tid"
+                continue
+            fi
+
             case "$choice" in
                 1)  test_01 ;; 2)  test_02 ;; 3)  test_03 ;; 4)  test_04 ;;
                 5)  test_05 ;; 6)  test_06 ;; 7)  test_07 ;; 8)  test_08 ;;
@@ -434,7 +650,13 @@ case "${1:-menu}" in
                     print_result
                     ;;
                 write)
-                    echo -e "\n${RED}── 测试全部写接口（预期全部 PERMISSION_DENIED）──${NC}"
+                    check_online_status
+                    if [ $? -eq 0 ]; then
+                        echo -e "\n${RED}── 测试全部写接口（在线模式，预期全部 PERMISSION_DENIED）──${NC}"
+                    else
+                        echo -e "\n${RED}── 测试全部写接口 ──${NC}"
+                        echo -e "${YELLOW}⚠ 当前离线，写操作将通过 require_offline 检查，可能因其他原因失败${NC}"
+                    fi
                     run_all_write
                     print_result
                     ;;
@@ -480,7 +702,7 @@ case "${1:-menu}" in
                     echo "  27) 告警处置(已处理)  28) 告警处置(已忽略)"
                     echo "  s1) VirusScan流"
                     echo ""
-                    echo -e "${CYAN}── 写接口（仅离线可用）──${NC}"
+                    echo -e "${CYAN}── 写接口（仅离线可用，在线返回 PERMISSION_DENIED）──${NC}"
                     echo "   w1) UpdateConfig        w2) UpdateProcessPolicy"
                     echo "   w3) UpdatePeripheral    w4) UpdateIpBlockPolicy"
                     echo "   w5) SubmitTask          w6) ExecuteIpJump"
@@ -492,14 +714,34 @@ case "${1:-menu}" in
                     echo ""
                     echo -e "${CYAN}── 快捷命令 ──${NC}"
                     echo "  all    测试全部只读 (1-28)"
-                    echo "  write  测试全部写 (w1-w16)"
+                    echo "  write  测试全部写 (w1-w16, 需离线模式)"
                     echo "  stream 测试全部流式 (17, 18, s1)"
-                    echo "  full   测试全部"
+                    echo "  full   测试全部 (读写+流)"
                     echo "  listen [秒]  监听告警流"
-                    echo "  ?|h    显示此帮助     q  退出"
+                    echo "  ?|h    显示此帮助    q    退出"
+                    echo "  stat   快速查看在线状态"
+                    echo ""
+                    echo -e "${CYAN}── 查看详细说明 ──${NC}"
+                    echo "  输入 \"<编号> ?\" 查看单个接口的详细说明"
+                    echo "  例如: w16 ?   → 查看 DeleteBackup 的参数、行为、注意事项"
+                    echo "        1 ?     → 查看 AgentStatus 返回内容说明"
+                    echo "        w8 ?    → 查看 CreateBackup 详细说明"
+                    echo ""
+                    echo -e "${CYAN}── 实际执行写操作（离线模式）──${NC}"
+                    echo "  输入 \"w<N> {json}\" 离线时实际执行写操作"
+                    echo "  例如: w16 {\"backup_id\":\"root_snap_6_20260626_155713\"}"
+                    echo "        w8  {\"name\":\"my_backup\"}"
                     echo ""
                     ;;
                 q|Q|quit|exit) echo "退出"; break ;;
+                stat)
+                    check_online_status
+                    case $? in
+                        0) echo -e "当前状态: ${GREEN}在线${NC} (写操作应被拒绝)" ;;
+                        1) echo -e "当前状态: ${RED}离线${NC} (写操作允许通过, w1-w16 测试将失败)" ;;
+                        2) echo -e "当前状态: ${YELLOW}无法判断${NC} (连接失败或状态未知)" ;;
+                    esac
+                    ;;
                 *) echo -e "${RED}无效选择: $choice${NC} (输入 ? 查看帮助)" ;;
             esac
         done
@@ -511,6 +753,13 @@ case "${1:-menu}" in
         print_result
         ;;
     write)
+        check_online_status
+        if [ $? -eq 0 ]; then
+            echo -e "\n${RED}── 测试写接口（在线模式，预期全部 PERMISSION_DENIED）──${NC}"
+        else
+            echo -e "\n${RED}── 测试写接口 ──${NC}"
+            echo -e "${YELLOW}⚠ 当前离线，写操作将通过 require_offline 检查，可能因其他原因失败${NC}"
+        fi
         run_all_write
         print_result
         ;;
@@ -519,6 +768,10 @@ case "${1:-menu}" in
         print_result
         ;;
     full)
+        check_online_status
+        if [ $? -ne 0 ]; then
+            echo -e "${YELLOW}⚠ 当前离线模式，w1-w16 写接口测试可能失败（非 PERMISSION_DENIED 错误）${NC}"
+        fi
         run_all_readonly
         run_all_stream
         run_all_write
@@ -536,26 +789,41 @@ case "${1:-menu}" in
     ?|help|-h|--help)
         echo "用法: $0 [选项]"
         echo ""
-        echo "  无参数           交互式菜单"
-        echo "  ?|help|-h       显示此帮助"
-        echo "  all             测试全部只读接口 (1-28)"
-        echo "  write           测试全部写接口 (w1-w16, 需离线模式)"
-        echo "  stream          测试流式接口 (17, 18, s1)"
-        echo "  full            测试全部接口（读写+流）"
-        echo "  listen [秒]     监听告警流（默认300秒, Ctrl+C停止）"
-        echo "  1-28            测试指定编号的只读接口"
-        echo "  s1              测试病毒扫描双向流"
-        echo "  w1-w16          测试指定编号的写接口"
-        echo "  menu            显示交互式菜单"
+        echo "── 交互模式 ──"
+        echo "  无参数           进入交互式菜单（推荐）"
+        echo "  menu            同无参数"
         echo ""
-        echo "示例:"
-        echo "  $0              进入交互式菜单"
-        echo "  $0 1            直接测试 AgentStatus"
-        echo "  $0 23           直接测试 GetExecutableList"
-        echo "  $0 s1           直接测试 VirusScan 双向流"
-        echo "  $0 all          测试全部只读接口"
-        echo "  $0 write        测试全部写接口"
-        echo "  $0 listen 60    监听告警流60秒"
+        echo "  交互菜单内可用命令:"
+        echo "    1-28, s1       测试指定只读/流式接口"
+        echo "    w1-w16          测试指定写接口"
+        echo "    all/write/stream/full  批量测试"
+        echo "    stat            快速查看 Agent 在线状态"
+        echo "    listen [秒]     监听告警流"
+        echo "    <编号> ?        查看单个接口的详细说明"
+        echo "    ?|h             显示菜单"
+        echo "    q               退出"
+        echo ""
+        echo "── 命令行直接调用 ──"
+        echo "  $0 1             直接测试 AgentStatus"
+        echo "  $0 23            直接测试 GetExecutableList"
+        echo "  $0 s1            直接测试 VirusScan 双向流"
+        echo "  $0 w8            直接测试 CreateBackup"
+        echo "  $0 all           测试全部只读接口 (1-28)"
+        echo "  $0 write         测试全部写接口 (w1-w16)"
+        echo "  $0 stream        测试流式接口 (17, 18, s1)"
+        echo "  $0 full          测试全部接口（读写+流）"
+        echo "  $0 listen [秒]   监听告警流（默认300秒）"
+        echo ""
+        echo "── 写接口说明 ──"
+        echo "  w1-w16 测试仅在 Agent ${RED}在线${NC}时验证 PERMISSION_DENIED 拒绝。"
+        echo "  若 Agent 当前离线，写操作会通过 require_offline 检查，实际执行时"
+        echo "  可能因参数无效/资源不存在等原因返回其他错误（非 PERMISSION_DENIED）。"
+        echo "  使用 'stat' 命令或测试编号 1 查看当前在线状态。"
+        echo ""
+        echo "── 详细说明 ──"
+        echo "  交互菜单中输入 '<编号> ?' 查看单个接口的参数、行为和注意事项。"
+        echo "  例如: w16 ?  → DeleteBackup 详细说明"
+        echo "        1 ?    → AgentStatus 返回内容说明"
         echo ""
         echo "环境变量:"
         echo "  GRPC_ADDR       目标地址（默认 127.0.0.1:50051）"
