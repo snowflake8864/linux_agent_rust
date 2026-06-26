@@ -26,6 +26,7 @@ members = [
      "crates/agent_manager",
     "crates/grpc_gateway",
     "crates/agent_local_svc",
+    "crates/local_store",
 ]
 
 [profile.dev]

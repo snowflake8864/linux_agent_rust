@@ -40,6 +40,7 @@ virus_scan_grpc = { path = "../virus_scan_grpc" }
 net_client = { path = "../net_client" }
 grpc_gateway = { path = "../grpc_gateway" }
 agent_local_svc = { path = "../agent_local_svc" }
+local_store = { path = "../local_store" }
 tonic = "0.14"
 prost = "0.14"
 #[CKlibm]

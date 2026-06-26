@@ -146,6 +146,37 @@ async fn main() -> std::io::Result<()> {
     }
     log_info!("当前模式: {}", if is_offline { "离线" } else { "在线" });
 
+    // 初始化本地数据库（建表幂等，已存在时跳过）
+    local_store::init_all();
+
+    // 从 DB 恢复跳变状态到内存缓存（让重启后无需等待服务器即可返回上次跳变状态）
+    match local_store::jump_status::load() {
+        Ok(Some(row)) => {
+            let mut js = agent_local_svc::JUMP_STATUS.lock().unwrap();
+            js.current_ip        = row.current_ip;
+            js.source_ip         = row.source_ip;
+            js.target_ip         = row.target_ip;
+            js.gateway           = row.gateway;
+            js.mode              = row.mode;
+            js.current_password  = row.current_password;
+            js.last_ip_jump_time = row.last_ip_jump_time;
+            js.last_pw_jump_time = row.last_pw_jump_time;
+            js.last_pw_jump_user = row.last_pw_jump_user;
+            js.ip_scheme         = row.ip_scheme;
+            js.ip_cycle_label    = row.ip_cycle_label;
+            js.ip_timing_label   = row.ip_timing_label;
+            js.ip_way_label      = row.ip_way_label;
+            js.pw_scheme         = row.pw_scheme;
+            js.pw_cycle_label    = row.pw_cycle_label;
+            js.pw_timing_label   = row.pw_timing_label;
+            log_info!("已从 jump.db 恢复跳变状态缓存");
+        }
+        Ok(None) => log_info!("jump.db 无历史数据，跳过恢复"),
+        Err(e)   => log_error!("从 jump.db 加载跳变状态失败: {}", e),
+    }
+
+    // 刚获得 token 时才担发 fetch，见 data_hub::update_token()
+
     // 创建 Netlink 套接字（在离线模式下仍尝试创建，供内核事件使用）
     let nl_sock = NlSockInfo::create_socket()
         .map_err(|e| {

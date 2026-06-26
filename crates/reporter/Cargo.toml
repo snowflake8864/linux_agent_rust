@@ -23,4 +23,6 @@ hostinfo = { path = "../hostinfo"}
 hex = "0.4"
 grpc_gateway = { path = "../grpc_gateway" }
 uuid = "1"
+local_store = { path = "../local_store" }
+chrono = "0.4"
 
