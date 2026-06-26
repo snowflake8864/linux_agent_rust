@@ -15,8 +15,10 @@ use grpc_gateway::jump::{
     PwJumpRequest, PwJumpResponse,
 };
 use grpc_gateway::backup::{
-    backup_service_server::BackupService, BackupList, CreateBackupRequest,
-    CreateBackupResponse, RestoreBackupRequest, RestoreBackupResponse,
+    backup_service_server::BackupService, BackupList, BackupInfo,
+    CreateBackupRequest, CreateBackupResponse,
+    RestoreBackupRequest, RestoreBackupResponse,
+    DeleteBackupRequest, DeleteBackupResponse,
 };
 use grpc_gateway::trust_dir::{
     trust_dir_service_server::TrustDirService, TrustDirList,
@@ -123,6 +125,8 @@ pub struct JumpServiceImpl {
 #[tonic::async_trait]
 impl JumpService for JumpServiceImpl {
     async fn get_jump_status(&self, _: Request<grpc_gateway::common::Empty>) -> Result<Response<JumpStatus>, Status> {
+        // 直接返回内存缓存，不请求服务器。
+        // 缓存在以下时机更新：开机在线拉取、IP跳变成功、口令跳变成功
         let status = crate::data_hub::JUMP_STATUS.lock().unwrap().clone();
         Ok(Response::new(status))
     }
@@ -171,7 +175,18 @@ pub struct BackupServiceImpl {
 #[tonic::async_trait]
 impl BackupService for BackupServiceImpl {
     async fn get_backup_list(&self, _: Request<grpc_gateway::common::Empty>) -> Result<Response<BackupList>, Status> {
-        Ok(Response::new(BackupList { backups: vec![] }))
+        let snapshots = snapman::list_snapshots().await
+            .map_err(|e| Status::internal(format!("获取快照列表失败: {:?}", e)))?;
+        let backups: Vec<BackupInfo> = snapshots.into_iter().map(|s| {
+            let size_bytes = parse_lvm_size_to_bytes(&s.size);
+            BackupInfo {
+                backup_id: s.name.clone(),
+                name: s.name.clone(),
+                created_at: s.created_at,
+                size_bytes,
+            }
+        }).collect();
+        Ok(Response::new(BackupList { backups }))
     }
     async fn create_backup(&self, req: Request<CreateBackupRequest>) -> Result<Response<CreateBackupResponse>, Status> {
         require_offline()?;
@@ -187,6 +202,31 @@ impl BackupService for BackupServiceImpl {
             .map_err(|e| Status::internal(e))?;
         Ok(Response::new(RestoreBackupResponse { success: true, message: "还原已执行".into() }))
     }
+    async fn delete_backup(&self, req: Request<DeleteBackupRequest>) -> Result<Response<DeleteBackupResponse>, Status> {
+        require_offline()?;
+        let id = req.into_inner().backup_id;
+        self.data_hub.delete_backup(&id).await
+            .map_err(|e| Status::internal(e))?;
+        Ok(Response::new(DeleteBackupResponse { success: true, message: "快照已删除".into() }))
+    }
+}
+
+/// 解析 LVM 大小字符串为 bytes，如 "3.00g" → 3221225472
+fn parse_lvm_size_to_bytes(s: &str) -> u64 {
+    let cleaned: String = s.trim().chars()
+        .skip_while(|c| !c.is_ascii_digit() && *c != '.')
+        .collect();
+    let lower = cleaned.to_lowercase();
+    let (num_str, mult): (&str, u64) = if lower.ends_with('g') {
+        (&lower[..lower.len()-1], 1073741824)
+    } else if lower.ends_with('m') {
+        (&lower[..lower.len()-1], 1048576)
+    } else if lower.ends_with('t') {
+        (&lower[..lower.len()-1], 1099511627776)
+    } else {
+        return 0;
+    };
+    num_str.parse::<f64>().ok().map(|n| (n * mult as f64) as u64).unwrap_or(0)
 }
 
 // ========================= TrustDir =========================
