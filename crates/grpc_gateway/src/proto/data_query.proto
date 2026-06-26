@@ -8,6 +8,9 @@ service DataQueryService {
     rpc GetProcessList(ProcessFilter) returns (ProcessList);
     rpc GetPortList(common.Empty) returns (PortList);
     rpc GetUsbDeviceList(common.Empty) returns (UsbDeviceList);
+    // 扫描系统可执行文件目录（/bin /usr/bin /usr/sbin /usr/local/bin /usr/lib/systemd），
+    // 返回路径、MD5及策略状态，结果按 MD5 去重
+    rpc GetExecutableList(common.Empty) returns (ExecutableList);
 }
 
 message ProcessFilter {
@@ -42,4 +45,25 @@ message PortList {
 
 message UsbDeviceList {
     repeated peripheral_policy.UsbDevice devices = 1;
+}
+
+// 策略状态枚举
+enum PolicyStatus {
+    POLICY_NONE = 0;      // 未在黑白名单中
+    POLICY_WHITELIST = 1; // 白名单（允许）
+    POLICY_BLACKLIST = 2; // 黑名单（拦截）
+}
+
+// 单个可执行文件信息
+message ExecutableInfo {
+    string path = 1;                 // 完整路径，如 /usr/bin/ls
+    string hash = 2;                 // MD5 値
+    PolicyStatus policy_status = 3;  // 当前黑白名单状态
+}
+
+// 可执行文件列表
+message ExecutableList {
+    repeated ExecutableInfo executables = 1;
+    int32 total = 2;    // 扫描到的总文件数（去重前）
+    int32 unique = 3;   // 去重后的数量
 }

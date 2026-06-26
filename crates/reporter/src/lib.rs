@@ -51,21 +51,45 @@ pub struct AuditLogInfo {
 /// Convert AuditLogInfo to AlertEvent and broadcast to gRPC AlertService.
 /// 只广播三类：进程告警、文件审计、USB插拔。其余 n_type 不推 gRPC。
 /// SSH 登录由 broadcast_ssh_log 单独处理。
+/// 先落地到 alert.db，再广播给已订阅的在线客户端。
 pub fn broadcast_audit_log(log: &AuditLogInfo) {
     let alert_type = match log.n_type {
         // 进程告警
         1001..=1002 | 1101..=1104 => 1, // PROCESS_ALERT
         // 模块告警
         1201..=1202 | 1301..=1302 => 1, // PROCESS_ALERT
-        // 防篡改-文件夹
+        // 防篹改-文件夹
         2001..=2105 => 2, // FILE_ALERT
-        // 防篡改-文件
+        // 防篹改-文件
         3001..=3105 => 2, // FILE_ALERT
         // 外设告警
         9003..=9008 => 3, // DEVICE_ALERT
         // 不在白名单内的不推 gRPC
         _ => return,
     };
+
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    // 1. 先持久化到 alert.db，保证客户端断线组再连可以补读历史告警
+    let row = local_store::alert_log::AlertLogRow {
+        id:                  0,
+        alert_type:          alert_type,
+        level:               log.n_level as i32,
+        process:             log.exception_process.clone().unwrap_or_default(),
+        path:                log.file_path.clone().unwrap_or_default(),
+        pid:                 0,
+        detail:              log.notice_remark.clone().unwrap_or_default(),
+        handle_status:       local_store::alert_log::HANDLE_STATUS_PENDING,
+        handle_status_label: "未处理".to_string(),
+        handle_user:         String::new(),
+        handled_at:          String::new(),
+        created_at:          now,
+    };
+    if let Err(e) = local_store::alert_log::insert(&row) {
+        logging::log_error!("[alert] 写入 alert.db 失败: {}", e);
+    }
+
+    // 2. 广播给已订阅的在线客户端
     grpc_gateway::notify::broadcast_alert(grpc_gateway::alert::AlertEvent {
         alert_id: uuid::Uuid::new_v4().to_string(),
         r#type: alert_type,

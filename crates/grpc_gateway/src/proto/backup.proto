@@ -7,6 +7,7 @@ service BackupService {
     rpc GetBackupList(common.Empty) returns (BackupList);
     rpc CreateBackup(CreateBackupRequest) returns (CreateBackupResponse);
     rpc RestoreBackup(RestoreBackupRequest) returns (RestoreBackupResponse);
+    rpc DeleteBackup(DeleteBackupRequest) returns (DeleteBackupResponse);
 }
 
 message BackupInfo {
@@ -35,6 +36,15 @@ message RestoreBackupRequest {
 }
 
 message RestoreBackupResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message DeleteBackupRequest {
+    string backup_id = 1;
+}
+
+message DeleteBackupResponse {
     bool success = 1;
     string message = 2;
 }
