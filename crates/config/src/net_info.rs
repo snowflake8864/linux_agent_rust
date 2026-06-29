@@ -562,6 +562,8 @@ impl NetInfoConfig {
             self.dev_uid = agent_uid::ensure_and_get_mgs_guid(&("/etc/.vedasystem"))
                 .unwrap_or_else(|_| "unknown".to_string());
         }
+        // 同步 uid 到 app.conf（供 EndpointSecurityApp GUI 读取）
+        self.sync_uid_to_app_conf();
         log_info!("=====dev_id:{}", self.dev_uid);
         if self.macid.is_empty() {
             self.macid = ip_mac::get_mac().unwrap_or("unknown".to_string());
@@ -590,6 +592,50 @@ impl NetInfoConfig {
         }
         Ok(())
     }
+
+    /// 将 uid 同步到 /opt/EndpointSecurityApp/app.conf
+    /// 供 EndpointSecurityApp GUI 读取，格式: uid=<dev_uid>
+    fn sync_uid_to_app_conf(&self) {
+        let app_conf = "/opt/EndpointSecurityApp/app.conf";
+        let uid_line = format!("uid={}", self.dev_uid);
+        match std::fs::read_to_string(app_conf) {
+            Ok(content) => {
+                let mut updated = false;
+                let lines: Vec<String> = content
+                    .lines()
+                    .map(|l| {
+                        if l.trim_start().starts_with("uid=") {
+                            updated = true;
+                            uid_line.clone()
+                        } else {
+                            l.to_string()
+                        }
+                    })
+                    .collect();
+                let mut new_content = if updated {
+                    lines.join("\n")
+                } else {
+                    // 没有 uid= 行，追加到末尾
+                    format!("{}\n{}", content.trim_end(), uid_line)
+                };
+                new_content.push('\n');
+                if let Err(e) = std::fs::write(app_conf, &new_content) {
+                    log_error!("写入 app.conf uid 失败: {}", e);
+                } else {
+                    log_info!("已同步 uid={} 到 app.conf", self.dev_uid);
+                }
+            }
+            Err(_) => {
+                // 文件不存在，创建
+                if let Err(e) = std::fs::write(app_conf, format!("{}\n", uid_line)) {
+                    log_error!("创建 app.conf 失败: {}", e);
+                } else {
+                    log_info!("已创建 app.conf uid={}", self.dev_uid);
+                }
+            }
+        }
+    }
+
     fn extract_ip(input: &str) -> Option<String> {
         use std::net::IpAddr;
 
