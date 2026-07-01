@@ -65,7 +65,10 @@ pub fn broadcast_audit_log(log: &AuditLogInfo) {
         // 外设告警
         9003..=9008 => 3, // DEVICE_ALERT
         // 不在白名单内的不推 gRPC
-        _ => return,
+        _ => {
+            log::warn!("[alert] 未广播的 n_type={}, path={:?}", log.n_type, log.file_path);
+            return;
+        }
     };
 
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();

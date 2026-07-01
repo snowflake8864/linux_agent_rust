@@ -4,8 +4,13 @@ package process_policy;
 import "common.proto";
 
 service ProcessPolicyService {
-    rpc GetProcessPolicy(common.Empty) returns (ProcessPolicy);
+    rpc GetProcessPolicy(ProcessPolicyFilter) returns (ProcessPolicy);
     rpc UpdateProcessPolicy(ProcessPolicy) returns (common.SimpleResponse);
+}
+
+// 查询过滤条件：指定获取白名单还是黑名单
+message ProcessPolicyFilter {
+    bool is_white = 1;
 }
 
 // 对应 HTTP: /v1/getprocwl 或 /v1/getprocbl 返回的 data.proclist

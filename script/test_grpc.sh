@@ -55,8 +55,9 @@ show_test_help() {
                echo "    返回当前心跳间隔(crontime)、设备标识等配置"
                echo "    用法: $0 2" ;;
         3|03)  echo -e "${CYAN}[3] ProcessPolicy${NC} — 获取进程黑白名单策略"
+               echo "    参数: {\"is_white\": true} 白名单 / false 黑名单"
                echo "    返回 hash_list 和 is_white 标志"
-               echo "    用法: $0 3" ;;
+               echo "    用法: $0 3  (白名单)  | 手动: test_03b (黑名单)" ;;
         4|04)  echo -e "${CYAN}[4] PeripheralPolicy${NC} — 获取外设管控策略"
                echo "    返回设备列表和黑白名单模式"
                echo "    用法: $0 4" ;;
@@ -79,8 +80,10 @@ show_test_help() {
                echo "    用法: $0 12" ;;
         13)    echo -e "${CYAN}[13] JumpStatus${NC} — 获取跳变机状态"
                echo "    用法: $0 13" ;;
-        14)    echo -e "${CYAN}[14] ProcessList${NC} — 获取进程列表"
-               echo "    用法: $0 14" ;;
+        14)    echo -e "${CYAN}[14] ProcessList${NC} — 获取进程列表（支持按策略状态过滤）"
+               echo "    参数: {\"limit\": N, \"sort_by\": \"pid\", \"filter_status\": 0-3}"
+               echo "    filter_status: 0=全部(默认), 1=白名单, 2=黑名单, 3=未知"
+               echo "    用法: $0 14 | 14b(白名单) | 14c(黑名单)" ;;
         15)    echo -e "${CYAN}[15] PortList${NC} — 获取端口列表"
                echo "    用法: $0 15" ;;
         16)    echo -e "${CYAN}[16] UsbDeviceList${NC} — 获取 USB 设备列表"
@@ -100,8 +103,9 @@ show_test_help() {
                echo "    用法: $0 21" ;;
         22)    echo -e "${CYAN}[22] 准入-AUTO${NC} — 切换准入控制为自动模式"
                echo "    用法: $0 22" ;;
-        23)    echo -e "${CYAN}[23] ExecutableList${NC} — 获取可执行文件列表"
-               echo "    用法: $0 23" ;;
+        23)    echo -e "${CYAN}[23] ExecutableList${NC} — 获取可执行文件列表（支持按策略状态过滤）"
+               echo "    参数: {\"filter_status\": 0-3}, 0=全部, 1=白名单, 2=黑名单, 3=未知"
+               echo "    用法: $0 23 | 23b(黑) | 23c(白) | 23d(未知)" ;;
         24)    echo -e "${CYAN}[24] VulnScan上报${NC} — 上报漏洞扫描结果"
                echo "    用法: $0 24" ;;
         25)    echo -e "${CYAN}[25] 历史告警(全部)${NC} — 查询所有历史告警"
@@ -303,8 +307,13 @@ test_01() { grpc_call "Agent状态(含is_online/protection_days)" \
 test_02() { grpc_call "当前配置" \
     config.proto config.ConfigService GetConfig; }
 
-test_03() { grpc_call "进程策略" \
-    process_policy.proto process_policy.ProcessPolicyService GetProcessPolicy; }
+test_03() { grpc_call "进程策略(白名单)" \
+    process_policy.proto process_policy.ProcessPolicyService GetProcessPolicy \
+    '{"is_white": true}'; }
+
+test_03b() { grpc_call "进程策略(黑名单)" \
+    process_policy.proto process_policy.ProcessPolicyService GetProcessPolicy \
+    '{"is_white": false}'; }
 
 test_04() { grpc_call "外设策略" \
     peripheral_policy.proto peripheral_policy.PeripheralPolicyService GetPeripheralPolicy; }
@@ -336,9 +345,24 @@ test_12() { grpc_call "备份列表" \
 test_13() { grpc_call "跳变状态(读内存缓存,不请求服务器)" \
     jump.proto jump.JumpService GetJumpStatus; }
 
-test_14() { grpc_call "进程列表(top 10, 按PID排序)" \
+test_14() { grpc_call "进程列表(全部, 按PID排序)" \
     data_query.proto data_query.DataQueryService GetProcessList \
-    '{"limit": 10, "sort_by": "pid"}' \
+    '{"sort_by": "pid"}' \
+    "peripheral_policy.proto"; }
+
+test_14b() { grpc_call "进程列表(仅白名单)" \
+    data_query.proto data_query.DataQueryService GetProcessList \
+    '{"filter_status": 1}' \
+    "peripheral_policy.proto"; }
+
+test_14c() { grpc_call "进程列表(仅黑名单)" \
+    data_query.proto data_query.DataQueryService GetProcessList \
+    '{"filter_status": 2}' \
+    "peripheral_policy.proto"; }
+
+test_14d() { grpc_call "进程列表(仅未知)" \
+    data_query.proto data_query.DataQueryService GetProcessList \
+    '{"filter_status": 3}' \
     "peripheral_policy.proto"; }
 
 test_15() { grpc_call "端口列表" \
@@ -374,9 +398,21 @@ test_22() { grpc_call "设置准入(自动/AUTO)" \
     admission.proto admission.AdmissionService UpdateAdmissionSwitch \
     '{"mode": 2}' ''; }
 
-test_23() { grpc_call "可执行文件列表(含策略状态,MD5去重)" \
+test_23() { grpc_call "可执行文件列表(全部, MD5去重)" \
     data_query.proto data_query.DataQueryService GetExecutableList \
     '{}' "peripheral_policy.proto" 60; }
+
+test_23b() { grpc_call "可执行文件列表(仅黑名单)" \
+    data_query.proto data_query.DataQueryService GetExecutableList \
+    '{"filter_status": 2}' "peripheral_policy.proto" 60; }
+
+test_23c() { grpc_call "可执行文件列表(仅白名单)" \
+    data_query.proto data_query.DataQueryService GetExecutableList \
+    '{"filter_status": 1}' "peripheral_policy.proto" 60; }
+
+test_23d() { grpc_call "可执行文件列表(仅未知)" \
+    data_query.proto data_query.DataQueryService GetExecutableList \
+    '{"filter_status": 3}' "peripheral_policy.proto" 60; }
 
 test_24() { grpc_call "漏洞扫描上报(测试数据)" \
     vuln_scan.proto vuln_scan.VulnScanService PutVulnScan \
@@ -582,6 +618,13 @@ run_all_readonly() {
         fn="test_$(printf '%02d' $((10#$i)))"
         type "$fn" &>/dev/null && "$fn"
     done
+    test_03b   # 黑名单
+    test_14b   # 进程列表-仅白名单
+    test_14c   # 进程列表-仅黑名单
+    test_14d   # 进程列表-仅未知
+    test_23b   # 可执行文件列表-仅黑名单
+    test_23c   # 可执行文件列表-仅白名单
+    test_23d   # 可执行文件列表-仅未知
 }
 
 run_all_write() {
@@ -607,9 +650,22 @@ case "${1:-menu}" in
         fi
 
         show_menu
+        last_choice=""
         while true; do
             echo -ne "${CYAN}选择接口编号 > ${NC}"
             read -r choice
+
+            # ── !! 重复上一条 / !N 历史命令 ──
+            if [[ "$choice" == "!!" ]]; then
+                if [ -z "$last_choice" ]; then
+                    echo -e "${YELLOW}暂无上一条命令${NC}"
+                    continue
+                fi
+                choice="$last_choice"
+                echo -e "${CYAN}[!!]${NC} $choice"
+            else
+                last_choice="$choice"
+            fi
 
             # ── 预检查: wN {...} 格式 → 实际执行写操作（非 PERMISSION_DENIED 测试）──
             if [[ "$choice" =~ ^(w[0-9]+)[[:space:]]+(\{.*\})$ ]]; then
@@ -620,6 +676,21 @@ case "${1:-menu}" in
                 else
                     echo -e "${RED}未知执行命令: $tid${NC}"
                 fi
+                continue
+            fi
+
+            # ── 预检查: 14/23/json {...} → 自定义 filter_status ──
+            if [[ "$choice" =~ ^(14|23|03|3|14b|14c|14d|23b|23c|23d|03b)[[:space:]]+(\{.*\})$ ]]; then
+                tid="${BASH_REMATCH[1]}"
+                json="${BASH_REMATCH[2]}"
+                case "$tid" in
+                    14|14b|14c|14d)
+                        grpc_call "进程列表(自定义)" data_query.proto data_query.DataQueryService GetProcessList "$json" "peripheral_policy.proto" ;;
+                    23|23b|23c|23d)
+                        grpc_call "可执行文件列表(自定义)" data_query.proto data_query.DataQueryService GetExecutableList "$json" "peripheral_policy.proto" 60 ;;
+                    3|03|03b)
+                        grpc_call "进程策略(自定义)" process_policy.proto process_policy.ProcessPolicyService GetProcessPolicy "$json" ;;
+                esac
                 continue
             fi
 
@@ -640,6 +711,8 @@ case "${1:-menu}" in
                 25) test_25 ;; 26) test_26 ;;
                 27) test_27 ;; 28) test_28 ;;
                 s1) test_s1 ;;
+                03b) test_03b ;; 14b) test_14b ;; 14c) test_14c ;; 14d) test_14d ;;
+                23b) test_23b ;; 23c) test_23c ;; 23d) test_23d ;;
                 w1)  test_w1  ;; w2)  test_w2  ;; w3)  test_w3  ;; w4)  test_w4  ;;
                 w5)  test_w5  ;; w6)  test_w6  ;; w7)  test_w7  ;; w8)  test_w8  ;;
                 w9)  test_w9  ;; w10) test_w10 ;; w11) test_w11 ;; w12) test_w12 ;;
@@ -701,6 +774,12 @@ case "${1:-menu}" in
                     echo "  25) 历史告警(全部)   26) 历史告警(未处理)"
                     echo "  27) 告警处置(已处理)  28) 告警处置(已忽略)"
                     echo "  s1) VirusScan流"
+                    echo ""
+                    echo -e "${CYAN}── 扩展测试（filter_status 过滤）──${NC}"
+                    echo "  03b) ProcessPolicy-黑名单    14b) ProcessList-仅白名单"
+                    echo "  14c) ProcessList-仅黑名单     14d) ProcessList-仅未知"
+                    echo "  23b) ExecutableList-黑名单    23c) ExecutableList-白名单"
+                    echo "  23d) ExecutableList-未知"
                     echo ""
                     echo -e "${CYAN}── 写接口（仅离线可用，在线返回 PERMISSION_DENIED）──${NC}"
                     echo "   w1) UpdateConfig        w2) UpdateProcessPolicy"
@@ -795,6 +874,7 @@ case "${1:-menu}" in
         echo ""
         echo "  交互菜单内可用命令:"
         echo "    1-28, s1       测试指定只读/流式接口"
+        echo "    03b,14b/14c/14d,23b  filter_status 过滤测试"
         echo "    w1-w16          测试指定写接口"
         echo "    all/write/stream/full  批量测试"
         echo "    stat            快速查看 Agent 在线状态"
@@ -805,7 +885,8 @@ case "${1:-menu}" in
         echo ""
         echo "── 命令行直接调用 ──"
         echo "  $0 1             直接测试 AgentStatus"
-        echo "  $0 23            直接测试 GetExecutableList"
+        echo "  $0 14c           直接测试 ProcessList(仅黑名单)"
+        echo "  $0 23b           直接测试 ExecutableList(仅黑名单)"
         echo "  $0 s1            直接测试 VirusScan 双向流"
         echo "  $0 w8            直接测试 CreateBackup"
         echo "  $0 all           测试全部只读接口 (1-28)"

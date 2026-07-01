@@ -34,18 +34,46 @@ impl DataQueryService for DataQueryServiceImpl {
             .get_process_list()
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        // 读取黑白名单 hash 集合，用于标注策略状态
+        let white_set: HashSet<String> = self
+            .data_hub
+            .get_process_policy(true)
+            .into_iter()
+            .collect();
+        let black_set: HashSet<String> = self
+            .data_hub
+            .get_process_policy(false)
+            .into_iter()
+            .collect();
+
         let mut infos: Vec<ProcessInfo> = processes
             .into_iter()
-            .map(|p| ProcessInfo {
-                pid: p.pid as i32,
-                name: p.name.clone(),
-                exe_path: p.exe_path.clone(),
-                hash: p.hash.clone(),
-                cpu_usage: String::new(),
-                mem_usage: format!("{} KB", p.memory_rss_kb),
-                user: p.user.clone(),
+            .map(|p| {
+                let policy_status = if white_set.contains(&p.hash) {
+                    PolicyStatus::PolicyWhitelist as i32
+                } else if black_set.contains(&p.hash) {
+                    PolicyStatus::PolicyBlacklist as i32
+                } else {
+                    PolicyStatus::PolicyNone as i32
+                };
+                ProcessInfo {
+                    pid: p.pid as i32,
+                    name: p.name.clone(),
+                    exe_path: p.exe_path.clone(),
+                    hash: p.hash.clone(),
+                    cpu_usage: String::new(),
+                    mem_usage: format!("{} KB", p.memory_rss_kb),
+                    user: p.user.clone(),
+                    policy_status,
+                }
             })
             .collect();
+
+        // 按策略状态过滤: 0=全部, 1=白名单, 2=黑名单, 3=未知
+        if filter.filter_status > 0 {
+            let target = if filter.filter_status == 3 { 0 } else { filter.filter_status };
+            infos.retain(|p| p.policy_status == target);
+        }
 
         // 默认按 pid 排序；sort_by 为空或显式传 "pid" 均走此分支
         if filter.sort_by.is_empty() || filter.sort_by == "pid" {
@@ -95,8 +123,9 @@ impl DataQueryService for DataQueryServiceImpl {
 
     async fn get_executable_list(
         &self,
-        _: Request<Empty>,
+        request: Request<ProcessFilter>,
     ) -> Result<Response<ExecutableList>, Status> {
+        let filter = request.into_inner();
         // 固定扫描目录，与上报服务器的 process_all_dirs 一致
         let scan_dirs: Vec<&str> = DEFAULT_SCAN_DIRS.to_vec();
 
@@ -154,8 +183,49 @@ impl DataQueryService for DataQueryServiceImpl {
                     PolicyStatus::PolicyNone as i32
                 };
 
+                // 按过滤条件提前筛掉不匹配的条目，减少最终结果集
+                if filter.filter_status > 0 {
+                    let target = if filter.filter_status == 3 { 0 } else { filter.filter_status };
+                    if policy_status != target {
+                        continue;
+                    }
+                }
+
                 executables.push(ExecutableInfo {
                     path: path_str,
+                    hash,
+                    policy_status,
+                });
+            }
+        }
+
+        // 补充 known_executables.db 中的非标准路径条目
+        if let Ok(db_entries) = local_store::known_executables::load_all() {
+            for (hash, path, _db_status) in db_entries {
+                // MD5 去重：标准目录扫描结果优先
+                if seen_hashes.contains(&hash) {
+                    continue;
+                }
+                seen_hashes.insert(hash.clone());
+
+                // 从 ProcessPolicy 实时计算策略状态（不使用 DB 里的缓存值）
+                let policy_status = if white_set.contains(&hash) {
+                    PolicyStatus::PolicyWhitelist as i32
+                } else if black_set.contains(&hash) {
+                    PolicyStatus::PolicyBlacklist as i32
+                } else {
+                    PolicyStatus::PolicyNone as i32
+                };
+
+                if filter.filter_status > 0 {
+                    let target = if filter.filter_status == 3 { 0 } else { filter.filter_status };
+                    if policy_status != target {
+                        continue;
+                    }
+                }
+
+                executables.push(ExecutableInfo {
+                    path,
                     hash,
                     policy_status,
                 });

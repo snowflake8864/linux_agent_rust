@@ -1,0 +1,662 @@
+=========================================================================
+  客户端 gRPC 接口文档 — 简化版（核心接口）
+  日期: 2026-07-01
+  Proto 文件: common.proto + agent_status.proto + jump.proto
+               + peripheral_policy.proto + process_policy.proto
+               + protection_mode.proto + alert.proto + backup.proto
+               + data_query.proto + virus_scan.proto + vuln_scan.proto
+               + admission.proto
+=========================================================================
+
+一、概述
+=========================================================================
+
+  架构说明:
+    Agent 是运行在终端上的安全服务程序，通过 gRPC 提供服务接口。
+    客户端（跨平台 GUI）连接 Agent 调用这些接口。
+
+  连接地址: <Agent所在机器IP>:50051 (plaintext, 无 TLS)
+    - 本机客户端: 127.0.0.1:50051
+    - 远程客户端: Agent 机器的局域网 IP:50051
+
+  Proto 文件清单:
+    - common.proto              （通用类型: Empty、SimpleResponse）
+    - agent_status.proto        （Agent 状态查询、在线/离线判断）
+    - jump.proto                （IP/密码跳变）
+    - process_policy.proto      （进程白/黑名单策略）
+    - peripheral_policy.proto   （外设/USB 白/黑名单策略）
+    - protection_mode.proto     （进程/外设防护模式切换）
+    - alert.proto               （告警订阅流 + 历史告警查询 + 告警处置）
+    - backup.proto              （备份/回滚）
+    - data_query.proto          （运行进程/端口/USB设备/可执行文件查询）
+    - virus_scan.proto          （病毒扫描，双向流式）
+    - vuln_scan.proto           （漏洞数据上报转发）
+    - admission.proto           （网络准入控制）
+
+  权限模型:
+    - Agent 在线时: 读操作(Get*)可用; 写/执行操作返回 PERMISSION_DENIED
+    - Agent 离线时: 全部操作可用
+
+  本地持久化 (/opt/osec/db/):
+    - alert.db              告警日志（SQLite）
+    - jump.db               跳变状态（单行）
+    - process_policy.db     进程黑白名单策略（hash + is_white）
+    - known_executables.db  非标准路径可执行文件（hash + path + policy_status）
+
+  策略状态枚举 (PolicyStatus, 定义于 data_query.proto):
+    POLICY_NONE      = 0  未知（不在任何名单中）
+    POLICY_WHITELIST = 1  白名单
+    POLICY_BLACKLIST = 2  黑名单
+
+  代码生成: 使用 protoc + grpc 插件从 proto 文件生成各语言 stub
+
+
+二、Agent 状态查询 (agent_status.proto)
+=========================================================================
+
+  服务名: AgentStatusService
+  包名: agent_status
+
+  接口: GetAgentStatus
+  权限: 始终可用
+  请求: Empty
+  返回: AgentStatus
+
+  返回字段:
+    is_online          bool         【核心】Agent 是否在线
+    agent_version      string       Agent 版本号
+    os_info            string       操作系统信息
+    protection_days    int32        已保护天数
+    device_uid         string       设备唯一标识
+    host_name          string       主机名
+    cpu_mem            CpuMemInfo   CPU/内存/磁盘使用率:
+      cpu_usage        string
+      mem_usage        string
+      disk_usage       string
+    modules            数组         各模块运行状态:
+      name             string
+      enabled          bool
+      status           string
+
+  使用场景:
+    - 客户端启动时立即调用，确定当前模式，显示仪表盘信息
+    - 根据 is_online 决定 UI 状态（在线时置灰写操作按钮）
+    - 定时轮询（建议 5-10 秒）或在操作前调用一次确认状态
+
+
+三、IP/密码跳变 (jump.proto)
+=========================================================================
+
+  服务名: JumpService
+  包名: jump
+
+  -----------------------------------------------------------------------
+  3.1 查询跳变状态
+  -----------------------------------------------------------------------
+
+  接口: GetJumpStatus
+  权限: 在线/离线均可
+  请求: Empty
+  返回: JumpStatus
+
+  返回字段:
+    【IP 跳变状态】
+    current_ip          string    当前逻辑主 IP
+    ip_jump_active      bool      是否正在周期跳变
+    active_time         uint32    周期间隔（秒）
+    aging_time          uint32    老化时间（分钟）
+    mode                uint32    1=Keep 2=Replace
+    source_ip           string    跳变源 IP
+    target_ip           string    跳变目标 IP/CIDR
+    gateway             string    网关
+    last_ip_jump_time   string    上次跳变时间
+    ip_scheme           uint32    跳变方案编号
+    ip_cycle_label      string    频率描述
+    ip_timing_label     string    时机描述
+    ip_way_label        string    方式描述
+
+    【密码跳变状态】
+    current_password    string    当前密码
+    last_pw_jump_user   string    被修改用户名
+    last_pw_jump_time   string    上次密码跳变时间
+    pw_scheme           uint32    口令跳变方案编号
+    pw_cycle_label      string    口令跳变频率描述
+    pw_timing_label     string    口令跳变时机描述
+
+  说明:
+    - 缓存数据，开机或跳变成功后从服务器刷新
+
+  -----------------------------------------------------------------------
+  3.2 执行 IP 跳变
+  -----------------------------------------------------------------------
+
+  接口: ExecuteIpJump
+  权限: 仅离线模式可用
+  请求: IpJumpRequest
+  返回: IpJumpResponse
+
+  请求字段:
+    gateway       string   网关（空则自动获取）
+    source_ip     string   源 IP（空则自动检测）
+    target_ip     string   【必填】目标 IP/CIDR
+    mode          uint32   【必填】1=Keep 2=Replace
+    allow_size    uint32   子网前缀长度
+    aging_time    uint32   老化时间（分钟）
+    active_time   uint32   循环间隔（秒），0=单次
+
+  返回字段:
+    success       bool     是否成功
+    status        uint32   1=成功 2=失败
+    reason        string   失败原因
+
+  -----------------------------------------------------------------------
+  3.3 执行密码跳变
+  -----------------------------------------------------------------------
+
+  接口: ExecutePwJump
+  权限: 仅离线模式可用
+  请求: PwJumpRequest
+  返回: PwJumpResponse
+
+  请求字段:
+    new_password   string   【必填】新密码
+
+  返回字段:
+    success        bool     是否成功
+    status         uint32   1=成功 2=失败
+    reason         string   失败原因
+
+
+四、进程策略 (process_policy.proto)
+=========================================================================
+
+  服务名: ProcessPolicyService
+  包名: process_policy
+
+  -----------------------------------------------------------------------
+  4.1 查询进程策略
+  -----------------------------------------------------------------------
+
+  接口: GetProcessPolicy
+  权限: 在线/离线均可
+  请求: ProcessPolicyFilter { is_white }
+  返回: ProcessPolicy
+
+  请求字段:
+    is_white       bool         要获取的名单类型
+
+  返回字段:
+    hash_list      string数组   进程 MD5 列表
+    is_white       bool         与请求一致
+
+  -----------------------------------------------------------------------
+  4.2 更新进程策略
+  -----------------------------------------------------------------------
+
+  接口: UpdateProcessPolicy
+  权限: 仅离线模式可用
+  请求: ProcessPolicy
+  返回: SimpleResponse
+
+  请求字段:
+    hash_list      string数组   【必填】进程 MD5 列表
+    is_white       bool         【必填】名单类型
+
+  返回字段:
+    success        bool
+    message        string
+
+  注意事项:
+    - 更新会完全替换当前策略（非增量）
+    - 空 hash_list 表示清空策略
+    - 持久化到 /opt/osec/db/process_policy.db，重启后自动恢复
+
+
+五、外设策略 (peripheral_policy.proto)
+=========================================================================
+
+  服务名: PeripheralPolicyService
+  包名: peripheral_policy
+
+  -----------------------------------------------------------------------
+  5.1 查询外设策略
+  -----------------------------------------------------------------------
+
+  接口: GetPeripheralPolicy
+  权限: 在线/离线均可
+  请求: Empty
+  返回: PeripheralPolicy
+
+  返回字段:
+    devices        数组
+      peripheral_eid   string   设备硬件 ID
+      peripheral_name  string   设备名称
+      intro            string   备注
+      type_            string   设备类型
+      allow            bool     是否允许
+    is_white       bool         名单类型
+
+  -----------------------------------------------------------------------
+  5.2 更新外设策略
+  -----------------------------------------------------------------------
+
+  接口: UpdatePeripheralPolicy
+  权限: 仅离线模式可用
+  请求: PeripheralPolicy
+  返回: SimpleResponse
+
+  注意事项:
+    - 更新会完全替换当前策略
+    - peripheral_eid 必须与硬件 ID 匹配
+
+
+六、防护模式 (protection_mode.proto)
+=========================================================================
+
+  包名: protection_mode
+  服务: ProcessDefenseService、PeripheralDefenseService
+
+  防护模式枚举 (DefenseMode):
+    OFF     = 0    关闭
+    MONITOR = 1    监控（只告警）
+    PROTECT = 2    保护（告警 + 阻止）
+
+  -----------------------------------------------------------------------
+  6.1 进程防护模式
+  -----------------------------------------------------------------------
+
+  接口: GetProcessDefenseMode
+  权限: 在线/离线均可
+  请求: Empty → ProcessDefenseMode { mode }
+
+  接口: UpdateProcessDefenseMode
+  权限: 仅离线模式可用
+  请求: ProcessDefenseMode { mode } → SimpleResponse
+
+  -----------------------------------------------------------------------
+  6.2 外设防护模式
+  -----------------------------------------------------------------------
+
+  接口: GetPeripheralDefenseMode
+  权限: 在线/离线均可
+  请求: Empty → PeripheralDefenseMode { mode }
+
+  接口: UpdatePeripheralDefenseMode
+  权限: 仅离线模式可用
+  请求: PeripheralDefenseMode { mode } → SimpleResponse
+
+
+七、告警服务 (alert.proto)
+=========================================================================
+
+  服务名: AlertService
+  包名: alert
+
+  -----------------------------------------------------------------------
+  7.1 订阅实时告警
+  -----------------------------------------------------------------------
+
+  接口: SubscribeAlerts
+  权限: 始终可用
+  请求: AlertFilter
+  返回: stream AlertEvent
+
+  请求字段 (AlertFilter):
+    type    AlertType    0=全部 1=进程 2=文件 3=外设 4=网络 5=勒索
+
+  返回字段 (AlertEvent):
+    alert_id         string       告警唯一 ID
+    type             AlertType    告警类型
+    level            uint32       告警级别
+    timestamp        uint64       时间戳
+    file_path        string       文件路径
+    process_name     string       进程名
+    md5              string       MD5 哈希
+    remark           string       备注
+    peripheral_name  string       外设名称
+    peripheral_eid   string       外设硬件 ID
+    rename_dir       string       重命名目录
+    p_param          string       附加参数
+    n_type           uint32       原始事件类型码
+
+  使用说明:
+    - 服务端流，调用一次后持续接收
+    - Agent 产生告警时实时推送，无需轮询
+    - 告警同时持久化到 alert.db，断开重连后可用 GetAlertLogs 补读
+
+  -----------------------------------------------------------------------
+  7.2 查询历史告警日志
+  -----------------------------------------------------------------------
+
+  接口: GetAlertLogs
+  权限: 始终可用
+  请求: AlertLogQuery
+  返回: AlertLogResponse
+
+  请求字段 (AlertLogQuery):
+    handle_status    int32    -1=全部 0=未处理 1=已处理 2=已忽略
+    page             uint32   页码（从 1 开始）
+    page_size        uint32   每页条数（默认 20）
+
+  返回字段 (AlertLogResponse):
+    items            数组     AlertLogItem 列表:
+      id               int64    告警记录 ID
+      alert_type       int32    告警大类
+      level            int32    级别
+      process          string   进程名
+      path             string   路径
+      pid              int32    进程 ID
+      detail           string   详情
+      handle_status    int32    0=未处理 1=已处理 2=已忽略
+      handle_status_label  string  状态文字（客户端直接显示）
+      handle_user      string   处置用户
+      handled_at       string   处置时间
+      created_at       string   产生时间
+      n_type           uint32   原始事件类型码
+    total            int32    总条数
+
+  -----------------------------------------------------------------------
+  7.3 处置告警
+  -----------------------------------------------------------------------
+
+  接口: HandleAlert
+  权限: 始终可用
+  请求: AlertHandleRequest
+  返回: AlertHandleResponse
+
+  请求字段 (AlertHandleRequest):
+    id               int64    【必填】告警记录 ID
+    handle_status    int32    【必填】1=已处理 2=已忽略
+    handle_user      string   处置用户名
+
+  返回字段 (AlertHandleResponse):
+    success          bool
+    message          string
+    affected         int32    影响行数
+
+  使用场景:
+    1. 客户端启动 → GetAlertLogs 获取历史告警
+    2. 保持 SubscribeAlerts 长连接接收新告警
+    3. 用户在列表中点"已处理"/"忽略" → HandleAlert
+
+
+八、备份/回滚 (backup.proto)
+=========================================================================
+
+  服务名: BackupService
+  包名: backup
+
+  接口: GetBackupList
+  权限: 在线/离线均可
+  请求: Empty → BackupList
+
+  返回:
+    backups    数组
+      backup_id    string   备份 ID
+      name         string   备份名称
+      created_at   string   创建时间
+      size_bytes   uint64   大小
+
+  接口: CreateBackup
+  权限: 仅离线模式可用
+  请求: CreateBackupRequest { name } → CreateBackupResponse { success, backup_id, message }
+
+  接口: RestoreBackup
+  权限: 仅离线模式可用
+  请求: RestoreBackupRequest { backup_id } → RestoreBackupResponse { success, message }
+
+
+九、数据查询 (data_query.proto)
+=========================================================================
+
+  服务名: DataQueryService
+  包名: data_query
+
+  -----------------------------------------------------------------------
+  9.1 查询运行进程列表
+  -----------------------------------------------------------------------
+
+  接口: GetProcessList
+  权限: 在线/离线均可
+  请求: ProcessFilter { limit, sort_by, filter_status }
+  返回: ProcessList
+
+  请求字段 (ProcessFilter):
+    limit          int32     返回条数限制（0=全部，默认按 PID 升序）
+    sort_by        string    排序字段（默认 "pid"）
+    filter_status  int32     按策略状态过滤:
+                               0 = 全部（默认）
+                               1 = 仅白名单
+                               2 = 仅黑名单
+                               3 = 仅未知（未在名单中）
+
+  返回字段 (ProcessInfo):
+    pid            int32
+    name           string
+    exe_path       string
+    hash           string     MD5
+    cpu_usage      string
+    mem_usage      string
+    user           string
+    policy_status  enum       PolicyStatus: 0=未知(无策略), 1=白名单, 2=黑名单
+
+  数据来源: /proc/ 实时进程 + ProcessPolicy 标注策略状态
+
+  -----------------------------------------------------------------------
+  9.2 查询监听端口列表
+  -----------------------------------------------------------------------
+
+  接口: GetPortList
+  权限: 在线/离线均可
+  请求: Empty → PortList
+
+  返回字段 (PortInfo):
+    protocol      string
+    port          uint32
+    process_name  string
+    pid           int32
+
+  -----------------------------------------------------------------------
+  9.3 查询已连接 USB 设备
+  -----------------------------------------------------------------------
+
+  接口: GetUsbDeviceList
+  权限: 在线/离线均可
+  请求: Empty → UsbDeviceList
+
+  返回字段 (UsbDevice):
+    peripheral_eid    string
+    peripheral_name   string
+    intro             string
+    type_             string
+    allow             bool
+
+  -----------------------------------------------------------------------
+  9.4 获取可执行文件列表
+  -----------------------------------------------------------------------
+
+  接口: GetExecutableList
+  权限: 在线/离线均可
+  请求: ProcessFilter { filter_status }
+  返回: ExecutableList
+
+  请求字段 (ProcessFilter):
+    filter_status  int32     按策略状态过滤（limit/sort_by 忽略）
+                               0 = 全部（默认）
+                               1 = 仅白名单
+                               2 = 仅黑名单
+                               3 = 仅未知（未在名单中）
+
+  返回字段:
+    executables    数组
+      path           string   完整路径
+      hash           string   MD5
+      policy_status  enum     0=未知(无策略), 1=白名单(POLICY_WHITELIST), 2=黑名单(POLICY_BLACKLIST)
+    total          int32    标准目录扫描到的总文件数（去重前）
+    unique         int32    去重后总数（含 DB 补充）
+
+  数据来源:
+    - 标准目录扫描: /bin/, /usr/bin/, /usr/sbin/, /usr/local/bin/, /usr/lib/systemd/
+    - DB 补充: /opt/osec/db/known_executables.db（内核发现的非标准路径自动入库）
+    - 两次数据按 MD5 去重，标准目录优先
+
+
+十、病毒扫描 (virus_scan.proto)
+=========================================================================
+
+  服务名: VirusScanService
+  包名: virus_scan
+
+  接口: StreamControl
+  类型: 双向流式 RPC
+  请求: stream ClientMessage
+  返回: stream ServerMessage
+
+  -----------------------------------------------------------------------
+  10.1 客户端消息 (ClientMessage.cmd)
+  -----------------------------------------------------------------------
+
+  StartScanRequest — 启动扫描
+    target           string        目标目录（full_disk=true 时忽略）
+    exclude_dirs     string[]      排除目录
+    include_script   bool          是否扫描脚本
+    full_disk        bool          全盘扫描
+
+  StopScanRequest — 停止
+    scan_id          string
+
+  PauseScanRequest — 暂停
+    scan_id          string
+
+  ResumeScanRequest — 恢复
+    scan_id          string
+
+  DisposeFileRequest — 处置感染文件
+    scan_id          string
+    file_path        string
+    action           enum          1=MOVE 2=REMOVE
+    quarantine_dir   string        （action=MOVE 时必填）
+
+  Ping — 心跳
+    timestamp        int64
+
+  -----------------------------------------------------------------------
+  10.2 服务端消息 (ServerMessage.event)
+  -----------------------------------------------------------------------
+
+  StartScanResponse
+    success, scan_id, message
+
+  ScanProgress — 进度（每 10 文件）
+    scan_id, scanned, total, viruses_found, current_path
+
+  FileScanResult — 单文件结果
+    scan_id, file_path, status (OK/VIRUS/ERROR), virus_name, scan_time_ms
+
+  VirusAlert — 病毒告警
+    scan_id, file_path, virus_name, threat_level, detected_at
+
+  ScanCompleted — 扫描完成
+    scan_id, total_scanned, viruses_found, duration_ms
+
+  ScanError — 错误
+    scan_id, code, message
+
+  DisposeFileResponse — 处置结果
+    scan_id, file_path, action, success, message
+
+  -----------------------------------------------------------------------
+  10.3 典型流程
+  -----------------------------------------------------------------------
+
+    1. 建立 StreamControl 双向流
+    2. 发送 StartScanRequest → 收到 StartScanResponse (获取 scan_id)
+    3. 接收 ScanProgress / FileScanResult 更新进度
+    4. 收到 VirusAlert 时弹窗，发送 DisposeFileRequest 处置
+    5. 收到 ScanCompleted 展示汇总
+
+
+十一、漏洞扫描数据上报 (vuln_scan.proto)
+=========================================================================
+
+  服务名: VulnScanService
+  包名: vuln_scan
+
+  接口: PutVulnScan
+  权限: 在线/离线均可
+  请求: PutVulnScanRequest
+  返回: PutVulnScanResponse
+
+  请求字段:
+    start_at      string        开始时间
+    end_at        string        结束时间
+    vuln_total    int32         漏洞总数
+    vuln_list     数组
+      title         string      CVE 编号
+      severity      string      HIGH/MEDIUM/LOW
+      file_path     string      受影响文件
+
+  返回字段:
+    success    bool
+    message    string
+
+
+十二、网络准入控制 (admission.proto)
+=========================================================================
+
+  服务名: AdmissionService
+  包名: admission
+
+  注意: 依赖配置 ENABLED=1 才注册，未启用时返回"未找到服务"
+
+  准入模式枚举 (AdmissionMode):
+    ADMISSION_OFF  = 0   关闭
+    ADMISSION_ON   = 1   开启
+    ADMISSION_AUTO = 2   自动检测
+
+  -----------------------------------------------------------------------
+  12.1 查询准入状态
+  -----------------------------------------------------------------------
+
+  接口: GetAdmissionSwitch
+  请求: Empty → AdmissionSwitchStatus
+
+  返回字段:
+    mode             AdmissionMode   当前模式
+    effective        bool            生效值: true=开 false=关
+    detecting        bool            是否正在自动检测
+    network_anomaly  bool            网络是否异常
+    message          string          状态描述
+    enabled          bool            功能是否启用
+
+  -----------------------------------------------------------------------
+  12.2 设置准入模式
+  -----------------------------------------------------------------------
+
+  接口: UpdateAdmissionSwitch
+  请求: AdmissionSwitchRequest { mode } → AdmissionSwitchResponse { success, message }
+
+  AUTO 模式行为:
+    1. 关准入 → 检测服务器连通性 → 成功则保持关闭
+    2. 开准入 → 检测服务器连通性 → 成功则保持开启
+    3. 均失败 → network_anomaly=true，周期重试
+
+
+十三、错误处理
+=========================================================================
+
+  PERMISSION_DENIED (7)   在线模式不允许写操作
+  UNAVAILABLE (14)        Agent 未运行
+  INTERNAL (13)           内部错误
+  INVALID_ARGUMENT (3)    参数错误（如 handle_status 传非 1/2 值）
+
+
+十四、客户端启动初始化流程
+=========================================================================
+
+  1. GetAgentStatus          → 确认在线/离线，初始化 UI
+  2. GetAlertLogs(status=-1) → 获取历史告警，补到 UI 列表
+  3. SubscribeAlerts(type=0) → 开启告警流，持续接收新告警
+  4. 根据需要调用各 Get* 接口加载数据
+
+=========================================================================

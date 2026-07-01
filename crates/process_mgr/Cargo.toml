@@ -12,3 +12,4 @@ hex = "0.4"
 once_cell = "1.17"
 logging = { path = "../logging" }
 log = "0.4"
+local_store = { path = "../local_store" }

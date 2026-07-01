@@ -134,6 +134,45 @@ impl ProcessPolicyManager {
                 Self::notify_kernel_update();
             }
         }
+
+        // 持久化到 SQLite（错误只记 log，不影响主流程）
+        let white: Vec<String> = self.white_set.iter().cloned().collect();
+        let black: Vec<String> = self.black_set.iter().cloned().collect();
+        if let Err(e) = local_store::process_policy::save_all(&white, &black) {
+            log_error!("[process_policy] 持久化失败: {}", e);
+        }
+        // 同步更新 known_executables 表中的 policy_status
+        if let Err(e) = local_store::known_executables::update_policy_status(&white, true) {
+            log_error!("[known_executables] 同步白名单失败: {}", e);
+        }
+        if let Err(e) = local_store::known_executables::update_policy_status(&black, false) {
+            log_error!("[known_executables] 同步黑名单失败: {}", e);
+        }
+    }
+
+    /// 从 SQLite 加载黑白名单到内存（启动时调用，不写 kernel）
+    pub fn load_policy_from_db(&mut self) {
+        match local_store::process_policy::load_all() {
+            Ok(entries) => {
+                self.white_set.clear();
+                self.black_set.clear();
+                for (hash, is_white) in entries {
+                    if is_white {
+                        self.white_set.insert(hash);
+                    } else {
+                        self.black_set.insert(hash);
+                    }
+                }
+                self.prev_white_set = self.white_set.clone();
+                self.prev_black_set = self.black_set.clone();
+                log_info!(
+                    "[process_policy] 从 DB 加载: {} 白名单, {} 黑名单",
+                    self.white_set.len(),
+                    self.black_set.len()
+                );
+            }
+            Err(e) => log_error!("[process_policy] 从 DB 加载失败: {}", e),
+        }
     }
 
     pub fn get_white_list(&self) -> Vec<String> {
