@@ -180,6 +180,13 @@ impl ProcessAuditHandler {
 fn file_exists(path: &str) -> bool {
     std::path::Path::new(path).exists()
 }
+
+const STANDARD_DIRS: &[&str] = &["/bin/", "/usr/bin/", "/usr/sbin/", "/usr/local/bin/", "/usr/lib/systemd/"];
+
+fn is_standard_dir(path: &str) -> bool {
+    STANDARD_DIRS.iter().any(|d| path.starts_with(d))
+}
+
 fn bin_to_hex<T: AsRef<[u8]>>(data: T) -> String {
     data.as_ref()
         .iter()
@@ -235,6 +242,26 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
         }
     };
     //log_info!("is docker= {}, proc_info: {:?}  p_dir: {:?}  hash: {:?} ",is_docker, proc_info, p_dir, hash);
+
+    // 非标准目录的可执行文件，自动入库
+    if !is_standard_dir(&p_dir) {
+        let policy_status = {
+            let mgr = process_mgr::POLICY_MANAGER.lock().unwrap();
+            let white = mgr.get_white_list();
+            let black = mgr.get_black_list();
+            if white.contains(&hash) {
+                1i32 // 白名单
+            } else if black.contains(&hash) {
+                2i32 // 黑名单
+            } else {
+                0i32 // 未知
+            }
+        };
+        if let Err(e) = local_store::known_executables::upsert(&hash, &p_dir, policy_status) {
+            log_error!("[known_executables] upsert 失败: {}", e);
+        }
+    }
+
     // 处理 AuditProcess
     if cfg.proc_switch {
         if proc_info.type_ == 1101 || proc_info.type_ == 1001 {

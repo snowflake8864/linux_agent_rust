@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 use grpc_gateway::process_policy::{
-    process_policy_service_server::ProcessPolicyService, ProcessPolicy,
+    process_policy_service_server::ProcessPolicyService, ProcessPolicy, ProcessPolicyFilter,
 };
 use grpc_gateway::common::SimpleResponse;
 use crate::data_hub::{require_offline, AgentDataHub};
@@ -15,9 +15,9 @@ pub struct ProcessPolicyServiceImpl {
 impl ProcessPolicyService for ProcessPolicyServiceImpl {
     async fn get_process_policy(
         &self,
-        _: Request<grpc_gateway::common::Empty>,
+        request: Request<ProcessPolicyFilter>,
     ) -> Result<Response<ProcessPolicy>, Status> {
-        let is_white = true; // always return whitelist by default
+        let is_white = request.into_inner().is_white;
         let hashes = self.data_hub.get_process_policy(is_white);
         Ok(Response::new(ProcessPolicy {
             hash_list: hashes,

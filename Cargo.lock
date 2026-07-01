@@ -1454,6 +1454,7 @@ dependencies = [
  "online",
  "openssl",
  "openssl-sys",
+ "process_mgr",
  "prost",
  "reporter",
  "task",
@@ -1942,6 +1943,7 @@ name = "process_mgr"
 version = "0.10.6"
 dependencies = [
  "hex",
+ "local_store",
  "log 0.4.29",
  "logging",
  "md-5",

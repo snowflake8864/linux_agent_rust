@@ -149,6 +149,9 @@ async fn main() -> std::io::Result<()> {
     // 初始化本地数据库（建表幂等，已存在时跳过）
     local_store::init_all();
 
+    // 从 DB 恢复进程黑白名单到内存
+    process_mgr::POLICY_MANAGER.lock().unwrap().load_policy_from_db();
+
     // 从 DB 恢复跳变状态到内存缓存（让重启后无需等待服务器即可返回上次跳变状态）
     match local_store::jump_status::load() {
         Ok(Some(row)) => {
