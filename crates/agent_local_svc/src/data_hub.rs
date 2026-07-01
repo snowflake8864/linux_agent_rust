@@ -9,6 +9,16 @@ use grpc_gateway::jump::JumpStatus;
 // Re-export from grpc_gateway so downstream code keeps working
 pub use grpc_gateway::agent_mode::{AgentMode, AGENT_MODE, ADMISSION_NETWORK_ANOMALY, require_offline, set_online, set_offline};
 
+/// 启动时自动注册网络故障回调，供 task_fetcher 等 crate 通过 grpc_gateway 间接触发。
+static REGISTER_CALLBACK: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+fn ensure_callback_registered() {
+    REGISTER_CALLBACK.get_or_init(|| {
+        grpc_gateway::agent_mode::register_network_failure_callback(
+            set_offline_and_check_admission as fn()
+        );
+    });
+}
+
 /// 全局 token 缓存，token 获取时由 online 模块更新，check_server_reachable 读取。
 static CURRENT_TOKEN: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
@@ -17,21 +27,56 @@ pub fn update_token(token: String) {
     *CURRENT_TOKEN.lock().unwrap() = Some(token);
 }
 
-/// 断线时调用：尝试切离线 + 如果真正切了且准入模式是 AUTO 则重新触发自动检测。
-/// 调用方不需要关心阈值——set_offline 内部会累计失败次数。
-pub fn set_offline_and_check_admission() {
-    if !set_offline() {
-        return; // 还没到阈值，未真正切离线
-    }
+/// 准入修复：根据当前模式设置 /proc/osec/tcp_force_ecn。
+/// 调用方不需要再重复写 proc——这里已经按模式处理。
+fn run_admission_repair() {
     let admission_enabled = {
         let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
         cfg.admission.enabled
     };
-    if admission_enabled && ADMISSION_MODE.load(Ordering::Relaxed) == 2 && !ADMISSION_DETECTING.load(Ordering::Relaxed) {
-        log_info!("[admission] 断线且 AUTO 模式，重新启动自动检测");
-        let hub = AgentDataHub::new();
-        hub.start_auto_detect();
+    if !admission_enabled {
+        log_info!("[admission] 准入功能未启用，跳过修复");
+        return;
     }
+
+    let hub = AgentDataHub::new();
+    let mode = ADMISSION_MODE.load(Ordering::Relaxed);
+    let effective = ADMISSION_EFFECTIVE.load(Ordering::Relaxed);
+    let detecting = ADMISSION_DETECTING.load(Ordering::Relaxed);
+    log_info!("[admission] 准入修复: mode={}, effective={}, detecting={}", mode, effective, detecting);
+
+    match mode {
+        0 => {
+            log_info!("[admission] OFF 模式 → 写 tcp_force_ecn=0（关准入）");
+            let _ = hub.write_admission_proc(false);
+        }
+        1 => {
+            log_info!("[admission] ON 模式 → 写 tcp_force_ecn=1（开准入）");
+            let _ = hub.write_admission_proc(true);
+        }
+        2 => {
+            if !detecting {
+                log_info!("[admission] AUTO 模式 → 启动自动检测（OFF→测→ON→测）");
+                hub.start_auto_detect();
+            } else {
+                log_info!("[admission] AUTO 模式 → 自动检测已在运行，跳过");
+            }
+        }
+        _ => {
+            log_error!("[admission] 未知的准入模式: {}", mode);
+        }
+    }
+}
+
+/// 断线时调用：累计失败次数，仅在首次切离线时执行准入修复。
+/// 已离线后不再重复触发——由 auto-detection 自身循环负责后续重试。
+pub fn set_offline_and_check_admission() {
+    ensure_callback_registered();
+    if !set_offline() {
+        return;
+    }
+    log_info!("[admission] 切离线，触发准入修复");
+    run_admission_repair();
 }
 
 /// 检测服务器是否可达：向 /v1/getinfo 发送空请求，验证返回 code=="000000"。
@@ -80,16 +125,19 @@ pub async fn check_server_reachable() -> bool {
 static PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// 由 gRPC handler 调用：触发后台连通性探测（不阻塞，立即返回）。
-/// handler 读 AGENT_MODE / ADMISSION_NETWORK_ANOMALY 缓存值，响应零延迟。
+/// 探测到不可达时，写入 /proc/osec/tcp_force_ecn 尝试修复准入状态。
 pub fn trigger_connectivity_probe() {
     if PROBE_RUNNING.swap(true, Ordering::Relaxed) {
         return; // 已有探测在跑，跳过
     }
     tokio::spawn(async move {
         if check_server_reachable().await {
+            log_info!("[connectivity] 探测可达，恢复在线");
             set_online();
         } else {
+            log_info!("[connectivity] 探测不可达，触发准入修复");
             let _ = set_offline();
+            run_admission_repair();
         }
         PROBE_RUNNING.store(false, Ordering::Relaxed);
     });
@@ -321,17 +369,21 @@ impl AgentDataHub {
                 ADMISSION_EFFECTIVE.store(0, Ordering::Relaxed);
                 self.write_admission_proc(false)?;
                 self.persist_admission_mode(0, false)?;
+                // 模式变更后尝试重连
+                trigger_connectivity_probe();
             }
             1 => { // ON
                 ADMISSION_MODE.store(1, Ordering::Relaxed);
                 ADMISSION_EFFECTIVE.store(1, Ordering::Relaxed);
                 self.write_admission_proc(true)?;
                 self.persist_admission_mode(1, true)?;
+                // 模式变更后尝试重连
+                trigger_connectivity_probe();
             }
             2 => { // AUTO
                 ADMISSION_MODE.store(2, Ordering::Relaxed);
                 self.persist_admission_mode(2, false)?;
-                // 启动自动检测（异步）
+                // 自动检测内部会尝试连通并恢复上线
                 self.start_auto_detect();
             }
             _ => return Err(format!("无效的准入模式: {}", mode)),
@@ -342,7 +394,7 @@ impl AgentDataHub {
     }
 
     /// 写入 /proc/osec/tcp_force_ecn
-    fn write_admission_proc(&self, enable: bool) -> Result<(), String> {
+    pub(crate) fn write_admission_proc(&self, enable: bool) -> Result<(), String> {
         let proc_path = "/proc/osec/tcp_force_ecn";
         if std::path::Path::new(proc_path).exists() {
             let val = if enable { "1" } else { "0" };
@@ -397,12 +449,13 @@ impl AgentDataHub {
                 let _ = data_hub.write_admission_proc(false);
                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                 if check_server_reachable().await {
-                    log_info!("[admission] 关准入可上线，设置 effective=OFF");
+                    log_info!("[admission] 关准入可上线，设置 effective=OFF，恢复在线");
                     ADMISSION_EFFECTIVE.store(0, Ordering::Relaxed);
                     let _ = data_hub.persist_admission_mode(2, false);
                     // ADMISSION_MODE 保持 AUTO(2)，不改变
                     ADMISSION_DETECTING.store(false, Ordering::Relaxed);
                     ADMISSION_NETWORK_ANOMALY.store(false, Ordering::Relaxed);
+                    set_online();
                     data_hub.notify(PolicyChangeType::ConfigChanged);
                     return;
                 }
@@ -413,12 +466,13 @@ impl AgentDataHub {
                 let _ = data_hub.write_admission_proc(true);
                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                 if check_server_reachable().await {
-                    log_info!("[admission] 开准入可上线，设置 effective=ON");
+                    log_info!("[admission] 开准入可上线，设置 effective=ON，恢复在线");
                     ADMISSION_EFFECTIVE.store(1, Ordering::Relaxed);
                     let _ = data_hub.persist_admission_mode(2, true);
                     // ADMISSION_MODE 保持 AUTO(2)，不改变
                     ADMISSION_DETECTING.store(false, Ordering::Relaxed);
                     ADMISSION_NETWORK_ANOMALY.store(false, Ordering::Relaxed);
+                    set_online();
                     data_hub.notify(PolicyChangeType::ConfigChanged);
                     return;
                 }

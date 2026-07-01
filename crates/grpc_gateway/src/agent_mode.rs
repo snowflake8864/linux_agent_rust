@@ -2,7 +2,7 @@
 ///
 /// - Online:  agent is connected to the server, write operations via gRPC are blocked
 /// - Offline: agent lost connection to the server, local gRPC write operations are allowed
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicBool, Ordering};
+use std::sync::{Mutex, LazyLock, atomic::{AtomicU8, AtomicU32, AtomicBool, Ordering}};
 use tonic::Status;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,4 +61,31 @@ pub fn require_offline() -> Result<(), Status> {
         ));
     }
     Ok(())
+}
+
+// ── 网络故障回调：各 crate 在请求服务器失败时通知，由 agent_local_svc 注册处理 ──
+
+/// 网络故障回调类型（准入检查 + 重连逻辑）
+type NetworkFailureCallback = fn();
+
+/// 注册的网络故障回调，由 agent_local_svc 在初始化时设置
+static NETWORK_FAILURE_CALLBACK: LazyLock<Mutex<Option<NetworkFailureCallback>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// 注册网络故障回调（由 agent_local_svc 调用一次）
+pub fn register_network_failure_callback(cb: NetworkFailureCallback) {
+    *NETWORK_FAILURE_CALLBACK.lock().unwrap() = Some(cb);
+}
+
+/// 通知网络故障：累计失败计数，仅在首次切离线时触发一次准入检查。
+///
+/// 供 task_fetcher / reporter 等任意 crate 在请求服务器超时/失败时调用。
+/// 无轮询，纯事件驱动。已离线后不会重复触发——由 auto-detection 自身循环负责重试。
+pub fn notify_network_failure() {
+    let just_went_offline = set_offline();
+    if just_went_offline {
+        if let Some(cb) = *NETWORK_FAILURE_CALLBACK.lock().unwrap() {
+            cb();
+        }
+    }
 }
