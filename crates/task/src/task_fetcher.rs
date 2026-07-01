@@ -40,6 +40,7 @@ use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use grpc_gateway::agent_mode::notify_network_failure;
 use std::sync::OnceLock;
 use grpc_gateway::notify::{notify_policy_change, init_local_task_rx, DIR_POLICY_CACHE, EXTORT_POLICY_CACHE, VIRTUAL_PORT_CACHE, TRUST_DIR_CACHE};
 use grpc_gateway::policy_watch::PolicyChangeType;
@@ -642,7 +643,7 @@ pub async fn run(
         tokio::select! {
             _ = task_interval.tick() => {
                 let url = format!("{}/v1/gettask", task_fetcher.base_url);
-                match net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+                match net_client.post_data_async(&url, "", Duration::from_secs(100), token_str).await {
                     Ok(response) => {
                         // 在线/离线由 connectivity_monitor 统一管理
                         let parsed: Value = match serde_json::from_str(&response) {
@@ -687,7 +688,7 @@ pub async fn run(
                     Err(err) => {
                         eprintln!("Error fetching task: {}", err);
                         log_info!("服务器离线或网络错误: {}", err);
-                        // 在线/离线由 connectivity_monitor 统一管理
+                        notify_network_failure();
                     }
                 }
             }
@@ -832,7 +833,7 @@ pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
     let token_str = token_owned.as_deref();
 
     let response = self.net_client
-        .post_data_async(&url, "", Duration::from_secs(10), token_str)
+        .post_data_async(&url, "", Duration::from_secs(30), token_str)
         .await
         .map_err(|e| format!("Error fetching update info: {}", e))?;
 
@@ -973,7 +974,7 @@ async fn task_upload_dir(&self, task_type: u64) -> Result<(), String> {
     let token_str = token.as_ref().map(|s| s.as_str());
 
     let response = match self.net_client
-        .post_data_async(&url, "", Duration::from_secs(10), token_str)
+        .post_data_async(&url, "", Duration::from_secs(30), token_str)
         .await
         {
             Ok(response) => response,
@@ -1072,7 +1073,7 @@ async fn task_down_dir_policy(&self, task_type: u64) -> Result<(), String> {
     let token = self.get_token();
     let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
 
-    match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+    match self.net_client.post_data_async(&url, "", Duration::from_secs(30), token_str).await {
         Ok(response) => {
             // 解析 JSON 响应
             let parsed: Value = match serde_json::from_str(&response) {
@@ -1134,7 +1135,7 @@ async fn task_down_conf(&mut self, task_type: u64) -> Result<(), String> {
 
     let token = self.get_token();
     let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-    match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+    match self.net_client.post_data_async(&url, "", Duration::from_secs(30), token_str).await {
         Ok(response) => {
             // 解析 JSON 响应
             let parsed: Value = match serde_json::from_str(&response) {
@@ -1185,7 +1186,7 @@ async fn task_down_black(&self, task_type: u64) -> Result<(), String> {
     let url = format!("{}/{}", self.base_url, download_url);
     let token = self.get_token();
     let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-    match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+    match self.net_client.post_data_async(&url, "", Duration::from_secs(30), token_str).await {
         Ok(response) => {
 
             // 解析 JSON 响应
@@ -1245,7 +1246,7 @@ pub async fn task_down_white(&self, task_type: u64) -> Result<(), String> {
 
     let token = self.get_token();
     let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-    match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+    match self.net_client.post_data_async(&url, "", Duration::from_secs(30), token_str).await {
         Ok(response) => {
             let parsed: Value = match serde_json::from_str(&response) {
                 Ok(parsed) => parsed,
@@ -1311,7 +1312,7 @@ async fn task_upload_port(&self, task_type: u64) -> Result<(), String> {
         Err(e) => return Err(format!("Failed to serialize port data to JSON: {}", e)),
     };
     log_info!("准备上传的数据: {}", json_data);
-    match self.net_client.post_data_async(&url, &json_data, Duration::from_secs(10), token_str).await{
+    match self.net_client.post_data_async(&url, &json_data, Duration::from_secs(30), token_str).await{
         Ok(response) => {log_info!("服务器响应: {}", response)},
         Err(err) => {
             log_info!("发送指标失败: {}", err);
@@ -1336,7 +1337,7 @@ pub async fn task_down_virtual_port(&self, task_type: u64) -> Result<(), String>
     let token = self.get_token();
     let token_str = token.as_ref().map(|s| s.as_str());
 
-    let response = self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await?;
+    let response = self.net_client.post_data_async(&url, "", Duration::from_secs(30), token_str).await?;
     let parsed: Value = serde_json::from_str(&response)
         .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
 
@@ -1462,7 +1463,7 @@ async fn task_down_netblock_policy(&self, task_type: u64) -> Result<(), String> 
     let token = self.get_token();
     let token_str = token.as_ref().map(|s| s.as_str());
     let response = match self.net_client
-        .post_data_async(&url, "", Duration::from_secs(10), token_str)
+        .post_data_async(&url, "", Duration::from_secs(30), token_str)
         .await
         {
             Ok(response) => response,
@@ -1522,7 +1523,7 @@ async fn task_down_black_ip_policy(&self, task_type: u64) -> Result<(), String> 
     let token = self.get_token();
     let token_str = token.as_ref().map(|s| s.as_str());
     let response = match self.net_client
-        .post_data_async(&url, "", Duration::from_secs(10), token_str)
+        .post_data_async(&url, "", Duration::from_secs(30), token_str)
         .await
         {
             Ok(response) => response,
@@ -1582,7 +1583,7 @@ async fn task_down_extort(&self, task_type: u64) -> Result<(), String> {
     log_info!("lesuo======={}",url);
     let token = self.get_token();
     let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-    match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+    match self.net_client.post_data_async(&url, "", Duration::from_secs(30), token_str).await {
         Ok(response) => {
 
             // 解析 JSON 响应
@@ -1683,7 +1684,7 @@ async fn task_uninstall(&self, task_type: u64) -> Result<(), String> {
     let token_str = token_owned.as_deref();
 
     let response = self.net_client
-        .post_data_async(&url, "", Duration::from_secs(10), token_str)
+        .post_data_async(&url, "", Duration::from_secs(30), token_str)
         .await
         .map_err(|e| format!("Error fetching update info: {}", e))?;
 
@@ -1713,7 +1714,7 @@ async fn task_get_white_peripherals(&self, task_type: u64) -> Result<(), String>
     let url = format!("{}/{}", self.base_url, download_url);
     let token = self.get_token();
     let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-    match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+    match self.net_client.post_data_async(&url, "", Duration::from_secs(30), token_str).await {
         Ok(response) => {
             // 解析 JSON 响应
             let parsed: Value = match serde_json::from_str(&response) {
@@ -1769,7 +1770,7 @@ async fn task_get_black_peripherals(&self, task_type: u64) -> Result<(), String>
     let url = format!("{}/{}", self.base_url, download_url);
     let token = self.get_token();
     let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-    match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+    match self.net_client.post_data_async(&url, "", Duration::from_secs(30), token_str).await {
         Ok(response) => {
             // 解析 JSON 响应
             let parsed: Value = match serde_json::from_str(&response) {
@@ -1837,7 +1838,7 @@ async fn task_usb_upload(&self, task_type: u64) -> Result<(), String> {
                 match self.net_client.post_data_async(
                     &url,
                     &json_str,
-                    Duration::from_secs(10),
+                    Duration::from_secs(30),
                     token_str
                 ).await {
                     Ok(response) => {log_info!("服务器响应: {}", response)},
@@ -1901,7 +1902,7 @@ async fn task_global_dir(&self,task_type: u64) -> Result<(), String> {
     let token = self.get_token();
     let token_str = token.as_ref().map(|s| s.as_str());
 
-    match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+    match self.net_client.post_data_async(&url, "", Duration::from_secs(30), token_str).await {
         Ok(response) => {
             let parsed: Value = match serde_json::from_str(&response) {
                 Ok(parsed) => parsed,
@@ -1972,7 +1973,7 @@ async fn task_outreach_detect(&self, task_type: u64) -> Result<(), String> {
     let token = self.get_token();
     let token_str = token.as_ref().map(|s| s.as_str());
 
-    let response = self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await?;
+    let response = self.net_client.post_data_async(&url, "", Duration::from_secs(30), token_str).await?;
     let parsed: Value = serde_json::from_str(&response)
         .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
 
@@ -2011,7 +2012,7 @@ async fn task_down_pwjump(&self, task_type: u64) -> Result<(), String> {
 
     let response = match self
         .net_client
-        .post_data_async(&url, "", Duration::from_secs(10), token_str)
+        .post_data_async(&url, "", Duration::from_secs(30), token_str)
         .await
         {
             Ok(res) => res,
@@ -2370,7 +2371,7 @@ async fn task_down_ipjump(&self, task_type: u64) -> Result<(), String> {
     log_info!("getIpJump request body: {}", body);
 
     let response = self.net_client
-        .post_data_async(&url, &body, Duration::from_secs(10), token_str)
+        .post_data_async(&url, &body, Duration::from_secs(30), token_str)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -2432,7 +2433,7 @@ async fn task_get_system_backups(&self, task_type: u64) -> Result<(), String> {
     let url = format!("{}/{}", self.base_url, download_url);
     let token = self.get_token();
     let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-    match self.net_client.post_data_async(&url, "", Duration::from_secs(10), token_str).await {
+    match self.net_client.post_data_async(&url, "", Duration::from_secs(30), token_str).await {
         Ok(response) => {
             // 解析 JSON 响应
             let parsed: Value = match serde_json::from_str(&response) {
@@ -2491,7 +2492,7 @@ async fn task_system_rollback(&self, task_type: u64) -> Result<(), String> {
 
     let response = self
         .net_client
-        .post_data_async(&url, "", Duration::from_secs(10), token_str)
+        .post_data_async(&url, "", Duration::from_secs(30), token_str)
         .await
         .map_err(|e| format!("Error fetching task: {}", e))?;
 
@@ -2552,7 +2553,7 @@ async fn task_ntp_sync(&self, task_type: u64) -> Result<(), String> {
 
     let response = match self
         .net_client
-        .post_data_async(&url, "", Duration::from_secs(10), token_str)
+        .post_data_async(&url, "", Duration::from_secs(30), token_str)
         .await
         {
             Ok(res) => res,
@@ -2660,7 +2661,7 @@ async fn report_task_completion(&self, task_type: u64) -> Result<(), String> {
     log_info!("Reporting completion: {} => {}", url, json_data);
 
     match self.net_client
-        .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
+        .post_data_async(&url, &json_data, Duration::from_secs(30), token_str)
         .await{
             Ok(response) => {log_info!("服务器响应: {}", response)},
             Err(err) => {
@@ -2682,7 +2683,7 @@ async fn upload_backup(&self, id: &str, state: i32, size: &str, fail_reason: &st
     log_info!("Reporting upload_backup: {} => {}", url, json_data);
 
     match self.net_client
-        .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
+        .post_data_async(&url, &json_data, Duration::from_secs(30), token_str)
         .await{
             Ok(response) => {log_info!("服务器响应: {}", response)},
             Err(err) => {
@@ -2700,7 +2701,7 @@ async fn upload_rollback(&self, id: &str, state: i32, fail_reason: &str) -> Resu
     log_info!("Reporting upload_rollback: {} => {}", url, json_data);
 
     match self.net_client
-        .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
+        .post_data_async(&url, &json_data, Duration::from_secs(30), token_str)
         .await{
             Ok(response) => {log_info!("服务器响应: {}", response)},
             Err(err) => {
@@ -2719,7 +2720,7 @@ async fn upload_passwd_result(&self, user: &str, pw: &str, state: u8, fail_reaso
     log_info!("Reporting putPwJump: {} => {}", url, json_data);
 
     match self.net_client
-        .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
+        .post_data_async(&url, &json_data, Duration::from_secs(30), token_str)
         .await{
             Ok(response) => {log_info!("服务器响应: {}", response)},
             Err(err) => {
@@ -2738,7 +2739,7 @@ async fn upload_ip_jump_result(&self, source_ip: &str, target_ip: &str, gateway:
     log_info!("Reporting putIpJump: {} => {}", url, json_data);
 
     match self.net_client
-        .post_data_async(&url, &json_data, Duration::from_secs(10), token_str)
+        .post_data_async(&url, &json_data, Duration::from_secs(30), token_str)
         .await{
             Ok(response) => {log_info!("服务器响应: {}", response)},
             Err(err) => {
@@ -2795,7 +2796,7 @@ impl TaskService for BootManager {
                         }
                         Err(err) => {
                             eprintln!("任务处理失败或服务器离线: {}", err);
-                            // 在线/离线由 connectivity_monitor 统一管理
+                            notify_network_failure();
 
                             // 发送离线信号，通知重新获取 token
                             if let Err(e) = host_is_offline_tx.send(true).await {
