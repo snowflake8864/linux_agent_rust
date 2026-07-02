@@ -47,8 +47,6 @@ impl NetClient {
                 .map_err(|e| format!("Failed to set proxy: {}", e))?;
             client_builder = client_builder.proxy(proxy);
             println!("Using proxy: {}", proxy_url);
-        } else {
-            println!("No proxy is set.");
         }
 
         // 使用客户端构建器来构建最终的 Client

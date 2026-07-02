@@ -99,24 +99,26 @@ impl BaseOnline {
     }
 
 
-    pub async fn run(net_client: &mut NetClient) -> Result<String, String> {
+    pub async fn run(net_client: &mut NetClient, verbose: bool) -> Result<String, String> {
         let base_online = BaseOnline::new();
         let json_str = serde_json::to_string(&base_online)
             .map_err(|e| format!("Failed to serialize to JSON: {}", e))?;
 
-        log_info!("Serialized JSON: {}", json_str);
+        if verbose {
+            log_info!("Serialized JSON: {}", json_str);
+        }
 
         let url = format!("{}/v1/auth", net_client.get_base_url().unwrap_or_default());
-        println!("==url:{}", url);
+        if verbose {
+            println!("==url:{}", url);
+        }
         match net_client.post_data_async(&url, &json_str, Duration::from_secs(30), None).await {
             Ok(response) => {
                 log_info!("response: {:?}", response);
-                // 尝试将响应解析为 AuthResponse 结构
                 match serde_json::from_str::<AuthResponse>(&response) {
                     Ok(auth_response) => {
-                        // 成功解析 token
                         log_info!("Token: {}", auth_response.data.token);
-                        return Ok(auth_response.data.token);  // 返回 token
+                        return Ok(auth_response.data.token);
                     }
                     Err(e) => {
                         eprintln!("Failed to parse response: {}", e);
@@ -125,11 +127,15 @@ impl BaseOnline {
                     }
                 }
             }
-
-            Err(err) =>{log_info!("获取 token 失败 Error:{}",err);eprintln!("Error: {}", err)},
+            Err(err) => {
+                if verbose {
+                    log_info!("获取 token 失败 Error:{}", err);
+                    eprintln!("Error: {}", err);
+                }
+            },
         }
 
-        Err("Failed to get token.".to_string()) // 如果没有 token，返回错误
+        Err("Failed to get token.".to_string())
     }
 
 }
@@ -142,6 +148,7 @@ impl StartOnline for BootManager {
     fn start_services(&mut self, token_tx: mpsc::Sender<String>, mut host_is_offline_rx: mpsc::Receiver<bool>) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
 
+            let mut auth_fail_count: u32 = 0;
             loop {
                 let base_url = self.get_base_url();
 
@@ -153,9 +160,10 @@ impl StartOnline for BootManager {
                     }
                 };
 
-                //let mut local_interval = interval(Duration::from_secs(30));
-                match BaseOnline::run(&mut net_client).await {
+                let verbose = auth_fail_count < 2;
+                match BaseOnline::run(&mut net_client, verbose).await {
                     Ok(token) => {
+                        auth_fail_count = 0;
                         if let Err(err) = token_tx.send(token.clone()).await {
                             eprintln!("发送 token 失败: {}", err);
                             continue;
@@ -258,8 +266,11 @@ impl StartOnline for BootManager {
                         }
                     }
                     Err(err) => {
-                        eprintln!("获取 token 时发生错误: {}", err);
-                        set_offline_and_check_admission(); // 无法获取 token，服务器不可达+检查准入
+                        auth_fail_count = auth_fail_count.saturating_add(1);
+                        if auth_fail_count <= 2 {
+                            eprintln!("获取 token 时发生错误: {}", err);
+                        }
+                        set_offline_and_check_admission();
                         continue;
                     }
                 }

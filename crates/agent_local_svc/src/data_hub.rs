@@ -59,15 +59,15 @@ pub async fn check_server_reachable() -> bool {
     let token_str = token.as_deref();
 
     let url = format!("{}/v1/getinfo", base_url);
-    log_info!("[connectivity] 探测 {} (token={})", url, if token_str.is_some() { "有" } else { "无" });
 
-    match net_client.post_data_async(&url, "", tokio::time::Duration::from_secs(2), token_str).await {
+    match net_client.post_data_async(&url, "", tokio::time::Duration::from_secs(10), token_str).await {
         Ok(resp) => {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp) {
                 let reachable = parsed["code"].as_str() == Some("000000");
-                log_info!("[connectivity] 探测结果: {} (code={})",
-                    if reachable { "可达" } else { "不可达" },
-                    parsed["code"].as_str().unwrap_or("?"));
+                if !reachable {
+                    log_info!("[connectivity] 探测不可达 (code={})",
+                        parsed["code"].as_str().unwrap_or("?"));
+                }
                 reachable
             } else {
                 log_info!("[connectivity] /v1/getinfo 响应解析失败: {}", &resp[..resp.len().min(200)]);
@@ -75,7 +75,9 @@ pub async fn check_server_reachable() -> bool {
             }
         }
         Err(e) => {
-            log_info!("[connectivity] {} 不可达: {}", url, e);
+            if AGENT_MODE.load(Ordering::Relaxed) == AgentMode::Online as u8 {
+                log_info!("[connectivity] {} 不可达: {}", url, e);
+            }
             false
         }
     }
@@ -569,30 +571,35 @@ impl AgentDataHub {
     }
 
     /// Update process policy (white/black list).
+    /// action: 0=移除, 1=白名单, 2=黑名单
     pub fn update_process_policy(
         &self,
         hashes: &[String],
-        is_white: bool,
+        action: i32,
     ) -> Result<(), String> {
         process_mgr::POLICY_MANAGER
             .lock()
             .unwrap()
-            .set_policy_process(hashes, is_white);
+            .set_policy_process(hashes, action);
         self.notify(PolicyChangeType::ProcessPolicyChanged);
         Ok(())
     }
 
-    /// Update peripheral (USB) policy.
+    /// Update peripheral (USB) policy. action: 0=移除, 1=白名单, 2=黑名单
     pub fn update_peripheral_policy(
         &self,
-        devices: Vec<udisk::device::UsbInfo>,
-        is_white: bool,
+        devices: &[udisk::device::UsbInfo],
+        action: i32,
     ) -> Result<(), String> {
         let mut guard = udisk::list::SHARED_USB_LIST.lock().unwrap();
-        if is_white {
-            guard.update_whitelist(devices);
-        } else {
-            guard.update_blacklist(devices);
+        match action {
+            0 => {
+                let eids: Vec<String> = devices.iter().map(|d| d.perpheral_eid.clone()).collect();
+                guard.remove_from_both(&eids);
+            }
+            1 => guard.update_whitelist(devices.to_vec()),
+            2 => guard.update_blacklist(devices.to_vec()),
+            _ => return Err(format!("无效 action: {}", action)),
         }
         self.notify(PolicyChangeType::PeripheralPolicyChanged);
         Ok(())

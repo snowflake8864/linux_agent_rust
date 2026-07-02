@@ -18,10 +18,10 @@ impl ProcessPolicyService for ProcessPolicyServiceImpl {
         request: Request<ProcessPolicyFilter>,
     ) -> Result<Response<ProcessPolicy>, Status> {
         let is_white = request.into_inner().is_white;
-        let hashes = self.data_hub.get_process_policy(is_white);
+        let hashes = self.data_hub.get_process_policy(is_white != 0);
         Ok(Response::new(ProcessPolicy {
             hash_list: hashes,
-            is_white,
+            action: is_white,
         }))
     }
 
@@ -32,7 +32,7 @@ impl ProcessPolicyService for ProcessPolicyServiceImpl {
         require_offline()?;
         let policy = request.into_inner();
         self.data_hub
-            .update_process_policy(&policy.hash_list, policy.is_white)
+            .update_process_policy(&policy.hash_list, policy.action)
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(SimpleResponse {
             success: true,

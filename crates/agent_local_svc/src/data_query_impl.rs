@@ -104,20 +104,51 @@ impl DataQueryService for DataQueryServiceImpl {
 
     async fn get_usb_device_list(
         &self,
-        _: Request<Empty>,
+        request: Request<ProcessFilter>,
     ) -> Result<Response<UsbDeviceList>, Status> {
-        let devices: Vec<UsbDevice> = self
+        let filter = request.into_inner();
+
+        let all_devices = udisk::monitor::get_all_local_usb_devices();
+
+        let white_set: HashSet<String> = self
             .data_hub
             .get_peripheral_policy(true)
             .into_iter()
-            .map(|d| UsbDevice {
-                peripheral_eid: d.perpheral_eid,
-                peripheral_name: d.perpheral_name,
-                intro: d.intro,
-                r#type: d.type_,
-                allow: d.allow,
+            .map(|d| d.perpheral_eid)
+            .collect();
+        let black_set: HashSet<String> = self
+            .data_hub
+            .get_peripheral_policy(false)
+            .into_iter()
+            .map(|d| d.perpheral_eid)
+            .collect();
+
+        let mut devices: Vec<UsbDevice> = all_devices
+            .into_iter()
+            .map(|d| {
+                let policy_status = if white_set.contains(&d.perpheral_eid) {
+                    1i32
+                } else if black_set.contains(&d.perpheral_eid) {
+                    2i32
+                } else {
+                    0i32
+                };
+                UsbDevice {
+                    peripheral_eid: d.perpheral_eid,
+                    peripheral_name: d.perpheral_name,
+                    intro: d.intro,
+                    r#type: d.type_,
+                    allow: d.allow,
+                    policy_status,
+                }
             })
             .collect();
+
+        if filter.filter_status > 0 {
+            let target = if filter.filter_status == 3 { 0 } else { filter.filter_status };
+            devices.retain(|d| d.policy_status == target);
+        }
+
         Ok(Response::new(UsbDeviceList { devices }))
     }
 
