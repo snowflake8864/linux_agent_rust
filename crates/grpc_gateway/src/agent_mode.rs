@@ -13,7 +13,7 @@ pub enum AgentMode {
 }
 
 /// 连续失败多少次才算"网络异常"（避免单次超时误报）
-const NETWORK_ANOMALY_THRESHOLD: u32 = 3;
+const NETWORK_ANOMALY_THRESHOLD: u32 = 2;
 
 /// Global agent mode, writable from online/task_fetcher, readable from gRPC handlers.
 pub static AGENT_MODE: AtomicU8 = AtomicU8::new(AgentMode::Online as u8);
@@ -77,15 +77,13 @@ pub fn register_network_failure_callback(cb: NetworkFailureCallback) {
     *NETWORK_FAILURE_CALLBACK.lock().unwrap() = Some(cb);
 }
 
-/// 通知网络故障：累计失败计数，仅在首次切离线时触发一次准入检查。
-///
-/// 供 task_fetcher / reporter 等任意 crate 在请求服务器超时/失败时调用。
-/// 无轮询，纯事件驱动。已离线后不会重复触发——由 auto-detection 自身循环负责重试。
+/// 通知网络故障：供 task_fetcher / reporter 在请求服务器失败时调用。
+/// 立即触发连通性探测，探测失败累计次数，达阈值自动切离线。
 pub fn notify_network_failure() {
-    let just_went_offline = set_offline();
-    if just_went_offline {
-        if let Some(cb) = *NETWORK_FAILURE_CALLBACK.lock().unwrap() {
-            cb();
-        }
+    // 先触发立即探测（不依赖下次轮询）
+    if let Some(cb) = *NETWORK_FAILURE_CALLBACK.lock().unwrap() {
+        cb();
     }
+    // 探测内部会调 set_offline / set_online，这里再补一次计数
+    set_offline();
 }

@@ -40,7 +40,7 @@ use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use grpc_gateway::agent_mode::notify_network_failure;
+use grpc_gateway::agent_mode::{notify_network_failure, set_online};
 use std::sync::OnceLock;
 use grpc_gateway::notify::{notify_policy_change, init_local_task_rx, DIR_POLICY_CACHE, EXTORT_POLICY_CACHE, VIRTUAL_PORT_CACHE, TRUST_DIR_CACHE};
 use grpc_gateway::policy_watch::PolicyChangeType;
@@ -645,7 +645,7 @@ pub async fn run(
                 let url = format!("{}/v1/gettask", task_fetcher.base_url);
                 match net_client.post_data_async(&url, "", Duration::from_secs(100), token_str).await {
                     Ok(response) => {
-                        // 在线/离线由 connectivity_monitor 统一管理
+                        set_online();
                         let parsed: Value = match serde_json::from_str(&response) {
                             Ok(parsed) => parsed,
                             Err(e) => {

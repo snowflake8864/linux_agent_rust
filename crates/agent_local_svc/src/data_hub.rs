@@ -99,15 +99,15 @@ pub async fn check_server_reachable() -> bool {
     let token_str = token.as_deref();
 
     let url = format!("{}/v1/getinfo", base_url);
-    log_info!("[connectivity] 探测 {} (token={})", url, if token_str.is_some() { "有" } else { "无" });
 
-    match net_client.post_data_async(&url, "", tokio::time::Duration::from_secs(2), token_str).await {
+    match net_client.post_data_async(&url, "", tokio::time::Duration::from_secs(10), token_str).await {
         Ok(resp) => {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp) {
                 let reachable = parsed["code"].as_str() == Some("000000");
-                log_info!("[connectivity] 探测结果: {} (code={})",
-                    if reachable { "可达" } else { "不可达" },
-                    parsed["code"].as_str().unwrap_or("?"));
+                if !reachable {
+                    log_info!("[connectivity] 探测不可达 (code={})",
+                        parsed["code"].as_str().unwrap_or("?"));
+                }
                 reachable
             } else {
                 log_info!("[connectivity] /v1/getinfo 响应解析失败: {}", &resp[..resp.len().min(200)]);
@@ -115,7 +115,9 @@ pub async fn check_server_reachable() -> bool {
             }
         }
         Err(e) => {
-            log_info!("[connectivity] {} 不可达: {}", url, e);
+            if AGENT_MODE.load(Ordering::Relaxed) == AgentMode::Online as u8 {
+                log_info!("[connectivity] {} 不可达: {}", url, e);
+            }
             false
         }
     }
