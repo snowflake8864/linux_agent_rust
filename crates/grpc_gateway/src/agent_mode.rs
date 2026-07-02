@@ -2,7 +2,7 @@
 ///
 /// - Online:  agent is connected to the server, write operations via gRPC are blocked
 /// - Offline: agent lost connection to the server, local gRPC write operations are allowed
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicBool, Ordering};
+use std::sync::{Mutex, LazyLock, atomic::{AtomicU8, AtomicU32, AtomicBool, Ordering}};
 use tonic::Status;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,7 +13,7 @@ pub enum AgentMode {
 }
 
 /// 连续失败多少次才算"网络异常"（避免单次超时误报）
-const NETWORK_ANOMALY_THRESHOLD: u32 = 3;
+const NETWORK_ANOMALY_THRESHOLD: u32 = 2;
 
 /// Global agent mode, writable from online/task_fetcher, readable from gRPC handlers.
 pub static AGENT_MODE: AtomicU8 = AtomicU8::new(AgentMode::Online as u8);
@@ -61,4 +61,29 @@ pub fn require_offline() -> Result<(), Status> {
         ));
     }
     Ok(())
+}
+
+// ── 网络故障回调：各 crate 在请求服务器失败时通知，由 agent_local_svc 注册处理 ──
+
+/// 网络故障回调类型（准入检查 + 重连逻辑）
+type NetworkFailureCallback = fn();
+
+/// 注册的网络故障回调，由 agent_local_svc 在初始化时设置
+static NETWORK_FAILURE_CALLBACK: LazyLock<Mutex<Option<NetworkFailureCallback>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// 注册网络故障回调（由 agent_local_svc 调用一次）
+pub fn register_network_failure_callback(cb: NetworkFailureCallback) {
+    *NETWORK_FAILURE_CALLBACK.lock().unwrap() = Some(cb);
+}
+
+/// 通知网络故障：供 task_fetcher / reporter 在请求服务器失败时调用。
+/// 立即触发连通性探测，探测失败累计次数，达阈值自动切离线。
+pub fn notify_network_failure() {
+    // 先触发立即探测（不依赖下次轮询）
+    if let Some(cb) = *NETWORK_FAILURE_CALLBACK.lock().unwrap() {
+        cb();
+    }
+    // 探测内部会调 set_offline / set_online，这里再补一次计数
+    set_offline();
 }

@@ -11,7 +11,7 @@
 #   ./test_grpc.sh listen [秒]   # 监听告警流
 # ============================================================================
 
-GRPC_ADDR="${GRPC_ADDR:-192.168.135.91:50051}"
+GRPC_ADDR="${GRPC_ADDR:-192.168.3.4:50051}"
 PROTO_DIR="$(dirname "$0")/../crates/grpc_gateway/src/proto"
 PROTO_DIR="$(cd "$PROTO_DIR" 2>/dev/null && pwd || echo "$PROTO_DIR")"
 
@@ -55,12 +55,13 @@ show_test_help() {
                echo "    返回当前心跳间隔(crontime)、设备标识等配置"
                echo "    用法: $0 2" ;;
         3|03)  echo -e "${CYAN}[3] ProcessPolicy${NC} — 获取进程黑白名单策略"
-               echo "    参数: {\"is_white\": true} 白名单 / false 黑名单"
-               echo "    返回 hash_list 和 is_white 标志"
+               echo "    参数: {\"isWhite\": 1} 白名单 / 0 黑名单"
+               echo "    返回 hash_list 和 action 标志"
                echo "    用法: $0 3  (白名单)  | 手动: test_03b (黑名单)" ;;
         4|04)  echo -e "${CYAN}[4] PeripheralPolicy${NC} — 获取外设管控策略"
-               echo "    返回设备列表和黑白名单模式"
-               echo "    用法: $0 4" ;;
+               echo "    参数: {\"isWhite\": 1} 白名单 / 0 黑名单"
+               echo "    返回设备列表和 action 标志"
+               echo "    用法: $0 4  (白名单)  | 手动: test_04b (黑名单)" ;;
         5|05)  echo -e "${CYAN}[5] IpBlockPolicy${NC} — 获取 IP 阻断策略"
                echo "    用法: $0 5" ;;
         6|06)  echo -e "${CYAN}[6] IpBlackPolicy${NC} — 获取 IP 黑名单策略"
@@ -86,8 +87,9 @@ show_test_help() {
                echo "    用法: $0 14 | 14b(白名单) | 14c(黑名单)" ;;
         15)    echo -e "${CYAN}[15] PortList${NC} — 获取端口列表"
                echo "    用法: $0 15" ;;
-        16)    echo -e "${CYAN}[16] UsbDeviceList${NC} — 获取 USB 设备列表"
-               echo "    用法: $0 16" ;;
+        16)    echo -e "${CYAN}[16] UsbDeviceList${NC} — 获取 USB 设备列表（支持 filter_status）"
+               echo "    参数: {\"filter_status\": 0-3}, 0=全部, 1=白名单, 2=黑名单, 3=未知"
+               echo "    用法: $0 16 | 16b(黑) | 16c(白) | 16d(未知)" ;;
         17)    echo -e "${CYAN}[17] PolicyWatch(流)${NC} — 订阅策略变更推送（流式）"
                echo "    服务端持续推送策略变更事件，需流式接收"
                echo "    用法: $0 17" ;;
@@ -126,10 +128,10 @@ show_test_help() {
                echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED"
                echo "    测试: 发送更新请求，验证在线/离线状态下的正确拒绝/允许" ;;
         w2)    echo -e "${CYAN}[w2] UpdateProcessPolicy${NC} — 更新进程黑白名单策略（写）"
-               echo "    参数: {\"hash_list\": [\"abc123\"], \"is_white\": true}"
+               echo "    参数: {\"hash_list\": [\"abc123\"], \"action\": 1}  (0=移除,1=白,2=黑)"
                echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
         w3)    echo -e "${CYAN}[w3] UpdatePeripheral${NC} — 更新外设策略（写）"
-               echo "    参数: {\"devices\": [], \"is_white\": true}"
+               echo "    参数: {\"devices\": [], \"action\": 1}  (0=移除,1=白,2=黑)"
                echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
         w4)    echo -e "${CYAN}[w4] UpdateIpBlockPolicy${NC} — 更新 IP 阻断策略（写）"
                echo "    参数: {\"ip_list\": [\"10.0.0.1\"], \"is_white\": true}"
@@ -536,8 +538,8 @@ test_w16() { grpc_expect_perm_denied "删除备份（在线拒绝）" \
 # 所以改用变量 + set-default 模式。
 
 _DEF_W1='{"crontime": 120}'
-_DEF_W2='{"hash_list": ["abc123"], "is_white": true}'
-_DEF_W3='{"devices": [], "is_white": true}'
+_DEF_W2='{"hash_list": ["abc123"], "action": 1}'
+_DEF_W3='{"devices": [], "action": 1}'
 _DEF_W4='{"items": [{"ip": "10.0.0.1", "direction": 1, "duration": 3600, "is_ipv6": false}]}'
 _DEF_W5='{"task_ids": [6, 19]}'
 _DEF_W6='{"gateway":"192.168.1.1","source_ip":"10.0.0.5","target_ip":"10.0.0.6","mode":1}'

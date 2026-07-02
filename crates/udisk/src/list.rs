@@ -110,6 +110,14 @@ impl BlackWhiteList {
         }
     }
 
+    pub fn remove_from_both(&mut self, eids: &[String]) {
+        let rm: HashSet<String> = eids.iter().cloned().collect();
+        self.whitelist.retain(|u| !rm.contains(&u.perpheral_eid));
+        self.blacklist.retain(|u| !rm.contains(&u.perpheral_eid));
+        self.white_eids = self.whitelist.iter().map(|u| u.perpheral_eid.clone()).collect();
+        self.black_eids = self.blacklist.iter().map(|u| u.perpheral_eid.clone()).collect();
+    }
+
 }
 
 pub type SharedBlackWhiteList = Arc<Mutex<BlackWhiteList>>;

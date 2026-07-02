@@ -55,93 +55,69 @@ impl ProcessPolicyManager {
     }
 
 
-    pub fn set_policy_process(&mut self, process_list: &[String], is_white: bool) {
+    /// action: 0=移除(未知), 1=白名单, 2=黑名单
+    pub fn set_policy_process(&mut self, process_list: &[String], action: i32) {
         let mut is_changed = false;
 
-        if is_white {
-            self.white_set.clear();
-            self.white_set.extend(process_list.iter().cloned());
-
-            // 👇 清理原来的黑名单中的路径
-            for path in &self.white_set {
-                if self.prev_black_set.contains(path) {
-                    let rule = format!("del 1 {}\n", path);
-                    Self::add_md5_rules(&rule);
-                    self.prev_black_set.remove(path); // 同时更新 prev_black_set
-                    is_changed = true;
+        match action {
+            0 => {
+                for path in process_list {
+                    if self.white_set.remove(path) {
+                        let rule = format!("del 0 {}\n", path);
+                        Self::add_md5_rules(&rule);
+                        self.prev_white_set.remove(path);
+                        is_changed = true;
+                    }
+                    if self.black_set.remove(path) {
+                        let rule = format!("del 1 {}\n", path);
+                        Self::add_md5_rules(&rule);
+                        self.prev_black_set.remove(path);
+                        is_changed = true;
+                    }
                 }
+                if is_changed { Self::notify_kernel_update(); }
             }
-
-            for path in &self.white_set {
-                if !self.prev_white_set.contains(path) {
-                    let rule = format!("{}=0\n", path);
-                    Self::add_md5_rules(&rule);
-                    is_changed = true;
+            1 => {
+                for path in process_list {
+                    if self.black_set.remove(path) {
+                        Self::add_md5_rules(&format!("del 1 {}\n", path));
+                        self.prev_black_set.remove(path);
+                        is_changed = true;
+                    }
+                    if !self.white_set.contains(path) {
+                        Self::add_md5_rules(&format!("{}=0\n", path));
+                        self.white_set.insert(path.clone());
+                        self.prev_white_set.insert(path.clone());
+                        is_changed = true;
+                    }
                 }
+                if is_changed { Self::notify_kernel_update(); }
             }
-
-            for path in &self.prev_white_set {
-                if !self.white_set.contains(path) {
-                    let rule = format!("del 0 {}\n", path);
-                    Self::add_md5_rules(&rule);
-                    is_changed = true;
+            2 => {
+                for path in process_list {
+                    if self.run_process_mode { Self::kill_process(path); }
+                    if self.white_set.remove(path) {
+                        Self::add_md5_rules(&format!("del 0 {}\n", path));
+                        self.prev_white_set.remove(path);
+                        is_changed = true;
+                    }
+                    if !self.black_set.contains(path) {
+                        Self::add_md5_rules(&format!("{}=1\n", path));
+                        self.black_set.insert(path.clone());
+                        self.prev_black_set.insert(path.clone());
+                        is_changed = true;
+                    }
                 }
+                if is_changed { Self::notify_kernel_update(); }
             }
-
-            if is_changed {
-                self.prev_white_set = self.white_set.clone();
-                Self::notify_kernel_update();
-            }
-        } else {
-            self.black_set.clear();
-            self.black_set.extend(process_list.iter().cloned());
-
-            //  杀掉进程
-            for path in process_list {
-                if self.run_process_mode {
-                    Self::kill_process(path);
-                }
-            }
-
-            //  清理原来的白名单中的路径
-            for path in &self.black_set {
-                if self.prev_white_set.contains(path) {
-                    let rule = format!("del 0 {}\n", path);
-                    Self::add_md5_rules(&rule);
-                    self.prev_white_set.remove(path); // 同时更新 prev_white_set
-                    is_changed = true;
-                }
-            }
-
-            for path in &self.black_set {
-                if !self.prev_black_set.contains(path) {
-                    let rule = format!("{}=1\n", path);
-                    Self::add_md5_rules(&rule);
-                    is_changed = true;
-                }
-            }
-
-            for path in &self.prev_black_set {
-                if !self.black_set.contains(path) {
-                    let rule = format!("del 1 {}\n", path);
-                    Self::add_md5_rules(&rule);
-                    is_changed = true;
-                }
-            }
-
-            if is_changed {
-                self.prev_black_set = self.black_set.clone();
-                Self::notify_kernel_update();
-            }
+            _ => { log_error!("[process_policy] 无效 action: {}", action); return; }
         }
 
-        // 持久化到 SQLite（错误只记 log，不影响主流程）
         let white: Vec<String> = self.white_set.iter().cloned().collect();
         let black: Vec<String> = self.black_set.iter().cloned().collect();
         if let Err(e) = local_store::process_policy::save_all(&white, &black) {
             log_error!("[process_policy] 持久化失败: {}", e);
         }
-        // 同步更新 known_executables 表中的 policy_status
         if let Err(e) = local_store::known_executables::update_policy_status(&white, true) {
             log_error!("[known_executables] 同步白名单失败: {}", e);
         }
