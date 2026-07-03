@@ -149,8 +149,21 @@ async fn main() -> std::io::Result<()> {
     // 初始化本地数据库（建表幂等，已存在时跳过）
     local_store::init_all();
 
-    // 从 DB 恢复进程黑白名单到内存
-    process_mgr::POLICY_MANAGER.lock().unwrap().load_policy_from_db();
+    // 从 DB 恢复策略到内存（仅 DB_POLICY 启用时）
+    {
+        let cfg = NETINFO_CONFIG.lock().unwrap();
+        let db_enabled = cfg.db_policy.enabled;
+        let is_offline = cfg.is_offline_mode;
+        drop(cfg);
+        if db_enabled {
+            process_mgr::POLICY_MANAGER.lock().unwrap().load_policy_from_db(is_offline);
+            if is_offline {
+                agent_local_svc::AgentDataHub::load_peripheral_policy_from_db_local();
+            } else {
+                agent_local_svc::AgentDataHub::load_peripheral_policy_from_db();
+            }
+        }
+    }
 
     // 从 DB 恢复跳变状态到内存缓存（让重启后无需等待服务器即可返回上次跳变状态）
     match local_store::jump_status::load() {

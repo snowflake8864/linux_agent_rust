@@ -9,6 +9,7 @@ use grpc_gateway::alert::{
     AlertEvent, AlertFilter,
     AlertLogQuery, AlertLogResponse, AlertLogItem,
     AlertHandleRequest, AlertHandleResponse,
+    BatchHandleRequest, BatchHandleResponse,
 };
 use crate::data_hub::AgentDataHub;
 
@@ -65,13 +66,14 @@ impl AlertService for AlertServiceImpl {
         let q = request.into_inner();
         let page      = if q.page == 0 { 1 } else { q.page };
         let page_size = if q.page_size == 0 { 20 } else { q.page_size };
-        // handle_status: -1 表示全部
+        // handle_status: -1 表示全部; alert_type: -1/0 表示全部
         let status_filter = if q.handle_status < 0 { None } else { Some(q.handle_status) };
+        let type_filter   = if q.alert_type <= 0 { None } else { Some(q.alert_type) };
 
-        let rows = local_store::alert_log::query_page(status_filter, page, page_size)
+        let rows = local_store::alert_log::query_page(status_filter, type_filter, page, page_size)
             .map_err(|e| Status::internal(format!("query alert_log 失败: {}", e)))?;
 
-        let total = local_store::alert_log::count(status_filter)
+        let total = local_store::alert_log::count(status_filter, type_filter)
             .map_err(|e| Status::internal(format!("count alert_log 失败: {}", e)))?;
 
         let items = rows.into_iter().map(|r| AlertLogItem {
@@ -87,7 +89,8 @@ impl AlertService for AlertServiceImpl {
             handle_user:         r.handle_user,
             handled_at:          r.handled_at,
             created_at:          r.created_at,
-            n_type:              0, // alert.db 未存 n_type，预留字段默认 0
+            n_type:              r.n_type,
+            identifier:          r.identifier,
         }).collect();
 
         Ok(Response::new(AlertLogResponse { items, total }))
@@ -135,6 +138,49 @@ impl AlertService for AlertServiceImpl {
             success,
             message,
             affected: affected as i32,
+        }))
+    }
+
+    async fn batch_handle_alerts(
+        &self,
+        request: Request<BatchHandleRequest>,
+    ) -> Result<Response<BatchHandleResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.ids.is_empty() {
+            return Ok(Response::new(BatchHandleResponse {
+                success: false,
+                message: "ids 不能为空".to_string(),
+                total: 0,
+                success_count: 0,
+                fail_count: 0,
+                failed_ids: vec![],
+            }));
+        }
+
+        let label = match req.handle_status {
+            1 => "已处理",
+            2 => "已忽略",
+            _ => return Err(Status::invalid_argument(
+                format!("handle_status 只能是 1(已处理) 或 2(已忽略)，收到: {}", req.handle_status),
+            )),
+        };
+
+        let total = req.ids.len() as i32;
+        let (success_count, fail_count, failed_ids) = local_store::alert_log::batch_update_handle_status(
+            &req.ids,
+            req.handle_status,
+            label,
+            &req.handle_user,
+        ).map_err(|e| Status::internal(format!("批量处置失败: {}", e)))?;
+
+        Ok(Response::new(BatchHandleResponse {
+            success: fail_count == 0,
+            message: format!("成功处置 {} 条，失败 {} 条", success_count, fail_count),
+            total,
+            success_count,
+            fail_count,
+            failed_ids,
         }))
     }
 }

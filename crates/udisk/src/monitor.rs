@@ -365,14 +365,23 @@ impl rusb::Hotplug<Context> for HotplugCallback {
                 }
                 DeviceListStatus::InBlacklist | DeviceListStatus::NotInAnyList => {
                     log::info!("上报 USB 设备拔出: name={}, eid={}, status={:?}", name, eid, status);
-                    
+
+                    // 拔出编码与插入一致：nType 区分名单状态，level 区分防护模式
+                    let (n_type, n_level) = match (&status, usb_protect) {
+                        (DeviceListStatus::InBlacklist, true)  => (9007u16, 3u32),
+                        (DeviceListStatus::InBlacklist, false) => (9007u16, 2u32),
+                        (DeviceListStatus::NotInAnyList, true) => (9008u16, 3u32),
+                        (DeviceListStatus::NotInAnyList, false) => (9008u16, 2u32),
+                        _ => unreachable!(),
+                    };
+
                     let log = AuditLogInfo {
                         file_path: None,
                         rename_dir: None,
                         exception_process: None,
                         md5: None,
-                        n_type: if usb_protect { 9007 } else { 9008 },
-                        n_level: if usb_protect { 3 } else { 2 },
+                        n_type,
+                        n_level,
                         n_time: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -617,6 +626,22 @@ impl StartUsbService for BootManager {
         &mut self, usb_audit_log_tx: mpsc::Sender<AuditLogInfo>, hotplug_signal_tx: mpsc::Sender<bool>
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
+            // 1. 立即启动 USB 热插拔监控（不需要 token，离线也能工作）
+            let current_devices = get_all_local_usb_devices();
+            let monitor = UsbMonitor::new_with_signal(
+                SHARED_USB_LIST.clone(),
+                usb_audit_log_tx,
+                hotplug_signal_tx,
+            )
+            .map_err(|e| format!("创建监控器失败: {:?}", e))?;
+
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = monitor.run() {
+                    log::error!("USB 监控运行失败: {:?}", e);
+                }
+            });
+
+            // 2. 后台等待 token 后上传设备列表到服务器（不阻塞监控启动）
             let base_url = self.get_base_url();
             let net_client = match NetClient::new(Some(base_url), true) {
                 Ok(client) => Arc::new(client),
@@ -625,25 +650,20 @@ impl StartUsbService for BootManager {
                     return Err("创建 NetClient 失败".to_string());
                 }
             };
-            let url = format!("{}/v1/addperipherals", net_client.get_base_url().unwrap_or_default());
+            let url = format!(
+                "{}/v1/addperipherals",
+                net_client.get_base_url().unwrap_or_default()
+            );
 
-            let current_devices = get_all_local_usb_devices();
-            loop {
-                if let Some(_) = self.get_token().await {
-                    let devices = current_devices.clone();
-                    upload_usb_info(&devices, &net_client, &url, self).await;
-                    break;
-                } else {
-                    sleep(Duration::from_secs(2)).await;
-                }
-            }
-            
-            let monitor = UsbMonitor::new_with_signal(SHARED_USB_LIST.clone(), usb_audit_log_tx, hotplug_signal_tx)
-                .map_err(|e| format!("创建监控器失败: {:?}", e))?;
-            
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = monitor.run() {
-                    log::error!("USB 监控运行失败: {:?}", e);
+            let boot_mgr_clone = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    if let Some(_) = boot_mgr_clone.get_token().await {
+                        upload_usb_info(&current_devices, &net_client, &url, &boot_mgr_clone).await;
+                        break;
+                    } else {
+                        sleep(Duration::from_secs(2)).await;
+                    }
                 }
             });
 

@@ -3,8 +3,8 @@
 # gRPC 接口测试脚本 — 可手动选择要测试的接口
 # 用法:
 #   ./test_grpc.sh              # 交互式菜单选择
-#   ./test_grpc.sh <编号>        # 直接测试指定接口 (1-28, s1)
-#   ./test_grpc.sh all           # 测试全部只读接口 (1-28)
+#   ./test_grpc.sh <编号>        # 直接测试指定接口 (1-30, s1)
+#   ./test_grpc.sh all           # 测试全部只读接口 (1-30)
 #   ./test_grpc.sh write         # 测试写接口（需离线模式）
 #   ./test_grpc.sh stream        # 测试流式接口 (17, 18, s1)
 #   ./test_grpc.sh full          # 测试全部接口（读写+流）
@@ -111,13 +111,19 @@ show_test_help() {
         24)    echo -e "${CYAN}[24] VulnScan上报${NC} — 上报漏洞扫描结果"
                echo "    用法: $0 24" ;;
         25)    echo -e "${CYAN}[25] 历史告警(全部)${NC} — 查询所有历史告警"
-               echo "    用法: $0 25" ;;
+               echo "    用法: $0 25  |  25b(仅外设)  | 25c(仅进程)" ;;
         26)    echo -e "${CYAN}[26] 历史告警(未处理)${NC} — 查询未处理的历史告警"
                echo "    用法: $0 26" ;;
         27)    echo -e "${CYAN}[27] 告警处置(已处理)${NC} — 将告警标记为已处理"
                echo "    用法: $0 27" ;;
         28)    echo -e "${CYAN}[28] 告警处置(已忽略)${NC} — 将告警标记为已忽略"
-               echo "    用法: $0 28" ;;
+               echo "    用法: $0 28  |  28b(批量已处理)";;
+        29)    echo -e "${CYAN}[29] ProcessDefenseMode${NC} — 获取进程防护模式（读）"
+               echo "    返回: mode (0=OFF, 1=MONITOR, 2=PROTECT)"
+               echo "    用法: $0 29" ;;
+        30)    echo -e "${CYAN}[30] PeripheralDefenseMode${NC} — 获取外设防护模式（读）"
+               echo "    返回: mode (0=OFF, 1=MONITOR, 2=PROTECT)"
+               echo "    用法: $0 30" ;;
         s1)    echo -e "${CYAN}[s1] VirusScan流${NC} — 病毒扫描双向流 (StreamControl)"
                echo "    双向流式接口，客户端发送扫描指令，服务端返回扫描结果"
                echo "    用法: $0 s1" ;;
@@ -162,11 +168,17 @@ show_test_help() {
                echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
         w13)   echo -e "${CYAN}[w13] UpdateExtortPolicy${NC} — 更新勒索防护策略（写）"
                echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
-        w14)   echo -e "${CYAN}[w14] ProcessDefenseMode${NC} — 进程防护模式切换（写）"
-               echo "    参数: {\"mode\": 1}"
+        w14)   echo -e "${CYAN}[w14] UpdateProcessDefenseMode${NC} — 进程防护模式切换（写）"
+               echo "    mode: 0=OFF(关闭)  1=MONITOR(只告警不阻止)  2=PROTECT(告警+阻止)"
+               echo "    用法: $0 w14 {\"mode\": 0}  # 关闭"
+               echo "          $0 w14 {\"mode\": 1}  # 监控"
+               echo "          $0 w14 {\"mode\": 2}  # 保护"
                echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
-        w15)   echo -e "${CYAN}[w15] PeripheralDefenseMode${NC} — 外设防护模式切换（写）"
-               echo "    参数: {\"mode\": 2}"
+        w15)   echo -e "${CYAN}[w15] UpdatePeripheralDefenseMode${NC} — 外设防护模式切换（写）"
+               echo "    mode: 0=OFF(关闭)  1=MONITOR(只告警不阻止)  2=PROTECT(告警+阻止)"
+               echo "    用法: $0 w15 {\"mode\": 0}  # 关闭"
+               echo "          $0 w15 {\"mode\": 1}  # 监控"
+               echo "          $0 w15 {\"mode\": 2}  # 保护"
                echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
         w16)   echo -e "${CYAN}[w16] DeleteBackup${NC} — 删除 LVM 快照（写）"
                echo "    参数: {\"backup_id\": \"snap_name_or_suffix\"}"
@@ -178,7 +190,7 @@ show_test_help() {
                echo -e "    ${GREEN}执行模式:${NC} w16 {\"backup_id\":\"root_snap_6_20260626_155713\"} → 实际删除指定快照" ;;
 
         *)     echo -e "${RED}未知测试编号: $tid${NC}"
-               echo "有效范围: 1-28, s1, w1-w16"
+               echo "有效范围: 1-30, s1, w1-w16"
                echo "输入 ? 查看完整菜单，输入 <编号> ? 查看单项说明" ;;
     esac
     echo ""
@@ -301,7 +313,7 @@ print_result() {
     echo -e "=============================================="
 }
 
-# ── 只读接口测试 (1-28) ─────────────────────────────────────────────────
+# ── 只读接口测试 (1-30) ─────────────────────────────────────────────────
 
 test_01() { grpc_call "Agent状态(含is_online/protection_days)" \
     agent_status.proto agent_status.AgentStatusService GetAgentStatus; }
@@ -311,14 +323,19 @@ test_02() { grpc_call "当前配置" \
 
 test_03() { grpc_call "进程策略(白名单)" \
     process_policy.proto process_policy.ProcessPolicyService GetProcessPolicy \
-    '{"is_white": true}'; }
+    '{"is_white": 1}'; }
 
 test_03b() { grpc_call "进程策略(黑名单)" \
     process_policy.proto process_policy.ProcessPolicyService GetProcessPolicy \
-    '{"is_white": false}'; }
+    '{"is_white": 0}'; }
 
-test_04() { grpc_call "外设策略" \
-    peripheral_policy.proto peripheral_policy.PeripheralPolicyService GetPeripheralPolicy; }
+test_04() { grpc_call "外设策略(白名单)" \
+    peripheral_policy.proto peripheral_policy.PeripheralPolicyService GetPeripheralPolicy \
+    '{"is_white": 1}'; }
+
+test_04b() { grpc_call "外设策略(黑名单)" \
+    peripheral_policy.proto peripheral_policy.PeripheralPolicyService GetPeripheralPolicy \
+    '{"is_white": 0}'; }
 
 test_05() { grpc_call "IP阻断策略" \
     ip_policy.proto ip_policy.IpPolicyService GetIpBlockPolicy; }
@@ -425,6 +442,14 @@ test_25() { grpc_call "历史告警日志(全部/分页)" \
     alert.proto alert.AlertService GetAlertLogs \
     '{"handle_status": -1, "page": 1, "page_size": 20}'; }
 
+test_25b() { grpc_call "历史告警日志(仅外设)" \
+    alert.proto alert.AlertService GetAlertLogs \
+    '{"handle_status": -1, "alert_type": 3, "page": 1, "page_size": 20}'; }
+
+test_25c() { grpc_call "历史告警日志(仅进程)" \
+    alert.proto alert.AlertService GetAlertLogs \
+    '{"handle_status": -1, "alert_type": 1, "page": 1, "page_size": 20}'; }
+
 test_26() { grpc_call "历史告警日志(未处理)" \
     alert.proto alert.AlertService GetAlertLogs \
     '{"handle_status": 0, "page": 1, "page_size": 20}'; }
@@ -438,6 +463,20 @@ test_27() { grpc_call "告警处置(标记已处理)" \
 test_28() { grpc_call "告警处置(标记已忽略)" \
     alert.proto alert.AlertService HandleAlert \
     '{"id": 1, "handle_status": 2, "handle_user": "admin"}'; }
+
+# 批量处置：标记为已处理
+test_28b() { grpc_call "告警处置(批量已处理)" \
+    alert.proto alert.AlertService BatchHandleAlerts \
+    '{"ids": [1, 2, 3], "handle_status": 1, "handle_user": "admin"}'; }
+
+# 防护模式读取：29=进程防护模式, 30=外设防护模式
+test_29() { grpc_call "进程防护模式(读)" \
+    protection_mode.proto protection_mode.ProcessDefenseService GetProcessDefenseMode \
+    '{}'; }
+
+test_30() { grpc_call "外设防护模式(读)" \
+    protection_mode.proto protection_mode.PeripheralDefenseService GetPeripheralDefenseMode \
+    '{}'; }
 
 # ── 流式接口测试 ────────────────────────────────────────────────────────
 
@@ -590,6 +629,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}   8) DirPolicy       16)  UsbDeviceList   24) VulnScan上报    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  25) 历史告警(全部)  26) 历史告警(未处理)                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  27) 告警处置(已处理) 28) 告警处置(已忽略)                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  29) ProcessDefenseMode(读)  30) PeripheralDefenseMode(读)${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  s1) VirusScan流(StreamControl)                              ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${RED}写接口（仅离线可用，在线应返回 PERMISSION_DENIED）${NC}       ${CYAN}║${NC}"
@@ -605,7 +645,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}  ${GREEN}wN {json} 离线时实际执行写操作${NC}                                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  例: w16 {\"backup_id\":\"snap_name\"}  → 实际删除快照           ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}all${NC}    测试全部只读接口 (1-28)                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${GREEN}all${NC}    测试全部只读接口 (1-30)                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${RED}write${NC}  测试全部写接口（验证在线拒绝）                    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}stream${NC} 测试全部流式接口 (17, 18, s1)                   ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}full${NC}   测试全部接口（读写+流）                          ${CYAN}║${NC}"
@@ -616,11 +656,12 @@ show_menu() {
 }
 
 run_all_readonly() {
-    for i in $(seq -w 1 28); do
+    for i in $(seq -w 1 30); do
         fn="test_$(printf '%02d' $((10#$i)))"
         type "$fn" &>/dev/null && "$fn"
     done
     test_03b   # 黑名单
+    test_04b   # 外设-黑名单
     test_14b   # 进程列表-仅白名单
     test_14c   # 进程列表-仅黑名单
     test_14d   # 进程列表-仅未知
@@ -682,7 +723,7 @@ case "${1:-menu}" in
             fi
 
             # ── 预检查: 14/23/json {...} → 自定义 filter_status ──
-            if [[ "$choice" =~ ^(14|23|03|3|14b|14c|14d|23b|23c|23d|03b)[[:space:]]+(\{.*\})$ ]]; then
+            if [[ "$choice" =~ ^(14|23|03|3|14b|14c|14d|23b|23c|23d|03b|04b)[[:space:]]+(\{.*\})$ ]]; then
                 tid="${BASH_REMATCH[1]}"
                 json="${BASH_REMATCH[2]}"
                 case "$tid" in
@@ -692,6 +733,8 @@ case "${1:-menu}" in
                         grpc_call "可执行文件列表(自定义)" data_query.proto data_query.DataQueryService GetExecutableList "$json" "peripheral_policy.proto" 60 ;;
                     3|03|03b)
                         grpc_call "进程策略(自定义)" process_policy.proto process_policy.ProcessPolicyService GetProcessPolicy "$json" ;;
+                    04b)
+                        grpc_call "外设策略(自定义)" peripheral_policy.proto peripheral_policy.PeripheralPolicyService GetPeripheralPolicy "$json" ;;
                 esac
                 continue
             fi
@@ -711,16 +754,19 @@ case "${1:-menu}" in
                 17) test_17 ;; 18) test_18 ;; 19) test_19 ;; 20) test_20 ;;
                 21) test_21 ;; 22) test_22 ;; 23) test_23 ;; 24) test_24 ;;
                 25) test_25 ;; 26) test_26 ;;
-                27) test_27 ;; 28) test_28 ;;
+                27) test_27 ;; 28) test_28 ;; 28b) test_28b ;;
+                29) test_29 ;; 30) test_30 ;;
                 s1) test_s1 ;;
                 03b) test_03b ;; 14b) test_14b ;; 14c) test_14c ;; 14d) test_14d ;;
+                04b) test_04b ;;
+                25b) test_25b ;; 25c) test_25c ;;
                 23b) test_23b ;; 23c) test_23c ;; 23d) test_23d ;;
                 w1)  test_w1  ;; w2)  test_w2  ;; w3)  test_w3  ;; w4)  test_w4  ;;
                 w5)  test_w5  ;; w6)  test_w6  ;; w7)  test_w7  ;; w8)  test_w8  ;;
                 w9)  test_w9  ;; w10) test_w10 ;; w11) test_w11 ;; w12) test_w12 ;;
                 w13) test_w13 ;; w14) test_w14 ;; w15) test_w15 ;; w16) test_w16 ;;
                 all)
-                    echo -e "\n${GREEN}── 测试全部只读接口 (1-28) ──${NC}"
+                    echo -e "\n${GREEN}── 测试全部只读接口 (1-30) ──${NC}"
                     run_all_readonly
                     print_result
                     ;;
@@ -751,7 +797,7 @@ case "${1:-menu}" in
                     secs=300
                     [[ "$choice" =~ listen[[:space:]]+([0-9]+) ]] && secs="${BASH_REMATCH[1]}"
                     echo -e "\n${YELLOW}── 监听告警流 ${secs}秒 (Ctrl+C 停止) ──${NC}"
-                    timeout "$secs" grpcurl -plaintext -emit-defaults \
+                    timeout --foreground "$secs" grpcurl -plaintext -emit-defaults \
                         -import-path "$PROTO_DIR" \
                         -proto common.proto -proto alert.proto \
                         -d '{"type": 0}' \
@@ -773,12 +819,15 @@ case "${1:-menu}" in
                     echo "  19) 查询准入           20) 准入-OFF"
                     echo "  21) 准入-ON            22) 准入-AUTO"
                     echo "  23) ExecutableList     24) VulnScan上报"
-                    echo "  25) 历史告警(全部)   26) 历史告警(未处理)"
+                    echo "  25) 历史告警(全部)   25b) 仅外设  25c) 仅进程"
+                    echo "  26) 历史告警(未处理)"
                     echo "  27) 告警处置(已处理)  28) 告警处置(已忽略)"
+                    echo "  29) ProcessDefenseMode(读)  30) PeripheralDefenseMode(读)"
                     echo "  s1) VirusScan流"
                     echo ""
-                    echo -e "${CYAN}── 扩展测试（filter_status 过滤）──${NC}"
-                    echo "  03b) ProcessPolicy-黑名单    14b) ProcessList-仅白名单"
+                    echo -e "${CYAN}── 扩展测试（filter_status / is_white 过滤）──${NC}"
+                    echo "  03b) ProcessPolicy-黑名单    04b) PeripheralPolicy-黑名单"
+                    echo "  14b) ProcessList-仅白名单    "
                     echo "  14c) ProcessList-仅黑名单     14d) ProcessList-仅未知"
                     echo "  23b) ExecutableList-黑名单    23c) ExecutableList-白名单"
                     echo "  23d) ExecutableList-未知"
@@ -794,7 +843,7 @@ case "${1:-menu}" in
                     echo "  w15) PeripheralDefenseMode  w16) DeleteBackup"
                     echo ""
                     echo -e "${CYAN}── 快捷命令 ──${NC}"
-                    echo "  all    测试全部只读 (1-28)"
+                    echo "  all    测试全部只读 (1-30)"
                     echo "  write  测试全部写 (w1-w16, 需离线模式)"
                     echo "  stream 测试全部流式 (17, 18, s1)"
                     echo "  full   测试全部 (读写+流)"
@@ -875,7 +924,7 @@ case "${1:-menu}" in
         echo "  menu            同无参数"
         echo ""
         echo "  交互菜单内可用命令:"
-        echo "    1-28, s1       测试指定只读/流式接口"
+        echo "    1-30, s1       测试指定只读/流式接口"
         echo "    03b,14b/14c/14d,23b  filter_status 过滤测试"
         echo "    w1-w16          测试指定写接口"
         echo "    all/write/stream/full  批量测试"
@@ -891,7 +940,7 @@ case "${1:-menu}" in
         echo "  $0 23b           直接测试 ExecutableList(仅黑名单)"
         echo "  $0 s1            直接测试 VirusScan 双向流"
         echo "  $0 w8            直接测试 CreateBackup"
-        echo "  $0 all           测试全部只读接口 (1-28)"
+        echo "  $0 all           测试全部只读接口 (1-30)"
         echo "  $0 write         测试全部写接口 (w1-w16)"
         echo "  $0 stream        测试流式接口 (17, 18, s1)"
         echo "  $0 full          测试全部接口（读写+流）"
@@ -923,7 +972,7 @@ case "${1:-menu}" in
             "test_$(printf '%02d' "$arg")"
         else
             echo "无效参数: $1"
-            echo "用法: $0 [?|help|all|write|stream|full|listen|<1-28>|s1|w1-w16|menu]"
+            echo "用法: $0 [?|help|all|write|stream|full|listen|<1-30>|s1|w1-w16|menu]"
             echo "试试: $0 ?  查看完整帮助"
             exit 1
         fi

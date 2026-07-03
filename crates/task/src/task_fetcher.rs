@@ -1212,7 +1212,12 @@ async fn task_down_black(&self, task_type: u64) -> Result<(), String> {
                 }
 
                 let mut mgr = POLICY_MANAGER.lock().unwrap();
-                mgr.set_policy_process(&hash_list, 2); // 黑名单
+                let save_to_db = if config::net_info::NETINFO_CONFIG.lock().unwrap().db_policy.enabled {
+                    Some(false)
+                } else {
+                    None
+                };
+                mgr.set_policy_process(&hash_list, 2, save_to_db);
             } else {
                 eprintln!("Error: Invalid response code: {}", parsed["code"]);
                 // 返回错误的 Result 类型
@@ -1269,7 +1274,12 @@ pub async fn task_down_white(&self, task_type: u64) -> Result<(), String> {
                 }
 
                 let mut mgr = POLICY_MANAGER.lock().unwrap();
-                mgr.set_policy_process(&hash_list, 1); // 白名单
+                let save_to_db = if config::net_info::NETINFO_CONFIG.lock().unwrap().db_policy.enabled {
+                    Some(false)
+                } else {
+                    None
+                };
+                mgr.set_policy_process(&hash_list, 1, save_to_db);
                 //println!("hash_list:{:?}",hash_list);
             }
         }
@@ -1797,8 +1807,39 @@ async fn task_get_black_peripherals(&self, task_type: u64) -> Result<(), String>
                     })
                 .collect();
 
+                // 先读 config 避免在持有 SHARED_USB_LIST 锁时再锁 config 导致 AB-BA 死锁
+                let usb_protect = config::net_info::NETINFO_CONFIG.lock().unwrap().usb_protect;
                 let mut guard = SHARED_USB_LIST.lock().unwrap();
-                guard.update_blacklist(blacklist);
+                guard.update_blacklist(blacklist, usb_protect);
+
+                // 持久化到在线表（仅 DB_POLICY 启用时）
+                if config::net_info::NETINFO_CONFIG.lock().unwrap().db_policy.enabled {
+                    let db_white: Vec<local_store::peripheral_policy::PeripheralPolicyRow> = guard
+                        .get_whitelist()
+                        .iter()
+                        .map(|d| local_store::peripheral_policy::PeripheralPolicyRow {
+                            peripheral_eid: d.perpheral_eid.clone(),
+                            peripheral_name: d.perpheral_name.clone(),
+                            intro: d.intro.clone(),
+                            type_: d.type_.clone(),
+                            is_white: true,
+                        })
+                        .collect();
+                    let db_black: Vec<local_store::peripheral_policy::PeripheralPolicyRow> = guard
+                        .get_blacklist()
+                        .iter()
+                        .map(|d| local_store::peripheral_policy::PeripheralPolicyRow {
+                            peripheral_eid: d.perpheral_eid.clone(),
+                            peripheral_name: d.perpheral_name.clone(),
+                            intro: d.intro.clone(),
+                            type_: d.type_.clone(),
+                            is_white: false,
+                        })
+                        .collect();
+                    if let Err(e) = local_store::peripheral_policy::save_all(&db_white, &db_black) {
+                        logging::log_error!("[peripheral_policy] task_fetcher 持久化失败: {}", e);
+                    }
+                }
             }
         }
         Err(err) => {

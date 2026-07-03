@@ -56,7 +56,8 @@ impl ProcessPolicyManager {
 
 
     /// action: 0=移除(未知), 1=白名单, 2=黑名单
-    pub fn set_policy_process(&mut self, process_list: &[String], action: i32) {
+    /// save_to_db: None=不存DB, Some(false)=存在线表, Some(true)=存本地表
+    pub fn set_policy_process(&mut self, process_list: &[String], action: i32, save_to_db: Option<bool>) {
         let mut is_changed = false;
 
         match action {
@@ -115,8 +116,18 @@ impl ProcessPolicyManager {
 
         let white: Vec<String> = self.white_set.iter().cloned().collect();
         let black: Vec<String> = self.black_set.iter().cloned().collect();
-        if let Err(e) = local_store::process_policy::save_all(&white, &black) {
-            log_error!("[process_policy] 持久化失败: {}", e);
+        match save_to_db {
+            Some(true) => {
+                if let Err(e) = local_store::process_policy::save_all_local(&white, &black) {
+                    log_error!("[process_policy] 持久化到本地表失败: {}", e);
+                }
+            }
+            Some(false) => {
+                if let Err(e) = local_store::process_policy::save_all(&white, &black) {
+                    log_error!("[process_policy] 持久化失败: {}", e);
+                }
+            }
+            None => { /* DB_POLICY 未启用，不写 DB */ }
         }
         if let Err(e) = local_store::known_executables::update_policy_status(&white, true) {
             log_error!("[known_executables] 同步白名单失败: {}", e);
@@ -127,8 +138,14 @@ impl ProcessPolicyManager {
     }
 
     /// 从 SQLite 加载黑白名单到内存（启动时调用，不写 kernel）
-    pub fn load_policy_from_db(&mut self) {
-        match local_store::process_policy::load_all() {
+    /// local: true=从离线本地表加载, false=从在线基线表加载
+    pub fn load_policy_from_db(&mut self, local: bool) {
+        let result = if local {
+            local_store::process_policy::load_all_local()
+        } else {
+            local_store::process_policy::load_all()
+        };
+        match result {
             Ok(entries) => {
                 self.white_set.clear();
                 self.black_set.clear();
@@ -142,7 +159,8 @@ impl ProcessPolicyManager {
                 self.prev_white_set = self.white_set.clone();
                 self.prev_black_set = self.black_set.clone();
                 log_info!(
-                    "[process_policy] 从 DB 加载: {} 白名单, {} 黑名单",
+                    "[process_policy] 从 DB({}) 加载: {} 白名单, {} 黑名单",
+                    if local { "local" } else { "online" },
                     self.white_set.len(),
                     self.black_set.len()
                 );

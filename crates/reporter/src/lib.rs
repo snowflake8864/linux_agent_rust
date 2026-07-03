@@ -74,19 +74,30 @@ pub fn broadcast_audit_log(log: &AuditLogInfo) {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     // 1. 先持久化到 alert.db，保证客户端断线组再连可以补读历史告警
+    // path:   进程/文件=可执行路径, 外设=peripheral_name
+    // identifier: 进程/文件/勒索=md5, 外设=peripheral_eid
     let row = local_store::alert_log::AlertLogRow {
         id:                  0,
         alert_type:          alert_type,
         level:               log.n_level as i32,
         process:             log.exception_process.clone().unwrap_or_default(),
-        path:                log.file_path.clone().unwrap_or_default(),
+        path:                match alert_type {
+            3 => log.peripheral_name.clone().unwrap_or_default(),
+            _ => log.file_path.clone().unwrap_or_default(),
+        },
         pid:                 0,
         detail:              log.notice_remark.clone().unwrap_or_default(),
+        identifier:          match alert_type {
+            1 | 2 | 5 => log.md5.clone().unwrap_or_default(),
+            3 => log.peripheral_eid.clone().unwrap_or_default(),
+            _ => String::new(),
+        },
         handle_status:       local_store::alert_log::HANDLE_STATUS_PENDING,
         handle_status_label: "未处理".to_string(),
         handle_user:         String::new(),
         handled_at:          String::new(),
         created_at:          now,
+        n_type:              log.n_type as u32,
     };
     if let Err(e) = local_store::alert_log::insert(&row) {
         logging::log_error!("[alert] 写入 alert.db 失败: {}", e);
