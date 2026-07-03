@@ -2722,6 +2722,7 @@ dependencies = [
  "grpc_gateway",
  "hostinfo",
  "libc",
+ "local_store",
  "log 0.4.29",
  "logging",
  "net_client",

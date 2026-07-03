@@ -1,6 +1,6 @@
 // udisk/src/list.rs
 use crate::device::UsbInfo;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::Arc;
 use logging::log_info;
@@ -78,12 +78,24 @@ impl BlackWhiteList {
         self.blacklist.retain(|u| !new_white_eids.contains(&u.perpheral_eid));
         self.black_eids = self.blacklist.iter().map(|u| u.perpheral_eid.clone()).collect();
 
-        // 更新白名单
-        self.whitelist = new_whitelist;
+        // 合并已有设备信息：保留旧的 name/intro/type，避免全量替换时覆盖为空
+        let existing: HashMap<String, &UsbInfo> = self.whitelist.iter()
+            .map(|u| (u.perpheral_eid.clone(), u))
+            .collect();
+        self.whitelist = new_whitelist.into_iter().map(|mut dev| {
+            if let Some(old) = existing.get(&dev.perpheral_eid) {
+                if dev.perpheral_name.is_empty() { dev.perpheral_name = old.perpheral_name.clone(); }
+                if dev.intro.is_empty() { dev.intro = old.intro.clone(); }
+                if dev.type_.is_empty() { dev.type_ = old.type_.clone(); }
+                if !dev.allow { dev.allow = old.allow; }
+            }
+            dev
+        }).collect();
         self.white_eids = new_white_eids;
     }
 
-    pub fn update_blacklist(&mut self, new_blacklist: Vec<UsbInfo>) {
+    /// usb_protect: 由调用方在外层锁前读取 NETINFO_CONFIG，避免锁顺序反转导致死锁
+    pub fn update_blacklist(&mut self, new_blacklist: Vec<UsbInfo>, usb_protect: bool) {
         let new_black_eids: HashSet<String> = new_blacklist.iter().map(|u| u.perpheral_eid.clone()).collect();
 
         // 找出新增的黑名单设备（原来不在黑名单中的）
@@ -96,17 +108,35 @@ impl BlackWhiteList {
         self.whitelist.retain(|u| !new_black_eids.contains(&u.perpheral_eid));
         self.white_eids = self.whitelist.iter().map(|u| u.perpheral_eid.clone()).collect();
 
-        // 更新黑名单
-        self.blacklist = new_blacklist;
+        // 合并已有设备信息：保留旧的 name/intro/type，避免全量替换时覆盖为空
+        let existing: HashMap<String, &UsbInfo> = self.blacklist.iter()
+            .map(|u| (u.perpheral_eid.clone(), u))
+            .collect();
+        self.blacklist = new_blacklist.into_iter().map(|mut dev| {
+            if let Some(old) = existing.get(&dev.perpheral_eid) {
+                if dev.perpheral_name.is_empty() { dev.perpheral_name = old.perpheral_name.clone(); }
+                if dev.intro.is_empty() { dev.intro = old.intro.clone(); }
+                if dev.type_.is_empty() { dev.type_ = old.type_.clone(); }
+                if !dev.allow { dev.allow = old.allow; }
+            }
+            dev
+        }).collect();
         self.black_eids = new_black_eids;
 
-        // 禁用新增黑名单设备
+        // 禁用新增黑名单设备：仅在 PROTECT 模式下物理禁用
         if !added_to_blacklist.is_empty() {
-            log_info!("检测到 {} 个新增黑名单设备，尝试禁用...", added_to_blacklist.len());
-            let blacklist_clone = added_to_blacklist.clone();
-            std::thread::spawn(move || {
-                crate::monitor::handle_blacklist_update(&blacklist_clone);
-            });
+            if usb_protect {
+                log_info!("检测到 {} 个新增黑名单设备，PROTECT 模式，尝试禁用...", added_to_blacklist.len());
+                let blacklist_clone = added_to_blacklist.clone();
+                std::thread::spawn(move || {
+                    crate::monitor::handle_blacklist_update(&blacklist_clone);
+                });
+            } else {
+                log_info!(
+                    "检测到 {} 个新增黑名单设备，非 PROTECT 模式，跳过物理禁用",
+                    added_to_blacklist.len()
+                );
+            }
         }
     }
 

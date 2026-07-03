@@ -80,6 +80,8 @@ pub struct NetInfoConfig {
     pub install_time: i64,
     // 准入功能配置
     pub admission: AdmissionConfig,
+    // DB策略持久化配置
+    pub db_policy: DbPolicyConfig,
 }
 
 /// 准入功能配置，对应 ini 中的 [ADMISSION] 段
@@ -100,6 +102,20 @@ impl Default for AdmissionConfig {
             retry_interval: 60,   // 默认60秒重试
             max_retries: 3,       // 默认3次
         }
+    }
+}
+
+/// DB策略持久化配置，对应 ini 中的 [DB_POLICY] 段
+/// ENABLED=1 时启用双表持久化（在线基线 + 离线本地）
+/// ENABLED=0 或不写此段时，策略只存内存（服务器下发），不读写 DB
+#[derive(Debug, Clone)]
+pub struct DbPolicyConfig {
+    pub enabled: bool,
+}
+
+impl Default for DbPolicyConfig {
+    fn default() -> Self {
+        DbPolicyConfig { enabled: false }
     }
 }
 
@@ -439,6 +455,11 @@ impl NetInfoConfig {
             config.admission.max_retries = value.trim().parse().unwrap_or(3);
         }
 
+        // [DB_POLICY] 段 — 没有此段则全部默认（enabled=false）
+        if let Some(value) = ini.get("DB_POLICY", "ENABLED") {
+            config.db_policy.enabled = matches!(value.trim(), "1");
+        }
+
         config
     }
 
@@ -551,6 +572,10 @@ impl NetInfoConfig {
         writeln!(file, "MODE={}", self.admission.mode)?;
         writeln!(file, "RETRY_INTERVAL={}", self.admission.retry_interval)?;
         writeln!(file, "MAX_RETRIES={}", self.admission.max_retries)?;
+
+        // [DB_POLICY] 段
+        writeln!(file, "[DB_POLICY]")?;
+        writeln!(file, "ENABLED={}", self.db_policy.enabled as u8)?;
 
         Ok(())
     }

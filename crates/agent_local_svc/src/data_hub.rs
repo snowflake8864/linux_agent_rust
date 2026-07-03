@@ -24,10 +24,38 @@ pub fn update_token(token: String) {
 
 /// 断线时调用：尝试切离线 + 如果真正切了且准入模式是 AUTO 则重新触发自动检测。
 /// 调用方不需要关心阈值——set_offline 内部会累计失败次数。
+/// 是否启用 DB 策略持久化
+fn db_policy_enabled() -> bool {
+    config::net_info::NETINFO_CONFIG.lock().unwrap().db_policy.enabled
+}
+
+/// 切在线时，若 DB_POLICY 启用，从在线表恢复策略
+fn restore_online_policies_from_db() {
+    let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
+    if !cfg.db_policy.enabled {
+        return;
+    }
+    drop(cfg);
+    AgentDataHub::load_peripheral_policy_from(false);
+    process_mgr::POLICY_MANAGER.lock().unwrap().load_policy_from_db(false);
+}
+
+/// 切离线时从 DB 本地表恢复离线策略（仅 DB_POLICY 启用时）
+fn reload_local_policies_on_offline() {
+    let db_enabled = config::net_info::NETINFO_CONFIG.lock().unwrap().db_policy.enabled;
+    if db_enabled {
+        AgentDataHub::load_peripheral_policy_from_db_local();
+        process_mgr::POLICY_MANAGER.lock().unwrap().load_policy_from_db(true);
+    }
+}
+
 pub fn set_offline_and_check_admission() {
     if !set_offline() {
         return; // 还没到阈值，未真正切离线
     }
+
+    reload_local_policies_on_offline();
+
     let admission_enabled = {
         let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
         cfg.admission.enabled
@@ -94,9 +122,16 @@ pub fn trigger_connectivity_probe() {
     }
     tokio::spawn(async move {
         if check_server_reachable().await {
+            let was_offline = AGENT_MODE.load(Ordering::Relaxed) == AgentMode::Offline as u8;
             set_online();
+            if was_offline {
+                restore_online_policies_from_db();
+            }
         } else {
-            let _ = set_offline();
+            let switched = set_offline();
+            if switched {
+                reload_local_policies_on_offline();
+            }
         }
         PROBE_RUNNING.store(false, Ordering::Relaxed);
     });
@@ -285,6 +320,53 @@ impl AgentDataHub {
             guard.get_whitelist().clone()
         } else {
             guard.get_blacklist().clone()
+        }
+    }
+
+    /// 启动时从 DB 在线表恢复外设黑白名单到内存。
+    pub fn load_peripheral_policy_from_db() {
+        Self::load_peripheral_policy_from(false)
+    }
+
+    /// 切离线时从 DB 本地表恢复外设黑白名单到内存。
+    pub fn load_peripheral_policy_from_db_local() {
+        Self::load_peripheral_policy_from(true)
+    }
+
+    fn load_peripheral_policy_from(local: bool) {
+        let result = if local {
+            local_store::peripheral_policy::load_all_local()
+        } else {
+            local_store::peripheral_policy::load_all()
+        };
+        match result {
+            Ok(rows) => {
+                let mut white = vec![];
+                let mut black = vec![];
+                for row in rows {
+                    let info = udisk::device::UsbInfo::new(
+                        row.peripheral_eid.clone(),
+                        row.peripheral_name,
+                        row.intro,
+                        row.type_,
+                        false,
+                    );
+                    if row.is_white {
+                        white.push(info);
+                    } else {
+                        black.push(info);
+                    }
+                }
+                let mut guard = udisk::list::SHARED_USB_LIST.lock().unwrap();
+                *guard = udisk::list::BlackWhiteList::from_vecs(black, white);
+                log_info!(
+                    "[peripheral_policy] 从 DB({}) 加载: {} 白名单, {} 黑名单",
+                    if local { "local" } else { "online" },
+                    guard.get_whitelist().len(),
+                    guard.get_blacklist().len()
+                );
+            }
+            Err(e) => log_error!("[peripheral_policy] 从 DB 加载失败: {}", e),
         }
     }
 
@@ -580,7 +662,7 @@ impl AgentDataHub {
         process_mgr::POLICY_MANAGER
             .lock()
             .unwrap()
-            .set_policy_process(hashes, action);
+            .set_policy_process(hashes, action, if db_policy_enabled() { Some(true) } else { None });
         self.notify(PolicyChangeType::ProcessPolicyChanged);
         Ok(())
     }
@@ -591,6 +673,8 @@ impl AgentDataHub {
         devices: &[udisk::device::UsbInfo],
         action: i32,
     ) -> Result<(), String> {
+        // 先读 NETINFO_CONFIG（在外层），避免在持有 SHARED_USB_LIST 锁时再锁 config 导致 AB-BA 死锁
+        let usb_protect = config::net_info::NETINFO_CONFIG.lock().unwrap().usb_protect;
         let mut guard = udisk::list::SHARED_USB_LIST.lock().unwrap();
         match action {
             0 => {
@@ -598,9 +682,39 @@ impl AgentDataHub {
                 guard.remove_from_both(&eids);
             }
             1 => guard.update_whitelist(devices.to_vec()),
-            2 => guard.update_blacklist(devices.to_vec()),
+            2 => guard.update_blacklist(devices.to_vec(), usb_protect),
             _ => return Err(format!("无效 action: {}", action)),
         }
+
+        // 持久化到离线本地表（仅 DB_POLICY 启用时）
+        if db_policy_enabled() {
+            let white: Vec<local_store::peripheral_policy::PeripheralPolicyRow> = guard
+                .get_whitelist()
+                .iter()
+                .map(|d| local_store::peripheral_policy::PeripheralPolicyRow {
+                    peripheral_eid: d.perpheral_eid.clone(),
+                    peripheral_name: d.perpheral_name.clone(),
+                    intro: d.intro.clone(),
+                    type_: d.type_.clone(),
+                    is_white: true,
+                })
+                .collect();
+            let black: Vec<local_store::peripheral_policy::PeripheralPolicyRow> = guard
+                .get_blacklist()
+                .iter()
+                .map(|d| local_store::peripheral_policy::PeripheralPolicyRow {
+                    peripheral_eid: d.perpheral_eid.clone(),
+                    peripheral_name: d.perpheral_name.clone(),
+                    intro: d.intro.clone(),
+                    type_: d.type_.clone(),
+                    is_white: false,
+                })
+                .collect();
+            if let Err(e) = local_store::peripheral_policy::save_all_local(&white, &black) {
+                log_error!("[peripheral_policy] 持久化到本地表失败: {}", e);
+            }
+        }
+
         self.notify(PolicyChangeType::PeripheralPolicyChanged);
         Ok(())
     }
