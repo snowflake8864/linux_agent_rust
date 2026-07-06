@@ -516,6 +516,15 @@ fn update_config_from_json(&mut self, conf: &serde_json::Map<String, Value>) -> 
     Ok(())
 }
 
+/// 离线/启动时从本地 net_info.ini 初始化内核开关。
+/// 以全默认值作为"旧配置"，与当前 NETINFO_CONFIG 做 diff，将所有已开启的开关下发内核。
+/// 后续上线收到服务端配置时，`apply_config_diff` 的 diff 仍正确（prev_* 已同步）。
+fn init_switches_from_local_config(&mut self) -> Result<(), String> {
+    let new = config::net_info::NETINFO_CONFIG.lock().unwrap().clone();
+    let old = NetInfoConfig::default();
+    self.apply_config_diff(&old, &new)
+}
+
 fn apply_config_diff(&mut self, old: &NetInfoConfig, new: &NetInfoConfig) -> Result<(), String> {
     // ---------- 自保护开关 ----------
     if new.self_protect_switch != self.prev_self_protect_switch {
@@ -615,6 +624,11 @@ pub async fn run(
         .ok_or("task_provider_base_url not set")?;
 
     let mut task_fetcher = TaskFetcher::new(base_url, token.clone(), pattern_mgr, nl_sock);
+
+    // 离线/启动时从本地 net_info.ini 读取开关并下发到内核
+    if let Err(e) = task_fetcher.init_switches_from_local_config() {
+        log::warn!("[task_fetcher] 本地开关初始化失败: {}", e);
+    }
 
     // 初始读取 cron_time
     let initial_cron_time = {
