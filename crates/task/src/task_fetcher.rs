@@ -521,6 +521,8 @@ fn update_config_from_json(&mut self, conf: &serde_json::Map<String, Value>) -> 
 /// 后续上线收到服务端配置时，`apply_config_diff` 的 diff 仍正确（prev_* 已同步）。
 fn init_switches_from_local_config(&mut self) -> Result<(), String> {
     let new = config::net_info::NETINFO_CONFIG.lock().unwrap().clone();
+    log::info!("[task_fetcher] init_switches: proc_switch={}, self_protect={}, file_switch={}, mod_ver={}",
+        new.proc_switch, new.self_protect_switch, new.file_switch, new.mod_ver);
     let old = NetInfoConfig::default();
     self.apply_config_diff(&old, &new)
 }

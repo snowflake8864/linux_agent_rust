@@ -27,6 +27,7 @@ impl ProcessAuditHandler {
         data: &[u8],
         data_len: u32,
     ) -> Result<(), String> {
+        log::info!("[process_audit] 收到内核进程事件, data_len={}", data_len);
         if data_len < mem::size_of::<NetlinkNetlog>() as u32 {
             return Err(format!(
                 "数据长度太小，期望至少 {} 字节，实际是 {} 字节",
@@ -135,8 +136,11 @@ impl ProcessAuditHandler {
                     ).await {
                         Ok(response) => {
                             for log in &loginfo { crate::broadcast_audit_log(log); }
-                        },//{log_info!("服务器响应: {}", response)},
-                        Err(err) => eprintln!("发送指标失败: {}", err),
+                        },
+                        Err(err) => {
+                            log::info!("[process_audit] 上传告警到服务器失败(离线): {}, 本地广播", err);
+                            for log in &loginfo { crate::broadcast_audit_log(log); }
+                        },
                     }
 
                 }
@@ -264,6 +268,8 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
 
     // 处理 AuditProcess
     if cfg.proc_switch {
+        log::info!("[process_audit] proc_switch=1, type_={}, p_dir={}",
+            proc_info.type_, p_dir);
         if proc_info.type_ == 1101 || proc_info.type_ == 1001 {
             processvec.push(AuditProcess {
                 n_time: 1692760326 as i64,
@@ -285,6 +291,8 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
 
         let flags = proc_info.flags_parsed();
         if flags.level > 0  && proc_info.type_ > 0 {
+            log::info!("[process_audit] 生成告警: type_={}, level={}, md5={}, path={}",
+                proc_info.type_, flags.level, hash, p_dir);
             loginfo.push(AuditLogInfo {
                 file_path: Some(p_dir.clone()),
                 md5: Some(hash.clone()),
@@ -299,6 +307,9 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
                 peripheral_eid: None,
                 p_param: None,
             });
+        } else {
+            log::info!("[process_audit] 跳过告警: type_={}, level={}, path={}",
+                proc_info.type_, flags.level, p_dir);
         }
     }
 
