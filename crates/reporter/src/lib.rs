@@ -71,7 +71,7 @@ pub fn broadcast_audit_log(log: &AuditLogInfo) {
         }
     };
 
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let now = chrono::Local::now().timestamp();
 
     // 1. 先持久化到 alert.db，保证客户端断线组再连可以补读历史告警
     // path:   进程/文件=可执行路径, 外设=peripheral_name
@@ -95,7 +95,7 @@ pub fn broadcast_audit_log(log: &AuditLogInfo) {
         handle_status:       local_store::alert_log::HANDLE_STATUS_PENDING,
         handle_status_label: "未处理".to_string(),
         handle_user:         String::new(),
-        handled_at:          String::new(),
+        handled_at:          0,
         created_at:          now,
         n_type:              log.n_type as u32,
     };

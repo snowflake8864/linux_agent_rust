@@ -111,9 +111,11 @@ show_test_help() {
         24)    echo -e "${CYAN}[24] VulnScan上报${NC} — 上报漏洞扫描结果"
                echo "    用法: $0 24" ;;
         25)    echo -e "${CYAN}[25] 历史告警(全部)${NC} — 查询所有历史告警"
-               echo "    用法: $0 25  |  25b(仅外设)  | 25c(仅进程)" ;;
+               echo "    用法: $0 25  |  25b(仅外设)  | 25c(仅进程)  | 25d(按identifier)"
+               echo "          25e(按handle_status_label)  | 25f(按时间范围)"
+               echo "          25g(组合: 时间+类型+处置状态)" ;;
         26)    echo -e "${CYAN}[26] 历史告警(未处理)${NC} — 查询未处理的历史告警"
-               echo "    用法: $0 26" ;;
+               echo "    用法: $0 26  |  26b(按identifier+未处理)" ;;
         27)    echo -e "${CYAN}[27] 告警处置(已处理)${NC} — 将告警标记为已处理"
                echo "    用法: $0 27" ;;
         28)    echo -e "${CYAN}[28] 告警处置(已忽略)${NC} — 将告警标记为已忽略"
@@ -454,6 +456,31 @@ test_26() { grpc_call "历史告警日志(未处理)" \
     alert.proto alert.AlertService GetAlertLogs \
     '{"handle_status": 0, "page": 1, "page_size": 20}'; }
 
+# 新增: 按 identifier 过滤 (进程md5/外设eid)
+test_25d() { grpc_call "历史告警日志(按identifier)" \
+    alert.proto alert.AlertService GetAlertLogs \
+    '{"page": 1, "page_size": 20, "identifier": "d41d8cd98f00b204e9800998ecf8427e"}'; }
+
+# 新增: 按 handle_status_label 过滤 ("未处理"/"已处理"/"已忽略")
+test_25e() { grpc_call "历史告警日志(按handle_status_label)" \
+    alert.proto alert.AlertService GetAlertLogs \
+    '{"page": 1, "page_size": 20, "handle_status_label": "未处理"}'; }
+
+# 新增: 按时间范围过滤 (Unix时间戳秒)
+test_25f() { grpc_call "历史告警日志(按时间范围)" \
+    alert.proto alert.AlertService GetAlertLogs \
+    '{"page": 1, "page_size": 20, "start_time": 1751234567, "end_time": 1751834567}'; }
+
+# 新增: 组合过滤 (时间 + 告警类型 + 处置状态)
+test_25g() { grpc_call "历史告警日志(组合:时间+类型+状态)" \
+    alert.proto alert.AlertService GetAlertLogs \
+    '{"page": 1, "page_size": 20, "handle_status": 0, "alert_type": 3, "start_time": 1751234567}'; }
+
+# 新增: 按identifier + 未处理状态组合
+test_26b() { grpc_call "历史告警日志(identifier+未处理)" \
+    alert.proto alert.AlertService GetAlertLogs \
+    '{"page": 1, "page_size": 20, "handle_status": 0, "identifier": "d41d8cd98f00b204e9800998ecf8427e"}'; }
+
 # 告警处置：标记为已处理(handle_status=1)
 test_27() { grpc_call "告警处置(标记已处理)" \
     alert.proto alert.AlertService HandleAlert \
@@ -628,6 +655,8 @@ show_menu() {
     echo -e "${CYAN}║${NC}   7) OutreachRules   15)  PortList        23) ExecutableList  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   8) DirPolicy       16)  UsbDeviceList   24) VulnScan上报    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  25) 历史告警(全部)  26) 历史告警(未处理)                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  25b)仅外设 25c)仅进程 25d)identifier 25e)label          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  25f)时间范围 25g)组合 26b)identifier+未处理             ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  27) 告警处置(已处理) 28) 告警处置(已忽略)                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  29) ProcessDefenseMode(读)  30) PeripheralDefenseMode(读)${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  s1) VirusScan流(StreamControl)                              ${CYAN}║${NC}"
@@ -668,6 +697,11 @@ run_all_readonly() {
     test_23b   # 可执行文件列表-仅黑名单
     test_23c   # 可执行文件列表-仅白名单
     test_23d   # 可执行文件列表-仅未知
+    test_25d   # 历史告警-按identifier
+    test_25e   # 历史告警-按handle_status_label
+    test_25f   # 历史告警-按时间范围
+    test_25g   # 历史告警-组合过滤
+    test_26b   # 历史告警-identifier+未处理
 }
 
 run_all_write() {
@@ -759,7 +793,8 @@ case "${1:-menu}" in
                 s1) test_s1 ;;
                 03b) test_03b ;; 14b) test_14b ;; 14c) test_14c ;; 14d) test_14d ;;
                 04b) test_04b ;;
-                25b) test_25b ;; 25c) test_25c ;;
+                25b) test_25b ;; 25c) test_25c ;; 25d) test_25d ;; 25e) test_25e ;;
+                25f) test_25f ;; 25g) test_25g ;; 26b) test_26b ;;
                 23b) test_23b ;; 23c) test_23c ;; 23d) test_23d ;;
                 w1)  test_w1  ;; w2)  test_w2  ;; w3)  test_w3  ;; w4)  test_w4  ;;
                 w5)  test_w5  ;; w6)  test_w6  ;; w7)  test_w7  ;; w8)  test_w8  ;;
@@ -820,7 +855,8 @@ case "${1:-menu}" in
                     echo "  21) 准入-ON            22) 准入-AUTO"
                     echo "  23) ExecutableList     24) VulnScan上报"
                     echo "  25) 历史告警(全部)   25b) 仅外设  25c) 仅进程"
-                    echo "  26) 历史告警(未处理)"
+                    echo "  25d) 按identifier 25e) 按label 25f) 时间范围 25g) 组合"
+                    echo "  26) 历史告警(未处理)  26b) identifier+未处理"
                     echo "  27) 告警处置(已处理)  28) 告警处置(已忽略)"
                     echo "  29) ProcessDefenseMode(读)  30) PeripheralDefenseMode(读)"
                     echo "  s1) VirusScan流"
