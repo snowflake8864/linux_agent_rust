@@ -268,8 +268,8 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
 
     // 处理 AuditProcess
     if cfg.proc_switch {
-        log::info!("[process_audit] proc_switch=1, type_={}, p_dir={}",
-            proc_info.type_, p_dir);
+        /*log::info!("[process_audit] proc_switch=1, type_={}, p_dir={}",
+            proc_info.type_, p_dir); */
         if proc_info.type_ == 1101 || proc_info.type_ == 1001 {
             processvec.push(AuditProcess {
                 n_time: 1692760326 as i64,
@@ -291,8 +291,8 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
 
         let flags = proc_info.flags_parsed();
         if flags.level > 0  && proc_info.type_ > 0 {
-            log::info!("[process_audit] 生成告警: type_={}, level={}, md5={}, path={}",
-                proc_info.type_, flags.level, hash, p_dir);
+            /*log::info!("[process_audit] 生成告警: type_={}, level={}, md5={}, path={}",
+                proc_info.type_, flags.level, hash, p_dir);*/
             loginfo.push(AuditLogInfo {
                 file_path: Some(p_dir.clone()),
                 md5: Some(hash.clone()),
