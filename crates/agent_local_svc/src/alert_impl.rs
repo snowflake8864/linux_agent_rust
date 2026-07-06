@@ -70,10 +70,19 @@ impl AlertService for AlertServiceImpl {
         let status_filter = if q.handle_status < 0 { None } else { Some(q.handle_status) };
         let type_filter   = if q.alert_type <= 0 { None } else { Some(q.alert_type) };
 
-        let rows = local_store::alert_log::query_page(status_filter, type_filter, page, page_size)
+        let filter = local_store::alert_log::AlertQueryFilter {
+            handle_status:       status_filter,
+            alert_type:          type_filter,
+            identifier:          if q.identifier.is_empty() { None } else { Some(&q.identifier) },
+            handle_status_label: if q.handle_status_label.is_empty() { None } else { Some(&q.handle_status_label) },
+            start_time:          if q.start_time > 0 { Some(q.start_time) } else { None },
+            end_time:            if q.end_time > 0 { Some(q.end_time) } else { None },
+        };
+
+        let rows = local_store::alert_log::query_page(&filter, page, page_size)
             .map_err(|e| Status::internal(format!("query alert_log 失败: {}", e)))?;
 
-        let total = local_store::alert_log::count(status_filter, type_filter)
+        let total = local_store::alert_log::count(&filter)
             .map_err(|e| Status::internal(format!("count alert_log 失败: {}", e)))?;
 
         let items = rows.into_iter().map(|r| AlertLogItem {
