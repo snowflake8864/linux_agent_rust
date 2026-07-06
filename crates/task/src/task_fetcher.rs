@@ -625,11 +625,6 @@ pub async fn run(
 
     let mut task_fetcher = TaskFetcher::new(base_url, token.clone(), pattern_mgr, nl_sock);
 
-    // 离线/启动时从本地 net_info.ini 读取开关并下发到内核
-    if let Err(e) = task_fetcher.init_switches_from_local_config() {
-        log::warn!("[task_fetcher] 本地开关初始化失败: {}", e);
-    }
-
     // 初始读取 cron_time
     let initial_cron_time = {
         let cfg = NETINFO_CONFIG.lock().unwrap();
@@ -2827,6 +2822,16 @@ impl TaskService for BootManager {
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
             let mut token_rx = token_rx;
+
+            // 离线/启动时从本地 net_info.ini 初始化内核开关（不等 token）
+            {
+                let base_url = self.get_base_url();
+                let mut fetcher = TaskFetcher::new(&base_url, None, self.pattern_mgr(), nl_sock.clone());
+                if let Err(e) = fetcher.init_switches_from_local_config() {
+                    log::warn!("[task_fetcher] 本地开关初始化失败: {}", e);
+                }
+            }
+
             loop {
 
                 let base_url = self.get_base_url();
