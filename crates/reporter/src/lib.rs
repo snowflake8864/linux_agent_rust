@@ -99,7 +99,13 @@ pub fn broadcast_audit_log(log: &AuditLogInfo) {
         created_at:          now,
         n_type:              log.n_type as u32,
     };
-    if let Err(e) = local_store::alert_log::insert(&row) {
+    if let Err(e) = local_store::alert_log::insert(&row, {
+        // 读取配置中的 alert_max_rows，0 = 不限制
+        config::net_info::NETINFO_CONFIG
+            .lock()
+            .map(|c| c.db_policy.alert_max_rows)
+            .unwrap_or(0)
+    }) {
         logging::log_error!("[alert] 写入 alert.db 失败: {}", e);
     }
 

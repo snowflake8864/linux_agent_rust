@@ -63,7 +63,8 @@ pub fn init_table() -> Result<()> {
 }
 
 /// 插入一条新告警（返回自增 id）
-pub fn insert(row: &AlertLogRow) -> Result<i64> {
+/// max_rows: 0 = 不限制，>0 = 插入后自动清理超出该数量的旧记录
+pub fn insert(row: &AlertLogRow, max_rows: u32) -> Result<i64> {
     let conn = open_conn(DB_PATH)?;
     conn.execute(
         "INSERT INTO alert_log (
@@ -76,7 +77,33 @@ pub fn insert(row: &AlertLogRow) -> Result<i64> {
             row.handled_at, row.created_at,
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    // 插入后检查是否需要清理旧数据
+    cleanup_old_records(&conn, max_rows)?;
+    Ok(id)
+}
+
+/// 清理超出限制的旧告警记录（保留最新的 max_rows 条，按 id 升序删除最早的）
+/// max_rows: 0 = 不限制，不做任何操作
+fn cleanup_old_records(conn: &rusqlite::Connection, max_rows: u32) -> Result<usize> {
+    if max_rows == 0 {
+        return Ok(0);
+    }
+    let total: i32 = conn.query_row("SELECT COUNT(*) FROM alert_log", [], |r| r.get(0))?;
+    let total = total as u32;
+    if total > max_rows {
+        let to_delete = total - max_rows;
+        let deleted = conn.execute(
+            "DELETE FROM alert_log WHERE id IN (SELECT id FROM alert_log ORDER BY id ASC LIMIT ?1)",
+            params![to_delete],
+        )?;
+        if deleted > 0 {
+            log::info!("[alert_log] 清理旧告警: 删除 {} 条，保留 {} 条（上限 {}）", deleted, total - deleted as u32, max_rows);
+        }
+        Ok(deleted)
+    } else {
+        Ok(0)
+    }
 }
 
 /// 更新指定告警的处置状态
