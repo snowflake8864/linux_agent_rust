@@ -502,6 +502,10 @@ impl AgentDataHub {
             _ => {}
         }
         let _ = guard.to_ini(&format!("{}/net_info.ini", guard.app_path));
+
+        // 立刻下发 defense_switch 到内核，与在线模式行为一致
+        sync_defense_switch_to_kernel(&guard);
+
         self.notify(PolicyChangeType::ConfigChanged);
         Ok(())
     }
@@ -1000,6 +1004,39 @@ impl AgentDataHub {
         }
 
         Ok((info.status, info.reason))
+    }
+}
+
+/// 从 NETINFO_CONFIG 计算 defense_switch 并写入 /proc/osec/defense_switch，
+/// 与 task_fetcher::apply_config_diff 的公式一致。
+fn sync_defense_switch_to_kernel(cfg: &config::net_info::NetInfoConfig) {
+    if cfg.mod_ver.is_empty() {
+        return; // 驱动未加载，不写
+    }
+    let file_flag_temp = cfg.file_switch || cfg.extortion_switch;
+    let enable_flag = (file_flag_temp as u32) * 2 + (cfg.proc_switch as u32);
+
+    let defense_switch = [
+        (cfg.open_port_switch, 14),
+        (cfg.internet_switch, 13),
+        (cfg.syslog_dns_switch, 12),
+        (cfg.syslog_outer_switch, 11),
+        (cfg.syslog_inner_switch, 10),
+        (cfg.proc_switch, 9),
+        (cfg.file_switch, 8),
+        (cfg.extortion_switch, 7),
+        (cfg.proc_protect, 6),
+        (cfg.file_protect, 5),
+        (cfg.extortion_protect, 4),
+    ]
+        .iter()
+        .fold(0u32, |acc, &(flag, shift)| acc | ((flag as u32) << shift))
+        | enable_flag;
+
+    let content = format!("defense_switch {}\n", defense_switch);
+    match std::fs::write("/proc/osec/defense_switch", &content) {
+        Ok(()) => log_info!("[data_hub] defense_switch={} 已下发内核", defense_switch),
+        Err(e) => log_error!("[data_hub] 写入 /proc/osec/defense_switch 失败: {}", e),
     }
 }
 
