@@ -108,14 +108,19 @@ impl Default for AdmissionConfig {
 /// DB策略持久化配置，对应 ini 中的 [DB_POLICY] 段
 /// ENABLED=1 时启用双表持久化（在线基线 + 离线本地）
 /// ENABLED=0 或不写此段时，策略只存内存（服务器下发），不读写 DB
+/// ALERT_MAX_ROWS=0 时不限制条数，>0 时自动清理超出该数量的旧告警
 #[derive(Debug, Clone)]
 pub struct DbPolicyConfig {
     pub enabled: bool,
+    pub alert_max_rows: u32,
 }
 
 impl Default for DbPolicyConfig {
     fn default() -> Self {
-        DbPolicyConfig { enabled: false }
+        DbPolicyConfig {
+            enabled: false,
+            alert_max_rows: 0,
+        }
     }
 }
 
@@ -459,6 +464,9 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("DB_POLICY", "ENABLED") {
             config.db_policy.enabled = matches!(value.trim(), "1");
         }
+        if let Some(value) = ini.get("DB_POLICY", "ALERT_MAX_ROWS") {
+            config.db_policy.alert_max_rows = value.trim().parse().unwrap_or(0);
+        }
 
         config
     }
@@ -576,6 +584,7 @@ impl NetInfoConfig {
         // [DB_POLICY] 段
         writeln!(file, "[DB_POLICY]")?;
         writeln!(file, "ENABLED={}", self.db_policy.enabled as u8)?;
+        writeln!(file, "ALERT_MAX_ROWS={}", self.db_policy.alert_max_rows)?;
 
         Ok(())
     }
