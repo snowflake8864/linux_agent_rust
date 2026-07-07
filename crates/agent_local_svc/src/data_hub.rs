@@ -391,7 +391,10 @@ impl AgentDataHub {
     pub fn get_process_list(
         &self,
     ) -> Result<Vec<procinfo::ProcessInfo>, String> {
-        procinfo::get_running_process_infos().map_err(|e| e.to_string())
+        let mut processes = procinfo::get_running_process_infos().map_err(|e| e.to_string())?;
+        // 合并内核推送的短生命周期进程（/proc 中不存在的 pid）
+        procinfo::merge_kernel_processes(&mut processes);
+        Ok(processes)
     }
 
     // ========================================================================

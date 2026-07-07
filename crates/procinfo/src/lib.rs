@@ -1,7 +1,9 @@
 // crates/procinfo/src/lib.rs
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use core::ptr::null_mut; // 用于 libc::time(*mut)
 use serde::Serialize;
@@ -11,6 +13,136 @@ use nix::unistd::{Uid, User};
 use time::macros::format_description;
 use time::OffsetDateTime;
 use logging::{log_info,log_error};
+
+// ============================================================================
+// 内核进程事件缓存
+// ============================================================================
+/// 内核通过 UIO (map3) 推送的进程执行事件。
+/// 用于补充 /proc 轮询无法捕获的短生命周期进程。
+#[derive(Debug, Clone)]
+pub struct KernelProcessEntry {
+    pub pid: u32,
+    pub ppid: u32,
+    pub uid: i32,
+    pub exe_path: String,
+    pub hash: String,
+    pub inserted_at_secs: u64,
+}
+
+struct KernelProcessCache {
+    entries: HashMap<u32, KernelProcessEntry>, // key = pid
+    max_entries: usize,
+    ttl_secs: u64,
+}
+
+impl KernelProcessCache {
+    fn new(max_entries: usize, ttl_secs: u64) -> Self {
+        Self { entries: HashMap::new(), max_entries, ttl_secs }
+    }
+
+    /// 插入或更新一个内核进程事件（按 pid 去重，保留最新的）
+    fn insert(&mut self, entry: KernelProcessEntry) {
+        // 超过容量限制时，清理过期条目
+        if self.entries.len() >= self.max_entries {
+            self.evict_expired();
+        }
+        // 仍超容量则删最旧的
+        if self.entries.len() >= self.max_entries {
+            if let Some(oldest_pid) = self.entries.iter()
+                .min_by_key(|(_, e)| e.inserted_at_secs)
+                .map(|(pid, _)| *pid)
+            {
+                self.entries.remove(&oldest_pid);
+            }
+        }
+        self.entries.insert(entry.pid, entry);
+    }
+
+    /// 获取最近 ttl_secs 内的所有记录，同时清理过期条目
+    fn get_recent(&mut self, now_secs: u64) -> Vec<KernelProcessEntry> {
+        self.evict_expired();
+        self.entries.values().cloned().collect()
+    }
+
+    fn evict_expired(&mut self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.entries.retain(|_, e| now - e.inserted_at_secs < self.ttl_secs);
+    }
+}
+
+/// 全局内核进程事件缓存：最多 2000 条，存活 60 秒
+pub static KERNEL_PROCESS_CACHE: LazyLock<Mutex<KernelProcessCache>> = LazyLock::new(|| {
+    Mutex::new(KernelProcessCache::new(2000, 60))
+});
+
+/// 插入一条内核进程事件到全局缓存（供 reporter 调用）
+pub fn insert_kernel_process(entry: KernelProcessEntry) {
+    if let Ok(mut cache) = KERNEL_PROCESS_CACHE.lock() {
+        cache.insert(entry);
+    }
+}
+
+/// 合并内核缓存的进程（短生命周期进程）到 /proc 结果中。
+/// 按 pid 去重：/proc 已有的保留 /proc 数据，仅追加 /proc 中不存在的 pid。
+pub fn merge_kernel_processes(proc_list: &mut Vec<ProcessInfo>) {
+    let existing_pids: HashSet<u32> = proc_list.iter().map(|p| p.pid).collect();
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let kernel_entries = {
+        let mut cache = match KERNEL_PROCESS_CACHE.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        cache.get_recent(now_secs)
+    };
+
+    for entry in kernel_entries {
+        if existing_pids.contains(&entry.pid) {
+            continue; // /proc 中已有此 pid，跳过
+        }
+        // 从路径提取进程名
+        let name = Path::new(&entry.exe_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let user = User::from_uid(Uid::from_raw(entry.uid as u32))
+            .ok()
+            .flatten()
+            .map(|u| u.name)
+            .unwrap_or_else(|| format!("uid_{}", entry.uid));
+
+        proc_list.push(ProcessInfo {
+            timestamp: entry.inserted_at_secs as i64,
+            name,
+            vendor: "unknown".to_string(),
+            package: "unknown".to_string(),
+            pid: entry.pid,
+            ppid: entry.ppid,
+            priority: 0,
+            thread_count: 0,
+            memory_rss_kb: 0,
+            start_time: String::new(),
+            exe_path: entry.exe_path,
+            user,
+            hash: entry.hash,
+            dependencies: Vec::new(),
+        });
+    }
+}
+
+// ============================================================================
+// ProcessInfo
+// ============================================================================
+
 #[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
