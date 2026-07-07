@@ -119,8 +119,31 @@ impl log::Log for CustomLogger {
     fn flush(&self) {}
 }
 */
+/// 第三方库日志噪音抑制列表
+/// 这些 crate 在 DEBUG/TRACE 级别会产生大量内部日志，
+/// 仅在 WARN 及以上级别才输出。
+const NOISY_CRATES: &[&str] = &[
+    "hyper",
+    "reqwest",
+    "tower",
+    "h2",
+    "rustls",
+    "tokio_rustls",
+    "tokio_util",
+    "mio",
+    "want",
+    "tracing",
+];
+
 impl log::Log for CustomLogger {
-   fn enabled(&self, metadata: &Metadata) -> bool {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        let target = metadata.target();
+
+        // 对噪音 crate 只放行 Warn/Error
+        if NOISY_CRATES.iter().any(|c| target.starts_with(c)) {
+            return metadata.level() <= log::Level::Warn;
+        }
+
         metadata.level() <= log::max_level()
     }
 
