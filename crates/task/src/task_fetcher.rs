@@ -793,7 +793,9 @@ async fn task_upload_process(&self, task_type: u64) -> Result<(), String> {
     let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
                                                         // 
     let processes = task::spawn_blocking(|| {
-        get_running_process_infos().map_err(|e| e.to_string())
+        let mut processes = get_running_process_infos().map_err(|e| e.to_string())?;
+        procinfo::merge_kernel_processes(&mut processes);
+        Ok::<_, String>(processes)
     })
     .await
         .map_err(|e| format!("Spawn error: {:?}", e))?

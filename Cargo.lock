@@ -2135,6 +2135,7 @@ dependencies = [
  "net_client",
  "once_cell",
  "process_mgr",
+ "procinfo",
  "serde",
  "serde_json",
  "tokio",

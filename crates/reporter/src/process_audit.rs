@@ -266,6 +266,22 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
         }
     }
 
+    // 写入内核进程事件缓存，供 gRPC ProcessList 补充短生命周期进程
+    {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        procinfo::insert_kernel_process(procinfo::KernelProcessEntry {
+            pid: proc_info.pid() as u32,
+            ppid: proc_info.ppid() as u32,
+            uid: proc_info.uid(),
+            exe_path: p_dir.clone(),
+            hash: hash.clone(),
+            inserted_at_secs: now_secs,
+        });
+    }
+
     // 处理 AuditProcess
     if cfg.proc_switch {
         /*log::info!("[process_audit] proc_switch=1, type_={}, p_dir={}",
