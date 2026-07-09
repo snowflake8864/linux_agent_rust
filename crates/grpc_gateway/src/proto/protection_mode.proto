@@ -1,0 +1,33 @@
+syntax = "proto3";
+package protection_mode;
+
+import "common.proto";
+
+// 防护模式枚举
+enum DefenseMode {
+    OFF = 0;        // 关闭
+    MONITOR = 1;    // 监控（只告警，不阻止）
+    PROTECT = 2;    // 保护（告警 + 阻止）
+}
+
+// ===== 进程防护模式 =====
+
+service ProcessDefenseService {
+    rpc GetProcessDefenseMode(common.Empty) returns (ProcessDefenseMode);
+    rpc UpdateProcessDefenseMode(ProcessDefenseMode) returns (common.SimpleResponse);
+}
+
+message ProcessDefenseMode {
+    DefenseMode mode = 1;
+}
+
+// ===== 外设防护模式 =====
+
+service PeripheralDefenseService {
+    rpc GetPeripheralDefenseMode(common.Empty) returns (PeripheralDefenseMode);
+    rpc UpdatePeripheralDefenseMode(PeripheralDefenseMode) returns (common.SimpleResponse);
+}
+
+message PeripheralDefenseMode {
+    DefenseMode mode = 1;
+}
