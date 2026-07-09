@@ -269,6 +269,7 @@ pub struct GuardianConfig {
     pub server_url: String,
     pub listen_addr: String,
     pub enabled: bool,
+    pub iptables_enabled: bool,
     pub heartbeat_interval: u64,
     pub control_list_interval: u64,
     pub client_download_url: String,
@@ -318,6 +319,9 @@ impl GuardianConfig {
             enabled: ini.get("security_eval", "enabled")
                 .map(|v| !matches!(v.trim(), "0" | "false"))
                 .unwrap_or(true),
+            iptables_enabled: ini.get("security_eval", "iptables_enabled")
+                .map(|v| !matches!(v.trim(), "0" | "false"))
+                .unwrap_or(false),
             heartbeat_interval: ini.get("security_eval", "heartbeat_interval")
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(30),
@@ -364,6 +368,7 @@ impl GuardianConfig {
             server_url: "https://127.0.0.1:443".to_string(),
             listen_addr: "127.0.0.1:50050".to_string(),
             enabled: true,
+            iptables_enabled: false,
             heartbeat_interval: 30,
             control_list_interval: 30,
             client_download_url: String::new(),
@@ -375,7 +380,7 @@ impl GuardianConfig {
 // ═══════════════════════════════════════════════════════
 // 全局策略缓存（controlList 写入，getSaPolicy handler 读取）
 // ═══════════════════════════════════════════════════════
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SaPolicyState {
     pub enabled: bool,
     pub client_download_url: String,
@@ -405,6 +410,233 @@ fn update_allowed_ips(ips: Vec<String>) {
             p.allowed_ips = ips;
         }
         Err(e) => log_error!("guardian_audit: 写策略失败: {}", e),
+    }
+}
+
+// ═══════════════════════════════════════════════════════
+// iptables 策略下发模块
+// ═══════════════════════════════════════════════════════
+mod iptables_sync {
+    use std::collections::HashMap;
+    use std::process::Command;
+    use serde::{Deserialize, Serialize};
+    use super::SaPolicyState;
+    use logging::{log_info, log_error};
+
+    /// 已下发规则持久化文件路径
+    const STATE_FILE: &str = "/opt/osec/guardian_audit_iptables.json";
+
+    /// 规则类别
+    #[derive(Serialize, Deserialize, Hash, Eq, PartialEq, Clone, Debug)]
+    pub enum RuleCategory {
+        ExternalWhitelist,
+        ExternalBlacklist,
+        InternalWhitelist,
+        InternalBlacklist,
+        AccessControl,
+    }
+
+    impl RuleCategory {
+        /// 返回 iptables 匹配方向参数: 白名单/黑名单用 -d 或 -s
+        fn direction_flag(&self) -> &'static str {
+            match self {
+                RuleCategory::ExternalWhitelist | RuleCategory::ExternalBlacklist => "-d",
+                RuleCategory::InternalWhitelist
+                | RuleCategory::InternalBlacklist
+                | RuleCategory::AccessControl => "-s",
+            }
+        }
+
+        /// 返回 iptables 动作: ACCEPT 或 DROP
+        fn target(&self) -> &'static str {
+            match self {
+                RuleCategory::ExternalWhitelist
+                | RuleCategory::InternalWhitelist
+                | RuleCategory::AccessControl => "ACCEPT",
+                RuleCategory::ExternalBlacklist
+                | RuleCategory::InternalBlacklist => "DROP",
+            }
+        }
+
+        /// 添加规则时的优先级顺序（越小越先添加）
+        fn order(&self) -> u8 {
+            match self {
+                RuleCategory::ExternalWhitelist => 0,
+                RuleCategory::InternalWhitelist => 1,
+                RuleCategory::AccessControl => 2,
+                RuleCategory::ExternalBlacklist => 3,
+                RuleCategory::InternalBlacklist => 4,
+            }
+        }
+    }
+
+    /// 已下发规则表: (类别, IP) → true
+    type AppliedRules = HashMap<(RuleCategory, String), bool>;
+
+    /// 执行单条 iptables 命令
+    fn run_iptables(args: &[&str]) -> Result<(), String> {
+        let output = Command::new("iptables")
+            .args(args)
+            .output()
+            .map_err(|e| format!("执行 iptables 失败: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("iptables {:?} 失败: {}", args, stderr.trim()));
+        }
+        Ok(())
+    }
+
+    /// 从 SaPolicyState 构建期望的规则集合
+    fn build_desired(policy: &SaPolicyState) -> AppliedRules {
+        let mut desired = AppliedRules::new();
+
+        for ip in &policy.external_whitelist {
+            if !ip.is_empty() {
+                desired.insert((RuleCategory::ExternalWhitelist, ip.clone()), true);
+            }
+        }
+        for ip in &policy.external_blacklist {
+            if !ip.is_empty() {
+                desired.insert((RuleCategory::ExternalBlacklist, ip.clone()), true);
+            }
+        }
+        for ip in &policy.internal_whitelist {
+            if !ip.is_empty() {
+                desired.insert((RuleCategory::InternalWhitelist, ip.clone()), true);
+            }
+        }
+        for ip in &policy.internal_blacklist {
+            if !ip.is_empty() {
+                desired.insert((RuleCategory::InternalBlacklist, ip.clone()), true);
+            }
+        }
+        for ip in &policy.allowed_ips {
+            if !ip.is_empty() {
+                desired.insert((RuleCategory::AccessControl, ip.clone()), true);
+            }
+        }
+
+        desired
+    }
+
+    /// 从持久化文件加载已下发规则
+    fn load_applied() -> AppliedRules {
+        match std::fs::read_to_string(STATE_FILE) {
+            Ok(content) => match serde_json::from_str::<AppliedRules>(&content) {
+                Ok(rules) => {
+                    log_info!("guardian_audit: 加载 iptables 状态文件, 已有 {} 条规则", rules.len());
+                    rules
+                }
+                Err(e) => {
+                    log_error!("guardian_audit: 解析 iptables 状态文件失败: {}", e);
+                    AppliedRules::new()
+                }
+            },
+            Err(_) => AppliedRules::new(),
+        }
+    }
+
+    /// 持久化已下发规则到文件
+    fn save_applied(rules: &AppliedRules) {
+        match serde_json::to_string_pretty(rules) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(STATE_FILE, json) {
+                    log_error!("guardian_audit: 保存 iptables 状态文件失败: {}", e);
+                }
+            }
+            Err(e) => log_error!("guardian_audit: 序列化 iptables 状态失败: {}", e),
+        }
+    }
+
+    /// 添加单条 iptables 规则
+    fn add_rule(cat: &RuleCategory, ip: &str) -> Result<(), String> {
+        let args = [
+            "-A", "FORWARD",
+            cat.direction_flag(), ip,
+            "-j", cat.target(),
+        ];
+        log_info!("guardian_audit: iptables {:?}", args);
+        run_iptables(&args)
+    }
+
+    /// 删除单条 iptables 规则
+    fn delete_rule(cat: &RuleCategory, ip: &str) -> Result<(), String> {
+        let args = [
+            "-D", "FORWARD",
+            cat.direction_flag(), ip,
+            "-j", cat.target(),
+        ];
+        log_info!("guardian_audit: iptables {:?}", args);
+        run_iptables(&args)
+    }
+
+    /// 核心：增量同步策略到 iptables
+    ///
+    /// 1. 从 JSON 文件加载已下发规则（applied）
+    /// 2. 从当前 SaPolicyState 构建期望规则（desired）
+    /// 3. 计算 diff: to_add = desired - applied, to_remove = applied - desired
+    /// 4. 首次同步时设置 -P FORWARD DROP
+    /// 5. 先删除多余规则，再按顺序添加新规则
+    /// 6. 持久化最新状态到 JSON 文件
+    pub fn sync_iptables(policy: &SaPolicyState) -> Result<(), String> {
+        let applied = load_applied();
+        let desired = build_desired(policy);
+
+        // 计算需要删除的规则
+        let to_remove: Vec<(RuleCategory, String)> = applied
+            .keys()
+            .filter(|k| !desired.contains_key(k))
+            .cloned()
+            .collect();
+
+        // 计算需要添加的规则
+        let to_add: Vec<(RuleCategory, String)> = desired
+            .keys()
+            .filter(|k| !applied.contains_key(k))
+            .cloned()
+            .collect();
+
+        // 无变化则跳过
+        if to_remove.is_empty() && to_add.is_empty() {
+            log_info!("guardian_audit: iptables 规则无变化,跳过同步");
+            return Ok(());
+        }
+
+        // 首次同步（无历史状态）时设置默认策略
+        if applied.is_empty() && !desired.is_empty() {
+            log_info!("guardian_audit: 首次同步,设置 iptables -P FORWARD DROP");
+            run_iptables(&["-P", "FORWARD", "DROP"])?;
+        }
+
+        // 先删除多余规则
+        for (cat, ip) in &to_remove {
+            if let Err(e) = delete_rule(cat, ip) {
+                log_error!("guardian_audit: 删除 iptables 规则失败: {} ({:?}, {})", e, cat, ip);
+            }
+        }
+
+        // 按类别顺序添加新规则（白名单先于黑名单）
+        let mut to_add_sorted = to_add;
+        to_add_sorted.sort_by_key(|(cat, _)| cat.order());
+
+        for (cat, ip) in &to_add_sorted {
+            if let Err(e) = add_rule(cat, ip) {
+                log_error!("guardian_audit: 添加 iptables 规则失败: {} ({:?}, {})", e, cat, ip);
+            }
+        }
+
+        // 持久化最新状态
+        save_applied(&desired);
+
+        log_info!(
+            "guardian_audit: iptables 同步完成, 删除 {} 条, 添加 {} 条, 总计 {} 条",
+            to_remove.len(),
+            to_add_sorted.len(),
+            desired.len()
+        );
+
+        Ok(())
     }
 }
 
@@ -584,6 +816,7 @@ pub fn start_guardian_audit_service() -> Pin<Box<dyn Future<Output = Result<Stri
     log_info!("guardian_audit: 监听地址: {}", config.listen_addr);
     log_info!("guardian_audit: 心跳间隔: {}s", config.heartbeat_interval);
     log_info!("guardian_audit: 控制列表间隔: {}s", config.control_list_interval);
+    log_info!("guardian_audit: iptables 下发: {}", if config.iptables_enabled { "开启" } else { "关闭" });
     
     Box::pin(async move {
         // 创建 NetClient
@@ -661,6 +894,7 @@ pub fn start_guardian_audit_service() -> Pin<Box<dyn Future<Output = Result<Stri
 
         // 3. controlList 任务
         let control_list_interval = config.control_list_interval;
+        let iptables_enabled = config.iptables_enabled;
         tokio::spawn({
             let base = config.server_url.clone();
             let client = Arc::clone(&client);
@@ -670,7 +904,7 @@ pub fn start_guardian_audit_service() -> Pin<Box<dyn Future<Output = Result<Stri
                     tick.tick().await;
                     let token = get_token();
                     let url = format!("{}/v1/device/controlList", base);
-                    
+
                     match client.post_data_async(&url, "{}", Duration::from_secs(10), token.as_deref()).await {
                         Ok(resp) => {
                             if is_token_expired(&resp) {
@@ -679,13 +913,21 @@ pub fn start_guardian_audit_service() -> Pin<Box<dyn Future<Output = Result<Stri
                                 }
                                 continue;
                             }
-                            
+
                             if let Ok(r) = serde_json::from_str::<ControlListResponse>(&resp) {
                                 if r.code == "000000" {
                                     log_info!("guardian_audit: controlList 响应 <- {}", resp);
                                     let ips: Vec<String> = r.data.list.iter()
                                         .map(|i| i.ip.clone()).collect();
                                     update_allowed_ips(ips);
+
+                                    // iptables 策略下发
+                                    if iptables_enabled {
+                                        let policy = SA_POLICY.read().unwrap().clone();
+                                        if let Err(e) = iptables_sync::sync_iptables(&policy) {
+                                            log_error!("guardian_audit: iptables 同步失败: {}", e);
+                                        }
+                                    }
                                 } else {
                                     log_error!("guardian_audit: controlList 异常 code={} resp={}", r.code, resp);
                                 }
