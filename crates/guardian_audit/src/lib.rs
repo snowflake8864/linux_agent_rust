@@ -14,6 +14,7 @@
 use std::pin::Pin;
 use std::future::Future;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use once_cell::sync::Lazy;
 use axum::{routing::get, Router, Json};
@@ -375,6 +376,51 @@ impl GuardianConfig {
             user_id: String::new(),
         }
     }
+
+    /// 将 control_list_interval 回写到 guardian_audit.ini（文件不存在则跳过）
+    fn persist_control_list_interval(seconds: u64) {
+        use std::fs;
+        use std::io::{BufRead, BufReader};
+
+        let config_path = "/opt/osec/guardian_audit.ini";
+        if !Path::new(config_path).exists() {
+            return;
+        }
+
+        let file = match fs::File::open(config_path) {
+            Ok(f) => f,
+            Err(e) => {
+                log_error!("guardian_audit: 回写 control_list_interval 失败（打开）: {}", e);
+                return;
+            }
+        };
+        let reader = BufReader::new(file);
+        let mut lines: Vec<String> = Vec::new();
+        let mut changed = false;
+        let mut in_section = false;
+
+        for line in reader.lines().flatten() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_section = trimmed == "[security_eval]";
+            }
+            if in_section && trimmed.starts_with("control_list_interval") {
+                lines.push(format!("control_list_interval = {}", seconds));
+                changed = true;
+                continue;
+            }
+            lines.push(line);
+        }
+
+        if changed {
+            let content = lines.join("\n");
+            if let Err(e) = fs::write(config_path, format!("{}\n", content)) {
+                log_error!("guardian_audit: 回写 control_list_interval 失败（写入）: {}", e);
+            } else {
+                log_info!("guardian_audit: 已将 control_list_interval={} 回写到 {}", seconds, config_path);
+            }
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -403,11 +449,41 @@ pub static SA_POLICY: Lazy<Arc<RwLock<SaPolicyState>>> = Lazy::new(|| {
     }))
 });
 
-fn update_allowed_ips(ips: Vec<String>) {
+/// 运行时 controlList 轮询间隔（秒），可由服务端 crontab_time 动态修改
+static CONTROL_LIST_INTERVAL: AtomicU64 = AtomicU64::new(30);
+
+fn update_sa_policy(data: &SaPolicyData) {
     match SA_POLICY.write() {
         Ok(mut p) => {
-            log_info!("guardian_audit: 更新准入白名单 {} 条", ips.len());
-            p.allowed_ips = ips;
+            p.enabled = data.enabled;
+            // client_download_url 以 guardian_audit.ini 中的为准，除非它为空
+            if p.client_download_url.is_empty() {
+                p.client_download_url = data.client_download_url.clone();
+            }
+            p.crontab_time = data.crontab_time;
+            p.external_whitelist = data.policy.external.whitelist.clone();
+            p.external_blacklist = data.policy.external.blacklist.clone();
+            p.internal_whitelist = data.policy.internal.whitelist.clone();
+            p.internal_blacklist = data.policy.internal.blacklist.clone();
+            p.allowed_ips = data.policy.access_control.allowed_ips.clone();
+
+            // crontab_time 即 control_list_interval，动态更新轮询间隔并回写 ini
+            let new_interval = data.crontab_time as u64;
+            if new_interval > 0 {
+                let old = CONTROL_LIST_INTERVAL.swap(new_interval, Ordering::Relaxed);
+                if old != new_interval {
+                    log_info!("guardian_audit: controlList 轮询间隔更新: {}s → {}s", old, new_interval);
+                }
+                GuardianConfig::persist_control_list_interval(new_interval);
+            }
+
+            log_info!(
+                "guardian_audit: 策略已更新 — enabled={}, crontab_time={}s, 外网白名单={}条, 外网黑名单={}条, 内网白名单={}条, 内网黑名单={}条, 准入={}条",
+                data.enabled, data.crontab_time,
+                p.external_whitelist.len(), p.external_blacklist.len(),
+                p.internal_whitelist.len(), p.internal_blacklist.len(),
+                p.allowed_ips.len()
+            );
         }
         Err(e) => log_error!("guardian_audit: 写策略失败: {}", e),
     }
@@ -724,24 +800,12 @@ struct HeartbeatResponse {
 }
 
 // ═══════════════════════════════════════════════════════
-// /v1/device/controlList 响应结构
+// /v1/device/controlList 响应结构（与 getSaPolicy 返回格式一致）
 // ═══════════════════════════════════════════════════════
-#[derive(Debug, Deserialize)]
-struct ControlItem {
-    ip: String,
-    #[serde(default)]
-    uid: String,
-}
-#[derive(Debug, Deserialize)]
-struct ControlListData {
-    list: Vec<ControlItem>,
-    #[serde(default)]
-    remark: String,
-}
 #[derive(Debug, Deserialize)]
 struct ControlListResponse {
     code: String,
-    data: ControlListData,
+    data: SaPolicyData,
     #[serde(default)]
     msg: String,
 }
@@ -755,30 +819,31 @@ struct SaPolicyResp {
     msg: String,
     data: SaPolicyData,
 }
-#[derive(Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SaPolicyData {
     enabled: bool,
     client_download_url: String,
     crontab_time: u32,
     policy: PolicyDetail,
 }
-#[derive(Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct PolicyDetail {
     external: IpList,
     internal: IpList,
     access_control: AccessControl,
 }
-#[derive(Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct IpList {
     whitelist: Vec<String>,
     blacklist: Vec<String>,
 }
-#[derive(Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct AccessControl {
     allowed_ips: Vec<String>,
 }
 
 async fn handle_get_sa_policy() -> Json<SaPolicyResp> {
+    log_info!("guardian_audit: /getSaPolicy 被调用");
     let state = SA_POLICY.read().unwrap();
     Json(SaPolicyResp {
         code: 200,
@@ -892,16 +957,16 @@ pub fn start_guardian_audit_service() -> Pin<Box<dyn Future<Output = Result<Stri
             }
         });
 
-        // 3. controlList 任务
-        let control_list_interval = config.control_list_interval;
+        // 3. controlList 任务（轮询间隔可由服务端 crontab_time 动态调整）
+        CONTROL_LIST_INTERVAL.store(config.control_list_interval, Ordering::Relaxed);
         let iptables_enabled = config.iptables_enabled;
         tokio::spawn({
             let base = config.server_url.clone();
             let client = Arc::clone(&client);
             async move {
-                let mut tick = interval(Duration::from_secs(control_list_interval));
                 loop {
-                    tick.tick().await;
+                    let secs = CONTROL_LIST_INTERVAL.load(Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_secs(if secs > 0 { secs } else { 30 })).await;
                     let token = get_token();
                     let url = format!("{}/v1/device/controlList", base);
 
@@ -914,22 +979,29 @@ pub fn start_guardian_audit_service() -> Pin<Box<dyn Future<Output = Result<Stri
                                 continue;
                             }
 
-                            if let Ok(r) = serde_json::from_str::<ControlListResponse>(&resp) {
-                                if r.code == "000000" {
-                                    log_info!("guardian_audit: controlList 响应 <- {}", resp);
-                                    let ips: Vec<String> = r.data.list.iter()
-                                        .map(|i| i.ip.clone()).collect();
-                                    update_allowed_ips(ips);
+                            log_info!("guardian_audit: controlList 原始响应 <- {}", resp);
+                            match serde_json::from_str::<ControlListResponse>(&resp) {
+                                Ok(r) => {
+                                    if r.code == "000000" {
+                                        log_info!("guardian_audit: controlList 解析成功, enabled={}, crontab_time={}", r.data.enabled, r.data.crontab_time);
+                                        log_info!("guardian_audit: policy: external_whitelist={:?}, external_blacklist={:?}", r.data.policy.external.whitelist, r.data.policy.external.blacklist);
+                                        log_info!("guardian_audit: policy: internal_whitelist={:?}, internal_blacklist={:?}", r.data.policy.internal.whitelist, r.data.policy.internal.blacklist);
+                                        log_info!("guardian_audit: policy: access_control.allowed_ips={:?}", r.data.policy.access_control.allowed_ips);
+                                        update_sa_policy(&r.data);
 
-                                    // iptables 策略下发
-                                    if iptables_enabled {
-                                        let policy = SA_POLICY.read().unwrap().clone();
-                                        if let Err(e) = iptables_sync::sync_iptables(&policy) {
-                                            log_error!("guardian_audit: iptables 同步失败: {}", e);
+                                        // iptables 策略下发
+                                        if iptables_enabled {
+                                            let policy = SA_POLICY.read().unwrap().clone();
+                                            if let Err(e) = iptables_sync::sync_iptables(&policy) {
+                                                log_error!("guardian_audit: iptables 同步失败: {}", e);
+                                            }
                                         }
+                                    } else {
+                                        log_error!("guardian_audit: controlList 异常 code={} msg={}", r.code, r.msg);
                                     }
-                                } else {
-                                    log_error!("guardian_audit: controlList 异常 code={} resp={}", r.code, resp);
+                                }
+                                Err(e) => {
+                                    log_error!("guardian_audit: controlList JSON 解析失败: {} | 原始响应: {}", e, resp);
                                 }
                             }
                         }
