@@ -194,7 +194,7 @@ impl TaskFetcher {
         tokio::spawn(async move {
             manager_clone.start_periodic_cleanup(&base_url_owned, token_for_cleanup, Duration::from_secs(60)).await;
         });
-
+/*
         let base_url_for_jump = base_url.to_string();
         let token_for_jump = token.clone();
 
@@ -202,7 +202,7 @@ impl TaskFetcher {
         tokio::spawn(async move {
             ip_jump_manager_for_daemon.start_ip_jump_daemon(base_url_for_jump, token_for_jump).await;
         });
-
+*/
         TaskFetcher {
             base_url: base_url.to_string(),
             token,
