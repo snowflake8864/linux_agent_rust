@@ -568,7 +568,8 @@ impl NetInfoConfig {
         if self.macid.is_empty() {
             self.macid = ip_mac::get_mac().unwrap_or("unknown".to_string());
         }
-        if self.host_name.is_empty() {
+        //if self.host_name.is_empty() 
+        {
             self.host_name =
                 SystemInfo::get_computer_name().unwrap_or_else(|_| "Unknown".to_string());
         }
