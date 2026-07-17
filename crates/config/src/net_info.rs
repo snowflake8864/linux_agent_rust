@@ -565,8 +565,12 @@ impl NetInfoConfig {
         // 同步 uid 到 app.conf（供 EndpointSecurityApp GUI 读取）
         self.sync_uid_to_app_conf();
         log_info!("=====dev_id:{}", self.dev_uid);
-        if self.macid.is_empty() {
-            self.macid = ip_mac::get_mac().unwrap_or("unknown".to_string());
+        // MAC 地址必须始终从系统获取，不能信任 ini 缓存值
+        // （ini 可能缓存了虚拟网卡/网关的 MAC）
+        {
+            let mac = ip_mac::get_mac().unwrap_or("unknown".to_string());
+            log_info!("acquire_host_info: macid from system = {}", mac);
+            self.macid = mac;
         }
         //if self.host_name.is_empty() 
         {
