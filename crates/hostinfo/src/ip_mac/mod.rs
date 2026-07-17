@@ -49,13 +49,46 @@ pub fn get_ip() -> Option<String> {
 }
 
 pub fn get_mac() -> Option<String> {
-    // 优先从 /sys/class/net/ 读取物理网卡的 MAC 地址
+    // 优先取默认路由出接口的 MAC 地址
+    if let Some(mac) = get_mac_of_default_route_iface() {
+        return Some(mac);
+    }
+
+    // 回退：从 /sys/class/net/ 读取物理网卡的 MAC 地址
     if let Some(mac) = get_mac_from_sysfs() {
         return Some(mac);
     }
 
-    // 回退到 ifconfig 方式（兼容旧系统）
+    // 最后回退到 ifconfig 方式（兼容旧系统）
     get_mac_from_ifconfig()
+}
+
+/// 获取默认路由出接口的 MAC 地址
+/// 解析 /proc/net/route，找到 Destination=00000000 的条目，取其 Iface 的 MAC
+fn get_mac_of_default_route_iface() -> Option<String> {
+    let route_content = std::fs::read_to_string("/proc/net/route").ok()?;
+    let default_iface = route_content
+        .lines()
+        .skip(1) // 跳过表头
+        .find(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            fields.len() >= 3 && fields[1] == "00000000" // Destination == 0.0.0.0
+        })
+        .and_then(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            fields.first().map(|s| s.to_string())
+        })?;
+
+    // 从 /sys/class/net/<iface>/address 读取 MAC
+    let addr_path = std::path::Path::new("/sys/class/net")
+        .join(&default_iface)
+        .join("address");
+    let mac = std::fs::read_to_string(&addr_path).ok()?;
+    let mac = mac.trim().to_string();
+    if mac.is_empty() || mac == "00:00:00:00:00:00" {
+        return None;
+    }
+    Some(mac)
 }
 
 /// 从 /sys/class/net/ 读取物理网卡的 MAC 地址
