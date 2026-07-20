@@ -54,7 +54,13 @@ pub async fn process_all_dirs(
                 None => continue,
             };
 
-            let md5 = get_md5_global(path_str).map_err(|e| format!("计算 MD5 失败: {}", e))?;
+            let md5 = match get_md5_global(path_str) {
+                Ok(m) => m,
+                Err(e) => {
+                    log_error!("计算 MD5 失败 {}: {}", path_str, e);
+                    continue;
+                }
+            };
 
             let item = LinuxDirProc {
                 dir: path_str.to_string(),
@@ -67,7 +73,7 @@ pub async fn process_all_dirs(
 
             if vec_info.len() >= 200 {
                 let json_str = build_linux_dir_json(&vec_info);
-                //log_info!("准备上传的数据: {}", json_str);
+                log_info!("准备上传进程数据, 数量: {}, 数据前200字符: {}", vec_info.len(), &json_str[..json_str.len().min(200)]);
                 match net_client.post_data_async(&url, &json_str, Duration::from_secs(10), token).await {
                     Ok(response) => log_info!("服务器响应: {}", response),
                     Err(err) => log_error!("发送指标失败: {}", err),
@@ -79,6 +85,7 @@ pub async fn process_all_dirs(
 
     if !vec_info.is_empty() {
         let json_str = build_linux_dir_json(&vec_info);
+        log_info!("准备上传进程数据(最后一批), 数量: {}, 数据前200字符: {}", vec_info.len(), &json_str[..json_str.len().min(200)]);
         match net_client.post_data_async(&url, &json_str, Duration::from_secs(10), token).await {
             Ok(response) => log_info!("服务器响应: {}", response),
             Err(err) => log_error!("发送指标失败: {}", err),

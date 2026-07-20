@@ -1,7 +1,4 @@
-use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -83,75 +80,22 @@ pub async fn update_and_write_policies(policies: Vec<IpPolicy>) -> Result<(), St
 
 // Write policies to /proc files
 async fn write_policies_to_proc(global_policies: &mut HashMap<String, IpPolicy>) -> Result<(), String> {
-    log_info!("write_policies_to_proc: Global policies: {:?}", *global_policies);
     log_info!("write_policies_to_proc: Number of policies: {}", global_policies.len());
 
-    // Separate IPv4 and IPv6 policies
-    let mut ipv4_policies: Vec<&IpPolicy> = Vec::new();
-    let mut ipv6_policies: Vec<&IpPolicy> = Vec::new();
+    // Separate IPv4 and IPv6
+    let mut ipv4: Vec<String> = Vec::new();
+    let mut ipv6: Vec<String> = Vec::new();
     for policy in global_policies.values() {
-        log_info!("Processing policy for IP {}: is_ipv6 = {}", policy.ip, policy.is_ipv6);
         if policy.is_ipv6 {
-            ipv6_policies.push(policy);
+            ipv6.push(policy.ip.clone());
         } else {
-            ipv4_policies.push(policy);
-        }
-    }
-    log_info!("IPv4 policies: {:?}", ipv4_policies);
-    log_info!("IPv6 policies: {:?}", ipv6_policies);
-
-    // Write IPv4 policies to /proc/osec/osec_conn/block_saddr_rt
-    let ipv4_proc_path = "/proc/osec/osec_conn/block_saddr_rt";
-    let mut ipv4_file = match OpenOptions::new()
-        .write(true)
-        .open(ipv4_proc_path)
-    {
-        Ok(file) => file,
-        Err(e) => {
-            eprintln!("Failed to open {}: {}", ipv4_proc_path, e);
-            return Err(format!("Failed to open {}: {}", ipv4_proc_path, e));
-        }
-    };
-    // Write "c\n" to clear
-    if let Err(e) = ipv4_file.write_all(b"c\n") {
-        eprintln!("Failed to write 'c\\n' to {}: {}", ipv4_proc_path, e);
-        return Err(format!("Failed to write 'c\\n' to {}: {}", ipv4_proc_path, e));
-    }
-    // Write IPv4 addresses
-    for policy in ipv4_policies {
-        let ip_line = format!("{}\n", policy.ip);
-        if let Err(e) = ipv4_file.write_all(ip_line.as_bytes()) {
-            eprintln!("Failed to write IP {} to {}: {}", policy.ip, ipv4_proc_path, e);
-            return Err(format!("Failed to write IP {} to {}: {}", policy.ip, ipv4_proc_path, e));
+            ipv4.push(policy.ip.clone());
         }
     }
 
-    // Write IPv6 policies to /proc/osec/osec_conn/block_saddr_rt_v6
-    let ipv6_proc_path = "/proc/osec/osec_conn/block_saddr_rt_v6";
-    let mut ipv6_file = match OpenOptions::new()
-        .write(true)
-        .open(ipv6_proc_path)
-    {
-        Ok(file) => file,
-        Err(e) => {
-            eprintln!("Failed to open {}: {}", ipv6_proc_path, e);
-            return Err(format!("Failed to open {}: {}", ipv6_proc_path, e));
-        }
-    };
-    // Write "c\n" to clear
-    if let Err(e) = ipv6_file.write_all(b"c\n") {
-        eprintln!("Failed to write 'c\\n' to {}: {}", ipv6_proc_path, e);
-        return Err(format!("Failed to write 'c\\n' to {}: {}", ipv6_proc_path, e));
-    }
-    // Write IPv6 addresses
-    for policy in ipv6_policies {
-        let ip_line = format!("{}\n", policy.ip);
-        if let Err(e) = ipv6_file.write_all(ip_line.as_bytes()) {
-            eprintln!("Failed to write IP {} to {}: {}", policy.ip, ipv6_proc_path, e);
-            return Err(format!("Failed to write IP {} to {}: {}", policy.ip, ipv6_proc_path, e));
-        }
-    }
-
+    // 通过 SecurityBackend（驱动写 /proc/osec，ebpf 写 BPF map）
+    common::backend::with_backend(|b| b.write_ipv4_block_policies(&ipv4))?;
+    common::backend::with_backend(|b| b.write_ipv6_block_policies(&ipv6))?;
     Ok(())
 }
 

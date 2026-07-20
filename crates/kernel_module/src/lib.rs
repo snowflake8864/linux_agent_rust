@@ -9,6 +9,9 @@ use logging::{log_info, log_error, log_warn};
 use common::manager::boot::BootManager;
 use levenshtein::levenshtein;
 
+pub mod driver_backend;
+pub use driver_backend::DriverBackend;
+
 pub trait LoadKernelDriver {
     fn load_kernel_driver(&mut self) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
 }

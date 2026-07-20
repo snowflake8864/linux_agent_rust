@@ -272,19 +272,14 @@ impl TaskFetcher {
     }
     fn write_raw(&self, rule_type: &str, value: &str) -> Result<(), String> {
         let content = format!("{} {}\n", rule_type, value);
-        fs::write("/proc/osec/net_rules", content)
-            .map_err(|e| format!("Failed to write to /proc/osec/net_rules: {}", e))
+        common::backend::with_backend(|b| b.write_net_rules(&content))
     }
     fn write_defense_switch(&self, rule_type: &str, value: &str) -> Result<(), String> {
-        let content = format!("{} {}\n", rule_type, value);
-        fs::write("/proc/osec/defense_switch", content)
-            .map_err(|e| format!("Failed to write to /proc/osec/defense_switch: {}", e))
+        common::backend::with_backend(|b| b.write_defense_switch(rule_type, value))
     }
 
     fn write_netblock_switch(&self, value: &str) -> Result<(), String> {
-        let content = format!("{}\n", value);
-        fs::write("/proc/osec/osec_conn/block_switch", content)
-            .map_err(|e| format!("Failed to write to /proc/osec/osec_conn/block_switch: {}", e))
+        common::backend::with_backend(|b| b.write_netblock_switch(value))
     }
     /*
        fn update_config_from_json(&mut self, conf: &serde_json::Map<String, Value>) -> Result<(), String> {

@@ -3,7 +3,9 @@ use tokio::signal::unix::{signal as unix_signal, SignalKind};
 use online::StartOnline;
 use task::{TaskService, TimerTask};
 use kernel_event::{StartKernelHandler, EventHandler,send_data_to_kernel};
-use kernel_module::{LoadKernelDriver, unload_driver, ensure_kernel_hold};
+use kernel_module::{LoadKernelDriver, unload_driver, ensure_kernel_hold, DriverBackend};
+use ebpf_backend::{EbpfBackend, capability::EbpfCapability};
+use common::backend::{SecurityBackend, set_backend};
 use common::manager::boot::BootManager;
 use reporter::{AuditLogInfo, StartBashLog};
 use tokio::sync::mpsc;
@@ -65,7 +67,7 @@ async fn main() -> std::io::Result<()> {
     }
     log_info!("程序开始启动");
 
-    // 卸载现有内核驱动
+    // 卸载现有内核驱动（driver 模式才会用，ebpf 模式跳过）
     let _ = unload_driver().ok();
 
     // 初始化 BootManager
@@ -76,64 +78,132 @@ async fn main() -> std::io::Result<()> {
     let (token_tx, token_rx) = mpsc::channel::<String>(8);
     let (host_is_offline_tx, host_is_offline_rx) = mpsc::channel::<bool>(8);
 
-    // 加载内核驱动并更新 mod_ver
+    // ── 后端选择 ──
     {
         let mut cfg = NETINFO_CONFIG.lock().unwrap();
-        let mut init = init.clone();
-        let mod_ver = init.load_kernel_driver().await.unwrap_or_else(|e| {
-            logging::log_error!("驱动加载失败: {}", e);
-            String::new()
-        });
-        cfg.mod_ver = mod_ver;
-        log_info!("load kernel driver: {}", cfg.mod_ver);
-        let _ = cfg.to_ini(&format!("{}/net_info.ini", cfg.app_path));
-
-        if !cfg.mod_ver.is_empty() {
-            ensure_kernel_hold();
-        }
-
-        // 驱动加载成功后，同步 admission 到 /proc/osec/tcp_force_ecn
+        let backend_mode = cfg.backend_mode.clone();
         let admission_enabled = cfg.admission.enabled;
         let admission_mode = cfg.admission.mode;
         let admission_switch = cfg.admission_switch;
-        let admission_on = !cfg.mod_ver.is_empty();
-        drop(cfg); // 释放锁
-        if admission_enabled && admission_on {
-            let proc_path = "/proc/osec/tcp_force_ecn";
-            if std::path::Path::new(proc_path).exists() {
-                let val = match admission_mode {
-                    0 => "0",  // OFF
-                    1 => "1",  // ON
-                    2 => "0",  // AUTO — 初始先关，等自动检测逻辑来切换
-                    _ => "0",
-                };
-                if let Err(e) = std::fs::write(proc_path, val) {
-                    log_error!("写入 {} 失败: {}", proc_path, e);
-                } else {
-                    log_info!("准入开关同步: {} = {}", proc_path, val);
+        let proc_protect = cfg.proc_protect;
+        let file_protect = cfg.file_protect;
+        let net_enabled = admission_enabled || cfg.open_port_switch;
+
+        log_info!("后端模式: {}", backend_mode);
+
+        let backend: Arc<dyn SecurityBackend> = match backend_mode.as_str() {
+            "ebpf" => {
+                // 纯 eBPF 模式：不加载驱动，直接初始化 eBPF
+                log_info!("进入 eBPF 模式，检测系统能力...");
+                let cap = EbpfCapability::check();
+                if !cap.all_ok() {
+                    for reason in cap.fail_reasons() {
+                        log_error!("eBPF 能力检测失败: {}", reason);
+                    }
+                    std::process::exit(1);
                 }
-            } else {
-                log_info!("{} 不存在，跳过准入同步（驱动未提供该接口）", proc_path);
-            }
+                log_info!("eBPF 能力检测通过");
 
-            // 初始化全局 ADMISSION_MODE 和 ADMISSION_EFFECTIVE
-            agent_local_svc::ADMISSION_MODE.store(admission_mode, std::sync::atomic::Ordering::Relaxed);
-            if admission_mode == 2 {
-                // AUTO 模式：effective 初始按 ini 里的 admission_switch 来
-                let eff = admission_switch as u8;
-                agent_local_svc::ADMISSION_EFFECTIVE.store(eff, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                agent_local_svc::ADMISSION_EFFECTIVE.store(admission_mode, std::sync::atomic::Ordering::Relaxed);
-            }
+                log_info!("eBPF 使用接口: {}", cfg.ifcfg);
+                let ebpf = EbpfBackend::new(
+                    "/opt/osec/bpf",
+                    file_protect,
+                    proc_protect,
+                    net_enabled,
+                    &cfg.ifcfg,
+                    "xdp",
+                ).unwrap_or_else(|e| {
+                    log_error!("EbpfBackend 创建失败: {}", e);
+                    std::process::exit(1);
+                });
 
-            // 如果是 AUTO 模式，启动自动检测
-            if admission_mode == 2 {
-                let hub = agent_local_svc::AgentDataHub::new();
-                hub.start_auto_detect();
+                if let Err(e) = ebpf.init() {
+                    log_error!("EbpfBackend 初始化失败: {}", e);
+                    std::process::exit(1);
+                }
+
+                // 准入控制：ECN-Echo
+                if admission_enabled && admission_mode == 1 {
+                    if let Err(e) = ebpf.write_tcp_force_ecn(true) {
+                        log_error!("eBPF ECN 设置失败: {}", e);
+                    }
+                }
+
+                cfg.mod_ver = "ebpf".to_string();
+                Arc::new(ebpf)
             }
-        } else if !admission_enabled {
-            log_info!("准入功能未启用（ENABLED=0），跳过");
+            _ => {
+                // driver 模式：先尝试加载驱动，失败 fallback 到 eBPF
+                let mut init_clone = init.clone();
+                let mod_ver = init_clone.load_kernel_driver().await.unwrap_or_else(|e| {
+                    log_error!("驱动加载失败: {}", e);
+                    String::new()
+                });
+
+                if !mod_ver.is_empty() {
+                    log_info!("驱动加载成功: {}", mod_ver);
+                    cfg.mod_ver = mod_ver;
+                    ensure_kernel_hold();
+
+                    // 准入控制通过 /proc
+                    if admission_enabled {
+                        let proc_path = "/proc/osec/tcp_force_ecn";
+                        if std::path::Path::new(proc_path).exists() {
+                            let val = match admission_mode {
+                                0 => "0", 1 => "1", 2 => "0", _ => "0",
+                            };
+                            let _ = std::fs::write(proc_path, val);
+                        }
+                    }
+
+                    Arc::new(DriverBackend::new())
+                } else {
+                    // 驱动失败，fallback 到 eBPF
+                    log_warn!("驱动加载失败，尝试 fallback 到 eBPF 模式");
+                    let cap = EbpfCapability::check();
+                    if !cap.all_ok() {
+                        for reason in cap.fail_reasons() {
+                            log_error!("eBPF 能力检测失败: {}", reason);
+                        }
+                        log_error!("驱动和 eBPF 均不可用，退出");
+                        std::process::exit(1);
+                    }
+
+                    let ebpf = EbpfBackend::new(
+                        "/opt/osec/bpf", file_protect, proc_protect, net_enabled,
+                        &cfg.ifcfg, "xdp",
+                    ).unwrap_or_else(|e| {
+                        log_error!("EbpfBackend fallback 失败: {}", e);
+                        std::process::exit(1);
+                    });
+
+                    if let Err(e) = ebpf.init() {
+                        log_error!("EbpfBackend fallback init 失败: {}", e);
+                        std::process::exit(1);
+                    }
+
+                    cfg.mod_ver = "ebpf-fallback".to_string();
+                    Arc::new(ebpf)
+                }
+            }
+        };
+
+        // 设置全局后端
+        set_backend(backend);
+        let _ = cfg.to_ini(&format!("{}/net_info.ini", cfg.app_path));
+
+        // 初始化 ADMISSION 全局变量
+        agent_local_svc::ADMISSION_MODE.store(admission_mode, std::sync::atomic::Ordering::Relaxed);
+        if admission_mode == 2 {
+            agent_local_svc::ADMISSION_EFFECTIVE.store(admission_switch as u8, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            agent_local_svc::ADMISSION_EFFECTIVE.store(admission_mode, std::sync::atomic::Ordering::Relaxed);
         }
+        if admission_mode == 2 {
+            let hub = agent_local_svc::AgentDataHub::new();
+            hub.start_auto_detect();
+        }
+        drop(cfg);
     }
 
     // 检查是否为离线模式（配置指定，直接设置，不经过阈值）

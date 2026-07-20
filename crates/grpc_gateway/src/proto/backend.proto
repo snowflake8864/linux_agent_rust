@@ -1,0 +1,28 @@
+syntax = "proto3";
+package backend;
+
+// 后端模式查询/设置服务
+service BackendService {
+    // 查询当前后端模式
+    rpc GetBackendMode(Empty) returns (BackendModeStatus);
+    // 设置后端模式（重启后生效）
+    rpc UpdateBackendMode(BackendModeRequest) returns (BackendModeResponse);
+}
+
+message Empty {}
+
+message BackendModeStatus {
+    string mode = 1;       // 配置中的模式: "ebpf" | "driver"
+    string effective = 2;  // 当前生效的模式
+    bool need_restart = 3; // 是否需要重启才能切换
+    string interface = 4;  // eBPF模式使用的网口 (driver模式返回空)
+}
+
+message BackendModeRequest {
+    string mode = 1;  // "ebpf" | "driver"
+}
+
+message BackendModeResponse {
+    bool success = 1;
+    string message = 2;
+}

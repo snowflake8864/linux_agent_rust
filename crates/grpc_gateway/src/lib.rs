@@ -23,6 +23,7 @@ pub mod data_query { tonic::include_proto!("data_query"); }
 pub mod policy_watch { tonic::include_proto!("policy_watch"); }
 pub mod protection_mode { tonic::include_proto!("protection_mode"); }
 pub mod admission { tonic::include_proto!("admission"); }
+pub mod backend { tonic::include_proto!("backend"); }
 
 pub mod notify;
 

@@ -42,7 +42,7 @@ use agent_local_svc::{
     IpPolicyServiceImpl, DataQueryServiceImpl, OutreachDetectServiceImpl,
     AgentStatusServiceImpl, AlertServiceImpl, LocalTaskServiceImpl,
     PolicyWatchServiceImpl, ProcessDefenseServiceImpl, PeripheralDefenseServiceImpl,
-    AdmissionServiceImpl,
+    AdmissionServiceImpl, BackendServiceImpl,
 };
 use agent_local_svc::stub_handlers::{
     DirPolicyServiceImpl, ExtortPolicyServiceImpl, JumpServiceImpl,
@@ -303,6 +303,14 @@ impl StartVirusScanGrpcService for BootManager {
                 } else {
                     log_info!("[gRPC] AdmissionService 未启用（ENABLED=0），跳过注册");
                 }
+
+                // BackendService — 始终注册
+                builder = builder.add_service(
+                    grpc_gateway::backend::backend_service_server::BackendServiceServer::new(
+                        BackendServiceImpl { data_hub: data_hub.clone() },
+                    )
+                );
+                log_info!("[gRPC] BackendService 已注册");
 
                 // ============================================================
                 builder.serve(addr)

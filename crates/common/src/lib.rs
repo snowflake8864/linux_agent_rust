@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use pattern::pattern_rules_mgr;
 pub mod manager;
+pub mod backend;
 
 #[derive(Debug, Default, Clone)]
 pub struct NetClient {

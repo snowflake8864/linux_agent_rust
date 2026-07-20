@@ -276,6 +276,89 @@ test_w13() { grpc_expect_perm_denied "更新勒索保护策略（在线拒绝）
     extort_policy.proto extort_policy.ExtortPolicyService UpdateExtortPolicy \
     '{"rules": [{"file_type":"doc","typ":1}]}'; }
 
+# ── eBPF 后端检测 ──────────────────────────────────────────────────────
+
+test_ebpf_cap() {
+    echo -ne "${CYAN}[CHECK]${NC} eBPF 系统能力检测 ... "
+    local ok=true
+    local reasons=""
+
+    # 1. 内核版本 >= 5.8
+    local kver=$(uname -r | cut -d. -f1,2)
+    local kmajor=$(echo "$kver" | cut -d. -f1)
+    local kminor=$(echo "$kver" | cut -d. -f2)
+    if [ "$kmajor" -lt 5 ] || { [ "$kmajor" -eq 5 ] && [ "$kminor" -lt 8 ]; }; then
+        ok=false
+        reasons="$reasons\n  内核版本过低: $kver (需要 >= 5.8)"
+    fi
+
+    # 2. BTF 支持
+    if [ ! -f /sys/kernel/btf/vmlinux ]; then
+        ok=false
+        reasons="$reasons\n  BTF 不可用: /sys/kernel/btf/vmlinux 不存在"
+    fi
+
+    # 3. BPF LSM
+    if ! grep -q '\bbpf\b' /sys/kernel/security/lsm 2>/dev/null; then
+        ok=false
+        reasons="$reasons\n  BPF LSM 未启用: /sys/kernel/security/lsm 不含 bpf"
+    fi
+
+    # 4. bpffs
+    if ! mount | grep -q 'bpf.*on.*/sys/fs/bpf'; then
+        ok=false
+        reasons="$reasons\n  bpffs 未挂载到 /sys/fs/bpf"
+    fi
+
+    if $ok; then
+        echo -e "${GREEN}通过${NC}"
+    else
+        echo -e "${RED}失败${NC}"
+        echo -e "$reasons"
+    fi
+}
+
+test_23() {
+    echo -e "${CYAN}[TEST]${NC} 后端模式查询 (AgentStatus) ... "
+    local output
+    if output=$(grpcurl -plaintext -emit-defaults \
+        -import-path "$PROTO_DIR" \
+        -proto common.proto -proto agent_status.proto \
+        -d '{}' -connect-timeout 3 -max-time 5 \
+        "$GRPC_ADDR" agent_status.AgentStatusService/GetAgentStatus 2>&1); then
+        local backend=$(echo "$output" | grep -o '"mod_ver":"[^"]*"' | cut -d'"' -f4)
+        if [ -n "$backend" ]; then
+            echo -e "  后端版本: ${GREEN}${backend}${NC}"
+            if echo "$backend" | grep -q "ebpf"; then
+                echo -e "  ${GREEN}当前使用 eBPF 模式${NC}"
+            else
+                echo -e "  ${YELLOW}当前使用驱动模式${NC}"
+            fi
+        fi
+        ((pass++))
+    else
+        echo -e "${RED}FAIL${NC}"
+        ((fail++))
+    fi
+}
+
+test_24() { grpc_call "进程策略（只读, eBPF兼容）" \
+    process_policy.proto process_policy.ProcessPolicyService GetProcessPolicy '{}'; }
+
+test_25() { grpc_call "IP阻断策略（只读, eBPF兼容）" \
+    ip_policy.proto ip_policy.IpPolicyService GetIpBlockPolicy '{}'; }
+
+test_26() { grpc_call "后端模式查询" \
+    backend.proto backend.BackendService GetBackendMode '{}'; }
+
+test_27() { grpc_call "设置后端-ebpf" \
+    backend.proto backend.BackendService UpdateBackendMode \
+    '{"mode": "ebpf"}'; }
+
+test_28() { grpc_call "设置后端-driver" \
+    backend.proto backend.BackendService UpdateBackendMode \
+    '{"mode": "driver"}'; }
+
 # ── menu ───────────────────────────────────────────────────────────────
 
 show_menu() {
@@ -308,6 +391,11 @@ show_menu() {
     echo -e "${CYAN}║${NC}  ${YELLOW}stream${NC} 测试全部流式接口                                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}full${NC}  测试全部接口（读写+流）                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}listen [秒]${NC} 监听告警流（默认300秒，Ctrl+C停止）    ${CYAN}║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║${NC}  ${GREEN}eBPF 专项:${NC}                                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   cap) eBPF能力检测    23) 后端状态查询               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   24) 进程策略(eBPF)  25) IP阻断(eBPF)                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   26) 查询后端模式    27) 设置ebpf    28) 设置driver   ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  q    退出                                              ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -365,9 +453,16 @@ case "${1:-menu}" in
                 w9) test_w9 ;;
                 w10) test_w10 ;;
                 w11) test_w11 ;; w12) test_w12 ;; w13) test_w13 ;;
+                cap) test_ebpf_cap ;;
+                23) test_23 ;;
+                24) test_24 ;;
+                25) test_25 ;;
+                26) test_26 ;;
+                27) test_27 ;;
+                28) test_28 ;;
                 all)
                     echo -e "\n${GREEN}── 测试全部只读接口 ──${NC}"
-                    for i in $(seq 1 22); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
+                    for i in $(seq 1 28); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
                     print_result
                     ;;
                 write)
@@ -393,7 +488,7 @@ case "${1:-menu}" in
                     ;;
                 full)
                     echo -e "\n${GREEN}── 测试全部接口 ──${NC}"
-                    for i in $(seq 1 22); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
+                    for i in $(seq 1 28); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
                     test_17; test_18
                     test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11; test_w12; test_w13
                     print_result
