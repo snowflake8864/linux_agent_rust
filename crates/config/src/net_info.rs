@@ -80,6 +80,8 @@ pub struct NetInfoConfig {
     pub install_time: i64,
     // 准入功能配置
     pub admission: AdmissionConfig,
+    // 后端模式: "driver" | "ebpf"
+    pub backend_mode: String,
 }
 
 /// 准入功能配置，对应 ini 中的 [ADMISSION] 段
@@ -439,6 +441,11 @@ impl NetInfoConfig {
             config.admission.max_retries = value.trim().parse().unwrap_or(3);
         }
 
+        // [BACKEND]
+        config.backend_mode = ini
+            .get("BACKEND", "MODE")
+            .unwrap_or_else(|| "driver".to_string());
+
         config
     }
 
@@ -551,6 +558,10 @@ impl NetInfoConfig {
         writeln!(file, "MODE={}", self.admission.mode)?;
         writeln!(file, "RETRY_INTERVAL={}", self.admission.retry_interval)?;
         writeln!(file, "MAX_RETRIES={}", self.admission.max_retries)?;
+
+        // [BACKEND] 段
+        writeln!(file, "[BACKEND]")?;
+        writeln!(file, "MODE={}", self.backend_mode)?;
 
         Ok(())
     }

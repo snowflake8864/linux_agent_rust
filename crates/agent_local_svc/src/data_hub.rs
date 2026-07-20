@@ -1,6 +1,7 @@
 use std::sync::{Mutex, LazyLock, atomic::{AtomicBool, AtomicU8, Ordering}};
 
 use logging::{log_info, log_error};
+use common::backend;
 use grpc_gateway::policy_watch::PolicyChangeType;
 use grpc_gateway::dir_policy::DirectionScanRule;
 use grpc_gateway::extort_policy::ExtortProtectRule;
@@ -406,22 +407,9 @@ impl AgentDataHub {
         Ok(())
     }
 
-    /// 写入 /proc/osec/tcp_force_ecn
+    /// 写入 TCP ECN 控制（通过 SecurityBackend，驱动/ebpf 自适应）
     pub(crate) fn write_admission_proc(&self, enable: bool) -> Result<(), String> {
-        let proc_path = "/proc/osec/tcp_force_ecn";
-        if std::path::Path::new(proc_path).exists() {
-            let val = if enable { "1" } else { "0" };
-            if let Err(e) = std::fs::write(proc_path, val) {
-                log_error!("[admission] 写入 {} 失败: {}", proc_path, e);
-                Err(format!("写入 {} 失败: {}", proc_path, e))
-            } else {
-                log_info!("[admission] 已写入 {} = {}", proc_path, val);
-                Ok(())
-            }
-        } else {
-            log_info!("[admission] {} 不存在，跳过写入（驱动未加载）", proc_path);
-            Ok(())
-        }
+        common::backend::with_backend(|b| b.write_tcp_force_ecn(enable))
     }
 
     /// 持久化准入模式到 ini
@@ -812,6 +800,45 @@ impl AgentDataHub {
 
         self.notify(PolicyChangeType::JumpStatusChanged);
         Ok((info.status, info.reason))
+    }
+
+    // ── 后端模式查询/设置 ──
+
+    /// 获取当前后端模式 (配置值, 生效值, 网口)
+    pub fn get_backend_mode(&self) -> (String, String, String) {
+        let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
+        let configured = cfg.backend_mode.clone();
+        let effective = match common::backend::get_backend() {
+            Some(ref b) => b.name().to_string(),
+            None => configured.clone(),
+        };
+        let interface = if effective == "ebpf" {
+            cfg.ifcfg.clone()
+        } else {
+            String::new()
+        };
+        (configured, effective, interface)
+    }
+
+    /// 更新后端模式，同步到 net_info.ini，返回是否需要重启
+    pub fn update_backend_mode(&self, new_mode: &str) -> Result<bool, String> {
+        let effective = match common::backend::get_backend() {
+            Some(b) => b.name().to_string(),
+            None => String::new(),
+        };
+
+        let need_restart = effective != new_mode;
+
+        // 写入 ini
+        let mut cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
+        cfg.backend_mode = new_mode.to_string();
+        let app_path = cfg.app_path.clone();
+        let ini_path = format!("{}/net_info.ini", app_path);
+        cfg.to_ini(&ini_path)
+            .map_err(|e| format!("写入 {} 失败: {}", ini_path, e))?;
+
+        log_info!("[backend] 模式已更新: {} -> {} (重启={})", effective, new_mode, need_restart);
+        Ok(need_restart)
     }
 }
 

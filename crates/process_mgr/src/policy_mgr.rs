@@ -1,7 +1,5 @@
 
 use std::collections::HashSet;
-use std::fs::OpenOptions;
-use std::io::Write;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use logging::{log_info,log_error};
@@ -27,27 +25,12 @@ impl ProcessPolicyManager {
     }
 
     fn add_md5_rules(data: &str) {
-        match OpenOptions::new().read(true).write(true).open(MD5_RULE_FILE) {
-            Ok(mut file) => {
-                let _ = file.write_all(data.as_bytes());
-            }
-            Err(e) => {
-                //log_error!("open {} failed: {}", MD5_RULE_FILE, e);
-            }
-        }
+        // 通过 SecurityBackend，驱动写 /proc/osec，ebpf 写 BPF map
+        let _ = common::backend::with_backend(|b| b.add_md5_rules(data));
     }
 
     fn notify_kernel_update() {
-        match OpenOptions::new().read(true).write(true).open(PROCESS_RULE_FILE) {
-            Ok(mut file) => {
-                let _data = "update\n";
-                let _ = file.write_all(_data.as_bytes());
-            }
-            Err(e) => {
-                log_error!("open {} failed: {}", PROCESS_RULE_FILE, e);
-            }
-        }
-
+        let _ = common::backend::with_backend(|b| b.notify_process_update());
     }
 
     fn kill_process(process_path: &str) {
