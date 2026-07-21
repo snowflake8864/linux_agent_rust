@@ -34,7 +34,7 @@ impl ProcessPolicyManager {
     }
 
     fn kill_process(process_path: &str) {
-       log_info!("Killing blacklisted process: {}", process_path);
+       log_info!("[process_policy] 命中黑名单进程，准备终止: {}", process_path);
     }
 
 
@@ -42,6 +42,7 @@ impl ProcessPolicyManager {
         let mut is_changed = false;
 
         if is_white {
+            log_info!("[process_policy] 应用白名单: {} 条hash", process_list.len());
             self.white_set.clear();
             self.white_set.extend(process_list.iter().cloned());
 
@@ -74,8 +75,10 @@ impl ProcessPolicyManager {
             if is_changed {
                 self.prev_white_set = self.white_set.clone();
                 Self::notify_kernel_update();
+                log_info!("[process_policy] 白名单已下发内核 ({} 条)", self.white_set.len());
             }
         } else {
+            log_info!("[process_policy] 应用黑名单: {} 条hash", process_list.len());
             self.black_set.clear();
             self.black_set.extend(process_list.iter().cloned());
 
@@ -115,6 +118,7 @@ impl ProcessPolicyManager {
             if is_changed {
                 self.prev_black_set = self.black_set.clone();
                 Self::notify_kernel_update();
+                log_info!("[process_policy] 黑名单已下发内核 ({} 条)", self.black_set.len());
             }
         }
     }
