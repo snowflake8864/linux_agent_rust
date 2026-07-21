@@ -100,6 +100,21 @@ pub struct PktModValue {
 
 unsafe impl aya::Pod for PktModValue {}
 
+// --- 进程事件 ring buffer (匹配 eBPF C struct unified_event) ---
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct UnifiedEvent {
+    pub event_type: u8,           // __u8 type; 2=EVENT_PROC
+    pub pid: u32,                 // __u32 pid
+    pub uid: u32,                 // __u32 uid
+    pub blocked: u8,              // __u8 blocked; 1=被拦截, 0=仅监控
+    pub comm: [u8; 16],           // char comm[16]
+    pub path: [u8; 64],           // char path[64]
+    pub _padding: [u8; 2],        // pad to 90 bytes (1+4+4+1+16+64=90)
+}
+
+unsafe impl aya::Pod for UnifiedEvent {}
+
 impl Default for PktModValue {
     fn default() -> Self {
         Self {

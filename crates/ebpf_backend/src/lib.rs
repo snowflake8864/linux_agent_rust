@@ -1,6 +1,8 @@
 use aya::maps::HashMap as AyaHashMap;
+use aya::maps::RingBuf;
 use log::{info, warn};
 use std::net::Ipv4Addr;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
@@ -11,6 +13,9 @@ pub mod capability;
 use loader::ModularLoader;
 use types::*;
 use common::backend::SecurityBackend;
+
+/// Size of the UnifiedEvent struct in eBPF = 90 bytes
+const UNIFIED_EVENT_SIZE: usize = 90;
 
 /// eBPF 后端 — 按需加载 proc/file/net 模块，通过 BPF maps 下发规则
 pub struct EbpfBackend {
@@ -26,6 +31,8 @@ pub struct EbpfBackend {
     process_cache: Arc<Mutex<(Vec<String>, Vec<String>)>>,
     /// 待下发规则缓存: hash → action (0=white, 1=black), 用于 md5_map 尚未包含该 hash 时暂存
     pending_rules: Arc<Mutex<std::collections::HashMap<String, u8>>>,
+    /// eBPF ring buffer 读取器（从 proc_agent 的 event_ringbuf 读取拦截事件）
+    proc_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +94,7 @@ impl EbpfBackend {
             md5_map: Arc::new(RwLock::new(std::collections::HashMap::new())),
             process_cache: Arc::new(Mutex::new((Vec::new(), Vec::new()))),
             pending_rules: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            proc_ringbuf: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -98,6 +106,18 @@ impl EbpfBackend {
         }
         if self.proc_loaded {
             loader.attach_proc_programs()?;
+            // 创建 ring buffer reader 用于接收 eBPF 进程拦截事件
+            if let Some(bpf) = loader.proc_bpf_mut() {
+                if let Some(map) = bpf.take_map("event_ringbuf") {
+                    match RingBuf::try_from(map) {
+                        Ok(rb) => {
+                            *self.proc_ringbuf.lock().unwrap() = Some(rb);
+                            info!("[EbpfBackend] Proc event ringbuf reader created");
+                        }
+                        Err(e) => warn!("[EbpfBackend] 创建 ringbuf reader 失败: {}", e),
+                    }
+                }
+            }
             info!("[EbpfBackend] Proc agent initialized");
         }
         if self.net_loaded {
@@ -110,6 +130,106 @@ impl EbpfBackend {
     pub fn is_file_loaded(&self) -> bool { self.file_loaded }
     pub fn is_proc_loaded(&self) -> bool { self.proc_loaded }
     pub fn is_net_loaded(&self) -> bool { self.net_loaded }
+
+    /// 启动 eBPF 进程事件 ring buffer 读取器
+    /// 当 eBPF proc_agent 拦截/监控进程时，通过 ringbuf 发送事件，这里读取并上报告警
+    pub fn start_proc_event_reader(self: &Arc<Self>) {
+        if !self.proc_loaded {
+            return;
+        }
+        let rb = self.proc_ringbuf.clone();
+        let backend = self.clone();
+
+        // 使用 std thread + epoll 读取 ring buffer（aya RingBuf::next() 是同步方法）
+        std::thread::spawn(move || {
+            info!("[EbpfBackend] 进程事件 ringbuf reader 已启动");
+            let poll_timeout = 500i32; // ms
+
+            loop {
+                let items = {
+                    let mut guard = rb.lock().unwrap();
+                    if let Some(ref mut ringbuf) = *guard {
+                        let fd = ringbuf.as_raw_fd();
+                        // 使用 epoll 等待 ringbuf fd 可读
+                        let epoll_fd = unsafe { libc::epoll_create1(0) };
+                        if epoll_fd < 0 {
+                            drop(guard);
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            continue;
+                        }
+                        let mut event = libc::epoll_event {
+                            events: (libc::EPOLLIN | libc::EPOLLHUP) as u32,
+                            u64: 0,
+                        };
+                        unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event); }
+                        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];
+                        let n = unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), 1, poll_timeout) };
+                        unsafe { libc::close(epoll_fd); }
+
+                        if n > 0 {
+                            // ringbuf 有数据，同步读取所有待处理事件
+                            let mut items: Vec<Vec<u8>> = Vec::new();
+                            while let Some(item) = ringbuf.next() {
+                                items.push(item.to_vec());
+                            }
+                            items
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        drop(guard);
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        continue;
+                    }
+                };
+
+                for data in items {
+                    if data.len() >= UNIFIED_EVENT_SIZE {
+                        let event: &UnifiedEvent = unsafe { &*(data.as_ptr() as *const UnifiedEvent) };
+                        let path = String::from_utf8_lossy(&event.path)
+                            .trim_end_matches('\0').to_string();
+                        let comm = String::from_utf8_lossy(&event.comm)
+                            .trim_end_matches('\0').to_string();
+
+                        if event.blocked == 1 {
+                            log::warn!(
+                                "[EbpfBackend] 🚫 进程被拦截: path={}, comm={}, pid={}, uid={}",
+                                path, comm, event.pid, event.uid
+                            );
+                            backend.report_blocked_process(event, &path, &comm);
+                        } else if event.blocked == 0 {
+                            log::info!(
+                                "[EbpfBackend] 👀 进程监控(仅记录): path={}, comm={}, pid={}",
+                                path, comm, event.pid
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// 上报被拦截进程告警（通过 reporter broadcast → gRPC AlertService）
+    fn report_blocked_process(&self, event: &UnifiedEvent, path: &str, comm: &str) {
+        let log = reporter::AuditLogInfo {
+            file_path: Some(path.to_string()),
+            md5: None,
+            n_type: 1101u16, // 进程黑名单拦截
+            n_level: 2,
+            n_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            rename_dir: None,
+            notice_remark: Some(format!("eBPF拦截: pid={} uid={}", event.pid, event.uid)),
+            exception_process: Some(comm.to_string()),
+            peripheral_name: None,
+            peripheral_remark: None,
+            peripheral_eid: None,
+            p_param: None,
+        };
+        reporter::broadcast_audit_log(&log);
+    }
 
     // ── 内部 helper ──
 
