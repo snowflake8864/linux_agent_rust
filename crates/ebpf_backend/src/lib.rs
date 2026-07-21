@@ -20,10 +20,12 @@ pub struct EbpfBackend {
     net_loaded: bool,
     pub interface: String,
     pub engine: String,
-    /// MD5 → [(dev, inode, path)] 映射（需后台扫描填充）
+    /// MD5 → [(dev, inode, path)] 映射（后台扫描填充）
     pub md5_map: Arc<RwLock<std::collections::HashMap<String, Vec<Md5Entry>>>>,
     /// 进程规则缓存 (whitelist, blacklist)
     process_cache: Arc<Mutex<(Vec<String>, Vec<String>)>>,
+    /// 待下发规则缓存: hash → action (0=white, 1=black), 用于 md5_map 尚未包含该 hash 时暂存
+    pending_rules: Arc<Mutex<std::collections::HashMap<String, u8>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +86,7 @@ impl EbpfBackend {
             engine: engine.to_string(),
             md5_map: Arc::new(RwLock::new(std::collections::HashMap::new())),
             process_cache: Arc::new(Mutex::new((Vec::new(), Vec::new()))),
+            pending_rules: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -119,6 +122,56 @@ impl EbpfBackend {
         Ok(())
     }
 
+    /// 从 data 行中提取 hash 列表
+    fn extract_hashes(&self, data: &str) -> Vec<String> {
+        data.lines()
+            .filter_map(|line| {
+                if line.starts_with("del ") { None }
+                else { line.find('=').map(|i| line[..i].to_string()) }
+            })
+            .collect()
+    }
+
+    /// 按 hash 删除 proc_rule（从 proc_rules map 中移除所有匹配 inode）
+    fn remove_proc_rule_by_hash(&self, hash: &str) -> anyhow::Result<()> {
+        let md5_map = self.md5_map.blocking_read();
+        if let Some(entries) = md5_map.get(hash) {
+            let mut loader = self.loader.lock().unwrap();
+            let bpf = loader.proc_bpf_mut().ok_or_else(|| anyhow::anyhow!("Proc agent not loaded"))?;
+            let mut proc_rules: AyaHashMap<_, ProcKey, ProcRuleVal> =
+                AyaHashMap::try_from(bpf.map_mut("proc_rules").unwrap())?;
+            for e in entries {
+                proc_rules.remove(&ProcKey { dev: e.dev, inode: e.inode })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 将 pending_rules 中已有 md5_map 的条目重新下发
+    fn replay_pending_rules(&self) {
+        let mut pending = self.pending_rules.lock().unwrap();
+        if pending.is_empty() { return; }
+
+        let md5_map = self.md5_map.blocking_read();
+        let mode = 2u8;
+        let mut replayed = 0;
+        let to_remove: Vec<String> = pending.iter()
+            .filter_map(|(hash, action)| {
+                if let Some(entries) = md5_map.get(hash.as_str()) {
+                    for e in entries {
+                        let _ = self.add_proc_rule_by_inode(e.dev, e.inode, *action, mode);
+                    }
+                    replayed += 1;
+                    Some(hash.clone())
+                } else { None }
+            })
+            .collect();
+        for h in &to_remove { pending.remove(h); }
+        if replayed > 0 {
+            info!("[EbpfBackend] replay_pending_rules: 补写 {} 条 (剩余 {} 条)", replayed, pending.len());
+        }
+    }
+
     pub async fn scan_executables(&self, dirs: &[String], recursive: bool) -> anyhow::Result<usize> {
         use tokio::fs;
         let mut map = self.md5_map.write().await;
@@ -144,6 +197,8 @@ impl EbpfBackend {
             }
         }
         info!("[EbpfBackend] Scanned {} executables, {} unique MD5s", count, map.len());
+        drop(map); // 释放写锁，让 replay_pending_rules 可以获取读锁
+        self.replay_pending_rules();
         Ok(count)
     }
 }
@@ -156,15 +211,22 @@ impl SecurityBackend for EbpfBackend {
 
     // 进程
     fn add_md5_rules(&self, data: &str) -> Result<(), String> {
-        // data 格式: "{path}=0\n" (白) / "{path}=1\n" (黑) / "del 0 {path}\n"
-        // eBPF 模式下，path 字段实际存的是 MD5 hash，需要查 md5_map 转换
+        // data 格式: "{hash}=0\n" (白) / "{hash}=1\n" (黑) / "del 0 {hash}\n"
+        // eBPF 模式下，path 字段实际存的是 MD5 hash，需要查 md5_map 转换为 inode 后写入 BPF map
         let is_white = data.contains("=0");
         let action = if is_white { 0u8 } else { 1u8 };
         let mode = 2u8; // protect
         let md5_map = self.md5_map.blocking_read();
+        let mut applied = 0;
+        let mut pending = 0;
+
         for line in data.lines() {
             let hash = if let Some(stripped) = line.strip_prefix("del ") {
-                continue; // eBPF 模式删除暂不支持，需要 remove_proc_rule_by_inode
+                // eBPF 模式删除: 从 pending_rules 移除
+                let h = if let Some(idx) = stripped.find(' ') { &stripped[idx+1..] } else { stripped };
+                let _ = self.remove_proc_rule_by_hash(h);
+                self.pending_rules.lock().unwrap().remove(h);
+                continue;
             } else if let Some(idx) = line.find('=') {
                 &line[..idx]
             } else { continue; };
@@ -173,8 +235,21 @@ impl SecurityBackend for EbpfBackend {
                 for e in entries {
                     let _ = self.add_proc_rule_by_inode(e.dev, e.inode, action, mode);
                 }
+                applied += 1;
+            } else {
+                // md5_map 尚未包含此 hash，暂存到 pending_rules，等扫描填充后补写
+                self.pending_rules.lock().unwrap().insert(hash.to_string(), action);
+                pending += 1;
+                log::warn!("[EbpfBackend] hash {} 不在 md5_map 中，暂存为待下发规则 (action={})", hash, action);
             }
         }
+
+        // 同步 process_cache
+        let mut cache = self.process_cache.lock().unwrap();
+        if is_white { cache.0 = self.extract_hashes(data); }
+        else { cache.1 = self.extract_hashes(data); }
+
+        log::info!("[EbpfBackend] add_md5_rules: 已下发 {} 条, 待扫描 {} 条", applied, pending);
         Ok(())
     }
 
