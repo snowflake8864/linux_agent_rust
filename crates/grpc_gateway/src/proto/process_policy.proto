@@ -4,13 +4,18 @@ package process_policy;
 import "common.proto";
 
 service ProcessPolicyService {
-    rpc GetProcessPolicy(common.Empty) returns (ProcessPolicy);
+    rpc GetProcessPolicy(ProcessPolicyFilter) returns (ProcessPolicy);
     rpc UpdateProcessPolicy(ProcessPolicy) returns (common.SimpleResponse);
+}
+
+// 查询过滤条件：指定获取白名单还是黑名单
+message ProcessPolicyFilter {
+    int32 is_white = 1;  // 1=白名单, 0=黑名单
 }
 
 // 对应 HTTP: /v1/getprocwl 或 /v1/getprocbl 返回的 data.proclist
 // 复用 handler: POLICY_MANAGER.set_policy_process()
 message ProcessPolicy {
     repeated string hash_list = 1;
-    bool is_white = 2;
+    int32 action = 2;  // 0=移除(未知), 1=白名单, 2=黑名单
 }

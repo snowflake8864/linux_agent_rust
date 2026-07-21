@@ -247,6 +247,35 @@ impl AgentDataHub {
         procinfo::get_running_process_infos().map_err(|e| e.to_string())
     }
 
+    /// Get combined process policy — returns both whitelist and blacklist hashes.
+    pub fn get_combined_process_policy(&self) -> (Vec<String>, Vec<String>) {
+        let mgr = process_mgr::POLICY_MANAGER.lock().unwrap();
+        (mgr.get_white_list(), mgr.get_black_list())
+    }
+
+    /// Get combined peripheral policy with status annotation.
+    /// Returns (UsbInfo, policy_status) where 1=whitelist, 2=blacklist.
+    pub fn get_combined_peripheral_policy(
+        &self,
+    ) -> Vec<(udisk::device::UsbInfo, u8)> {
+        let guard = udisk::list::SHARED_USB_LIST.lock().unwrap();
+        let white = guard.get_whitelist().clone();
+        let black = guard.get_blacklist().clone();
+
+        let mut result = Vec::new();
+        for d in &white {
+            result.push((d.clone(), 1u8));
+        }
+        let white_eids: std::collections::HashSet<&str> =
+            white.iter().map(|d| d.perpheral_eid.as_str()).collect();
+        for d in &black {
+            if !white_eids.contains(d.perpheral_eid.as_str()) {
+                result.push((d.clone(), 2u8));
+            }
+        }
+        result
+    }
+
     // ========================================================================
     // Write methods — offline only (caller must check require_offline first)
     // ========================================================================
@@ -510,12 +539,17 @@ impl AgentDataHub {
         });
     }
 
-    /// Update process policy (white/black list).
+    /// Update process policy (white/black list). action: 0=移除, 1=白名单, 2=黑名单
     pub fn update_process_policy(
         &self,
         hashes: &[String],
-        is_white: bool,
+        action: i32,
     ) -> Result<(), String> {
+        let is_white = match action {
+            1 => true,
+            2 => false,
+            _ => return Err(format!("无效 action: {}", action)),
+        };
         process_mgr::POLICY_MANAGER
             .lock()
             .unwrap()
@@ -524,17 +558,22 @@ impl AgentDataHub {
         Ok(())
     }
 
-    /// Update peripheral (USB) policy.
+    /// Update peripheral (USB) policy. action: 0=移除, 1=白名单, 2=黑名单
     pub fn update_peripheral_policy(
         &self,
-        devices: Vec<udisk::device::UsbInfo>,
-        is_white: bool,
+        devices: &[udisk::device::UsbInfo],
+        action: i32,
     ) -> Result<(), String> {
+        let usb_protect = config::net_info::NETINFO_CONFIG.lock().unwrap().usb_protect;
         let mut guard = udisk::list::SHARED_USB_LIST.lock().unwrap();
-        if is_white {
-            guard.update_whitelist(devices);
-        } else {
-            guard.update_blacklist(devices);
+        match action {
+            0 => {
+                let eids: Vec<String> = devices.iter().map(|d| d.perpheral_eid.clone()).collect();
+                guard.remove_from_both(&eids);
+            }
+            1 => guard.update_whitelist(devices.to_vec()),
+            2 => guard.update_blacklist(devices.to_vec(), usb_protect),
+            _ => return Err(format!("无效 action: {}", action)),
         }
         self.notify(PolicyChangeType::PeripheralPolicyChanged);
         Ok(())

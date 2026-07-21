@@ -1797,7 +1797,7 @@ async fn task_get_black_peripherals(&self, task_type: u64) -> Result<(), String>
                 .collect();
 
                 let mut guard = SHARED_USB_LIST.lock().unwrap();
-                guard.update_blacklist(blacklist);
+                guard.update_blacklist(blacklist, true);
             }
         }
         Err(err) => {

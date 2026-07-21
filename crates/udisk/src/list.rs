@@ -83,7 +83,7 @@ impl BlackWhiteList {
         self.white_eids = new_white_eids;
     }
 
-    pub fn update_blacklist(&mut self, new_blacklist: Vec<UsbInfo>) {
+    pub fn update_blacklist(&mut self, new_blacklist: Vec<UsbInfo>, usb_protect: bool) {
         let new_black_eids: HashSet<String> = new_blacklist.iter().map(|u| u.perpheral_eid.clone()).collect();
 
         // 找出新增的黑名单设备（原来不在黑名单中的）
@@ -108,6 +108,15 @@ impl BlackWhiteList {
                 crate::monitor::handle_blacklist_update(&blacklist_clone);
             });
         }
+    }
+
+    /// Remove devices from both whitelist and blacklist (action=0).
+    pub fn remove_from_both(&mut self, eids: &[String]) {
+        let remove_set: HashSet<&str> = eids.iter().map(|s| s.as_str()).collect();
+        self.whitelist.retain(|u| !remove_set.contains(u.perpheral_eid.as_str()));
+        self.blacklist.retain(|u| !remove_set.contains(u.perpheral_eid.as_str()));
+        self.white_eids = self.whitelist.iter().map(|u| u.perpheral_eid.clone()).collect();
+        self.black_eids = self.blacklist.iter().map(|u| u.perpheral_eid.clone()).collect();
     }
 
 }
