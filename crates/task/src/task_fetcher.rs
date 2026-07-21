@@ -764,8 +764,8 @@ async fn handle_task(&mut self, task_type: TaskTypeEnum) -> Result<(), String> {
 // 处理 TASK_UPLOAD_PROCESS 任务
 async fn task_upload_process(&self, task_type: u64) -> Result<(), String> {
 
-    self.report_task_completion(task_type).await
-        .map_err(|e| e.to_string())?;
+//    self.report_task_completion(task_type).await
+//        .map_err(|e| e.to_string())?;
 
     let upload_url = match self.api_interface.get("upload_process") {
         Some(url) => url,
@@ -809,6 +809,10 @@ async fn task_upload_process(&self, task_type: u64) -> Result<(), String> {
             log_error!("构建 JSON 失败: {}", e);
         }
     }
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
+
     Ok(())
 }
 
