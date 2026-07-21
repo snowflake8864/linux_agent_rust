@@ -7,12 +7,17 @@ import "peripheral_policy.proto";
 service DataQueryService {
     rpc GetProcessList(ProcessFilter) returns (ProcessList);
     rpc GetPortList(common.Empty) returns (PortList);
-    rpc GetUsbDeviceList(common.Empty) returns (UsbDeviceList);
+    rpc GetUsbDeviceList(ProcessFilter) returns (UsbDeviceList);
+    // 扫描系统可执行文件目录（/bin /usr/bin /usr/sbin /usr/local/bin /usr/lib/systemd），
+    // 返回路径、MD5及策略状态，结果按 MD5 去重
+    rpc GetExecutableList(ProcessFilter) returns (ExecutableList);
 }
 
 message ProcessFilter {
     int32 limit = 1;
     string sort_by = 2;
+    // 按策略状态过滤: 0=全部(默认), 1=白名单, 2=黑名单, 3=未知(未在名单中)
+    int32 filter_status = 3;
 }
 
 message ProcessInfo {
@@ -23,6 +28,7 @@ message ProcessInfo {
     string cpu_usage = 5;
     string mem_usage = 6;
     string user = 7;
+    PolicyStatus policy_status = 8;
 }
 
 message ProcessList {
@@ -42,4 +48,25 @@ message PortList {
 
 message UsbDeviceList {
     repeated peripheral_policy.UsbDevice devices = 1;
+}
+
+// 策略状态枚举
+enum PolicyStatus {
+    POLICY_NONE = 0;      // 未在黑白名单中
+    POLICY_WHITELIST = 1; // 白名单（允许）
+    POLICY_BLACKLIST = 2; // 黑名单（拦截）
+}
+
+// 单个可执行文件信息
+message ExecutableInfo {
+    string path = 1;                 // 完整路径，如 /usr/bin/ls
+    string hash = 2;                 // MD5 値
+    PolicyStatus policy_status = 3;  // 当前黑白名单状态
+}
+
+// 可执行文件列表
+message ExecutableList {
+    repeated ExecutableInfo executables = 1;
+    int32 total = 2;    // 扫描到的总文件数（去重前）
+    int32 unique = 3;   // 去重后的数量
 }
