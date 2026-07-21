@@ -105,7 +105,7 @@ async fn main() -> std::io::Result<()> {
                 log_info!("eBPF 能力检测通过");
 
                 log_info!("eBPF 使用接口: {}", cfg.ifcfg);
-                let ebpf = EbpfBackend::new(
+                let ebpf = Arc::new(EbpfBackend::new(
                     "/opt/osec/bpf",
                     file_protect,
                     proc_protect,
@@ -115,12 +115,25 @@ async fn main() -> std::io::Result<()> {
                 ).unwrap_or_else(|e| {
                     log_error!("EbpfBackend 创建失败: {}", e);
                     std::process::exit(1);
-                });
+                }));
 
                 if let Err(e) = ebpf.init() {
                     log_error!("EbpfBackend 初始化失败: {}", e);
                     std::process::exit(1);
                 }
+
+                // 扫描系统可执行文件目录，填充 md5_map（hash→inode 映射）
+                // 这是 eBPF 进程黑白名单生效的前提：下发 MD5 规则后需通过 md5_map 查找 inode 写入 BPF map
+                let scan_dirs: Vec<String> = [
+                    "/bin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/lib/systemd",
+                ].iter().map(|s| s.to_string()).collect();
+                let ebpf_scan = ebpf.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = ebpf_scan.scan_executables(&scan_dirs, true).await {
+                        log_error!("[EbpfBackend] 扫描可执行文件失败: {}", e);
+                    }
+                });
+                log_info!("eBPF md5_map 后台扫描已启动");
 
                 // 准入控制：ECN-Echo
                 if admission_enabled && admission_mode == 1 {
@@ -130,7 +143,7 @@ async fn main() -> std::io::Result<()> {
                 }
 
                 cfg.mod_ver = "ebpf".to_string();
-                Arc::new(ebpf)
+                ebpf
             }
             _ => {
                 // driver 模式：先尝试加载驱动，失败 fallback 到 eBPF
