@@ -163,37 +163,48 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
 
     if (bpf_probe_read_kernel_str(buf, 256, bprm->filename) < 0) return 0;
 
+    bpf_printk("[PROC] exec check: %s", buf);
+
     // Get the file's inode for proc_rules lookup
     struct file *file = BPF_CORE_READ(bprm, file);
     if (!file) return 0;
-    
+
     struct inode *inode = BPF_CORE_READ(file, f_inode);
     if (!inode) return 0;
-    
+
     struct proc_key key;
     dev_t kdev = BPF_CORE_READ(inode, i_sb, s_dev);
     key.dev = kernel_dev_to_user(kdev);
     key.inode = BPF_CORE_READ(inode, i_ino);
-    
+
     // Try inode-based rule first
     struct proc_rule *rule = bpf_map_lookup_elem(&proc_rules, &key);
-    
+    if (rule) {
+        bpf_printk("[PROC] INODE RULE HIT: %s dev=%llu inode=%llu",
+                   buf, key.dev, key.inode);
+        bpf_printk("[PROC]   action=%u mode=%u", rule->action, rule->mode);
+    }
+
     // Fallback to pattern-based rules
     if (!rule) {
         struct pattern_key pkey = {};
         __builtin_memcpy(pkey.pattern, buf, sizeof(pkey.pattern));
         struct pattern_rule *prule = bpf_map_lookup_elem(&proc_patterns, &pkey);
         if (prule) {
+            bpf_printk("[PROC] PATTERN RULE HIT (full path): %s action=%u mode=%u",
+                       buf, prule->action, prule->mode);
             __u8 effective_mode = resolve_mode(prule->mode, FEATURE_PROC);
             if (effective_mode == MODE_PROTECT && prule->action == ACTION_DENY) {
+                bpf_printk("[PROC] BLOCKED (pattern): %s", buf);
                 send_monitor_event(EVENT_PROC, buf, 1);
                 return -EPERM;
             }
+            bpf_printk("[PROC] MONITOR (pattern): %s", buf);
             send_monitor_event(EVENT_PROC, buf, 0);
             return 0;
         }
     }
-    
+
     // Check basename pattern
     if (!rule) {
         const char *last_slash = NULL;
@@ -207,11 +218,15 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
             __builtin_memcpy(pkey.pattern, last_slash + 1, sizeof(pkey.pattern));
             struct pattern_rule *prule = bpf_map_lookup_elem(&proc_patterns, &pkey);
             if (prule) {
+                bpf_printk("[PROC] PATTERN RULE HIT (basename): %s action=%u mode=%u",
+                           last_slash + 1, prule->action, prule->mode);
                 __u8 effective_mode = resolve_mode(prule->mode, FEATURE_PROC);
                 if (effective_mode == MODE_PROTECT && prule->action == ACTION_DENY) {
+                    bpf_printk("[PROC] BLOCKED (basename): %s", buf);
                     send_monitor_event(EVENT_PROC, buf, 1);
                     return -EPERM;
                 }
+                bpf_printk("[PROC] MONITOR (basename): %s", buf);
                 send_monitor_event(EVENT_PROC, buf, 0);
                 return 0;
             }
@@ -221,9 +236,11 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
     if (rule) {
         __u8 effective_mode = resolve_mode(rule->mode, FEATURE_PROC);
         if (effective_mode == MODE_PROTECT && rule->action == ACTION_DENY) {
+            bpf_printk("[PROC] BLOCKED (inode): %s", buf);
             send_monitor_event(EVENT_PROC, buf, 1);
             return -EPERM;
         }
+        bpf_printk("[PROC] MONITOR (inode): %s", buf);
         send_monitor_event(EVENT_PROC, buf, 0);
     }
 

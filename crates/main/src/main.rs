@@ -182,6 +182,13 @@ async fn main() -> std::io::Result<()> {
                         std::process::exit(1);
                     }
 
+                    // 准入控制：ECN-Echo
+                    if admission_enabled && admission_mode == 1 {
+                        if let Err(e) = ebpf.write_tcp_force_ecn(true) {
+                            log_error!("eBPF ECN 设置失败: {}", e);
+                        }
+                    }
+
                     cfg.mod_ver = "ebpf-fallback".to_string();
                     Arc::new(ebpf)
                 }

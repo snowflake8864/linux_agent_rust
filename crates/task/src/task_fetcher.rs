@@ -783,7 +783,7 @@ async fn task_upload_process(&self, task_type: u64) -> Result<(), String> {
         .map_err(|e| format!("Spawn error: {:?}", e))?
         .map_err(|e| format!("Collection error: {}", e))?;
 
-    //log_info!("Collected {} processes", processes.len());
+    log_info!("Collected {} processes", processes.len());
     //for p in &processes {
     //    log_info!("[{}] {} -> {}", p.pid, p.name, p.exe_path);
     //}
