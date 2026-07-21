@@ -87,13 +87,17 @@ fi
 
 # --- Secure Boot check ---
 echo "🔍 Checking Secure Boot status..."
+SECURE_BOOT_ENABLED=0
+
 if [ -d /sys/firmware/efi ]; then
     if command -v mokutil >/dev/null 2>&1; then
         sb_state=\$(mokutil --sb-state 2>/dev/null | grep -i 'SecureBoot' | awk '{print \$2}')
         if [[ "\$sb_state" == "enabled" ]]; then
-            echo "❌ Secure Boot is enabled. \$MODE not allowed."
-            echo "👉 Please disable Secure Boot in BIOS/UEFI and retry."
-            exit 1
+            echo "⚠️  Secure Boot is enabled — kernel driver (osec_base.ko) cannot load."
+            echo "   Will rely on eBPF backend instead."
+            SECURE_BOOT_ENABLED=1
+        else
+            echo "✅ Secure Boot is disabled."
         fi
     else
         sb_file=\$(find /sys/firmware/efi/efivars/ -maxdepth 1 -name 'SecureBoot-*' 2>/dev/null | head -n1)
@@ -105,9 +109,9 @@ if [ -d /sys/firmware/efi ]; then
         if [ -f "\$sb_file" ]; then
             sb_value=\$(od -An -t u1 "\$sb_file" 2>/dev/null | awk '{if (NR==1) print \$2}')
             if [ "\$sb_value" = "1" ]; then
-                echo "❌ Secure Boot is enabled. \$MODE not allowed."
-                echo "👉 Please disable Secure Boot in BIOS/UEFI and retry."
-                exit 1
+                echo "⚠️  Secure Boot is enabled — kernel driver (osec_base.ko) cannot load."
+                echo "   Will rely on eBPF backend instead."
+                SECURE_BOOT_ENABLED=1
             elif [ "\$sb_value" = "0" ]; then
                 echo "✅ Secure Boot is disabled."
             else
@@ -119,9 +123,134 @@ if [ -d /sys/firmware/efi ]; then
     fi
 else
     if [[ "\$MODE" == "install" ]]; then
-        echo "❌ Legacy BIOS mode detected (no UEFI present)"
+        echo "ℹ️  Legacy BIOS mode (no UEFI) — will use eBPF backend."
     fi
 fi
+
+# --- eBPF capability check & auto-enable BPF LSM in GRUB ---
+check_and_enable_bpf_lsm() {
+    local REBOOT_NEEDED=0
+    echo ""
+    echo "🔍 Checking eBPF / BPF LSM capability..."
+
+    # 1. Kernel version >= 5.8
+    KERNEL_VER=\$(uname -r)
+    KERNEL_MAJOR=\$(echo "\$KERNEL_VER" | cut -d. -f1)
+    KERNEL_MINOR=\$(echo "\$KERNEL_VER" | cut -d. -f2)
+
+    if [ "\$KERNEL_MAJOR" -lt 5 ] 2>/dev/null || { [ "\$KERNEL_MAJOR" -eq 5 ] 2>/dev/null && [ "\$KERNEL_MINOR" -lt 8 ] 2>/dev/null; }; then
+        echo "   ⚠️  Kernel \$KERNEL_VER < 5.8, BPF LSM not supported. Skip auto-config."
+        return 0
+    fi
+    echo "   ✅ Kernel \$KERNEL_VER >= 5.8"
+
+    # 2. BTF
+    if [ ! -f /sys/kernel/btf/vmlinux ]; then
+        echo "   ⚠️  BTF not available (/sys/kernel/btf/vmlinux missing). Skip auto-config."
+        return 0
+    fi
+    echo "   ✅ BTF available"
+
+    # 3. Check active lsm= in /proc/cmdline (kernel honours the LAST one)
+    ACTIVE_LSM=\$(cat /proc/cmdline 2>/dev/null | tr ' ' '\n' | grep '^lsm=' | tail -1 | sed 's/^lsm=//')
+
+    if [ -n "\$ACTIVE_LSM" ] && echo "\$ACTIVE_LSM" | grep -qw 'bpf'; then
+        echo "   ✅ BPF LSM already enabled (cmdline: lsm=\$ACTIVE_LSM)"
+        if [ "\$SECURE_BOOT_ENABLED" = "1" ]; then
+            echo "   ℹ️  Secure Boot is on — eBPF backend will be used."
+        fi
+        return 0
+    fi
+
+    if [ -z "\$ACTIVE_LSM" ]; then
+        echo "   ⚠️  No lsm= in /proc/cmdline"
+    else
+        echo "   ⚠️  BPF LSM not in active cmdline (lsm=\$ACTIVE_LSM)"
+    fi
+
+    if [ "\$SECURE_BOOT_ENABLED" = "1" ]; then
+        echo "   🔴 Secure Boot enabled — eBPF is the only backend. BPF LSM is REQUIRED."
+    fi
+    echo "   🔧 Configuring GRUB to enable BPF LSM..."
+
+    # 4. Edit /etc/default/grub
+    if [ ! -f /etc/default/grub ]; then
+        echo "   ❌ /etc/default/grub not found. Cannot auto-configure."
+        echo "   👉 Please manually add 'bpf' to lsm= kernel parameter and update GRUB."
+        return 0
+    fi
+
+    # Backup original
+    cp /etc/default/grub /etc/default/grub.bak.osec.\$(date +%Y%m%d%H%M%S) 2>/dev/null || true
+
+    # Find the LAST lsm= line — kernel uses the last lsm= on cmdline,
+    # which typically comes from GRUB_CMDLINE_LINUX_SECURITY (Kylin) or GRUB_CMDLINE_LINUX
+    LSM_LINE=\$(grep -n 'lsm=' /etc/default/grub | tail -1)
+
+    if [ -n "\$LSM_LINE" ]; then
+        LINE_NUM=\$(echo "\$LSM_LINE" | cut -d: -f1)
+        echo "   📝 Appending bpf to lsm= at line \$LINE_NUM"
+        sed -i "\${LINE_NUM}s/lsm=\([^\"]*\)/lsm=\1,bpf/" /etc/default/grub
+    else
+        echo "   📝 Adding lsm=bpf to GRUB_CMDLINE_LINUX"
+        if grep -q '^GRUB_CMDLINE_LINUX=' /etc/default/grub; then
+            sed -i 's/^GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 lsm=bpf"/' /etc/default/grub
+        else
+            echo 'GRUB_CMDLINE_LINUX="lsm=bpf"' >> /etc/default/grub
+        fi
+    fi
+
+    # 5. Run GRUB update (auto-detect UEFI/BIOS + available tools)
+    echo "   🔄 Regenerating GRUB configuration..."
+    UPDATED=0
+
+    if command -v update-grub >/dev/null 2>&1; then
+        # Debian/Ubuntu/Kylin wrapper — works for both UEFI & BIOS
+        update-grub && UPDATED=1
+    elif [ -d /sys/firmware/efi ]; then
+        echo "   Detected UEFI system"
+        for candidate in /boot/efi/EFI/*/grub.cfg /boot/grub2/grub.cfg /boot/grub/grub.cfg; do
+            if [ -f "\$candidate" ]; then
+                if command -v grub2-mkconfig >/dev/null 2>&1; then
+                    grub2-mkconfig -o "\$candidate" && UPDATED=1 && break
+                elif command -v grub-mkconfig >/dev/null 2>&1; then
+                    grub-mkconfig -o "\$candidate" && UPDATED=1 && break
+                fi
+            fi
+        done
+    else
+        echo "   Detected BIOS/Legacy system"
+        for cfg in /boot/grub2/grub.cfg /boot/grub/grub.cfg; do
+            if [ -d "\$(dirname "\$cfg")" ]; then
+                if command -v grub2-mkconfig >/dev/null 2>&1; then
+                    grub2-mkconfig -o "\$cfg" && UPDATED=1 && break
+                elif command -v grub-mkconfig >/dev/null 2>&1; then
+                    grub-mkconfig -o "\$cfg" && UPDATED=1 && break
+                fi
+            fi
+        done
+    fi
+
+    if [ "\$UPDATED" -eq 0 ]; then
+        echo "   ❌ GRUB auto-update failed."
+        echo "   👉 Please manually add 'bpf' to lsm= in /etc/default/grub and run: update-grub"
+        return 0
+    fi
+
+    echo "   ✅ GRUB configuration updated with BPF LSM enabled."
+    echo ""
+    echo "   ╔══════════════════════════════════════════════════════════╗"
+    echo "   ║  🔴 REBOOT REQUIRED                                     ║"
+    echo "   ║  BPF LSM has been enabled in GRUB.                      ║"
+    echo "   ║  Please REBOOT after installation to apply changes:     ║"
+    echo "   ║      sudo reboot                                        ║"
+    echo "   ╚══════════════════════════════════════════════════════════╝"
+    echo ""
+
+    # Signal to caller that reboot is needed
+    touch /tmp/.osec_reboot_needed
+    return 0
+}
 
 OSEC_VERSION="$VERSION"
 ARCH=\$(uname -m)
@@ -143,6 +272,9 @@ if [[ "\$MODE" == "install" ]]; then
     cp -rf /tmp/opt/osec/* "\$INSTALL_DIR/"
     chmod 755 "\$INSTALL_DIR" -R
     chown -R root:root "\$INSTALL_DIR"
+
+    # eBPF LSM detect and auto-enable in GRUB (install only)
+    check_and_enable_bpf_lsm
 elif [[ "\$MODE" == "upgrade" ]]; then
     [ -d "\$INSTALL_DIR" ] || { echo "Not installed!"; exit 1; }
     
@@ -481,6 +613,14 @@ if [ -d /run/systemd/system ]; then
 
 if [[ "\$MODE" == "install" ]]; then
     echo "✅ Installation completed!"
+    if [ -f /tmp/.osec_reboot_needed ]; then
+        echo ""
+        echo "╔══════════════════════════════════════════════════════════╗"
+        echo "║  🔴 请重启系统以使 BPF LSM 内核参数生效                   ║"
+        echo "║       sudo reboot                                        ║"
+        echo "╚══════════════════════════════════════════════════════════╝"
+        rm -f /tmp/.osec_reboot_needed
+    fi
 else
     echo "✅ Upgrade completed! (agent_manager preserved)"
 fi
