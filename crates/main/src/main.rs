@@ -135,6 +135,9 @@ async fn main() -> std::io::Result<()> {
                 });
                 log_info!("eBPF md5_map 后台扫描已启动");
 
+                // 启动 eBPF 进程事件 ring buffer reader（拦截/监控告警上报）
+                ebpf.start_proc_event_reader();
+
                 // 准入控制：ECN-Echo
                 if admission_enabled && admission_mode == 1 {
                     if let Err(e) = ebpf.write_tcp_force_ecn(true) {
@@ -182,18 +185,27 @@ async fn main() -> std::io::Result<()> {
                         std::process::exit(1);
                     }
 
-                    let ebpf = EbpfBackend::new(
+                    let ebpf = Arc::new(EbpfBackend::new(
                         "/opt/osec/bpf", file_protect, proc_protect, net_enabled,
                         &cfg.ifcfg, "xdp",
                     ).unwrap_or_else(|e| {
                         log_error!("EbpfBackend fallback 失败: {}", e);
                         std::process::exit(1);
-                    });
+                    }));
 
                     if let Err(e) = ebpf.init() {
                         log_error!("EbpfBackend fallback init 失败: {}", e);
                         std::process::exit(1);
                     }
+
+                    // 后台扫描 + ringbuf reader
+                    let ebpf_fb = ebpf.clone();
+                    tokio::spawn(async move {
+                        let dirs: Vec<String> = ["/bin","/usr/bin","/usr/sbin","/usr/local/bin","/usr/lib/systemd"]
+                            .iter().map(|s| s.to_string()).collect();
+                        let _ = ebpf_fb.scan_executables(&dirs, true).await;
+                    });
+                    ebpf.start_proc_event_reader();
 
                     // 准入控制：ECN-Echo
                     if admission_enabled && admission_mode == 1 {
@@ -203,7 +215,7 @@ async fn main() -> std::io::Result<()> {
                     }
 
                     cfg.mod_ver = "ebpf-fallback".to_string();
-                    Arc::new(ebpf)
+                    ebpf
                 }
             }
         };
