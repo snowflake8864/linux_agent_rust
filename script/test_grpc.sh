@@ -151,11 +151,21 @@ test_01() { grpc_call "Agent状态(含is_online/protection_days)" \
 test_02() { grpc_call "当前配置" \
     config.proto config.ConfigService GetConfig; }
 
-test_03() { grpc_call "进程策略" \
-    process_policy.proto process_policy.ProcessPolicyService GetProcessPolicy; }
+test_03() { grpc_call "进程策略(白名单)" \
+    process_policy.proto process_policy.ProcessPolicyService GetProcessPolicy \
+    '{"is_white": 1}'; }
 
-test_04() { grpc_call "外设策略" \
-    peripheral_policy.proto peripheral_policy.PeripheralPolicyService GetPeripheralPolicy; }
+test_03b() { grpc_call "进程策略(黑名单)" \
+    process_policy.proto process_policy.ProcessPolicyService GetProcessPolicy \
+    '{"is_white": 0}'; }
+
+test_04() { grpc_call "外设策略(白名单)" \
+    peripheral_policy.proto peripheral_policy.PeripheralPolicyService GetPeripheralPolicy \
+    '{"is_white": 1}'; }
+
+test_04b() { grpc_call "外设策略(黑名单)" \
+    peripheral_policy.proto peripheral_policy.PeripheralPolicyService GetPeripheralPolicy \
+    '{"is_white": 0}'; }
 
 test_05() { grpc_call "IP阻断策略" \
     ip_policy.proto ip_policy.IpPolicyService GetIpBlockPolicy; }
@@ -184,9 +194,19 @@ test_12() { grpc_call "备份列表" \
 test_13() { grpc_call "跳变状态" \
     jump.proto jump.JumpService GetJumpStatus; }
 
-test_14() { grpc_call "进程列表(top 10)" \
+test_14() { grpc_call "进程列表(top 10, filter=all)" \
     data_query.proto data_query.DataQueryService GetProcessList \
-    '{"limit": 10, "sort_by": "pid"}' \
+    '{"limit": 10, "sort_by": "pid", "filter_status": 0}' \
+    "peripheral_policy.proto"; }
+
+test_14b() { grpc_call "进程列表(仅白名单)" \
+    data_query.proto data_query.DataQueryService GetProcessList \
+    '{"limit": 10, "sort_by": "pid", "filter_status": 1}' \
+    "peripheral_policy.proto"; }
+
+test_14c() { grpc_call "进程列表(仅黑名单)" \
+    data_query.proto data_query.DataQueryService GetProcessList \
+    '{"limit": 10, "sort_by": "pid", "filter_status": 2}' \
     "peripheral_policy.proto"; }
 
 test_15() { grpc_call "端口列表" \
@@ -228,13 +248,13 @@ test_w1() { grpc_expect_perm_denied "更新配置（在线拒绝）" \
     config.proto config.ConfigService UpdateConfig \
     '{"crontime": 120}'; }
 
-test_w2() { grpc_expect_perm_denied "更新进程策略（在线拒绝）" \
+test_w2() { grpc_expect_perm_denied "更新进程策略(在线拒绝)" \
     process_policy.proto process_policy.ProcessPolicyService UpdateProcessPolicy \
-    '{"hash_list": ["abc123"], "is_white": true}'; }
+    '{"hash_list": ["abc123"], "action": 1}'; }
 
-test_w3() { grpc_expect_perm_denied "更新外设策略（在线拒绝）" \
+test_w3() { grpc_expect_perm_denied "更新外设策略(在线拒绝)" \
     peripheral_policy.proto peripheral_policy.PeripheralPolicyService UpdatePeripheralPolicy \
-    '{"devices": [], "is_white": true}'; }
+    '{"devices": [], "action": 1}'; }
 
 test_w4() { grpc_expect_perm_denied "更新IP阻断（在线拒绝）" \
     ip_policy.proto ip_policy.IpPolicyService UpdateIpBlockPolicy \
@@ -342,11 +362,15 @@ test_23() {
     fi
 }
 
-test_24() { grpc_call "进程策略（只读, eBPF兼容）" \
-    process_policy.proto process_policy.ProcessPolicyService GetProcessPolicy '{}'; }
+test_24() { grpc_call "进程策略(只读, eBPF兼容)" \
+    process_policy.proto process_policy.ProcessPolicyService GetProcessPolicy '{"is_white": 1}'; }
 
-test_25() { grpc_call "IP阻断策略（只读, eBPF兼容）" \
+test_25() { grpc_call "IP阻断策略(只读, eBPF兼容)" \
     ip_policy.proto ip_policy.IpPolicyService GetIpBlockPolicy '{}'; }
+
+test_29() { grpc_call "可执行文件列表" \
+    data_query.proto data_query.DataQueryService GetExecutableList \
+    '{"filter_status": 0}' "peripheral_policy.proto"; }
 
 test_26() { grpc_call "后端模式查询" \
     backend.proto backend.BackendService GetBackendMode '{}'; }
@@ -375,7 +399,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}   5) IpBlockPolicy   13)  JumpStatus     21) 准入-ON         ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   6) IpBlackPolicy   14)  ProcessList    22) 准入-AUTO       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   7) OutreachRules   15)  PortList                         ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   8) DirPolicy       16)  UsbDeviceList                    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   8) DirPolicy       16)  UsbDeviceList  29) ExecutableList ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${RED}写接口（仅离线可用，在线应返回 PERMISSION_DENIED）${NC}       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   w1) UpdateConfig   w2) UpdateProcessPolicy              ${CYAN}║${NC}"
@@ -460,9 +484,11 @@ case "${1:-menu}" in
                 26) test_26 ;;
                 27) test_27 ;;
                 28) test_28 ;;
+                29) test_29 ;;
                 all)
                     echo -e "\n${GREEN}── 测试全部只读接口 ──${NC}"
                     for i in $(seq 1 28); do test_0$i 2>/dev/null || test_$i 2>/dev/null; done
+                    test_29
                     print_result
                     ;;
                 write)
