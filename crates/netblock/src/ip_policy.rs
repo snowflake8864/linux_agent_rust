@@ -24,8 +24,25 @@ lazy_static::lazy_static! {
     pub static ref IP_EXPIRY_TASKS: Arc<RwLock<HashMap<String, JoinHandle<()>>>> = Arc::new(RwLock::new(HashMap::new()));
 }
 
+// 清理内核 IP 封禁列表（先清空再重写，确保已删除的条目被移除）
+fn clear_block_lists() -> Result<(), String> {
+    let paths = [
+        "/proc/osec/osec_conn/block_saddr_rt",
+        "/proc/osec/osec_conn/block_saddr_rt_v6",
+    ];
+    for path in &paths {
+        std::fs::write(path, "c\n")
+            .map_err(|e| format!("clear_block_lists: write 'c\\n' to {} failed: {}", path, e))?;
+    }
+    log_info!("[netblock] 已清理内核封禁列表");
+    Ok(())
+}
+
 // Update global map and write to kernel
 pub async fn update_and_write_policies(policies: Vec<IpPolicy>) -> Result<(), String> {
+    // 一进来先清理内核列表，确保已删除的 IP 条目被移除
+    clear_block_lists()?;
+
     let mut global_policies = IP_POLICIES.write().await;
     let mut expiry_tasks = IP_EXPIRY_TASKS.write().await;
 
@@ -112,11 +129,6 @@ async fn write_policies_to_proc(global_policies: &mut HashMap<String, IpPolicy>)
             return Err(format!("Failed to open {}: {}", ipv4_proc_path, e));
         }
     };
-    // Write "c\n" to clear
-    if let Err(e) = ipv4_file.write_all(b"c\n") {
-        eprintln!("Failed to write 'c\\n' to {}: {}", ipv4_proc_path, e);
-        return Err(format!("Failed to write 'c\\n' to {}: {}", ipv4_proc_path, e));
-    }
     // Write IPv4 addresses
     for policy in ipv4_policies {
         let ip_line = format!("{}\n", policy.ip);
@@ -138,11 +150,6 @@ async fn write_policies_to_proc(global_policies: &mut HashMap<String, IpPolicy>)
             return Err(format!("Failed to open {}: {}", ipv6_proc_path, e));
         }
     };
-    // Write "c\n" to clear
-    if let Err(e) = ipv6_file.write_all(b"c\n") {
-        eprintln!("Failed to write 'c\\n' to {}: {}", ipv6_proc_path, e);
-        return Err(format!("Failed to write 'c\\n' to {}: {}", ipv6_proc_path, e));
-    }
     // Write IPv6 addresses
     for policy in ipv6_policies {
         let ip_line = format!("{}\n", policy.ip);
