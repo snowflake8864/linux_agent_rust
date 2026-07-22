@@ -54,12 +54,13 @@ pub async fn update_and_write_policies(policies: Vec<IpPolicy>) -> Result<(), St
     for policy in &policies {
         let ip = policy.ip.clone();
 
-        if policy.duration > 0 {
+        let duration = policy.duration;
+        if duration > 0 {
             let ip_for_task = ip.clone();
             let policies_map = Arc::clone(&IP_POLICIES);
             let tasks_map = Arc::clone(&IP_EXPIRY_TASKS);
             let task = tokio::spawn(async move {
-                sleep(Duration::from_secs(policy.duration)).await;
+                sleep(Duration::from_secs(duration)).await;
                 let mut policies = policies_map.write().await;
                 policies.remove(&ip_for_task);
                 let mut tasks = tasks_map.write().await;
