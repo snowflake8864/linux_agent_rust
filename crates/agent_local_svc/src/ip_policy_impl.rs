@@ -46,6 +46,7 @@ impl IpPolicyService for IpPolicyServiceImpl {
                 direction: i.direction,
                 duration: i.duration,
                 is_ipv6: i.is_ipv6,
+                source: 2,
             })
             .collect();
         self.data_hub
@@ -91,6 +92,7 @@ impl IpPolicyService for IpPolicyServiceImpl {
                 direction: i.direction,
                 duration: i.duration,
                 is_ipv6: i.is_ipv6,
+                source: 2,
             })
             .collect();
         self.data_hub

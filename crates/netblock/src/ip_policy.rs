@@ -10,12 +10,19 @@ use tokio::time::{sleep, Duration};
 use logging::log_info;
 
 // Define IP policy structure
+/// 策略来源: 0=netblock(server下发), 1=black_ip(server下发), 2=gRPC
+pub const SRC_NETBLOCK: u8 = 0;
+pub const SRC_BLACK_IP: u8 = 1;
+pub const SRC_GRPC: u8 = 2;
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct IpPolicy {
     pub direction: u32,    // Block direction
     pub ip: String,        // IP address (IPv4 or IPv6)
     pub duration: u64,     // Duration in seconds, 0 means permanent
     pub is_ipv6: bool,     // Whether it is an IPv6 address
+    #[serde(skip)]
+    pub source: u8,        // 策略来源（不序列化，运行时标记）
 }
 
 // Define global maps for IP policies and expiry tasks
@@ -43,12 +50,21 @@ pub async fn update_and_write_policies(policies: Vec<IpPolicy>) -> Result<(), St
     let mut global_policies = IP_POLICIES.write().await;
     let mut expiry_tasks = IP_EXPIRY_TASKS.write().await;
 
-    // 全量替换：先清空旧策略和旧过期任务
-    for (ip, task) in expiry_tasks.drain() {
-        task.abort();
-        log_info!("[netblock] 取消 IP {} 的过期任务（全量替换）", ip);
-    }
-    global_policies.clear();
+    // 获取本批次来源（取第一条的 source，批次内必定一致）
+    let source = policies.first().map(|p| p.source).unwrap_or(0);
+
+    // 只清理同来源的旧策略和过期任务，不影响其他来源
+    expiry_tasks.retain(|ip, task| {
+        if let Some(p) = global_policies.get(ip) {
+            if p.source == source {
+                task.abort();
+                log_info!("[netblock] 取消 IP {} 的过期任务 (source={})", ip, source);
+                return false;
+            }
+        }
+        true
+    });
+    global_policies.retain(|_, p| p.source != source);
 
     // 写入新策略并管理过期任务
     for policy in &policies {

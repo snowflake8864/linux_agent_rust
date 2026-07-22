@@ -1524,6 +1524,7 @@ async fn task_down_netblock_policy(&self, task_type: u64) -> Result<(), String> 
                     direction,
                     duration,
                     is_ipv6: is_ipv6(ip),
+                    source: 0,
                 });
             }
         }
@@ -1583,11 +1584,12 @@ async fn task_down_black_ip_policy(&self, task_type: u64) -> Result<(), String> 
                     direction,
                     duration: 0, // black_ip_policy 没有 duration，设为 0
                     is_ipv6: is_ipv6(ip),
+                    source: 1,
                 });
             }
         }
     }
-
+    log_info!("==============================================ip block{:?}", policies);
     // 更新全局 Map 并下发到内核
     update_and_write_policies(policies).await
 }
