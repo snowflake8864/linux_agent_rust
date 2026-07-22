@@ -129,8 +129,12 @@ async fn write_policies_to_proc(global_policies: &mut HashMap<String, IpPolicy>)
             return Err(format!("Failed to open {}: {}", ipv4_proc_path, e));
         }
     };
-    // Write IPv4 addresses
+    // Write IPv4 addresses (先校验格式，过滤非法 IP)
     for policy in ipv4_policies {
+        if policy.ip.parse::<std::net::Ipv4Addr>().is_err() {
+            eprintln!("[netblock] 跳过非法 IPv4: {}", policy.ip);
+            continue;
+        }
         let ip_line = format!("{}\n", policy.ip);
         if let Err(e) = ipv4_file.write_all(ip_line.as_bytes()) {
             eprintln!("Failed to write IP {} to {}: {}", policy.ip, ipv4_proc_path, e);
@@ -150,8 +154,12 @@ async fn write_policies_to_proc(global_policies: &mut HashMap<String, IpPolicy>)
             return Err(format!("Failed to open {}: {}", ipv6_proc_path, e));
         }
     };
-    // Write IPv6 addresses
+    // Write IPv6 addresses (先校验格式，过滤非法 IP)
     for policy in ipv6_policies {
+        if policy.ip.parse::<std::net::Ipv6Addr>().is_err() {
+            eprintln!("[netblock] 跳过非法 IPv6: {}", policy.ip);
+            continue;
+        }
         let ip_line = format!("{}\n", policy.ip);
         if let Err(e) = ipv6_file.write_all(ip_line.as_bytes()) {
             eprintln!("Failed to write IP {} to {}: {}", policy.ip, ipv6_proc_path, e);
