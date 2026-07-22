@@ -40,55 +40,39 @@ fn clear_block_lists() -> Result<(), String> {
 
 // Update global map and write to kernel
 pub async fn update_and_write_policies(policies: Vec<IpPolicy>) -> Result<(), String> {
-    // 一进来先清理内核列表，确保已删除的 IP 条目被移除
-    clear_block_lists()?;
-
     let mut global_policies = IP_POLICIES.write().await;
     let mut expiry_tasks = IP_EXPIRY_TASKS.write().await;
 
-    // Update global map and manage expiry tasks
-    for policy in policies {
-        let ip = policy.ip.clone();
-        let has_task = expiry_tasks.contains_key(&ip);
+    // 全量替换：先清空旧策略和旧过期任务
+    for (ip, task) in expiry_tasks.drain() {
+        task.abort();
+        log_info!("[netblock] 取消 IP {} 的过期任务（全量替换）", ip);
+    }
+    global_policies.clear();
 
-        // If duration == 0 and task exists, cancel it
-        if policy.duration == 0 && has_task {
-            if let Some(task) = expiry_tasks.remove(&ip) {
-                task.abort();
-                log_info!("IP {} duration set to 0, cancelled expiry task", ip);
-            }
-        }
-        // If duration > 0 and no task, create new task
-        else if policy.duration > 0 && !has_task {
-            let ip_for_task = ip.clone(); // Clone ip for task
+    // 写入新策略并管理过期任务
+    for policy in &policies {
+        let ip = policy.ip.clone();
+
+        if policy.duration > 0 {
+            let ip_for_task = ip.clone();
             let policies_map = Arc::clone(&IP_POLICIES);
             let tasks_map = Arc::clone(&IP_EXPIRY_TASKS);
             let task = tokio::spawn(async move {
-                // Wait for duration seconds
                 sleep(Duration::from_secs(policy.duration)).await;
-                // Remove expired IP
                 let mut policies = policies_map.write().await;
                 policies.remove(&ip_for_task);
-                log_info!("IP {} expired and removed, current policies: {:?}", ip_for_task, *policies);
-                // Remove task handle
                 let mut tasks = tasks_map.write().await;
                 tasks.remove(&ip_for_task);
-                // Write updated policies
+                // 过期后重写内核
                 if let Err(e) = write_policies_to_proc(&mut policies).await {
-                    eprintln!("Failed to re-write policies in expiry task for IP {}: {}", ip_for_task, e);
+                    eprintln!("[netblock] IP {} 过期后重写内核失败: {}", ip_for_task, e);
                 }
             });
-            // Store task handle
             expiry_tasks.insert(ip.clone(), task);
-            log_info!("Created expiry task for IP {}, duration: {}", ip, policy.duration);
-        }
-        // If duration > 0 and task exists, keep existing task, update policy
-        else if policy.duration > 0 && has_task {
-            log_info!("IP {} has existing expiry task, skipped creating new task, updated duration: {}", ip, policy.duration);
         }
 
-        // Update IP_POLICIES
-        global_policies.insert(ip, policy);
+        global_policies.insert(ip, policy.clone());
     }
 
     // Log merged policies
@@ -98,8 +82,9 @@ pub async fn update_and_write_policies(policies: Vec<IpPolicy>) -> Result<(), St
     write_policies_to_proc(&mut global_policies).await
 }
 
-// Write policies to /proc files
+// Write policies to /proc files（先清理内核列表再全量重写）
 async fn write_policies_to_proc(global_policies: &mut HashMap<String, IpPolicy>) -> Result<(), String> {
+    clear_block_lists()?;
     log_info!("write_policies_to_proc: Global policies: {:?}", *global_policies);
     log_info!("write_policies_to_proc: Number of policies: {}", global_policies.len());
 
