@@ -1530,7 +1530,7 @@ async fn task_down_netblock_policy(&self, task_type: u64) -> Result<(), String> 
         }
     }
 
-    update_and_write_policies(policies).await
+    update_and_write_policies(policies, 0).await
 }
 
 async fn task_down_black_ip_policy(&self, task_type: u64) -> Result<(), String> {
@@ -1591,7 +1591,7 @@ async fn task_down_black_ip_policy(&self, task_type: u64) -> Result<(), String> 
     }
     log_info!("==============================================ip block{:?}", policies);
     // 更新全局 Map 并下发到内核
-    update_and_write_policies(policies).await
+    update_and_write_policies(policies, 1).await
 }
 async fn task_down_extort(&self, task_type: u64) -> Result<(), String> {
 

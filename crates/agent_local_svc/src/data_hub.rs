@@ -731,7 +731,7 @@ impl AgentDataHub {
         &self,
         items: &[netblock::ip_policy::IpPolicy],
     ) -> Result<(), String> {
-        netblock::ip_policy::update_and_write_policies(items.to_vec()).await?;
+        netblock::ip_policy::update_and_write_policies(items.to_vec(), 2).await?;
         self.notify(PolicyChangeType::IpBlockPolicyChanged);
         Ok(())
     }

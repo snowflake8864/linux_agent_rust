@@ -45,13 +45,11 @@ fn clear_block_lists() -> Result<(), String> {
     Ok(())
 }
 
-// Update global map and write to kernel
-pub async fn update_and_write_policies(policies: Vec<IpPolicy>) -> Result<(), String> {
+/// Update global map and write to kernel.
+/// `source` 指定策略来源 (SRC_NETBLOCK / SRC_BLACK_IP / SRC_GRPC)，确保只清理同来源旧条目。
+pub async fn update_and_write_policies(policies: Vec<IpPolicy>, source: u8) -> Result<(), String> {
     let mut global_policies = IP_POLICIES.write().await;
     let mut expiry_tasks = IP_EXPIRY_TASKS.write().await;
-
-    // 获取本批次来源（取第一条的 source，批次内必定一致）
-    let source = policies.first().map(|p| p.source).unwrap_or(0);
 
     // 只清理同来源的旧策略和过期任务，不影响其他来源
     expiry_tasks.retain(|ip, task| {
