@@ -198,6 +198,20 @@ impl ModularLoader {
         self.net_bpf.as_mut()
     }
 
+    /// 写入 global_modes map (0=MONITOR, 1=PROTECT → eBPF 用 1=MONITOR, 2=PROTECT)
+    pub fn set_global_mode(bpf: &mut Bpf, feature_idx: u32, protect: bool) -> anyhow::Result<()> {
+        let map = match bpf.map_mut("global_modes") {
+            Some(m) => m,
+            None => { info!("[EbpfBackend] global_modes map 不存在，跳过"); return Ok(()); }
+        };
+        let mut arr: Array<_, u8> = Array::try_from(map)?;
+        let val: u8 = if protect { 2 } else { 1 }; // 1=MONITOR, 2=PROTECT
+        arr.set(feature_idx, val, 0)?;
+        info!("[EbpfBackend] ✅ global_modes[{}] = {} ({})", feature_idx, val,
+            if protect { "PROTECT" } else { "MONITOR" });
+        Ok(())
+    }
+
     /// 启用/禁用 eBPF 模块的 feature_switches
     /// feature_idx: 0=FILE, 1=PROC, 2=NET
     pub fn enable_feature(bpf: &mut Bpf, feature_idx: u32, enabled: bool) -> anyhow::Result<()> {

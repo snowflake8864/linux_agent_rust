@@ -74,6 +74,7 @@ struct {
 
 // ===== Constants =====
 #define EVENT_PROC 2
+#define EVENT_PROC_UNKNOWN 3  // 不明进程
 // Mode constants (match Rust: mode.as_u8() + 1)
 // Rust: Monitor=0, Protect=1 -> +1 -> Monitor=1, Protect=2
 #define MODE_MONITOR 1
@@ -232,14 +233,34 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
     }
 
     if (rule) {
+        // 命中规则：区分白/黑名单
+        if (rule->action == ACTION_ALLOW) {
+            // 白名单 → 放行，不产生事件
+            return 0;
+        }
+        // 黑名单 (ACTION_DENY)
         __u8 effective_mode = resolve_mode(rule->mode, FEATURE_PROC);
-        if (effective_mode == MODE_PROTECT && rule->action == ACTION_DENY) {
-            bpf_printk("[PROC] BLOCKED (inode): %s", buf);
+        if (effective_mode == MODE_PROTECT) {
+            bpf_printk("[PROC] BLOCKED (黑名单): %s", buf);
             send_monitor_event(EVENT_PROC, buf, 1);
             return -EPERM;
         }
-        bpf_printk("[PROC] MONITOR (inode): %s", buf);
+        bpf_printk("[PROC] MONITOR (黑名单): %s", buf);
         send_monitor_event(EVENT_PROC, buf, 0);
+        return 0;
+    }
+
+    // 未命中任何规则 → 不明进程
+    // 使用 global_modes 决定监控/保护
+    {
+        __u8 effective_mode = resolve_mode(0, FEATURE_PROC);
+        if (effective_mode == MODE_PROTECT) {
+            bpf_printk("[PROC] BLOCKED (不明): %s", buf);
+            send_monitor_event(EVENT_PROC_UNKNOWN, buf, 1);
+            return -EPERM;
+        }
+        bpf_printk("[PROC] MONITOR (不明): %s", buf);
+        send_monitor_event(EVENT_PROC_UNKNOWN, buf, 0);
     }
 
     return 0;
