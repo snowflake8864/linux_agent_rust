@@ -145,7 +145,7 @@ async fn main() -> std::io::Result<()> {
         AGENT_MODE.store(AgentMode::Online as u8, std::sync::atomic::Ordering::Relaxed);
     }
     log_info!("当前模式: {}", if is_offline { "离线" } else { "在线" });
-
+/*
     // 初始化本地数据库（建表幂等，已存在时跳过）
     local_store::init_all();
 
@@ -190,7 +190,7 @@ async fn main() -> std::io::Result<()> {
         Ok(None) => log_info!("jump.db 无历史数据，跳过恢复"),
         Err(e)   => log_error!("从 jump.db 加载跳变状态失败: {}", e),
     }
-
+*/
     // 刚获得 token 时才担发 fetch，见 data_hub::update_token()
 
     // 创建 Netlink 套接字（在离线模式下仍尝试创建，供内核事件使用）

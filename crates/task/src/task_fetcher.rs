@@ -188,7 +188,7 @@ impl TaskFetcher {
         let ip_jump_manager = IpJumpManager::new(&ifcfg); 
         let base_url_owned = base_url.to_string();
         let token_for_cleanup = token.clone();
-
+/*
         // Clone the Arc for the periodic cleanup task
         let manager_clone = Arc::clone(&ip_jump_manager.clone());
         tokio::spawn(async move {
@@ -202,7 +202,7 @@ impl TaskFetcher {
         tokio::spawn(async move {
             ip_jump_manager_for_daemon.start_ip_jump_daemon(base_url_for_jump, token_for_jump).await;
         });
-
+*/
         TaskFetcher {
             base_url: base_url.to_string(),
             token,
@@ -1589,7 +1589,6 @@ async fn task_down_black_ip_policy(&self, task_type: u64) -> Result<(), String> 
             }
         }
     }
-    log_info!("==============================================ip block{:?}", policies);
     // 更新全局 Map 并下发到内核
     update_and_write_policies(policies, 1).await
 }
