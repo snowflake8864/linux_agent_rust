@@ -24,3 +24,4 @@ cscope.*
 *.swp
 *.swo
 *.bak
+bpf/*.bpf.o
