@@ -268,11 +268,11 @@ impl EbpfBackend {
                         if event.blocked == 1 {
                             log::warn!("[EbpfBackend] 🚫 黑名单命中(保护): path={}, comm={}, pid={}, uid={}",
                                 path, comm, event.pid, event.uid);
-                            backend.report_process_event(event, &path, &comm, 1101, "拦截");
+                            backend.report_process_event(event, &path, &comm, 1102, "拦截");
                         } else {
                             log::info!("[EbpfBackend] 👀 黑名单命中(监控): path={}, comm={}, pid={}",
                                 path, comm, event.pid);
-                            backend.report_process_event(event, &path, &comm, 1001, "监控");
+                            backend.report_process_event(event, &path, &comm, 1002, "监控");
                         }
                     }
                 }
