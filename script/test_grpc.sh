@@ -383,6 +383,52 @@ test_28() { grpc_call "设置后端-driver" \
     backend.proto backend.BackendService UpdateBackendMode \
     '{"mode": "driver"}'; }
 
+# ── per-interface help ──
+show_test_help() {
+    local tid="$1"
+    echo ""
+    case "$tid" in
+        main|h|help)
+            echo -e "${CYAN}═══ 只读接口 ═══${NC}"
+            echo "   1)  AgentStatus      — Agent运行状态"
+            echo "   2)  Config           — Agent配置"
+            echo "   3)  ProcessPolicy(白) — 进程白名单  |  3b) 进程黑名单"
+            echo "   4)  PeripheralPolicy — 外设策略"
+            echo "  14)  ProcessList      — 进程列表(14b=白 14c=黑)"
+            echo "  29)  ExecutableList   — 可执行文件列表"
+            echo ""
+            echo -e "${CYAN}═══ 写接口 ═══${NC}"
+            echo "  w2)  UpdateProcessPolicy — ★ 进程黑白名单(eBPF在线可下发)"
+            echo "  w3-w13 其他写接口(仅离线)"
+            echo ""
+            echo -e "${GREEN}用法: 输入编号测试, \"编号 ?\" 查看详情, \"w2 <json>\" 直接下发${NC}"
+            ;;
+        1)  echo -e "${CYAN}[1] AgentStatus${NC} — Agent运行状态" ;;
+        2)  echo -e "${CYAN}[2] Config${NC} — Agent配置" ;;
+        3)  echo -e "${CYAN}[3] ProcessPolicy(白)${NC} — 进程白名单"
+            echo "    gRPC: GetProcessPolicy {\"is_white\": 1}" ;;
+        3b) echo -e "${CYAN}[3b] ProcessPolicy(黑)${NC} — 进程黑名单"
+            echo "    gRPC: GetProcessPolicy {\"is_white\": 0}"
+            echo "    返回: hash_list + path_list(从md5_map查路径)" ;;
+        14) echo -e "${CYAN}[14] ProcessList${NC} — 进程列表"
+            echo "    filter_status: 0=全部 1=白名单 2=黑名单 3=未知" ;;
+        w2) echo -e "${CYAN}[w2] UpdateProcessPolicy${NC} — ★ 进程黑白名单(eBPF在线下发)"
+            echo ""
+            echo "  直接下发:  输入 w2 {\"hash_list\":[\"<MD5>\"],\"action\":2}"
+            echo "  测试模式:  单独输入 w2 (使用预设数据)"
+            echo ""
+            echo "  完整示例:"
+            echo "    1. md5sum /usr/bin/ls"
+            echo "    2. 菜单输入: w2 {\"hash_list\":[\"abc123\"],\"action\":2}"
+            echo "    3. ./test_grpc.sh 3b  (查看是否生效)"
+            echo "    4. sudo cat /sys/kernel/debug/tracing/trace_pipe  (验证拦截)"
+            echo "    5. sudo bpftool map dump name proc_rules  (查看BPF规则)" ;;
+        *)  echo -e "${RED}未知: $tid${NC}"
+            echo "  有效: 1-22, 23, 29, 3b, w1-w13. 输入 h 看完整菜单." ;;
+    esac
+    echo ""
+}
+
 # ── menu ───────────────────────────────────────────────────────────────
 
 show_menu() {
@@ -443,10 +489,34 @@ case "${1:-menu}" in
         while true; do
             echo -ne "${CYAN}选择接口编号 > ${NC}"
             read -r choice
-            case "$choice" in
+            # Handle "?" / "<id> ?" for per-interface help
+            if [[ "$choice" =~ \?$ ]]; then
+                tid="${choice%%\?*}"
+                tid="${tid%% }"
+                [ -z "$tid" ] && show_test_help "main" || show_test_help "$tid"
+                continue
+            fi
+            # Handle "w2 <json>" direct policy push
+            if [[ "$choice" =~ ^w2[[:space:]]+\{ ]]; then
+                json_data="${choice#w2 }"
+                echo -ne "${CYAN}[直接下发]${NC} 进程策略 ... "
+                output=$(grpcurl -plaintext -emit-defaults                     -import-path "$PROTO_DIR"                     -proto common.proto -proto process_policy.proto                     -d "$json_data"                     -connect-timeout 3 -max-time 10                     "$GRPC_ADDR" process_policy.ProcessPolicyService/UpdateProcessPolicy 2>&1) && rc=0 || rc=1
+                if [ $rc -eq 0 ]; then
+                    echo -e "${GREEN}成功${NC}"
+                    echo "$output" | sed 's/^/  /'
+                    echo -ne "${CYAN}[查询]${NC} 黑名单: "
+                    grpcurl -plaintext -emit-defaults                         -import-path "$PROTO_DIR"                         -proto common.proto -proto process_policy.proto                         -d '{"is_white": 0}'                         -connect-timeout 3 -max-time 5                         "$GRPC_ADDR" process_policy.ProcessPolicyService/GetProcessPolicy 2>&1 | sed 's/^/  /'
+                else
+                    echo -e "${RED}失败${NC}"
+                    echo "$output" | sed 's/^/  /'
+                fi
+                continue
+            fi
+                        case "$choice" in
                 1)  test_01 ;;
                 2)  test_02 ;;
                 3)  test_03 ;;
+                3b|3B) test_03b ;;
                 4)  test_04 ;;
                 5)  test_05 ;;
                 6)  test_06 ;;
@@ -519,7 +589,7 @@ case "${1:-menu}" in
                     test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11; test_w12; test_w13
                     print_result
                     ;;
-	                \?|h|help)
+	                '?'|h|help)
 	                    echo ""
 	                    echo -e "${CYAN}── 只读接口 ──${NC}"
 	                    echo "   1) AgentStatus       2) Config"
@@ -583,38 +653,40 @@ case "${1:-menu}" in
         test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8; test_w9; test_w10; test_w11; test_w12; test_w13
         print_result
         ;;
-    ?|help|-h|--help)
-        echo "用法: $0 [选项]"
+    '?'|help|-h|--help)
+        echo "用法: $0 [编号|命令]"
         echo ""
-        echo "  无参数          交互式菜单"
-        echo "  ?|help|-h      显示此帮助"
-        echo "  all            测试全部只读接口 (1-22)"
-        echo "  write          测试全部写接口 (w1-w13, 需离线模式)"
-        echo "  stream          测试流式接口 (17-18)"
-        echo "  full            测试全部接口（读写+流）"
-        echo "  listen [秒]     监听告警流（默认300秒, Ctrl+C停止）"
-        echo "  1-22            测试指定编号的接口"
-        echo "  w1-w13          测试指定编号的写接口"
-        echo "  menu            显示交互式菜单"
+        echo "═══ 进程黑白名单 ═══"
+        echo "  查看白名单:  $0 3"
+        echo "  查看黑名单:  $0 3b"
+        echo "  直接下发:    菜单输入 w2 {\"hash_list\":[\"<MD5>\"],\"action\":2}"
+        echo "  验证拦截:    sudo cat /sys/kernel/debug/tracing/trace_pipe"
+        echo "  BPF规则:     sudo bpftool map dump name proc_rules"
         echo ""
-        echo "示例:"
-        echo "  $0              进入交互式菜单"
-        echo "  $0 1            直接测试 AgentStatus"
-        echo "  $0 all          测试全部只读接口"
-        echo "  $0 write        测试全部写接口"
-        echo "  $0 listen 60    监听告警流60秒"
+        echo "═══ 只读接口 ═══"
+        echo "  1)AgentStatus 2)Config 3)ProcessPolicy(白) 3b)ProcessPolicy(黑)"
+        echo "  4)PeripheralPolicy 5)IpBlock 6)IpBlack 7)Outreach 8)DirPolicy"
+        echo "  9)Extort 10)TrustDir 11)VirtualPort 12)BackupList 13)Jump"
+        echo "  14)ProcessList 15)PortList 16)UsbDevice 17)PolicyWatch(流)"
+        echo "  18)Alert(流) 19)查询准入 20-22)准入OFF/ON/AUTO 29)ExecutableList"
         echo ""
-        echo "配置:"
-        echo "  GRPC_ADDR        目标地址（默认 127.0.0.1:50051）"
-        echo "  PROTO_DIR        proto 文件目录（自动检测）"
+        echo "═══ 写接口 ═══"
+        echo "  w2)UpdateProcessPolicy(eBPF在线可下发) w1,w3-w13 仅离线"
+        echo ""
+        echo "═══ 快捷命令 ═══"
+        echo "  all 只读 | write 写 | stream 流式 | full 全部 | listen [秒] | menu"
+        echo ""
+        echo "配置: GRPC_ADDR=$GRPC_ADDR  PROTO_DIR=$PROTO_DIR"
         ;;
 
     *)
         # Treat as a number: run that specific test
-        if [[ "$choice" =~ ^w[1-9]$ ]] || [[ "$choice" =~ ^w1[0-3]$ ]]; then
-            "test_$choice"
-        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le 22 ]; then
-            "test_$(printf '%02d' "$choice")"
+        if [[ "$1" =~ ^w[1-9]$ ]] || [[ "$1" =~ ^w1[0-3]$ ]]; then
+            "test_$1"
+        elif [[ "$1" =~ ^3[bB]$ ]]; then
+            test_03b
+        elif [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 22 ]; then
+            "test_$(printf '%02d' "$1")"
         else
             echo "无效参数: $1"
             echo "用法: $0 [?|help|all|write|stream|full|listen|<1-22>|w1-w13|menu]"

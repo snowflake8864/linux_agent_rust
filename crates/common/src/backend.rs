@@ -12,6 +12,8 @@ pub trait SecurityBackend: Send + Sync {
     fn notify_process_update(&self) -> Result<(), String>;
     fn get_process_whitelist(&self) -> Vec<String>;
     fn get_process_blacklist(&self) -> Vec<String>;
+    /// 查询 hash 对应的文件路径（从 md5_map 中获取，eBPF 模式有效）
+    fn lookup_hash_paths(&self, _hash: &str) -> Vec<String> { Vec::new() }
 
     // ── 网络 / 准入 ──
     fn write_tcp_force_ecn(&self, enable: bool) -> Result<(), String>;

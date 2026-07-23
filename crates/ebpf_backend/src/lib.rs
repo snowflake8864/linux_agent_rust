@@ -4,8 +4,7 @@ use log::{info, warn};
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 
 pub mod loader;
 pub mod types;
@@ -56,33 +55,58 @@ impl EbpfBackend {
         let mut proc_loaded = false;
         let mut net_loaded = false;
 
+        info!("[EbpfBackend] ===== 开始加载 eBPF 模块 =====");
+        info!("[EbpfBackend] 配置: file_protect={}, proc_protect={}, net_enabled={}, iface={}, engine={}",
+            file_protect, proc_protect, net_enabled, interface, engine);
+        info!("[EbpfBackend] BPF 对象文件目录: {}", bpf_dir);
+
         if file_protect {
             let path = format!("{}/file_agent.bpf.o", bpf_dir);
+            info!("[EbpfBackend] 检查文件: {}", path);
             if Path::new(&path).exists() {
+                info!("[EbpfBackend] 找到 file_agent.bpf.o，开始加载...");
                 loader.load_file_agent(&path)?;
                 file_loaded = true;
+                info!("[EbpfBackend] ✅ file_agent.bpf.o 加载成功");
             } else {
-                warn!("[EbpfBackend] {} not found, skip file agent", path);
+                warn!("[EbpfBackend] ❌ {} 不存在，跳过 file agent", path);
             }
+        } else {
+            info!("[EbpfBackend] file_protect=false，跳过 file agent");
         }
+
         if proc_protect {
             let path = format!("{}/proc_agent.bpf.o", bpf_dir);
+            info!("[EbpfBackend] 检查文件: {}", path);
             if Path::new(&path).exists() {
+                info!("[EbpfBackend] 找到 proc_agent.bpf.o，开始加载...");
                 loader.load_proc_agent(&path)?;
                 proc_loaded = true;
+                info!("[EbpfBackend] ✅ proc_agent.bpf.o 加载成功");
             } else {
-                warn!("[EbpfBackend] {} not found, skip proc agent", path);
+                warn!("[EbpfBackend] ❌ {} 不存在，跳过 proc agent", path);
             }
+        } else {
+            info!("[EbpfBackend] proc_protect=false，跳过 proc agent");
         }
+
         if net_enabled {
             let path = format!("{}/net_agent.bpf.o", bpf_dir);
+            info!("[EbpfBackend] 检查文件: {}", path);
             if Path::new(&path).exists() {
+                info!("[EbpfBackend] 找到 net_agent.bpf.o，开始加载...");
                 loader.load_net_agent(&path)?;
                 net_loaded = true;
+                info!("[EbpfBackend] ✅ net_agent.bpf.o 加载成功");
             } else {
-                warn!("[EbpfBackend] {} not found, skip net agent", path);
+                warn!("[EbpfBackend] ❌ {} 不存在，跳过 net agent", path);
             }
+        } else {
+            info!("[EbpfBackend] net_enabled=false，跳过 net agent");
         }
+
+        info!("[EbpfBackend] ===== ELF 解析完成: file={}, proc={}, net={} =====",
+            file_loaded, proc_loaded, net_loaded);
 
         Ok(Self {
             loader: Arc::new(Mutex::new(loader)),
@@ -99,31 +123,57 @@ impl EbpfBackend {
     }
 
     pub fn init(&self) -> anyhow::Result<()> {
+        info!("[EbpfBackend] ===== 开始挂载 eBPF 程序到内核 =====");
         let mut loader = self.loader.lock().unwrap();
+
         if self.file_loaded {
+            info!("[EbpfBackend] --- 挂载 file agent ---");
             loader.attach_file_programs()?;
-            info!("[EbpfBackend] File agent initialized");
+            // 启用 file feature switch (index 0)
+            if let Some(bpf) = loader.file_bpf_mut() {
+                ModularLoader::enable_feature(bpf, 0, true)?;
+            }
+            info!("[EbpfBackend] ✅ File agent 挂载完成");
+        } else {
+            info!("[EbpfBackend] file_loaded=false，跳过 file agent 挂载");
         }
+
         if self.proc_loaded {
+            info!("[EbpfBackend] --- 挂载 proc agent ---");
             loader.attach_proc_programs()?;
-            // 创建 ring buffer reader 用于接收 eBPF 进程拦截事件
+            // 启用 proc feature switch (index 1)
             if let Some(bpf) = loader.proc_bpf_mut() {
+                ModularLoader::enable_feature(bpf, 1, true)?;
                 if let Some(map) = bpf.take_map("event_ringbuf") {
                     match RingBuf::try_from(map) {
                         Ok(rb) => {
                             *self.proc_ringbuf.lock().unwrap() = Some(rb);
-                            info!("[EbpfBackend] Proc event ringbuf reader created");
+                            info!("[EbpfBackend] ✅ Proc event ringbuf reader 创建成功");
                         }
-                        Err(e) => warn!("[EbpfBackend] 创建 ringbuf reader 失败: {}", e),
+                        Err(e) => warn!("[EbpfBackend] ❌ 创建 ringbuf reader 失败: {}", e),
                     }
+                } else {
+                    warn!("[EbpfBackend] ❌ 未找到 event_ringbuf map");
                 }
             }
-            info!("[EbpfBackend] Proc agent initialized");
+            info!("[EbpfBackend] ✅ Proc agent 挂载完成");
+        } else {
+            info!("[EbpfBackend] proc_loaded=false，跳过 proc agent 挂载");
         }
+
         if self.net_loaded {
+            info!("[EbpfBackend] --- 挂载 net agent ---");
             loader.attach_net_programs(&self.interface, &self.engine)?;
-            info!("[EbpfBackend] Net agent initialized on {} ({})", self.interface, self.engine);
+            // 启用 net feature switch (index 2) — net_agent 可能没有 feature_switches map，容错
+            if let Some(bpf) = loader.net_bpf_mut() {
+                ModularLoader::enable_feature(bpf, 2, true)?;
+            }
+            info!("[EbpfBackend] ✅ Net agent 挂载完成 ({}@{})", self.interface, self.engine);
+        } else {
+            info!("[EbpfBackend] net_loaded=false，跳过 net agent 挂载");
         }
+
+        info!("[EbpfBackend] ===== 所有 eBPF 程序挂载完毕 =====");
         Ok(())
     }
 
@@ -254,7 +304,7 @@ impl EbpfBackend {
 
     /// 按 hash 删除 proc_rule（从 proc_rules map 中移除所有匹配 inode）
     fn remove_proc_rule_by_hash(&self, hash: &str) -> anyhow::Result<()> {
-        let md5_map = self.md5_map.blocking_read();
+        let md5_map = self.md5_map.read().unwrap();
         if let Some(entries) = md5_map.get(hash) {
             let mut loader = self.loader.lock().unwrap();
             let bpf = loader.proc_bpf_mut().ok_or_else(|| anyhow::anyhow!("Proc agent not loaded"))?;
@@ -272,7 +322,7 @@ impl EbpfBackend {
         let mut pending = self.pending_rules.lock().unwrap();
         if pending.is_empty() { return; }
 
-        let md5_map = self.md5_map.blocking_read();
+        let md5_map = self.md5_map.read().unwrap();
         let mode = 2u8;
         let mut replayed = 0;
         let to_remove: Vec<String> = pending.iter()
@@ -292,9 +342,8 @@ impl EbpfBackend {
         }
     }
 
-    pub async fn scan_executables(&self, dirs: &[String], recursive: bool) -> anyhow::Result<usize> {
-        use tokio::fs;
-        let mut map = self.md5_map.write().await;
+    pub fn scan_executables(&self, dirs: &[String], recursive: bool) -> anyhow::Result<usize> {
+        let mut map = self.md5_map.write().unwrap();
         let mut count = 0;
         for dir in dirs {
             let walker = if recursive { walkdir::WalkDir::new(dir) } else { walkdir::WalkDir::new(dir).max_depth(1) };
@@ -304,7 +353,7 @@ impl EbpfBackend {
                 if let Ok(data) = std::fs::read(path) {
                     if data.len() < 4 || &data[..4] != b"\x7fELF" { continue; }
                 } else { continue; }
-                if let Ok(data) = fs::read(path).await {
+                if let Ok(data) = std::fs::read(path) {
                     let hash = hex::encode(md5::compute(&data).0);
                     use std::os::unix::fs::MetadataExt;
                     if let Ok(md) = std::fs::metadata(path) {
@@ -336,7 +385,7 @@ impl SecurityBackend for EbpfBackend {
         let is_white = data.contains("=0");
         let action = if is_white { 0u8 } else { 1u8 };
         let mode = 2u8; // protect
-        let md5_map = self.md5_map.blocking_read();
+        let md5_map = self.md5_map.read().unwrap();
         let mut applied = 0;
         let mut pending = 0;
 
@@ -380,6 +429,13 @@ impl SecurityBackend for EbpfBackend {
     }
     fn get_process_blacklist(&self) -> Vec<String> {
         self.process_cache.lock().unwrap().1.clone()
+    }
+
+    fn lookup_hash_paths(&self, hash: &str) -> Vec<String> {
+        let md5_map = self.md5_map.read().unwrap();
+        md5_map.get(hash)
+            .map(|entries| entries.iter().map(|e| e.path.clone()).collect())
+            .unwrap_or_default()
     }
 
     // 网络
