@@ -22,6 +22,12 @@ pub struct EbpfBackend {
     file_loaded: bool,
     proc_loaded: bool,
     net_loaded: bool,
+    /// 功能开关 (对应 *_SWITCH 配置)
+    file_switch: bool,
+    proc_switch: bool,
+    /// 防护模式 (对应 *_PROTECT 配置): false=监控, true=保护
+    file_protect: bool,
+    proc_protect: bool,
     pub interface: String,
     pub engine: String,
     /// MD5 → [(dev, inode, path)] 映射（后台扫描填充）
@@ -30,8 +36,10 @@ pub struct EbpfBackend {
     process_cache: Arc<Mutex<(Vec<String>, Vec<String>)>>,
     /// 待下发规则缓存: hash → action (0=white, 1=black), 用于 md5_map 尚未包含该 hash 时暂存
     pending_rules: Arc<Mutex<std::collections::HashMap<String, u8>>>,
-    /// eBPF ring buffer 读取器（从 proc_agent 的 event_ringbuf 读取拦截事件）
+    /// eBPF ring buffer 读取器（从 proc_agent 的 event_ringbuf 读取进程拦截/监控事件）
     proc_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
+    /// eBPF ring buffer 读取器（从 file_agent 的 event_ringbuf 读取文件拦截/监控事件）
+    file_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,8 +52,8 @@ pub struct Md5Entry {
 impl EbpfBackend {
     pub fn new(
         bpf_dir: &str,
-        file_protect: bool,
-        proc_protect: bool,
+        file_enabled: bool, file_switch: bool, file_protect: bool,
+        proc_enabled: bool, proc_switch: bool, proc_protect: bool,
         net_enabled: bool,
         interface: &str,
         engine: &str,
@@ -56,11 +64,10 @@ impl EbpfBackend {
         let mut net_loaded = false;
 
         info!("[EbpfBackend] ===== 开始加载 eBPF 模块 =====");
-        info!("[EbpfBackend] 配置: file_protect={}, proc_protect={}, net_enabled={}, iface={}, engine={}",
-            file_protect, proc_protect, net_enabled, interface, engine);
-        info!("[EbpfBackend] BPF 对象文件目录: {}", bpf_dir);
+        info!("[EbpfBackend] .o加载: file={}, proc={}, net={} | switch: file={}, proc={} | protect: file={}, proc={}",
+            file_enabled, proc_enabled, net_enabled, file_switch, proc_switch, file_protect, proc_protect);
 
-        if file_protect {
+        if file_enabled {
             let path = format!("{}/file_agent.bpf.o", bpf_dir);
             info!("[EbpfBackend] 检查文件: {}", path);
             if Path::new(&path).exists() {
@@ -72,10 +79,10 @@ impl EbpfBackend {
                 warn!("[EbpfBackend] ❌ {} 不存在，跳过 file agent", path);
             }
         } else {
-            info!("[EbpfBackend] file_protect=false，跳过 file agent");
+            info!("[EbpfBackend] FILE_AGENT=0，跳过 file agent");
         }
 
-        if proc_protect {
+        if proc_enabled {
             let path = format!("{}/proc_agent.bpf.o", bpf_dir);
             info!("[EbpfBackend] 检查文件: {}", path);
             if Path::new(&path).exists() {
@@ -87,7 +94,7 @@ impl EbpfBackend {
                 warn!("[EbpfBackend] ❌ {} 不存在，跳过 proc agent", path);
             }
         } else {
-            info!("[EbpfBackend] proc_protect=false，跳过 proc agent");
+            info!("[EbpfBackend] PROC_AGENT=0，跳过 proc agent");
         }
 
         if net_enabled {
@@ -102,7 +109,7 @@ impl EbpfBackend {
                 warn!("[EbpfBackend] ❌ {} 不存在，跳过 net agent", path);
             }
         } else {
-            info!("[EbpfBackend] net_enabled=false，跳过 net agent");
+            info!("[EbpfBackend] NET_AGENT=0，跳过 net agent");
         }
 
         info!("[EbpfBackend] ===== ELF 解析完成: file={}, proc={}, net={} =====",
@@ -110,15 +117,16 @@ impl EbpfBackend {
 
         Ok(Self {
             loader: Arc::new(Mutex::new(loader)),
-            file_loaded,
-            proc_loaded,
-            net_loaded,
+            file_loaded, proc_loaded, net_loaded,
+            file_switch, proc_switch,
+            file_protect, proc_protect,
             interface: interface.to_string(),
             engine: engine.to_string(),
             md5_map: Arc::new(RwLock::new(std::collections::HashMap::new())),
             process_cache: Arc::new(Mutex::new((Vec::new(), Vec::new()))),
             pending_rules: Arc::new(Mutex::new(std::collections::HashMap::new())),
             proc_ringbuf: Arc::new(Mutex::new(None)),
+            file_ringbuf: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -129,9 +137,20 @@ impl EbpfBackend {
         if self.file_loaded {
             info!("[EbpfBackend] --- 挂载 file agent ---");
             loader.attach_file_programs()?;
-            // 启用 file feature switch (index 0)
+            // 启用 file feature switch (index 0) + 创建 ringbuf reader
             if let Some(bpf) = loader.file_bpf_mut() {
-                ModularLoader::enable_feature(bpf, 0, true)?;
+                ModularLoader::enable_feature(bpf, 0, self.file_switch)?;
+                if let Some(map) = bpf.take_map("event_ringbuf") {
+                    match RingBuf::try_from(map) {
+                        Ok(rb) => {
+                            *self.file_ringbuf.lock().unwrap() = Some(rb);
+                            info!("[EbpfBackend] ✅ File event ringbuf reader 创建成功");
+                        }
+                        Err(e) => warn!("[EbpfBackend] ❌ 创建 file ringbuf reader 失败: {}", e),
+                    }
+                } else {
+                    warn!("[EbpfBackend] ⚠ file_agent 无 event_ringbuf map，文件事件不上报");
+                }
             }
             info!("[EbpfBackend] ✅ File agent 挂载完成");
         } else {
@@ -143,7 +162,7 @@ impl EbpfBackend {
             loader.attach_proc_programs()?;
             // 启用 proc feature switch (index 1)
             if let Some(bpf) = loader.proc_bpf_mut() {
-                ModularLoader::enable_feature(bpf, 1, true)?;
+                ModularLoader::enable_feature(bpf, 1, self.proc_switch)?;
                 if let Some(map) = bpf.take_map("event_ringbuf") {
                     match RingBuf::try_from(map) {
                         Ok(rb) => {
@@ -181,102 +200,149 @@ impl EbpfBackend {
     pub fn is_proc_loaded(&self) -> bool { self.proc_loaded }
     pub fn is_net_loaded(&self) -> bool { self.net_loaded }
 
+    /// 运行时更新 feature_switches（服务器下发 SWITCH/PROTECT 时调用）
+    pub fn sync_runtime_switches(&self, file_switch: bool, proc_switch: bool,
+                                  _file_protect: bool, _proc_protect: bool) {
+        let mut loader = self.loader.lock().unwrap();
+        if self.file_loaded {
+            if let Some(bpf) = loader.file_bpf_mut() {
+                let _ = ModularLoader::enable_feature(bpf, 0, file_switch);
+            }
+        }
+        if self.proc_loaded {
+            if let Some(bpf) = loader.proc_bpf_mut() {
+                let _ = ModularLoader::enable_feature(bpf, 1, proc_switch);
+            }
+        }
+        // PROTECT 变更需要刷新已有规则 mode，下次规则同步时自动生效
+    }
+
+    /// 从 ringbuf 中读取所有待处理事件（epoll + 同步读取）
+    fn drain_ringbuf(ringbuf_mutex: &Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>) -> Vec<Vec<u8>> {
+        let mut guard = ringbuf_mutex.lock().unwrap();
+        if let Some(ref mut ringbuf) = *guard {
+            let fd = ringbuf.as_raw_fd();
+            let epoll_fd = unsafe { libc::epoll_create1(0) };
+            if epoll_fd < 0 { return Vec::new(); }
+            let mut ev = libc::epoll_event { events: (libc::EPOLLIN | libc::EPOLLHUP) as u32, u64: 0 };
+            unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut ev); }
+            let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];
+            let n = unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), 1, 500) };
+            unsafe { libc::close(epoll_fd); }
+
+            if n > 0 {
+                let mut items: Vec<Vec<u8>> = Vec::new();
+                while let Some(item) = ringbuf.next() {
+                    items.push(item.to_vec());
+                }
+                items
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 解析 ringbuf 事件
+    fn parse_event(data: &[u8]) -> Option<(&UnifiedEvent, String, String)> {
+        if data.len() < UNIFIED_EVENT_SIZE { return None; }
+        let event: &UnifiedEvent = unsafe { &*(data.as_ptr() as *const UnifiedEvent) };
+        let path = String::from_utf8_lossy(&event.path).trim_end_matches('\0').to_string();
+        let comm = String::from_utf8_lossy(&event.comm).trim_end_matches('\0').to_string();
+        Some((event, path, comm))
+    }
+
     /// 启动 eBPF 进程事件 ring buffer 读取器
     /// 当 eBPF proc_agent 拦截/监控进程时，通过 ringbuf 发送事件，这里读取并上报告警
     pub fn start_proc_event_reader(self: &Arc<Self>) {
-        if !self.proc_loaded {
-            return;
-        }
+        if !self.proc_loaded { return; }
         let rb = self.proc_ringbuf.clone();
         let backend = self.clone();
-
-        // 使用 std thread + epoll 读取 ring buffer（aya RingBuf::next() 是同步方法）
         std::thread::spawn(move || {
             info!("[EbpfBackend] 进程事件 ringbuf reader 已启动");
-            let poll_timeout = 500i32; // ms
-
             loop {
-                let items = {
-                    let mut guard = rb.lock().unwrap();
-                    if let Some(ref mut ringbuf) = *guard {
-                        let fd = ringbuf.as_raw_fd();
-                        // 使用 epoll 等待 ringbuf fd 可读
-                        let epoll_fd = unsafe { libc::epoll_create1(0) };
-                        if epoll_fd < 0 {
-                            drop(guard);
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                            continue;
-                        }
-                        let mut event = libc::epoll_event {
-                            events: (libc::EPOLLIN | libc::EPOLLHUP) as u32,
-                            u64: 0,
-                        };
-                        unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event); }
-                        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];
-                        let n = unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), 1, poll_timeout) };
-                        unsafe { libc::close(epoll_fd); }
-
-                        if n > 0 {
-                            // ringbuf 有数据，同步读取所有待处理事件
-                            let mut items: Vec<Vec<u8>> = Vec::new();
-                            while let Some(item) = ringbuf.next() {
-                                items.push(item.to_vec());
-                            }
-                            items
-                        } else {
-                            Vec::new()
-                        }
-                    } else {
-                        drop(guard);
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                        continue;
-                    }
-                };
-
-                for data in items {
-                    if data.len() >= UNIFIED_EVENT_SIZE {
-                        let event: &UnifiedEvent = unsafe { &*(data.as_ptr() as *const UnifiedEvent) };
-                        let path = String::from_utf8_lossy(&event.path)
-                            .trim_end_matches('\0').to_string();
-                        let comm = String::from_utf8_lossy(&event.comm)
-                            .trim_end_matches('\0').to_string();
-
+                let items = Self::drain_ringbuf(&rb);
+                for data in &items {
+                    if let Some((event, path, comm)) = Self::parse_event(data) {
                         if event.blocked == 1 {
-                            log::warn!(
-                                "[EbpfBackend] 🚫 进程被拦截: path={}, comm={}, pid={}, uid={}",
-                                path, comm, event.pid, event.uid
-                            );
-                            backend.report_blocked_process(event, &path, &comm);
-                        } else if event.blocked == 0 {
-                            log::info!(
-                                "[EbpfBackend] 👀 进程监控(仅记录): path={}, comm={}, pid={}",
-                                path, comm, event.pid
-                            );
+                            log::warn!("[EbpfBackend] 🚫 进程被拦截: path={}, comm={}, pid={}, uid={}",
+                                path, comm, event.pid, event.uid);
+                            backend.report_process_event(event, &path, &comm, 1101, "拦截");
+                        } else {
+                            log::info!("[EbpfBackend] 👀 进程监控: path={}, comm={}, pid={}",
+                                path, comm, event.pid);
+                            backend.report_process_event(event, &path, &comm, 1001, "监控");
                         }
                     }
+                }
+                if items.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
                 }
             }
         });
     }
 
-    /// 上报被拦截进程告警（通过 reporter broadcast → gRPC AlertService）
-    fn report_blocked_process(&self, event: &UnifiedEvent, path: &str, comm: &str) {
+    /// 启动 eBPF 文件事件 ring buffer 读取器
+    /// 当 eBPF file_agent 拦截/监控文件操作时，通过 ringbuf 发送事件，这里读取并上报告警
+    pub fn start_file_event_reader(self: &Arc<Self>) {
+        if !self.file_loaded { return; }
+        let rb = self.file_ringbuf.clone();
+        let backend = self.clone();
+        std::thread::spawn(move || {
+            info!("[EbpfBackend] 文件事件 ringbuf reader 已启动");
+            loop {
+                let items = Self::drain_ringbuf(&rb);
+                for data in &items {
+                    if let Some((event, path, comm)) = Self::parse_event(data) {
+                        if event.blocked == 1 {
+                            log::warn!("[EbpfBackend] 🚫 文件操作被拦截: path={}, comm={}, pid={}",
+                                path, comm, event.pid);
+                            backend.report_file_event(event, &path, &comm, 3101, "拦截");
+                        } else {
+                            log::info!("[EbpfBackend] 👀 文件操作监控: path={}, comm={}, pid={}",
+                                path, comm, event.pid);
+                            backend.report_file_event(event, &path, &comm, 3001, "监控");
+                        }
+                    }
+                }
+                if items.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        });
+    }
+
+    /// 上报进程告警（拦截: n_type=1101, 监控: n_type=1001）
+    fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_type: u16, action: &str) {
         let log = reporter::AuditLogInfo {
             file_path: Some(path.to_string()),
             md5: None,
-            n_type: 1101u16, // 进程黑名单拦截
-            n_level: 2,
+            n_type,
+            n_level: if n_type >= 1100 { 2 } else { 1 },
             n_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             rename_dir: None,
-            notice_remark: Some(format!("eBPF拦截: pid={} uid={}", event.pid, event.uid)),
+            notice_remark: Some(format!("eBPF进程{}: pid={} uid={}", action, event.pid, event.uid)),
             exception_process: Some(comm.to_string()),
-            peripheral_name: None,
-            peripheral_remark: None,
-            peripheral_eid: None,
-            p_param: None,
+            peripheral_name: None, peripheral_remark: None, peripheral_eid: None, p_param: None,
+        };
+        reporter::broadcast_audit_log(&log);
+    }
+
+    /// 上报文件告警（拦截: n_type=3101, 监控: n_type=3001）
+    fn report_file_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_type: u16, action: &str) {
+        let log = reporter::AuditLogInfo {
+            file_path: Some(path.to_string()),
+            md5: None,
+            n_type,
+            n_level: if n_type >= 3100 { 2 } else { 1 },
+            n_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+            rename_dir: None,
+            notice_remark: Some(format!("eBPF文件{}: pid={}", action, event.pid)),
+            exception_process: Some(comm.to_string()),
+            peripheral_name: None, peripheral_remark: None, peripheral_eid: None, p_param: None,
         };
         reporter::broadcast_audit_log(&log);
     }
@@ -384,7 +450,8 @@ impl SecurityBackend for EbpfBackend {
         // eBPF 模式下，path 字段实际存的是 MD5 hash，需要查 md5_map 转换为 inode 后写入 BPF map
         let is_white = data.contains("=0");
         let action = if is_white { 0u8 } else { 1u8 };
-        let mode = 2u8; // protect
+        // mode: 1=监控(MONITOR) 2=保护(PROTECT)，由 PROC_PROTECT/FILE_PROTECT 控制
+        let mode = if self.proc_protect { 2u8 } else { 1u8 };
         let md5_map = self.md5_map.read().unwrap();
         let mut applied = 0;
         let mut pending = 0;
