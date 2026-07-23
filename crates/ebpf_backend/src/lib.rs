@@ -140,6 +140,7 @@ impl EbpfBackend {
             // 启用 file feature switch (index 0) + 创建 ringbuf reader
             if let Some(bpf) = loader.file_bpf_mut() {
                 ModularLoader::enable_feature(bpf, 0, self.file_switch)?;
+                ModularLoader::set_global_mode(bpf, 0, self.file_protect)?;
                 if let Some(map) = bpf.take_map("event_ringbuf") {
                     match RingBuf::try_from(map) {
                         Ok(rb) => {
@@ -163,6 +164,7 @@ impl EbpfBackend {
             // 启用 proc feature switch (index 1)
             if let Some(bpf) = loader.proc_bpf_mut() {
                 ModularLoader::enable_feature(bpf, 1, self.proc_switch)?;
+                ModularLoader::set_global_mode(bpf, 1, self.proc_protect)?;
                 if let Some(map) = bpf.take_map("event_ringbuf") {
                     match RingBuf::try_from(map) {
                         Ok(rb) => {
@@ -200,18 +202,20 @@ impl EbpfBackend {
     pub fn is_proc_loaded(&self) -> bool { self.proc_loaded }
     pub fn is_net_loaded(&self) -> bool { self.net_loaded }
 
-    /// 运行时更新 feature_switches（服务器下发 SWITCH/PROTECT 时调用）
+    /// 运行时更新 feature_switches + global_modes（服务器下发 SWITCH/PROTECT 时调用）
     pub fn sync_runtime_switches(&self, file_switch: bool, proc_switch: bool,
-                                  _file_protect: bool, _proc_protect: bool) {
+                                  file_protect: bool, proc_protect: bool) {
         let mut loader = self.loader.lock().unwrap();
         if self.file_loaded {
             if let Some(bpf) = loader.file_bpf_mut() {
                 let _ = ModularLoader::enable_feature(bpf, 0, file_switch);
+                let _ = ModularLoader::set_global_mode(bpf, 0, file_protect);
             }
         }
         if self.proc_loaded {
             if let Some(bpf) = loader.proc_bpf_mut() {
                 let _ = ModularLoader::enable_feature(bpf, 1, proc_switch);
+                let _ = ModularLoader::set_global_mode(bpf, 1, proc_protect);
             }
         }
         // PROTECT 变更需要刷新已有规则 mode，下次规则同步时自动生效
@@ -265,14 +269,20 @@ impl EbpfBackend {
                 let items = Self::drain_ringbuf(&rb);
                 for data in &items {
                     if let Some((event, path, comm)) = Self::parse_event(data) {
+                        let is_black = event.event_type == 2; // EVENT_PROC
+                        let is_unknown = event.event_type == 3; // EVENT_PROC_UNKNOWN
                         if event.blocked == 1 {
-                            log::warn!("[EbpfBackend] 🚫 黑名单命中(保护): path={}, comm={}, pid={}, uid={}",
+                            let n_type = if is_black { 1102 } else { 1101 }; // 保护+黑/不明
+                            log::warn!("[EbpfBackend] 🚫 {}命中(保护): path={}, comm={}, pid={}, uid={}",
+                                if is_black { "黑名单" } else { "不明进程" },
                                 path, comm, event.pid, event.uid);
-                            backend.report_process_event(event, &path, &comm, 1102, "拦截");
+                            backend.report_process_event(event, &path, &comm, n_type, "拦截");
                         } else {
-                            log::info!("[EbpfBackend] 👀 黑名单命中(监控): path={}, comm={}, pid={}",
+                            let n_type = if is_black { 1002 } else { 1001 }; // 监控+黑/不明
+                            log::info!("[EbpfBackend] 👀 {}命中(监控): path={}, comm={}, pid={}",
+                                if is_black { "黑名单" } else { "不明进程" },
                                 path, comm, event.pid);
-                            backend.report_process_event(event, &path, &comm, 1002, "监控");
+                            backend.report_process_event(event, &path, &comm, n_type, "监控");
                         }
                     }
                 }
