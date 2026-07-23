@@ -85,14 +85,13 @@ async fn main() -> std::io::Result<()> {
         let admission_enabled = cfg.admission.enabled;
         let admission_mode = cfg.admission.mode;
         let admission_switch = cfg.admission_switch;
-        // eBPF 模块开关: [EBPF] 段优先，未设置时回退到 [SERVERINFO] 段
-        let proc_protect = cfg.ebpf_proc_agent || cfg.proc_protect;
-        let file_protect = cfg.ebpf_file_agent || cfg.file_protect;
-        let net_enabled = cfg.ebpf_net_agent || admission_enabled || cfg.open_port_switch;
-        log_info!("[eBPF] 模块开关: proc={} (ebpf={}, srv={}), file={} (ebpf={}, srv={}), net={} (ebpf={}, adm={}, port={})",
-            proc_protect, cfg.ebpf_proc_agent, cfg.proc_protect,
-            file_protect, cfg.ebpf_file_agent, cfg.file_protect,
-            net_enabled, cfg.ebpf_net_agent, admission_enabled, cfg.open_port_switch);
+        // .o 加载由 [EBPF] 段独立控制，服务器 SWITCH/PROTECT 只控制运行时行为
+        let proc_enabled = cfg.ebpf_proc_agent;
+        let file_enabled = cfg.ebpf_file_agent;
+        let net_enabled = cfg.ebpf_net_agent;
+        log_info!("[eBPF] 模块加载: proc={}, file={}, net={}", proc_enabled, file_enabled, net_enabled);
+        log_info!("[eBPF] 运行时开关: proc_switch={}, file_switch={} | 模式: proc_protect={}, file_protect={}",
+            cfg.proc_switch, cfg.file_switch, cfg.proc_protect, cfg.file_protect);
 
         log_info!("后端模式: {}", backend_mode);
 
@@ -117,11 +116,10 @@ async fn main() -> std::io::Result<()> {
                 log_info!("[eBPF] 创建 EbpfBackend (bpf_dir=/opt/osec/bpf)...");
                 let ebpf = Arc::new(EbpfBackend::new(
                     "/opt/osec/bpf",
-                    file_protect,
-                    proc_protect,
+                    file_enabled, cfg.file_switch, cfg.file_protect,
+                    proc_enabled, cfg.proc_switch, cfg.proc_protect,
                     net_enabled,
-                    &cfg.ifcfg,
-                    "xdp",
+                    &cfg.ifcfg, "xdp",
                 ).unwrap_or_else(|e| {
                     log_error!("EbpfBackend 创建失败: {}", e);
                     std::process::exit(1);
@@ -146,8 +144,9 @@ async fn main() -> std::io::Result<()> {
                 });
                 log_info!("eBPF md5_map 后台扫描已启动");
 
-                // 启动 eBPF 进程事件 ring buffer reader（拦截/监控告警上报）
+                // 启动 eBPF 进程/文件事件 ring buffer reader（拦截/监控告警上报）
                 ebpf.start_proc_event_reader();
+                ebpf.start_file_event_reader();
 
                 // 准入控制：ECN-Echo
                 if admission_enabled && admission_mode == 1 {
@@ -197,7 +196,10 @@ async fn main() -> std::io::Result<()> {
                     }
 
                     let ebpf = Arc::new(EbpfBackend::new(
-                        "/opt/osec/bpf", file_protect, proc_protect, net_enabled,
+                        "/opt/osec/bpf",
+                        file_enabled, cfg.file_switch, cfg.file_protect,
+                        proc_enabled, cfg.proc_switch, cfg.proc_protect,
+                        net_enabled,
                         &cfg.ifcfg, "xdp",
                     ).unwrap_or_else(|e| {
                         log_error!("EbpfBackend fallback 失败: {}", e);
@@ -217,6 +219,7 @@ async fn main() -> std::io::Result<()> {
                         let _ = ebpf_fb.scan_executables(&dirs, true);
                     });
                     ebpf.start_proc_event_reader();
+                    ebpf.start_file_event_reader();
 
                     // 准入控制：ECN-Echo
                     if admission_enabled && admission_mode == 1 {
