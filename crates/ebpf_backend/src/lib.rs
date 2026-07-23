@@ -266,11 +266,12 @@ impl EbpfBackend {
                 for data in &items {
                     if let Some((event, path, comm)) = Self::parse_event(data) {
                         if event.blocked == 1 {
-                            log::warn!("[EbpfBackend] 🚫 进程被拦截: path={}, comm={}, pid={}, uid={}",
+                            log::warn!("[EbpfBackend] 🚫 黑名单命中(保护): path={}, comm={}, pid={}, uid={}",
                                 path, comm, event.pid, event.uid);
                             backend.report_process_event(event, &path, &comm, 1101, "拦截");
                         } else {
-                            // 监控事件只上报服务器，不写本地日志
+                            log::info!("[EbpfBackend] 👀 黑名单命中(监控): path={}, comm={}, pid={}",
+                                path, comm, event.pid);
                             backend.report_process_event(event, &path, &comm, 1001, "监控");
                         }
                     }
