@@ -163,8 +163,6 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
 
     if (bpf_probe_read_kernel_str(buf, 256, bprm->filename) < 0) return 0;
 
-    bpf_printk("[PROC] exec check: %s", buf);
-
     // Get the file's inode for proc_rules lookup
     struct file *file = BPF_CORE_READ(bprm, file);
     if (!file) return 0;

@@ -82,6 +82,10 @@ pub struct NetInfoConfig {
     pub admission: AdmissionConfig,
     // 后端模式: "driver" | "ebpf"
     pub backend_mode: String,
+    // eBPF 模块开关: 控制加载哪些 .bpf.o（[EBPF] 段）
+    pub ebpf_file_agent: bool,
+    pub ebpf_proc_agent: bool,
+    pub ebpf_net_agent: bool,
 }
 
 /// 准入功能配置，对应 ini 中的 [ADMISSION] 段
@@ -446,6 +450,17 @@ impl NetInfoConfig {
             .get("BACKEND", "MODE")
             .unwrap_or_else(|| "driver".to_string());
 
+        // [EBPF] — 控制 eBPF 模式下加载哪些模块（.bpf.o）
+        if let Some(value) = ini.get("EBPF", "FILE_AGENT") {
+            config.ebpf_file_agent = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("EBPF", "PROC_AGENT") {
+            config.ebpf_proc_agent = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("EBPF", "NET_AGENT") {
+            config.ebpf_net_agent = matches!(value.trim(), "1");
+        }
+
         config
     }
 
@@ -562,6 +577,12 @@ impl NetInfoConfig {
         // [BACKEND] 段
         writeln!(file, "[BACKEND]")?;
         writeln!(file, "MODE={}", self.backend_mode)?;
+
+        // [EBPF] 段 — eBPF 模块开关
+        writeln!(file, "[EBPF]")?;
+        writeln!(file, "FILE_AGENT={}", self.ebpf_file_agent as u8)?;
+        writeln!(file, "PROC_AGENT={}", self.ebpf_proc_agent as u8)?;
+        writeln!(file, "NET_AGENT={}", self.ebpf_net_agent as u8)?;
 
         Ok(())
     }

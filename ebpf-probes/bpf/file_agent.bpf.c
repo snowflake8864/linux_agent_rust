@@ -319,9 +319,7 @@ int BPF_PROG(enforce_file_open, struct file *file) {
 
 SEC("lsm.s/inode_create")
 int BPF_PROG(enforce_inode_create, struct inode *dir, struct dentry *dentry, umode_t mode) {
-    bpf_printk("inode_create: entered");
     if (!feature_enabled(FEATURE_FILE)) {
-        bpf_printk("inode_create: feature not enabled");
         return 0;
     }
     
@@ -342,11 +340,8 @@ int BPF_PROG(enforce_inode_create, struct inode *dir, struct dentry *dentry, umo
     parent_key.dev = kernel_dev_to_user(kdev);
     parent_key.inode = BPF_CORE_READ(dir, i_ino);
     
-    bpf_printk("inode_create: parent dev=%lu inode=%lu file=%s", parent_key.dev, parent_key.inode, filename);
-    
     struct dir_policy *policy = bpf_map_lookup_elem(&dir_policies, &parent_key);
     if (!policy) {
-        bpf_printk("inode_create: no policy for dev=%lu inode=%lu", parent_key.dev, parent_key.inode);
         return 0;
     }
     
@@ -432,9 +427,7 @@ int BPF_PROG(enforce_inode_unlink, struct inode *dir, struct dentry *dentry) {
 
 SEC("lsm.s/inode_mkdir")
 int BPF_PROG(enforce_inode_mkdir, struct inode *dir, struct dentry *dentry, umode_t mode) {
-    bpf_printk("inode_mkdir: entered");
     if (!feature_enabled(FEATURE_FILE)) {
-        bpf_printk("inode_mkdir: feature not enabled");
         return 0;
     }
     
@@ -452,11 +445,8 @@ int BPF_PROG(enforce_inode_mkdir, struct inode *dir, struct dentry *dentry, umod
     parent_key.dev = kernel_dev_to_user(kdev);
     parent_key.inode = BPF_CORE_READ(dir, i_ino);
     
-    bpf_printk("inode_mkdir: parent dev=%lu inode=%lu file=%s", parent_key.dev, parent_key.inode, filename);
-    
     struct dir_policy *policy = bpf_map_lookup_elem(&dir_policies, &parent_key);
     if (!policy) {
-        bpf_printk("inode_mkdir: no policy for dev=%lu inode=%lu", parent_key.dev, parent_key.inode);
         return 0;
     }
     

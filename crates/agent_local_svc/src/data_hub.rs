@@ -545,17 +545,37 @@ impl AgentDataHub {
         hashes: &[String],
         action: i32,
     ) -> Result<(), String> {
-        let is_white = match action {
-            1 => true,
-            2 => false,
-            _ => return Err(format!("无效 action: {}", action)),
-        };
-        process_mgr::POLICY_MANAGER
-            .lock()
-            .unwrap()
-            .set_policy_process(hashes, is_white);
-        self.notify(PolicyChangeType::ProcessPolicyChanged);
-        Ok(())
+        let mut mgr = process_mgr::POLICY_MANAGER.lock().unwrap();
+        match action {
+            0 => {
+                // 移除：从两个名单中都删除这些 hash
+                let whitelist: Vec<String> = mgr.get_white_list().into_iter()
+                    .filter(|h| !hashes.contains(h)).collect();
+                let blacklist: Vec<String> = mgr.get_black_list().into_iter()
+                    .filter(|h| !hashes.contains(h)).collect();
+                mgr.set_policy_process(&whitelist, true);
+                mgr.set_policy_process(&blacklist, false);
+                drop(mgr);
+                self.notify(PolicyChangeType::ProcessPolicyChanged);
+                return Ok(());
+            }
+            1 | 2 => {
+                let is_white = action == 1;
+                // gRPC 本地调用时合并而非替换：先取现有名单，追加新 hash 后再下发
+                let existing = if is_white { mgr.get_white_list() } else { mgr.get_black_list() };
+                let mut merged: Vec<String> = existing;
+                for h in hashes {
+                    if !merged.contains(h) {
+                        merged.push(h.clone());
+                    }
+                }
+                mgr.set_policy_process(&merged, is_white);
+                drop(mgr);
+                self.notify(PolicyChangeType::ProcessPolicyChanged);
+                Ok(())
+            }
+            _ => Err(format!("无效 action: {}", action)),
+        }
     }
 
     /// Update peripheral (USB) policy. action: 0=移除, 1=白名单, 2=黑名单

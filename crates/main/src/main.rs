@@ -85,26 +85,36 @@ async fn main() -> std::io::Result<()> {
         let admission_enabled = cfg.admission.enabled;
         let admission_mode = cfg.admission.mode;
         let admission_switch = cfg.admission_switch;
-        let proc_protect = cfg.proc_protect;
-        let file_protect = cfg.file_protect;
-        let net_enabled = admission_enabled || cfg.open_port_switch;
+        // eBPF 模块开关: [EBPF] 段优先，未设置时回退到 [SERVERINFO] 段
+        let proc_protect = cfg.ebpf_proc_agent || cfg.proc_protect;
+        let file_protect = cfg.ebpf_file_agent || cfg.file_protect;
+        let net_enabled = cfg.ebpf_net_agent || admission_enabled || cfg.open_port_switch;
+        log_info!("[eBPF] 模块开关: proc={} (ebpf={}, srv={}), file={} (ebpf={}, srv={}), net={} (ebpf={}, adm={}, port={})",
+            proc_protect, cfg.ebpf_proc_agent, cfg.proc_protect,
+            file_protect, cfg.ebpf_file_agent, cfg.file_protect,
+            net_enabled, cfg.ebpf_net_agent, admission_enabled, cfg.open_port_switch);
 
         log_info!("后端模式: {}", backend_mode);
 
         let backend: Arc<dyn SecurityBackend> = match backend_mode.as_str() {
             "ebpf" => {
                 // 纯 eBPF 模式：不加载驱动，直接初始化 eBPF
-                log_info!("进入 eBPF 模式，检测系统能力...");
+                log_info!("===== 进入 eBPF 模式 =====");
+                log_info!("[eBPF] 检测系统能力...");
                 let cap = EbpfCapability::check();
+                log_info!("[eBPF] 内核版本: {} (ok={})", cap.kernel_version, cap.kernel_ok);
+                log_info!("[eBPF] BTF: {}  |  BPF LSM: {}  |  bpffs: {}",
+                    cap.btf_ok, cap.bpf_lsm_ok, cap.bpf_fs_ok);
                 if !cap.all_ok() {
                     for reason in cap.fail_reasons() {
-                        log_error!("eBPF 能力检测失败: {}", reason);
+                        log_error!("[eBPF] ❌ 能力检测失败: {}", reason);
                     }
                     std::process::exit(1);
                 }
-                log_info!("eBPF 能力检测通过");
+                log_info!("[eBPF] ✅ 能力检测通过");
 
-                log_info!("eBPF 使用接口: {}", cfg.ifcfg);
+                log_info!("[eBPF] 使用接口: {}", cfg.ifcfg);
+                log_info!("[eBPF] 创建 EbpfBackend (bpf_dir=/opt/osec/bpf)...");
                 let ebpf = Arc::new(EbpfBackend::new(
                     "/opt/osec/bpf",
                     file_protect,
@@ -118,9 +128,10 @@ async fn main() -> std::io::Result<()> {
                 }));
 
                 if let Err(e) = ebpf.init() {
-                    log_error!("EbpfBackend 初始化失败: {}", e);
+                    log_error!("[eBPF] ❌ EbpfBackend 初始化失败: {}", e);
                     std::process::exit(1);
                 }
+                log_info!("[eBPF] ✅ EbpfBackend 初始化完成，所有 BPF 程序已加载到内核");
 
                 // 扫描系统可执行文件目录，填充 md5_map（hash→inode 映射）
                 // 这是 eBPF 进程黑白名单生效的前提：下发 MD5 规则后需通过 md5_map 查找 inode 写入 BPF map
@@ -128,8 +139,8 @@ async fn main() -> std::io::Result<()> {
                     "/bin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/lib/systemd",
                 ].iter().map(|s| s.to_string()).collect();
                 let ebpf_scan = ebpf.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = ebpf_scan.scan_executables(&scan_dirs, true).await {
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = ebpf_scan.scan_executables(&scan_dirs, true) {
                         log_error!("[EbpfBackend] 扫描可执行文件失败: {}", e);
                     }
                 });
@@ -200,10 +211,10 @@ async fn main() -> std::io::Result<()> {
 
                     // 后台扫描 + ringbuf reader
                     let ebpf_fb = ebpf.clone();
-                    tokio::spawn(async move {
+                    tokio::task::spawn_blocking(move || {
                         let dirs: Vec<String> = ["/bin","/usr/bin","/usr/sbin","/usr/local/bin","/usr/lib/systemd"]
                             .iter().map(|s| s.to_string()).collect();
-                        let _ = ebpf_fb.scan_executables(&dirs, true).await;
+                        let _ = ebpf_fb.scan_executables(&dirs, true);
                     });
                     ebpf.start_proc_event_reader();
 

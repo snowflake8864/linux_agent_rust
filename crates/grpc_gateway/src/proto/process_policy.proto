@@ -18,4 +18,5 @@ message ProcessPolicyFilter {
 message ProcessPolicy {
     repeated string hash_list = 1;
     int32 action = 2;  // 0=移除(未知), 1=白名单, 2=黑名单
+    repeated string path_list = 3;  // 对应 hash 的文件路径（从 md5_map 查询）
 }
