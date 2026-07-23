@@ -270,8 +270,7 @@ impl EbpfBackend {
                                 path, comm, event.pid, event.uid);
                             backend.report_process_event(event, &path, &comm, 1101, "拦截");
                         } else {
-                            log::info!("[EbpfBackend] 👀 进程监控: path={}, comm={}, pid={}",
-                                path, comm, event.pid);
+                            // 监控事件只上报服务器，不写本地日志
                             backend.report_process_event(event, &path, &comm, 1001, "监控");
                         }
                     }
@@ -300,8 +299,6 @@ impl EbpfBackend {
                                 path, comm, event.pid);
                             backend.report_file_event(event, &path, &comm, 3101, "拦截");
                         } else {
-                            log::info!("[EbpfBackend] 👀 文件操作监控: path={}, comm={}, pid={}",
-                                path, comm, event.pid);
                             backend.report_file_event(event, &path, &comm, 3001, "监控");
                         }
                     }
