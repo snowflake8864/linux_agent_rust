@@ -53,6 +53,8 @@ pub struct AuditLogInfo {
 /// SSH 登录由 broadcast_ssh_log 单独处理。
 /// 先落地到 alert.db，再广播给已订阅的在线客户端。
 pub fn broadcast_audit_log(log: &AuditLogInfo) {
+    return; // hj_v3.0: 不写SQLite，不gRPC广播
+    let _ = log;
     let alert_type = match log.n_type {
         // 进程告警
         1001..=1002 | 1101..=1104 => 1, // PROCESS_ALERT
@@ -124,11 +126,13 @@ pub fn broadcast_audit_log(log: &AuditLogInfo) {
         rename_dir: log.rename_dir.clone().unwrap_or_default(),
         p_param: log.p_param.clone().unwrap_or_default(),
         n_type: log.n_type as u32,
-    });
+    }); // unreachable
 }
 
 /// Broadcast SysNetLog (network communication log) to gRPC AlertService.
 pub fn broadcast_net_log(log: &crate::SysNetLog) {
+    return; // hj_v3.0
+    let _ = log; // suppress unused warning after return
     grpc_gateway::notify::broadcast_alert(grpc_gateway::alert::AlertEvent {
         alert_id: uuid::Uuid::new_v4().to_string(),
         r#type: 4, level: 1, timestamp: log.time as u64,
@@ -144,6 +148,8 @@ pub fn broadcast_net_log(log: &crate::SysNetLog) {
 
 /// Broadcast SyslogSshLog (SSH login log) to gRPC AlertService.
 pub fn broadcast_ssh_log(log: &crate::SyslogSshLog) {
+    return; // hj_v3.0
+    let _ = log;
     grpc_gateway::notify::broadcast_alert(grpc_gateway::alert::AlertEvent {
         alert_id: uuid::Uuid::new_v4().to_string(),
         r#type: 0, level: if log.status == 0 { 1 } else { 2 },

@@ -48,7 +48,7 @@ impl StartBashLog for BootManager {
                                 }
                                 */
                                 log_buffer.push(log.clone());
-                                crate::broadcast_audit_log(&log);
+                                // crate::broadcast_audit_log(&log);
                             }
                             None => {
                                 log_error!("file_audit_log_rx 通道已关闭，退出任务。");

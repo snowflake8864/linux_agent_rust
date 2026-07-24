@@ -129,12 +129,12 @@ impl ProcessPolicyManager {
             }
             None => { /* DB_POLICY 未启用，不写 DB */ }
         }
-        if let Err(e) = local_store::known_executables::update_policy_status(&white, true) {
-            log_error!("[known_executables] 同步白名单失败: {}", e);
-        }
-        if let Err(e) = local_store::known_executables::update_policy_status(&black, false) {
-            log_error!("[known_executables] 同步黑名单失败: {}", e);
-        }
+        // if let Err(e) = local_store::known_executables::update_policy_status(&white, true) {
+        //     log_error!("[known_executables] 同步白名单失败: {}", e);
+        // }
+        // if let Err(e) = local_store::known_executables::update_policy_status(&black, false) {
+        //     log_error!("[known_executables] 同步黑名单失败: {}", e);
+        // }
     }
 
     /// 从 SQLite 加载黑白名单到内存（启动时调用，不写 kernel）
