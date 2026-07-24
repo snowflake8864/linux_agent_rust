@@ -135,11 +135,11 @@ impl ProcessAuditHandler {
                         self.boot_manager.get_token().await.as_deref(),
                     ).await {
                         Ok(response) => {
-                            for log in &loginfo { crate::broadcast_audit_log(log); }
+                            // for log in &loginfo { crate::broadcast_audit_log(log); }
                         },
                         Err(err) => {
                             log::info!("[process_audit] 上传告警到服务器失败(离线): {}, 本地广播", err);
-                            for log in &loginfo { crate::broadcast_audit_log(log); }
+                            // for log in &loginfo { crate::broadcast_audit_log(log); }
                         },
                     }
 
@@ -261,9 +261,9 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
                 0i32 // 未知
             }
         };
-        if let Err(e) = local_store::known_executables::upsert(&hash, &p_dir, policy_status) {
-            log_error!("[known_executables] upsert 失败: {}", e);
-        }
+        // if let Err(e) = local_store::known_executables::upsert(&hash, &p_dir, policy_status) {
+            // log_error!("[known_executables] upsert 失败: {}", e);
+        // }
     }
 
     // 写入内核进程事件缓存，供 gRPC ProcessList 补充短生命周期进程
