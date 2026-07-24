@@ -50,7 +50,7 @@ struct proc_rule {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
+    __uint(max_entries, 65536);
     __type(key, struct proc_key);
     __type(value, struct proc_rule);
 } proc_rules SEC(".maps");
@@ -154,7 +154,7 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
     if (!feature_enabled(FEATURE_PROC)) {
         return 0;
     }
-    
+
     __u32 zero = 0;
     struct path_buffer *scratch = bpf_map_lookup_elem(&path_scratch, &zero);
     if (!scratch) return 0;
@@ -178,11 +178,6 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
 
     // Try inode-based rule first
     struct proc_rule *rule = bpf_map_lookup_elem(&proc_rules, &key);
-    if (rule) {
-        bpf_printk("[PROC] INODE RULE HIT: %s dev=%llu inode=%llu",
-                   buf, key.dev, key.inode);
-        bpf_printk("[PROC]   action=%u mode=%u", rule->action, rule->mode);
-    }
 
     // Fallback to pattern-based rules
     if (!rule) {
@@ -190,15 +185,12 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
         __builtin_memcpy(pkey.pattern, buf, sizeof(pkey.pattern));
         struct pattern_rule *prule = bpf_map_lookup_elem(&proc_patterns, &pkey);
         if (prule) {
-            bpf_printk("[PROC] PATTERN RULE HIT (full path): %s action=%u mode=%u",
-                       buf, prule->action, prule->mode);
             __u8 effective_mode = resolve_mode(prule->mode, FEATURE_PROC);
             if (effective_mode == MODE_PROTECT && prule->action == ACTION_DENY) {
                 bpf_printk("[PROC] BLOCKED (pattern): %s", buf);
                 send_monitor_event(EVENT_PROC, buf, 1);
                 return -EPERM;
             }
-            bpf_printk("[PROC] MONITOR (pattern): %s", buf);
             send_monitor_event(EVENT_PROC, buf, 0);
             return 0;
         }
@@ -217,15 +209,12 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
             __builtin_memcpy(pkey.pattern, last_slash + 1, sizeof(pkey.pattern));
             struct pattern_rule *prule = bpf_map_lookup_elem(&proc_patterns, &pkey);
             if (prule) {
-                bpf_printk("[PROC] PATTERN RULE HIT (basename): %s action=%u mode=%u",
-                           last_slash + 1, prule->action, prule->mode);
                 __u8 effective_mode = resolve_mode(prule->mode, FEATURE_PROC);
                 if (effective_mode == MODE_PROTECT && prule->action == ACTION_DENY) {
                     bpf_printk("[PROC] BLOCKED (basename): %s", buf);
                     send_monitor_event(EVENT_PROC, buf, 1);
                     return -EPERM;
                 }
-                bpf_printk("[PROC] MONITOR (basename): %s", buf);
                 send_monitor_event(EVENT_PROC, buf, 0);
                 return 0;
             }
@@ -238,28 +227,27 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
             // 白名单 → 放行，不产生事件
             return 0;
         }
-        // 黑名单 (ACTION_DENY)
+        // blacklist (ACTION_DENY)
         __u8 effective_mode = resolve_mode(rule->mode, FEATURE_PROC);
         if (effective_mode == MODE_PROTECT) {
-            bpf_printk("[PROC] BLOCKED (黑名单): %s", buf);
+            bpf_printk("[PROC] BLOCKED(black): %s", buf);
             send_monitor_event(EVENT_PROC, buf, 1);
             return -EPERM;
         }
-        bpf_printk("[PROC] MONITOR (黑名单): %s", buf);
+        bpf_printk("[PROC] MONITOR(black): %s", buf);
         send_monitor_event(EVENT_PROC, buf, 0);
         return 0;
     }
 
-    // 未命中任何规则 → 不明进程
-    // 使用 global_modes 决定监控/保护
+    // unknown process - use global_modes
     {
         __u8 effective_mode = resolve_mode(0, FEATURE_PROC);
         if (effective_mode == MODE_PROTECT) {
-            bpf_printk("[PROC] BLOCKED (不明): %s", buf);
+            bpf_printk("[PROC] BLOCKED(unknown): %s", buf);
             send_monitor_event(EVENT_PROC_UNKNOWN, buf, 1);
             return -EPERM;
         }
-        bpf_printk("[PROC] MONITOR (不明): %s", buf);
+        // monitor: silent, only ringbuf
         send_monitor_event(EVENT_PROC_UNKNOWN, buf, 0);
     }
 
