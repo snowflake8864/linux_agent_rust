@@ -272,17 +272,19 @@ impl EbpfBackend {
                         let is_black = event.event_type == 2; // EVENT_PROC
                         let is_unknown = event.event_type == 3; // EVENT_PROC_UNKNOWN
                         if event.blocked == 1 {
-                            let n_type = if is_black { 1102 } else { 1101 }; // 保护+黑/不明
+                            let n_type = if is_black { 1102 } else { 1101 };
                             log::warn!("[EbpfBackend] 🚫 {}命中(保护): path={}, comm={}, pid={}, uid={}",
                                 if is_black { "黑名单" } else { "不明进程" },
                                 path, comm, event.pid, event.uid);
                             backend.report_process_event(event, &path, &comm, n_type, "拦截");
-                        } else {
-                            let n_type = if is_black { 1002 } else { 1001 }; // 监控+黑/不明
-                            log::info!("[EbpfBackend] 👀 {}命中(监控): path={}, comm={}, pid={}",
-                                if is_black { "黑名单" } else { "不明进程" },
+                        } else if is_black {
+                            // 黑名单+监控：打印本地日志 + 上报
+                            log::info!("[EbpfBackend] 👀 黑名单命中(监控): path={}, comm={}, pid={}",
                                 path, comm, event.pid);
-                            backend.report_process_event(event, &path, &comm, n_type, "监控");
+                            backend.report_process_event(event, &path, &comm, 1002, "监控");
+                        } else {
+                            // 不明进程+监控：只上报不打印
+                            backend.report_process_event(event, &path, &comm, 1001, "监控");
                         }
                     }
                 }
