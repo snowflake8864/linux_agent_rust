@@ -934,14 +934,12 @@ pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
 
 
     let binary_name = "MagicArmorAgent";
-    let (current_arch, need_hot_upgrade) = if cfg!(target_arch = "x86_64") {
-        ("x86_64", Path::new(temp_dir).join(format!("{}.x86_64", binary_name)).exists())
-    } else if cfg!(target_arch = "aarch64") {
-        ("aarch64", Path::new(temp_dir).join(format!("{}.aarch64", binary_name)).exists())
-    } else {
-        log_info!("[upgrade] ⚠️ 当前架构 {} 不支持自动热升级二进制，将当作普通脚本更新处理", std::env::consts::ARCH);
-        ("unknown", false)
-    };
+    let running_arch = detect_runtime_arch();
+    let need_hot_upgrade = Path::new(temp_dir).join(format!("{}.{}", binary_name, running_arch)).exists();
+    let current_arch = if need_hot_upgrade { running_arch.as_str() } else { "unknown" };
+    if !need_hot_upgrade {
+        log_info!("[upgrade] ⚠️ 升级包中未找到 {}.{} 的热升级二进制，将当作普通脚本更新处理", binary_name, running_arch);
+    }
 
     if need_hot_upgrade {
         log_info!("[upgrade] 🎯 检测到更新包包含新版本主程序 MagicArmorAgent.{}，开始完整热升级", current_arch);
@@ -2995,6 +2993,30 @@ async fn is_process_running(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 运行时检测 CPU 架构（uname -m），不受编译目标影响
+fn detect_runtime_arch() -> String {
+    match std::process::Command::new("uname").arg("-m").output() {
+        Ok(output) => {
+            let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            match arch.as_str() {
+                "x86_64" | "amd64" => "x86_64".to_string(),
+                "aarch64" | "arm64"  => "aarch64".to_string(),
+                other => {
+                    log::warn!("[upgrade] uname -m 返回未知架构: {}，回退到编译目标 {}", other, std::env::consts::ARCH);
+                    match std::env::consts::ARCH {
+                        "x86_64" | "aarch64" => std::env::consts::ARCH.to_string(),
+                        a => a.to_string(),
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            log::error!("[upgrade] uname -m 执行失败: {}，使用编译目标架构", e);
+            std::env::consts::ARCH.to_string()
+        }
+    }
+}
+
 pub async fn stop_agent() -> Result<(), String> {
     log_info!("[upgrade] 开始停止 agent_manager / MagicArmorAgent / osec_cli 服务");
 
@@ -3205,14 +3227,7 @@ pub async fn replace_binary_with_arch_check(temp_dir: &str) -> Result<(), String
 
     log_info!("[upgrade] 开始替换二进制，临时目录: {}", temp_dir);
 
-    let current_arch = if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else {
-        log_info!("[upgrade] ❌ 不支持的架构: {}", std::env::consts::ARCH);
-        return Err(format!("不支持的架构: {}", std::env::consts::ARCH));
-    };
+    let current_arch = detect_runtime_arch();
     log_info!("[upgrade] 当前系统架构: {}", current_arch);
 
     let expected_filename = format!("{}.{}", binary_name, current_arch);
