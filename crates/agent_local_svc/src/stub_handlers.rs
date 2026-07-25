@@ -131,7 +131,10 @@ impl JumpService for JumpServiceImpl {
         Ok(Response::new(status))
     }
 
-    async fn execute_ip_jump(&self, req: Request<IpJumpRequest>) -> Result<Response<IpJumpResponse>, Status> {
+    async fn execute_ip_jump(&self, _req: Request<IpJumpRequest>) -> Result<Response<IpJumpResponse>, Status> {
+        // IP Jump 已关闭
+        Err(Status::unavailable("IP Jump is disabled"))
+        /*
         require_offline()?;
         let r = req.into_inner();
         let (source_ip, target_ip, gateway, status, reason) = self
@@ -148,6 +151,7 @@ impl JumpService for JumpServiceImpl {
             status: status as u32,
             reason,
         }))
+        */
     }
 
     async fn execute_pw_jump(&self, req: Request<PwJumpRequest>) -> Result<Response<PwJumpResponse>, Status> {

@@ -16,10 +16,10 @@ static CURRENT_TOKEN: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::
 /// 同时触发一次 newestJumpInfo 拉取：这是启动后有效 token 的第一个时机。
 pub fn update_token(token: String) {
     *CURRENT_TOKEN.lock().unwrap() = Some(token);
-    // token 就绪后立即异步担发一次 fetch，更新跳变状态缓存并持久化
-    tokio::spawn(async move {
-        AgentDataHub::new().fetch_newest_jump_info().await;
-    });
+    // IP Jump 已关闭，不再触发 fetch_newest_jump_info
+    //tokio::spawn(async move {
+    //    AgentDataHub::new().fetch_newest_jump_info().await;
+    //});
 }
 
 /// 断线时调用：尝试切离线 + 如果真正切了且准入模式是 AUTO 则重新触发自动检测。

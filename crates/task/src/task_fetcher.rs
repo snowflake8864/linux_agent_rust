@@ -185,9 +185,9 @@ impl TaskFetcher {
             cfg.ifcfg.clone()
         };
 
-        let ip_jump_manager = IpJumpManager::new(&ifcfg); 
-        let base_url_owned = base_url.to_string();
-        let token_for_cleanup = token.clone();
+        let ip_jump_manager = IpJumpManager::new(&ifcfg);
+        //let base_url_owned = base_url.to_string();
+        //let token_for_cleanup = token.clone();
 /*
         // Clone the Arc for the periodic cleanup task
         let manager_clone = Arc::clone(&ip_jump_manager.clone());
@@ -657,6 +657,7 @@ pub async fn run(
                 match net_client.post_data_async(&url, "", Duration::from_secs(100), token_str).await {
                     Ok(response) => {
                         set_online();
+                        log_info!("gettask response: {}", response);
                         let parsed: Value = match serde_json::from_str(&response) {
                             Ok(parsed) => parsed,
                             Err(e) => {
@@ -687,7 +688,7 @@ pub async fn run(
                                 }
                             }
                         } else if parsed["code"] == "401" {
-                            log_info!("token 无效");
+                            log_info!("token 无效:{:?}",token_str);
                             return Err("token 无效".to_string());
                         } else {
                             let code = parsed["code"].as_str().unwrap_or("unknown");
@@ -750,7 +751,7 @@ async fn handle_task(&mut self, task_type: TaskTypeEnum) -> Result<(), String> {
         TaskTypeEnum::TaskUpdateUUI => self.task_update_uuid(34).await,
         TaskTypeEnum::TaskOutReachDetect => self.task_outreach_detect(35).await,
         TaskTypeEnum::TaskPwJump => self.task_down_pwjump(36).await,
-        TaskTypeEnum::TaskIpJump => self.task_down_ipjump(37).await,
+        //TaskTypeEnum::TaskIpJump => self.task_down_ipjump(37).await,
         TaskTypeEnum::TaskSystemBackup => self.task_get_system_backups(38).await,
         TaskTypeEnum::TaskSystemRollback => self.task_system_rollback(39).await,
         TaskTypeEnum::TaskNtpSyncAt => self.task_ntp_sync(40).await,
