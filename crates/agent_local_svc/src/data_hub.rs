@@ -330,6 +330,8 @@ impl AgentDataHub {
         try_update!(@u32  baseline_time,          updates.baseline_time);
         try_update!(@u32  hardware_time,          updates.hardware_time);
 
+        try_update!(@bool grpc_alert_push, updates.alert_push);
+
         if let Some(ref s) = updates.logipport {
             if !s.is_empty() {
                 new_cfg.log_ip_port = Some(s.clone());

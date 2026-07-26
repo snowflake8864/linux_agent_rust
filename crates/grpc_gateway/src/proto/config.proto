@@ -41,6 +41,7 @@ message ConfigData {
     optional uint32 baseline_time = 27;
     optional uint32 hardware_time = 28;
     optional string logipport = 29;
+    optional bool alert_push = 30;
 }
 
 message ConfigResponse {
