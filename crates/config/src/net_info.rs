@@ -70,6 +70,7 @@ pub struct NetInfoConfig {
     pub grpc_addr: String,
     pub grpc_dev_addr: String,
     pub grpc_batch_size: usize,
+    pub grpc_allow_config_write_online: bool,
     pub vigilixav_enabled: bool,
     pub vigilixav_host: String,
     pub vigilixav_port: u16,
@@ -400,6 +401,9 @@ impl NetInfoConfig {
         } else {
             config.grpc_batch_size = 100;
         }
+        if let Some(value) = ini.get("GRPC", "ALLOW_CONFIG_WRITE_ONLINE") {
+            config.grpc_allow_config_write_online = matches!(value.trim(), "1");
+        }
 
         // [VIGILIXAV] — VigilixAV 病毒扫描配置
         if let Some(value) = ini.get("VIGILIXAV", "ENABLED") {
@@ -551,6 +555,7 @@ impl NetInfoConfig {
         writeln!(file, "GRPC_ADDR={}", self.grpc_addr)?;
         writeln!(file, "DEV_GRPC_ADDR={}", self.grpc_dev_addr)?;
         writeln!(file, "BATCH_SIZE={}", self.grpc_batch_size)?;
+        writeln!(file, "ALLOW_CONFIG_WRITE_ONLINE={}", self.grpc_allow_config_write_online as u8)?;
         writeln!(file, "[VIGILIXAV]")?;
         writeln!(file, "ENABLED={}", self.vigilixav_enabled as u8)?;
         writeln!(file, "HOST={}", self.vigilixav_host)?;

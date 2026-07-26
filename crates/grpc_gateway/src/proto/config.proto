@@ -9,37 +9,38 @@ service ConfigService {
 }
 
 // 对应 Rust: config::net_info::NetInfoConfig
-// 字段名与 JSON key 一致，与 update_config_from_json 使用的 key 对齐
+// ★ 所有字段均为 optional：未设置的字段 gRPC 不更新（真正部分更新）
+// 字段名与 JSON key 一致（snake_case，兼容服务器下发的 JSON key）
 message ConfigData {
-    uint32 crontime = 1;
-    bool file_switch = 2;
-    bool proc_switch = 3;
-    bool extortion_protect = 4;
-    bool extortion_switch = 5;
-    bool file_protect = 6;
-    bool self_protect_switch = 7;
-    bool open_port_switch = 8;
-    bool dynamic_switch = 9;
-    bool proc_protect = 10;
-    bool usb_protect = 11;
-    bool usb_switch = 12;
-    bool syslog_inner_switch = 13;
-    bool syslog_outer_switch = 14;
-    bool syslog_dns_switch = 15;
-    bool internet_switch = 16;
-    bool syslog_process_switch = 17;
-    bool syslog_login_switch = 18;
-    bool outreach_switch = 19;
-    bool baseline_switch = 20;
-    bool hardware_switch = 21;
-    uint32 logproto = 22;
-    uint32 logsent = 23;
-    uint32 debug_switch = 24;
-    uint32 module_switch = 25;
-    uint32 outreach_time = 26;
-    uint32 baseline_time = 27;
-    uint32 hardware_time = 28;
-    string logipport = 29;
+    optional uint32 crontime = 1;
+    optional bool file_switch = 2;
+    optional bool proc_switch = 3;
+    optional bool extortion_protect = 4;
+    optional bool extortion_switch = 5;
+    optional bool file_protect = 6;
+    optional bool self_protect_switch = 7;
+    optional bool open_port_switch = 8;
+    optional bool dynamic_switch = 9;
+    optional bool proc_protect = 10;
+    optional bool usb_protect = 11;
+    optional bool usb_switch = 12;
+    optional bool syslog_inner_switch = 13;
+    optional bool syslog_outer_switch = 14;
+    optional bool syslog_dns_switch = 15;
+    optional bool internet_switch = 16;
+    optional bool syslog_process_switch = 17;
+    optional bool syslog_login_switch = 18;
+    optional bool outreach_switch = 19;
+    optional bool baseline_switch = 20;
+    optional bool hardware_switch = 21;
+    optional uint32 logproto = 22;
+    optional uint32 logsent = 23;
+    optional uint32 debug_switch = 24;
+    optional uint32 module_switch = 25;
+    optional uint32 outreach_time = 26;
+    optional uint32 baseline_time = 27;
+    optional uint32 hardware_time = 28;
+    optional string logipport = 29;
 }
 
 message ConfigResponse {

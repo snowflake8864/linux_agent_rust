@@ -36,6 +36,8 @@ pub struct EbpfBackend {
     process_cache: Arc<Mutex<(Vec<String>, Vec<String>)>>,
     /// 待下发规则缓存: hash → action (0=white, 1=black), 用于 md5_map 尚未包含该 hash 时暂存
     pending_rules: Arc<Mutex<std::collections::HashMap<String, u8>>>,
+    /// 已下发规则缓存: hash → action (0=white, 1=black), 用于模式切换时刷新 BPF proc_rules
+    applied_rules: Arc<Mutex<std::collections::HashMap<String, u8>>>,
     /// eBPF ring buffer 读取器（从 proc_agent 的 event_ringbuf 读取进程拦截/监控事件）
     proc_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
     /// eBPF ring buffer 读取器（从 file_agent 的 event_ringbuf 读取文件拦截/监控事件）
@@ -125,6 +127,7 @@ impl EbpfBackend {
             md5_map: Arc::new(RwLock::new(std::collections::HashMap::new())),
             process_cache: Arc::new(Mutex::new((Vec::new(), Vec::new()))),
             pending_rules: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            applied_rules: Arc::new(Mutex::new(std::collections::HashMap::new())),
             proc_ringbuf: Arc::new(Mutex::new(None)),
             file_ringbuf: Arc::new(Mutex::new(None)),
         })
@@ -202,23 +205,45 @@ impl EbpfBackend {
     pub fn is_proc_loaded(&self) -> bool { self.proc_loaded }
     pub fn is_net_loaded(&self) -> bool { self.net_loaded }
 
-    /// 运行时更新 feature_switches + global_modes（服务器下发 SWITCH/PROTECT 时调用）
+    /// 运行时更新 feature_switches + global_modes + 刷新已有 proc_rules
     pub fn sync_runtime_switches(&self, file_switch: bool, proc_switch: bool,
                                   file_protect: bool, proc_protect: bool) {
-        let mut loader = self.loader.lock().unwrap();
-        if self.file_loaded {
-            if let Some(bpf) = loader.file_bpf_mut() {
-                let _ = ModularLoader::enable_feature(bpf, 0, file_switch);
-                let _ = ModularLoader::set_global_mode(bpf, 0, file_protect);
+        {
+            let mut loader = self.loader.lock().unwrap();
+            if self.file_loaded {
+                if let Some(bpf) = loader.file_bpf_mut() {
+                    let _ = ModularLoader::enable_feature(bpf, 0, file_switch);
+                    let _ = ModularLoader::set_global_mode(bpf, 0, file_protect);
+                }
+            }
+            if self.proc_loaded {
+                if let Some(bpf) = loader.proc_bpf_mut() {
+                    let _ = ModularLoader::enable_feature(bpf, 1, proc_switch);
+                    let _ = ModularLoader::set_global_mode(bpf, 1, proc_protect);
+                }
             }
         }
-        if self.proc_loaded {
-            if let Some(bpf) = loader.proc_bpf_mut() {
-                let _ = ModularLoader::enable_feature(bpf, 1, proc_switch);
-                let _ = ModularLoader::set_global_mode(bpf, 1, proc_protect);
+        // 无条件刷新所有 proc_rules，确保模式与 global_modes 一致
+        self.refresh_all_proc_rules(proc_protect);
+    }
+
+    /// 用新 mode 重写所有已下发的 proc_rules BPF 条目
+    fn refresh_all_proc_rules(&self, protect: bool) {
+        let mode: u8 = if protect { 2 } else { 1 };
+        let applied = self.applied_rules.lock().unwrap();
+        let md5_map = self.md5_map.read().unwrap();
+        let mut refreshed = 0;
+
+        for (hash, &action) in applied.iter() {
+            if let Some(entries) = md5_map.get(hash) {
+                for e in entries {
+                    let _ = self.add_proc_rule_by_inode(e.dev, e.inode, action, mode);
+                }
+                refreshed += 1;
             }
         }
-        // PROTECT 变更需要刷新已有规则 mode，下次规则同步时自动生效
+        log::info!("[EbpfBackend] 🔄 模式切换: 已刷新 {} 条 proc_rules (mode={})", refreshed,
+            if protect { "PROTECT" } else { "MONITOR" });
     }
 
     /// 从 ringbuf 中读取所有待处理事件（epoll + 同步读取）
@@ -472,6 +497,7 @@ impl SecurityBackend for EbpfBackend {
                 let h = if let Some(idx) = stripped.find(' ') { &stripped[idx+1..] } else { stripped };
                 let _ = self.remove_proc_rule_by_hash(h);
                 self.pending_rules.lock().unwrap().remove(h);
+                self.applied_rules.lock().unwrap().remove(h);
                 continue;
             } else if let Some(idx) = line.find('=') {
                 &line[..idx]
@@ -481,6 +507,7 @@ impl SecurityBackend for EbpfBackend {
                 for e in entries {
                     let _ = self.add_proc_rule_by_inode(e.dev, e.inode, action, mode);
                 }
+                self.applied_rules.lock().unwrap().insert(hash.to_string(), action);
                 applied += 1;
             } else {
                 // md5_map 尚未包含此 hash，暂存到 pending_rules，等扫描填充后补写
@@ -581,6 +608,13 @@ impl SecurityBackend for EbpfBackend {
     }
     fn write_dpi_true_process(&self, _data: &str, _clear: bool) -> Result<(), String> {
         warn!("[EbpfBackend] DPI true process not supported");
+        Ok(())
+    }
+
+    // ── 运行时开关同步到 BPF maps ──
+    fn sync_switches(&self, file_switch: bool, proc_switch: bool,
+                     file_protect: bool, proc_protect: bool) -> Result<(), String> {
+        self.sync_runtime_switches(file_switch, proc_switch, file_protect, proc_protect);
         Ok(())
     }
 
