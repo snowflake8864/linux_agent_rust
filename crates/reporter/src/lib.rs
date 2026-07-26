@@ -1,13 +1,24 @@
 // crates/reporter/src/lib.rs
 use serde::Serialize;
+use std::sync::{Mutex, OnceLock};
+use tokio::sync::mpsc;
+use logging::{log_info, log_warn, log_error};
 pub mod file_audit;
 pub mod process_audit;
 pub mod fake_port_audit;
 pub mod self_protect;
 pub mod netlink_msg;
-pub mod net_service_log; 
+pub mod net_service_log;
 pub mod log_worker;
 pub use log_worker::StartBashLog;
+
+/// 全局 mpsc 发送端：用于将告警推送到 log_worker → HTTP /v1/alertupload
+pub static AUDIT_LOG_TX: OnceLock<Mutex<Option<mpsc::Sender<AuditLogInfo>>>> = OnceLock::new();
+
+/// 由 main.rs 初始化：注册 mpsc sender 以供 eBPF 等后端上报告警
+pub fn set_audit_log_tx(tx: mpsc::Sender<AuditLogInfo>) {
+    let _ = AUDIT_LOG_TX.set(Mutex::new(Some(tx)));
+}
 pub mod build_json;
 pub use build_json::{build_alert_log_json,build_auto_process_list_json,build_batch_process_edr_json, build_open_port_json, build_self_protect_alert_log_json};
 
@@ -51,7 +62,38 @@ pub struct AuditLogInfo {
 /// Convert AuditLogInfo to AlertEvent and broadcast to gRPC AlertService.
 /// 只广播三类：进程告警、文件审计、USB插拔。其余 n_type 不推 gRPC。
 /// SSH 登录由 broadcast_ssh_log 单独处理。
+/// 将告警推送到 HTTP 上报通道（log_worker → POST /v1/alertupload）
+/// eBPF 等后端直接调用此函数，将告警同时送入 HTTP 上报队列
+pub fn send_to_http_upload(log: &AuditLogInfo) {
+    if let Some(mutex) = AUDIT_LOG_TX.get() {
+        if let Ok(guard) = mutex.lock() {
+            if let Some(ref tx) = *guard {
+                match tx.try_send(log.clone()) {
+                    Ok(_) => {
+                        log_info!("[上报] ✅ 告警已推入上报队列 n_type={} path={:?}",
+                            log.n_type, log.file_path);
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        log_warn!("[上报] ⚠️ 上报队列满，丢弃告警 n_type={}", log.n_type);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        log_error!("[上报] ❌ 上报通道已关闭");
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn broadcast_audit_log(log: &AuditLogInfo) {
+    // 检查 ALERT_PUSH 开关：0=不推 gRPC，1=推（默认）
+    let push_enabled = config::net_info::NETINFO_CONFIG.lock()
+        .map(|c| c.grpc_alert_push)
+        .unwrap_or(true);
+    if !push_enabled {
+        return;
+    }
+
     let alert_type = match log.n_type {
         // 进程告警
         1001..=1002 | 1101..=1104 => 1, // PROCESS_ALERT

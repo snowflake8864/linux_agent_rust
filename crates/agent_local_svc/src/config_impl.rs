@@ -47,6 +47,7 @@ impl ConfigService for ConfigServiceImpl {
             baseline_time:         Some(cfg.baseline_time),
             hardware_time:         Some(cfg.hardware_time),
             logipport:             Some(cfg.log_ip_port.clone().unwrap_or_default()),
+            alert_push:            Some(cfg.grpc_alert_push),
         }))
     }
 

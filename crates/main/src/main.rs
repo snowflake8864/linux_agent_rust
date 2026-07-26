@@ -75,6 +75,7 @@ async fn main() -> std::io::Result<()> {
 
     // 创建通信通道
     let (file_audit_log_tx, file_audit_log_rx) = mpsc::channel::<AuditLogInfo>(512);
+    reporter::set_audit_log_tx(file_audit_log_tx.clone());
     let (token_tx, token_rx) = mpsc::channel::<String>(8);
     let (host_is_offline_tx, host_is_offline_rx) = mpsc::channel::<bool>(8);
 

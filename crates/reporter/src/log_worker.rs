@@ -48,6 +48,8 @@ impl StartBashLog for BootManager {
                                 }
                                 */
                                 log_buffer.push(log.clone());
+                                log_info!("[上报] 📥 收到告警 n_type={} buffer={}/512",
+                                    log.n_type, log_buffer.len());
                                 crate::broadcast_audit_log(&log);
                             }
                             None => {
@@ -68,7 +70,10 @@ impl StartBashLog for BootManager {
                                         Duration::from_secs(10),
                                         self.get_token().await.as_deref(),
                                     ).await {
-                                        Ok(response) => {/*log_info!("服务器响应: {}", response)*/},
+                                        Ok(response) => {
+                                            log_info!("[上报] ✅ HTTP POST /v1/alertupload 成功({}条) resp={}",
+                                                log_buffer.len(), response);
+                                        },
                                         Err(err) => eprintln!("发送指标失败: {}", err),
                                     }
 

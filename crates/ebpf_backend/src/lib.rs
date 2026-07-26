@@ -362,7 +362,8 @@ impl EbpfBackend {
             exception_process: Some(comm.to_string()),
             peripheral_name: None, peripheral_remark: None, peripheral_eid: None, p_param: None,
         };
-        reporter::broadcast_audit_log(&log);
+        reporter::broadcast_audit_log(&log);   // gRPC 推送
+        reporter::send_to_http_upload(&log);    // HTTP 上报到服务器
     }
 
     /// 上报文件告警（拦截: n_type=3101, 监控: n_type=3001）
@@ -379,7 +380,8 @@ impl EbpfBackend {
             exception_process: Some(comm.to_string()),
             peripheral_name: None, peripheral_remark: None, peripheral_eid: None, p_param: None,
         };
-        reporter::broadcast_audit_log(&log);
+        reporter::broadcast_audit_log(&log);   // gRPC 推送
+        reporter::send_to_http_upload(&log);   // HTTP 上报到服务器
     }
 
     // ── 内部 helper ──
