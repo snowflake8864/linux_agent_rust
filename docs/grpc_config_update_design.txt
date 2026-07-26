@@ -1,0 +1,229 @@
+================================================================================
+  gRPC ConfigService::UpdateConfig 完整下发方案（driver + eBPF）
+  日期: 2026-07-26
+  分支: greatwall-guard_v3.0
+================================================================================
+
+一、背景
+═══════════════════════════════════════════════════════════════════════════════
+
+服务器触发的 task_down_conf（TaskTypeEnum::TaskDownConf=6）路径：
+  task_fetcher::run() → handle_task() → task_down_conf()
+    → update_config_from_json()
+      ├── 1. 克隆 old_cfg
+      ├── 2. 从 JSON 更新字段到 new_cfg
+      ├── 3. to_ini() 写入 net_info.ini
+      └── 4. apply_config_diff(&old, &new) → 下发到内核
+
+现有 gRPC 路径：
+  ConfigService::UpdateConfig() → ConfigServiceImpl::update_config()
+    → require_offline()?   ← 在线模式拒绝
+    → data_hub.update_config()
+      ├── 1. proto → JSON map
+      ├── 2. 更新 NETINFO_CONFIG 字段
+      └── 3. to_ini() 写入 net_info.ini
+      ❌ 缺失 apply_config_diff！内核层不下发。
+
+
+二、核心差距分析
+═══════════════════════════════════════════════════════════════════════════════
+
+apply_config_diff 负责的操作及 driver/ebpf 差异：
+
+| 操作                        | driver 模式                  | eBPF 模式                      |
+|-----------------------------|------------------------------|--------------------------------|
+| self_protect_switch         | nl_sock.send_uint32(0x103)  | skip + warn（nl_sock 为 None） |
+| open_port_switch            | write /proc/osec/net_rules  | SecurityBackend stub → Ok(())  |
+| dynamic_switch              | write block_switch procfs   | SecurityBackend stub → Ok(())  |
+| defense_switch (12 flag合成) | write /proc/osec/defense    | SecurityBackend stub → Ok(())  |
+| proc_switch / syslog_process| nl_sock.send_message(0x702) | skip + warn（nl_sock 为 None） |
+| file_switch 关              | pattern_mgr.clear_protect   | pattern_mgr（backend无关）     |
+| extortion_protect 关        | pattern_mgr.clear_exiport   | pattern_mgr（backend无关）     |
+| switch/protect→BPF maps     | 无（driver不需要）           | sync_switches → BPF maps  ★新增 |
+
+★ 新增的安全后端方法 sync_switches()：
+  - 定义在 SecurityBackend trait（common/src/backend.rs）
+  - 默认空操作（driver模式不需要）
+  - EbpfBackend 对接已有的 sync_runtime_switches() 方法
+    → 写入 BPF maps: feature_switches + global_modes
+
+
+三、方案设计
+═══════════════════════════════════════════════════════════════════════════════
+
+3.1 整体架构
+
+                    ┌──────────────────────┐
+                    │  pub fn apply_config_diff(old, new)   │  ← 独立函数
+                    │  (crates/task/src/task_fetcher.rs)    │
+                    └──────────┬───────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                │
+         server路径        gRPC路径         直接调用
+    (task_fetcher.rs)  (data_hub.rs)      (均可复用)
+
+3.2 资源全局化
+  两个 TaskFetcher 独占的资源通过 OnceLock 全局化：
+
+  pub static GLOBAL_NL_SOCK: OnceLock<Mutex<Option<NlSockInfo>>> = OnceLock::new();
+  pub static GLOBAL_PATTERN_MGR: OnceLock<Arc<Mutex<PatternRulesMgr>>> = OnceLock::new();
+
+  在 TaskFetcher::new() 中注册，apply_config_diff 独立函数通过全局单例访问。
+
+3.3 INI 开关设计
+  [GRPC] 段新增字段：ALLOW_CONFIG_WRITE_ONLINE
+
+  值=0（默认）：在线 gRPC 调用 UpdateConfig 返回 PERMISSION_DENIED
+  值=1        ：在线 gRPC 调用 UpdateConfig 允许执行，完整下发
+
+  开关在 NetInfoConfig 中的字段：grpc_allow_config_write_online: bool
+
+
+四、文件改动清单
+═══════════════════════════════════════════════════════════════════════════════
+
+4.1 crates/config/src/net_info.rs
+──────────────────────────────────
+  新增字段:
+    pub grpc_allow_config_write_online: bool,   // 默认 false
+
+  from_ini():
+    读取 [GRPC] ALLOW_CONFIG_WRITE_ONLINE，值=="1" 为 true
+
+  to_ini():
+    写入 [GRPC] ALLOW_WRITE_ONLINE={0|1}
+
+4.2 crates/common/src/backend.rs
+──────────────────────────────────
+  SecurityBackend trait 新增方法:
+    fn sync_switches(&self, _file_switch: bool, _proc_switch: bool,
+                     _file_protect: bool, _proc_protect: bool) -> Result<(), String> {
+        Ok(())  // 默认空操作（driver模式）
+    }
+
+4.3 crates/ebpf_backend/src/lib.rs
+──────────────────────────────────
+  EbpfBackend 实现 sync_switches():
+    fn sync_switches(&self, file_switch, proc_switch,
+                     file_protect, proc_protect) -> Result<(), String> {
+        self.sync_runtime_switches(file_switch, proc_switch, file_protect, proc_protect);
+        Ok(())
+    }
+  对接已有的 sync_runtime_switches() → BPF maps: feature_switches + global_modes
+
+4.4 crates/task/src/task_fetcher.rs
+──────────────────────────────────
+  (a) 新增全局单例（文件顶部，impl TaskFetcher 之前）:
+      pub static GLOBAL_NL_SOCK: OnceLock<Mutex<Option<NlSockInfo>>> = OnceLock::new();
+      pub static GLOBAL_PATTERN_MGR: OnceLock<Arc<Mutex<PatternRulesMgr>>> = OnceLock::new();
+
+  (b) TaskFetcher::new() 注册全局资源（构造 TaskFetcher 之前）:
+      GLOBAL_NL_SOCK.set(Mutex::new(nl_sock.clone())).ok();
+      GLOBAL_PATTERN_MGR.set(pattern_mgr.clone()).ok();
+
+  (c) 提取独立函数 pub fn apply_config_diff(old, new)（impl TaskFetcher 之前）:
+      - 比较 old vs new 各字段
+      - SelfProtect/NetLogPolicy: 通过 GLOBAL_NL_SOCK 操作（None 时 skip+warn）
+      - VirtualOpenPort/DefenseSwitch/NetBlockSwitch: 通过 common::backend::with_backend()
+      - file/extortion switch 关: 通过 GLOBAL_PATTERN_MGR
+      - 尾调用 sync_switches() 将 switch/protect 写入 ebpf BPF maps
+
+  (d) TaskFetcher::apply_config_diff 方法改为委托:
+      委托给独立函数后，同步 self.prev_* 状态追踪
+
+  (e) TaskFetcher::update_config_from_json 不变（仍调用 self.apply_config_diff）
+
+4.5 crates/task/src/lib.rs
+──────────────────────────────────
+  新增导出:
+    pub use task_fetcher::apply_config_diff;
+
+4.6 crates/agent_local_svc/src/config_impl.rs
+──────────────────────────────────
+  update_config() 改为条件检查:
+    let allow_online = NETINFO_CONFIG.lock().unwrap().grpc_allow_config_write_online;
+    if !allow_online {
+        require_offline()?;  // 开关关→保持旧行为
+    }
+    // 开关开→跳过离线检查，直接执行
+
+4.7 crates/agent_local_svc/src/data_hub.rs
+──────────────────────────────────
+  update_config() 新增:
+    let old_cfg = guard.clone();                    // 修改前保存
+    ...
+    task::apply_config_diff(&old_cfg, &new_cfg)?;   // 下发到内核
+
+
+五、行为矩阵
+═══════════════════════════════════════════════════════════════════════════════
+
+                          ALLOW_CONFIG_WRITE_ONLINE=0    ALLOW_CONFIG_WRITE_ONLINE=1
+                          ──────────────────────────    ──────────────────────────
+  在线模式 - 服务器路径   完整下发 ✅（不受影响）         完整下发 ✅（不受影响）
+  在线模式 - gRPC 路径    PERMISSION_DENIED（旧行为）   完整下发 ✅（新增能力）
+  离线模式 - 服务器路径   不可用（服务器不可达）          不可用（服务器不可达）
+  离线模式 - gRPC 路径    完整下发 ✅（补齐了diff）      完整下发 ✅（补齐了diff）
+
+  "完整下发" = ini 写入 + apply_config_diff → 内核/BPF
+
+
+六、安全性考量
+═══════════════════════════════════════════════════════════════════════════════
+
+  (1) 默认值 0 = 安全保守，已部署系统升级后行为不变
+  (2) 开关=1 时，在线模式下服务器下发和 gRPC 下发可能并发
+      → NETINFO_CONFIG 的 Mutex 保证原子性
+      → 最后写者胜出（last-write-wins）
+      → 两者都是可信来源（服务器/本地管理员），竞态可接受
+  (3) eBPF 模式下 nl_sock 为 None
+      → SelfProtect、NetLogPolicy 操作被优雅跳过（log warn）
+      → sync_switches() 正常写入 BPF maps
+  (4) 其他 gRPC 写操作（task_local、ip_policy、protection_mode 等）
+      不受此改动影响，仍由 require_offline() 统一管控
+
+
+七、不变量（不受影响的路径）
+═══════════════════════════════════════════════════════════════════════════════
+
+  ✅ task_fetcher::run() 主循环
+  ✅ task_down_conf() HTTP 请求逻辑
+  ✅ handle_task() 分发逻辑
+  ✅ notify_policy_change() 通知机制
+  ✅ ConfigData proto 定义
+  ✅ ConfigServiceImpl 接口签名
+  ✅ 其他 gRPC 写服务的 require_offline() 行为
+  ✅ ConfigService::GetConfig（只读，始终可用）
+
+
+八、验证方法
+═══════════════════════════════════════════════════════════════════════════════
+
+  编译验证:
+    cargo build --workspace  ← 通过（0 error）
+
+  功能验证:
+    1. 默认行为不变:
+       - ALLOW_CONFIG_WRITE_ONLINE 不存在或=0
+       - 在线 gRPC UpdateConfig → PERMISSION_DENIED
+
+    2. 开启在线写入:
+       - 在 net_info.ini 中设 ALLOW_CONFIG_WRITE_ONLINE=1
+       - 重启 agent
+       - 在线 gRPC UpdateConfig → 成功，配置写入 ini + 内核
+
+    3. 服务器路径:
+       - task_down_conf 功能完全不变
+
+    4. Driver 模式:
+       - cat /proc/osec/defense_switch → 反映 gRPC 修改
+
+    5. eBPF 模式:
+       - gRPC UpdateConfig 不报错（nl_sock skip）
+       - BPF maps 正确更新（sync_switches）
+       - 日志中有 "[EbpfBackend]" stub 警告（后续完善）
+
+================================================================================
+  生成: Claude Code | 分支: greatwall-guard_v3.0 | 日期: 2026-07-26
+================================================================================

@@ -3,6 +3,7 @@ use std::sync::{Mutex, LazyLock, atomic::{AtomicBool, AtomicU8, Ordering}};
 use logging::{log_info, log_error};
 use common::backend;
 use grpc_gateway::policy_watch::PolicyChangeType;
+use task;
 use grpc_gateway::dir_policy::DirectionScanRule;
 use grpc_gateway::extort_policy::ExtortProtectRule;
 use grpc_gateway::jump::JumpStatus;
@@ -280,85 +281,66 @@ impl AgentDataHub {
     // Write methods — offline only (caller must check require_offline first)
     // ========================================================================
 
-    /// Update config and persist to ini.
+    /// Update config and persist to ini. Only fields present (Some) in the proto are updated.
+    /// Fields left as None keep their current values — true partial update.
     pub fn update_config(
         &self,
         updates: &grpc_gateway::config::ConfigData,
     ) -> Result<(), String> {
-        let mut map = serde_json::Map::new();
-        let v = updates.clone();
+        let mut guard = config::net_info::NETINFO_CONFIG.lock().unwrap();
+        let old_cfg = guard.clone();
+        let mut new_cfg = old_cfg.clone();
 
-        // Build JSON map from proto fields (only non-default values)
-        if v.crontime != 0 { map.insert("crontime".into(), serde_json::Value::from(v.crontime)); }
-        map.insert("file_switch".into(), v.file_switch.into());
-        map.insert("proc_switch".into(), v.proc_switch.into());
-        map.insert("extortion_protect".into(), v.extortion_protect.into());
-        map.insert("extortion_switch".into(), v.extortion_switch.into());
-        map.insert("file_protect".into(), v.file_protect.into());
-        map.insert("self_protect_switch".into(), v.self_protect_switch.into());
-        map.insert("open_port_switch".into(), v.open_port_switch.into());
-        map.insert("dynamic_switch".into(), v.dynamic_switch.into());
-        map.insert("proc_protect".into(), v.proc_protect.into());
-        map.insert("usb_protect".into(), v.usb_protect.into());
-        map.insert("usb_switch".into(), v.usb_switch.into());
-        map.insert("syslog_inner_switch".into(), v.syslog_inner_switch.into());
-        map.insert("syslog_outer_switch".into(), v.syslog_outer_switch.into());
-        map.insert("syslog_dns_switch".into(), v.syslog_dns_switch.into());
-        map.insert("internet_switch".into(), v.internet_switch.into());
-        map.insert("syslog_process_switch".into(), v.syslog_process_switch.into());
-        map.insert("syslog_login_switch".into(), v.syslog_login_switch.into());
-        map.insert("outreach_switch".into(), v.outreach_switch.into());
-        map.insert("baseline_switch".into(), v.baseline_switch.into());
-        map.insert("hardware_switch".into(), v.hardware_switch.into());
-        if v.logproto != 0 { map.insert("logproto".into(), serde_json::Value::from(v.logproto)); }
-        if v.logsent != 0 { map.insert("logsent".into(), serde_json::Value::from(v.logsent)); }
-        if v.debug_switch != 0 { map.insert("debug_switch".into(), serde_json::Value::from(v.debug_switch)); }
-        if v.module_switch != 0 { map.insert("module_switch".into(), serde_json::Value::from(v.module_switch)); }
-        if v.outreach_time != 0 { map.insert("outreach_time".into(), serde_json::Value::from(v.outreach_time)); }
-        if v.baseline_time != 0 { map.insert("baseline_time".into(), serde_json::Value::from(v.baseline_time)); }
-        if v.hardware_time != 0 { map.insert("hardware_time".into(), serde_json::Value::from(v.hardware_time)); }
-        if !v.logipport.is_empty() {
-            map.insert("logipport".into(), serde_json::Value::from(v.logipport.as_str()));
+        // ── macro: only update if field is Some ──
+        macro_rules! try_update {
+            (@bool $field:ident, $v:expr) => {
+                if let Some(val) = $v { new_cfg.$field = val; }
+            };
+            (@u32 $field:ident, $v:expr) => {
+                if let Some(val) = $v { new_cfg.$field = val; }
+            };
         }
 
-        // Apply to NETINFO_CONFIG
-        let mut guard = config::net_info::NETINFO_CONFIG.lock().unwrap();
-        let mut new_cfg = guard.clone();
+        try_update!(@u32  cron_time,              updates.crontime);
+        try_update!(@bool file_switch,            updates.file_switch);
+        try_update!(@bool proc_switch,            updates.proc_switch);
+        try_update!(@bool extortion_protect,      updates.extortion_protect);
+        try_update!(@bool extortion_switch,       updates.extortion_switch);
+        try_update!(@bool file_protect,           updates.file_protect);
+        try_update!(@bool self_protect_switch,    updates.self_protect_switch);
+        try_update!(@bool open_port_switch,       updates.open_port_switch);
+        try_update!(@bool dynamic_switch,         updates.dynamic_switch);
+        try_update!(@bool proc_protect,           updates.proc_protect);
+        try_update!(@bool usb_protect,            updates.usb_protect);
+        try_update!(@bool usb_switch,             updates.usb_switch);
+        try_update!(@bool syslog_inner_switch,    updates.syslog_inner_switch);
+        try_update!(@bool syslog_outer_switch,    updates.syslog_outer_switch);
+        try_update!(@bool syslog_dns_switch,      updates.syslog_dns_switch);
+        try_update!(@bool internet_switch,        updates.internet_switch);
+        try_update!(@bool syslog_process_switch,  updates.syslog_process_switch);
+        try_update!(@bool syslog_login_switch,    updates.syslog_login_switch);
+        try_update!(@bool outreach_switch,        updates.outreach_switch);
+        try_update!(@bool baseline_switch,        updates.baseline_switch);
+        try_update!(@bool hardware_switch,        updates.hardware_switch);
+        try_update!(@u32  log_proto,              updates.logproto);
+        try_update!(@u32  log_sent,               updates.logsent);
+        try_update!(@u32  cli_port,               updates.debug_switch);
+        try_update!(@u32  module_switch,          updates.module_switch);
+        try_update!(@u32  outreach_time,          updates.outreach_time);
+        try_update!(@u32  baseline_time,          updates.baseline_time);
+        try_update!(@u32  hardware_time,          updates.hardware_time);
 
-        if let Ok(val) = get_u32(&map, "crontime") { new_cfg.cron_time = val; }
-        if let Ok(val) = get_bool(&map, "file_switch") { new_cfg.file_switch = val; }
-        if let Ok(val) = get_bool(&map, "proc_switch") { new_cfg.proc_switch = val; }
-        if let Ok(val) = get_bool(&map, "extortion_protect") { new_cfg.extortion_protect = val; }
-        if let Ok(val) = get_bool(&map, "extortion_switch") { new_cfg.extortion_switch = val; }
-        if let Ok(val) = get_bool(&map, "file_protect") { new_cfg.file_protect = val; }
-        if let Ok(val) = get_bool(&map, "self_protect_switch") { new_cfg.self_protect_switch = val; }
-        if let Ok(val) = get_bool(&map, "open_port_switch") { new_cfg.open_port_switch = val; }
-        if let Ok(val) = get_bool(&map, "dynamic_switch") { new_cfg.dynamic_switch = val; }
-        if let Ok(val) = get_bool(&map, "proc_protect") { new_cfg.proc_protect = val; }
-        if let Ok(val) = get_bool(&map, "usb_protect") { new_cfg.usb_protect = val; }
-        if let Ok(val) = get_bool(&map, "usb_switch") { new_cfg.usb_switch = val; }
-        if let Ok(val) = get_bool(&map, "syslog_inner_switch") { new_cfg.syslog_inner_switch = val; }
-        if let Ok(val) = get_bool(&map, "syslog_outer_switch") { new_cfg.syslog_outer_switch = val; }
-        if let Ok(val) = get_bool(&map, "syslog_dns_switch") { new_cfg.syslog_dns_switch = val; }
-        if let Ok(val) = get_bool(&map, "internet_switch") { new_cfg.internet_switch = val; }
-        if let Ok(val) = get_bool(&map, "syslog_process_switch") { new_cfg.syslog_process_switch = val; }
-        if let Ok(val) = get_bool(&map, "syslog_login_switch") { new_cfg.syslog_login_switch = val; }
-        if let Ok(val) = get_bool(&map, "outreach_switch") { new_cfg.outreach_switch = val; }
-        if let Ok(val) = get_bool(&map, "baseline_switch") { new_cfg.baseline_switch = val; }
-        if let Ok(val) = get_bool(&map, "hardware_switch") { new_cfg.hardware_switch = val; }
-        if let Ok(val) = get_u32(&map, "logproto") { new_cfg.log_proto = val; }
-        if let Ok(val) = get_u32(&map, "logsent") { new_cfg.log_sent = val; }
-        if let Ok(val) = get_u32(&map, "debug_switch") { new_cfg.cli_port = val; }
-        if let Ok(val) = get_u32(&map, "module_switch") { new_cfg.module_switch = val; }
-        if let Ok(val) = get_u32(&map, "outreach_time") { new_cfg.outreach_time = val; }
-        if let Ok(val) = get_u32(&map, "baseline_time") { new_cfg.baseline_time = val; }
-        if let Ok(val) = get_u32(&map, "hardware_time") { new_cfg.hardware_time = val; }
-        if let Some(s) = map.get("logipport").and_then(|v| v.as_str()) {
-            if !s.is_empty() { new_cfg.log_ip_port = Some(s.to_string()); }
+        if let Some(ref s) = updates.logipport {
+            if !s.is_empty() {
+                new_cfg.log_ip_port = Some(s.clone());
+            }
         }
 
         *guard = new_cfg.clone();
         let _ = guard.to_ini(&format!("{}/net_info.ini", guard.app_path));
+
+        // 下发配置变更到内核（driver走netlink+procfs，eBPF走BPF maps）
+        task::apply_config_diff(&old_cfg, &new_cfg)?;
 
         self.notify(PolicyChangeType::ConfigChanged);
         Ok(())
@@ -923,7 +905,16 @@ pub fn get_bool(
     key: &str,
 ) -> Result<bool, String> {
     map.get(key)
-        .and_then(|v| v.as_number().and_then(|n| n.as_u64()))
-        .map(|n| n != 0)
+        .and_then(|v| {
+            // proto bool → JSON true/false
+            if let Some(b) = v.as_bool() {
+                return Some(b);
+            }
+            // server HTTP JSON → 0/1
+            if let Some(n) = v.as_number().and_then(|n| n.as_u64()) {
+                return Some(n != 0);
+            }
+            None
+        })
         .ok_or_else(|| format!("Missing or invalid field: {}", key))
 }

@@ -30,6 +30,13 @@ pub trait SecurityBackend: Send + Sync {
     fn write_process_dpi_rules(&self, data: &str, clear: bool) -> Result<(), String>;
     fn write_dpi_true_process(&self, data: &str, clear: bool) -> Result<(), String>;
 
+    // ── 运行时开关同步 ──
+    /// eBPF模式：将file/proc的switch和protect写入BPF maps；driver模式：空操作
+    fn sync_switches(&self, _file_switch: bool, _proc_switch: bool,
+                     _file_protect: bool, _proc_protect: bool) -> Result<(), String> {
+        Ok(())
+    }
+
     // ── 其他 /proc/osec ──
     fn emit_docker_event(&self, kind: u8, flag: u8, pid: i32) -> Result<(), String>;
     fn clear_docker_rt(&self) -> Result<(), String>;
