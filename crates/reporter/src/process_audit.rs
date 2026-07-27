@@ -27,7 +27,7 @@ impl ProcessAuditHandler {
         data: &[u8],
         data_len: u32,
     ) -> Result<(), String> {
-        log::info!("[process_audit] 收到内核进程事件, data_len={}", data_len);
+        //log::info!("[process_audit] 收到内核进程事件, data_len={}", data_len);
         if data_len < mem::size_of::<NetlinkNetlog>() as u32 {
             return Err(format!(
                 "数据长度太小，期望至少 {} 字节，实际是 {} 字节",
