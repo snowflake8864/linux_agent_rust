@@ -688,7 +688,8 @@ pub async fn run(
                                 }
                             }
                         } else if parsed["code"] == "401" {
-                            log_info!("token 无效:{:?}, url:{}",token_str, url);
+                            let msg = parsed["msg"].as_str().unwrap_or("Unknown error");
+                            log_info!("token 无效:{:?}, msg:{}",token_str, msg);
                             return Err("token 无效".to_string());
                         } else {
                             let code = parsed["code"].as_str().unwrap_or("unknown");
