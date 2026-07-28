@@ -113,7 +113,8 @@ impl StartVirusScanGrpcService for BootManager {
                     }
                 };
 
-                let pool = Arc::new(VigilixAVConnectionPool::new(connection, timeout, vigilixav_pool_size));
+                let quarantine_dir = "/opt/vigilixav/quarantine".to_string();
+                let pool = Arc::new(VigilixAVConnectionPool::new(connection, timeout, vigilixav_pool_size, quarantine_dir));
 
                 // 首次 ping 可能因 vigilixd 还在加载病毒库而失败，重试多次（总计约 30s）
                 let mut last_err = String::new();

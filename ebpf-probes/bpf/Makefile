@@ -21,14 +21,17 @@ endif
 ARCH ?= $(DEFAULT_ARCH)
 ifeq ($(ARCH),arm64)
 	ARCH_DEFINE := __TARGET_ARCH_arm64
+	ARCH_DIR := aarch64
 else
 	ARCH_DEFINE := __TARGET_ARCH_x86
+	ARCH_DIR := x86_64
 endif
 
 CFLAGS := -target bpf -D$(ARCH_DEFINE) -I. -O2 -g -c
 
-# Output directory for BPF objects (matches xtask behavior)
-BPF_OUT_DIR := ../../bpf
+# Output directory: bpf_arch/{x86_64,aarch64}/
+# override: make BPF_OUT_DIR=/path/to/other
+BPF_OUT_DIR ?= ../../bpf_arch/$(ARCH_DIR)
 
 # Source files - modular version
 SOURCES := common_maps.bpf.c file_agent.bpf.c proc_agent.bpf.c net_agent.bpf.c
