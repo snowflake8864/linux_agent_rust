@@ -5,6 +5,7 @@ use tokio::time::{interval, Duration, Interval,sleep, timeout};
 use std::pin::Pin;
 use std::future::Future;
 use serde_json::Value;
+use serde::Deserialize;
 use net_client::core::NetClient;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -29,6 +30,8 @@ use tokio::task;
 use serde_json::json;
 use tokio::net::UnixStream;
 use zip::ZipArchive;
+use zip::write::{FileOptions, ZipWriter};
+use zip::CompressionMethod;
 use snapman::{create_snapshot, restore_snapshot};
 use rules_jump_mgr::{IpJumpManager, PasswordManager, IpJumpConfig, PutIpJumpInfo, PutPwJumpInfo};
 // 在线/离线状态由 agent_local_svc::start_connectivity_monitor 统一管理，task_fetcher 不再设置
@@ -82,6 +85,14 @@ pub struct TaskFetcher {
 }
 use num_derive::FromPrimitive; // 支持从整数到枚举的转换
 use num_traits::FromPrimitive;
+/// 对应 C++ SAMPLE_INFO 结构体，用于 getdraw 接口返回的样本文件列表
+#[derive(Debug, Clone, Deserialize)]
+struct SampleItem {
+    aid: i32,
+    p_dir: String,
+    p_hash: String,
+}
+
 #[derive(Debug, FromPrimitive)]
 enum TaskTypeEnum {
     TaskUploadProcess = 0,
@@ -138,6 +149,34 @@ fn ip_str_to_u32(ip: &str) -> Result<u32, String> {
     let parsed = ip.parse::<Ipv4Addr>().map_err(|e| e.to_string())?;
     Ok(u32::from_be_bytes(parsed.octets()))
 }
+/// 将单个文件打包成 zip，用于上传样本
+/// 对应 C++ 的 zip_files(zip_file, &path, 1, "")
+fn zip_single_file(src_path: &str, zip_path: &str) -> Result<(), String> {
+    let file = std::fs::File::create(zip_path)
+        .map_err(|e| format!("Cannot create zip file {}: {}", zip_path, e))?;
+    let mut zip = ZipWriter::new(file);
+    let options = FileOptions::default()
+        .compression_method(CompressionMethod::Stored) // 无密码，不压缩
+        .unix_permissions(0o644);
+
+    let file_name = Path::new(src_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("Invalid file path: {}", src_path))?;
+
+    zip.start_file(file_name, options)
+        .map_err(|e| format!("zip start_file error: {}", e))?;
+    let data = std::fs::read(src_path)
+        .map_err(|e| format!("Cannot read file {}: {}", src_path, e))?;
+    std::io::Write::write_all(&mut zip, &data)
+        .map_err(|e| format!("zip write error: {}", e))?;
+    zip.finish()
+        .map_err(|e| format!("zip finish error: {}", e))?;
+
+    log_info!("zip_single_file: {} -> {}", src_path, zip_path);
+    Ok(())
+}
+
 impl TaskFetcher {
     pub fn new(base_url: &str, token: Option<String>, pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>, nl_sock: Option<NlSockInfo>) -> Self 
     {
@@ -174,6 +213,8 @@ impl TaskFetcher {
         api_interface.insert("uploadBackup".to_string(), "v1/uploadBackup".to_string());
         api_interface.insert("getOutreachDetect".to_string(), "v1/getOutreachDetect".to_string());
         api_interface.insert("getNtpConf".to_string(), "v1/getNtpConf".to_string());
+        api_interface.insert("getdraw".to_string(), "/v1/getdraw".to_string());
+        api_interface.insert("uploaddraw".to_string(), "/v1/uploaddraw".to_string());
         let net_client = NetClient::new(
             Some(base_url.to_string()),
             true,
@@ -1911,9 +1952,98 @@ async fn task_usb_upload(&self, task_type: u64) -> Result<(), String> {
     Ok(())
 }
 // 处理 TASK_UPLOADSAMPLE 任务
+// 业务逻辑（对应 C++ CEntClientNetAgent::DoTaskUploadSample）：
+//   1. POST "" -> /v1/getdraw  获取需上传的样本文件列表
+//   2. 逐个 zip -> POST multipart -> /v1/uploaddraw 上传
+//   3. 清理临时 zip 文件
 async fn task_upload_sample(&self, task_type: u64) -> Result<(), String> {
-    println!("Processing TASK_UPLOADSAMPLE...");
-    // 上传样本的处理
+    log_info!("Processing TASK_UPLOADSAMPLE...");
+
+    self.report_task_completion(task_type).await
+        .map_err(|e| e.to_string())?;
+
+    // ── Step 1: 获取样本文件列表 ──
+    let getdraw_url = match self.api_interface.get("getdraw") {
+        Some(url) => url,
+        None => return Err("URL for getdraw not found".to_string()),
+    };
+    let getdraw_full = format!("{}/{}", self.base_url, getdraw_url);
+    let token = self.get_token();
+    let token_str = token.as_ref().map(|s| s.as_str());
+
+    let response = self.net_client.post_data_async(
+        &getdraw_full, "", Duration::from_secs(30), token_str
+    ).await.map_err(|e| format!("getdraw request failed: {}", e))?;
+
+    let parsed: Value = serde_json::from_str(&response)
+        .map_err(|e| format!("getdraw parse error: {}", e))?;
+
+    if parsed["code"] != "000000" {
+        return Err(format!("getdraw bad code: {}", parsed["code"]));
+    }
+
+    // ── Step 2: 解析样本列表 ──
+    let data = &parsed["data"];
+    let samples: Vec<SampleItem> = serde_json::from_value(data.clone())
+        .map_err(|e| format!("parse sample list error: {}", e))?;
+
+    if samples.is_empty() {
+        log_info!("No samples to upload");
+        return Ok(());
+    }
+
+    log_info!("Received {} sample files to upload", samples.len());
+
+    // ── Step 3: 获取 uploaddraw API ──
+    let uploaddraw_url = match self.api_interface.get("uploaddraw") {
+        Some(url) => url,
+        None => return Err("URL for uploaddraw not found".to_string()),
+    };
+    let upload_full = format!("{}/{}", self.base_url, uploaddraw_url);
+
+    // ── Step 4: 逐个打包上传 ──
+    for item in &samples {
+        // a. 检查文件是否存在
+        if !Path::new(&item.p_dir).exists() {
+            log_error!("Sample file not found, skip: {}", item.p_dir);
+            continue;
+        }
+
+        // b. 打包成 zip
+        let zip_path = format!("{}.zip", item.p_dir);
+        if let Err(e) = zip_single_file(&item.p_dir, &zip_path) {
+            log_error!("Failed to zip sample {}: {}", item.p_dir, e);
+            continue;
+        }
+
+        // c. 检查 zip 文件是否创建成功
+        if !Path::new(&zip_path).exists() {
+            log_error!("Zip file not created: {}", zip_path);
+            continue;
+        }
+
+        // d. 上传 zip 文件（multipart: file + hash）
+        match self.net_client.post_file_async(
+            &upload_full,
+            &zip_path,
+            &item.p_hash,
+            Duration::from_secs(60),
+            token_str,
+        ).await {
+            Ok(resp) => {
+                log_info!("Sample uploaded ok [{}] -> {}", item.p_hash, item.p_dir);
+                log_info!("Upload response: {}", resp);
+            }
+            Err(e) => {
+                log_error!("Sample upload failed [{}] {}: {}", item.p_hash, item.p_dir, e);
+            }
+        }
+
+        // e. 清理临时 zip
+        let _ = std::fs::remove_file(&zip_path);
+        log_info!("Sample upload done: {}", item.p_dir);
+    }
+
     Ok(())
 }
 
