@@ -25,12 +25,19 @@ impl ProcessPolicyManager {
     }
 
     fn add_md5_rules(data: &str) {
-        // 通过 SecurityBackend，驱动写 /proc/osec，ebpf 写 BPF map
-        let _ = common::backend::with_backend(|b| b.add_md5_rules(data));
+        log_info!("[process_policy] >>> add_md5_rules raw='{}'", data.trim_end());
+        match common::backend::with_backend(|b| b.add_md5_rules(data)) {
+            Ok(()) => log_info!("[process_policy] ✅ add_md5_rules: 已写入内核"),
+            Err(e) => log_error!("[process_policy] ❌ add_md5_rules 失败: {}", e),
+        }
     }
 
     fn notify_kernel_update() {
-        let _ = common::backend::with_backend(|b| b.notify_process_update());
+        log_info!("[process_policy] >>> notify_kernel_update");
+        match common::backend::with_backend(|b| b.notify_process_update()) {
+            Ok(()) => log_info!("[process_policy] ✅ notify_kernel_update: 已通知内核"),
+            Err(e) => log_error!("[process_policy] ❌ notify_kernel_update 失败: {}", e),
+        }
     }
 
     fn kill_process(process_path: &str) {

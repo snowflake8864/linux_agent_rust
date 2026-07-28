@@ -148,9 +148,13 @@ fn ip_str_to_u32(ip: &str) -> Result<u32, String> {
 /// eBPF  模式：通过 SecurityBackend trait（BPF maps）+ sync_switches 下发
 /// gRPC 和服务器路径共用此函数，避免重复逻辑。
 pub fn apply_config_diff(old: &NetInfoConfig, new: &NetInfoConfig) -> Result<(), String> {
+    // gRPC 路径用：对比 old→new 变化后下发，无 prev_* 状态
+    // HTTP task_fetcher 路径走 TaskFetcher::apply_config_diff (self.prev_* 对比)
+    let driver_ready = !new.mod_ver.is_empty();
+
     // ── 自保护开关 ──
     if new.self_protect_switch != old.self_protect_switch {
-        if !new.mod_ver.is_empty() {
+        if driver_ready {
             if let Some(mgr) = GLOBAL_PATTERN_MGR.get() {
                 let mut pattern_mgr = mgr.lock().map_err(|e| e.to_string())?;
                 pattern_mgr.add_file_pattern(new.self_protect_switch);
@@ -160,8 +164,6 @@ pub fn apply_config_diff(old: &NetInfoConfig, new: &NetInfoConfig) -> Result<(),
                 if let Some(ref s) = *sock {
                     s.send_uint32(0x103, new.self_protect_switch as u32)
                         .map_err(|e| format!("nl_sock self_protect: {}", e))?;
-                } else {
-                    log_warn!("apply_config_diff: nl_sock is None, skip self_protect (eBPF mode)");
                 }
             }
         }
@@ -169,7 +171,7 @@ pub fn apply_config_diff(old: &NetInfoConfig, new: &NetInfoConfig) -> Result<(),
 
     // ── 虚拟开端口 ──
     if new.open_port_switch != old.open_port_switch {
-        if !new.mod_ver.is_empty() {
+        if driver_ready {
             let content = format!("vir_open_port_switch {}\n",
                 if new.open_port_switch { "1" } else { "0" });
             common::backend::with_backend(|b| b.write_net_rules(&content))?;
@@ -185,7 +187,7 @@ pub fn apply_config_diff(old: &NetInfoConfig, new: &NetInfoConfig) -> Result<(),
 
     // ── 文件开关关闭 → 清理保护目录 ──
     if new.file_switch != old.file_switch {
-        if !new.mod_ver.is_empty() && !new.file_switch {
+        if driver_ready && !new.file_switch {
             if let Some(mgr) = GLOBAL_PATTERN_MGR.get() {
                 let mut pattern_mgr = mgr.lock().map_err(|e| e.to_string())?;
                 pattern_mgr.clear_protect_dir();
@@ -195,7 +197,7 @@ pub fn apply_config_diff(old: &NetInfoConfig, new: &NetInfoConfig) -> Result<(),
 
     // ── 勒索保护关闭 → 清理勒索目录 ──
     if new.extortion_protect != old.extortion_protect {
-        if !new.mod_ver.is_empty() && !new.extortion_protect {
+        if driver_ready && !new.extortion_protect {
             if let Some(mgr) = GLOBAL_PATTERN_MGR.get() {
                 let mut pattern_mgr = mgr.lock().map_err(|e| e.to_string())?;
                 pattern_mgr.clear_exiport_dir();
@@ -206,32 +208,24 @@ pub fn apply_config_diff(old: &NetInfoConfig, new: &NetInfoConfig) -> Result<(),
     // ── 进程日志开关 ──
     if new.proc_switch != old.proc_switch || new.syslog_process_switch != old.syslog_process_switch {
         log_info!(
-            "apply_config_diff: proc_switch:{}→{}, syslog_process_switch:{}→{}",
+            "apply_config_diff: proc_switch:{}→{} syslog_process_switch:{}→{}",
             old.proc_switch, new.proc_switch,
             old.syslog_process_switch, new.syslog_process_switch
         );
         if let Some(sock_guard) = GLOBAL_NL_SOCK.get() {
             let sock = sock_guard.lock().unwrap();
             if let Some(ref s) = *sock {
-                let buf = [
-                    new.syslog_process_switch as u8,
-                    new.proc_switch as u8,
-                    0,
-                    0,
-                ];
+                let buf = [new.syslog_process_switch as u8, new.proc_switch as u8, 0, 0];
                 s.send_message(0x702, &buf)
                     .map_err(|e| format!("nl_sock netlog_policy: {}", e))?;
-            } else {
-                log_warn!("apply_config_diff: nl_sock is None, skip netlog_policy (eBPF mode)");
             }
         }
     }
 
-    // ── defense_switch 合成 ──
+    // ── defense_switch ──
     let file_flag_temp = new.file_switch || new.extortion_switch;
     let enable_flag = (file_flag_temp as u32) * 2 + (new.proc_switch as u32);
-
-    let defense_switch = [
+    let defense_switch: u32 = [
         (new.open_port_switch, 14),
         (new.internet_switch, 13),
         (new.syslog_dns_switch, 12),
@@ -243,14 +237,11 @@ pub fn apply_config_diff(old: &NetInfoConfig, new: &NetInfoConfig) -> Result<(),
         (new.proc_protect, 6),
         (new.file_protect, 5),
         (new.extortion_protect, 4),
-    ]
-        .iter()
-        .fold(0u32, |acc, &(flag, shift)| acc | ((flag as u32) << shift))
-        | enable_flag;
+    ].iter().fold(0u32, |acc, &(flag, shift)| acc | ((flag as u32) << shift)) | enable_flag;
 
     let old_file_flag_temp = old.file_switch || old.extortion_switch;
     let old_enable_flag = (old_file_flag_temp as u32) * 2 + (old.proc_switch as u32);
-    let old_defense_switch = [
+    let old_defense_switch: u32 = [
         (old.open_port_switch, 14),
         (old.internet_switch, 13),
         (old.syslog_dns_switch, 12),
@@ -262,13 +253,11 @@ pub fn apply_config_diff(old: &NetInfoConfig, new: &NetInfoConfig) -> Result<(),
         (old.proc_protect, 6),
         (old.file_protect, 5),
         (old.extortion_protect, 4),
-    ]
-        .iter()
-        .fold(0u32, |acc, &(flag, shift)| acc | ((flag as u32) << shift))
-        | old_enable_flag;
+    ].iter().fold(0u32, |acc, &(flag, shift)| acc | ((flag as u32) << shift)) | old_enable_flag;
 
     if defense_switch != old_defense_switch {
-        if !new.mod_ver.is_empty() {
+        if driver_ready {
+            log_info!("apply_config_diff: 下发 defense_switch={}", defense_switch);
             common::backend::with_backend(|b| b.write_defense_switch(
                 "defense_switch ", &defense_switch.to_string()
             ))?;
@@ -426,9 +415,11 @@ impl TaskFetcher {
     }
     fn write_raw(&self, rule_type: &str, value: &str) -> Result<(), String> {
         let content = format!("{} {}\n", rule_type, value);
+        log_info!("[task_fetcher] write_raw '/proc/osec/net_rules' <='{}'", content.trim_end());
         common::backend::with_backend(|b| b.write_net_rules(&content))
     }
     fn write_defense_switch(&self, rule_type: &str, value: &str) -> Result<(), String> {
+        log_info!("[task_fetcher] write_defense_switch '/proc/osec/defense_switch' <='{} {}'", rule_type, value);
         common::backend::with_backend(|b| b.write_defense_switch(rule_type, value))
     }
 
@@ -665,23 +656,81 @@ fn update_config_from_json(&mut self, conf: &serde_json::Map<String, Value>) -> 
     Ok(())
 }
 
-fn apply_config_diff(&mut self, old: &NetInfoConfig, new: &NetInfoConfig) -> Result<(), String> {
-    // 委托给独立函数（server路径 + gRPC路径共用）
-    apply_config_diff(old, new)?;
+fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Result<(), String> {
+    // v2.0 行为：用 self.prev_* 跟踪状态变化，非无条件写入
+    let driver_ready = !new.mod_ver.is_empty();
 
-    // 同步 prev_* 状态追踪
-    self.prev_self_protect_switch = new.self_protect_switch;
-    self.prev_open_port_switch = new.open_port_switch;
-    self.prev_dynamic_switch = new.dynamic_switch;
-    self.prev_file_switch = new.file_switch;
-    self.prev_extortion_switch = new.extortion_protect;
-    self.prev_proc_switch = new.proc_switch;
-    self.prev_syslog_process_switch = new.syslog_process_switch;
+    // ── 自保护开关（netlink 0x103，匹配 v2.0） ──
+    if new.self_protect_switch != self.prev_self_protect_switch {
+        log_info!("[task_fetcher] self_protect:{}→{} → netlink 0x103",
+            self.prev_self_protect_switch, new.self_protect_switch);
+        self.prev_self_protect_switch = new.self_protect_switch;
+        if driver_ready {
+            let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
+            pattern_mgr.add_file_pattern(new.self_protect_switch);
+            self.nl_sock.as_ref()
+                .ok_or("Netlink socket not initialized".to_string())?
+                .send_uint32(0x103, new.self_protect_switch as u32)
+                .map_err(|e| e.to_string())?;
+        }
+    }
 
-    // recompute defense_switch for prev tracking
+    // ── 虚拟开端口 ──
+    if new.open_port_switch != self.prev_open_port_switch {
+        self.prev_open_port_switch = new.open_port_switch;
+        if driver_ready {
+            let content = format!("vir_open_port_switch {}\n",
+                if new.open_port_switch { "1" } else { "0" });
+            common::backend::with_backend(|b| b.write_net_rules(&content))?;
+        }
+    }
+
+    // ── 动态阻断 ──
+    if new.dynamic_switch != self.prev_dynamic_switch {
+        self.prev_dynamic_switch = new.dynamic_switch;
+        common::backend::with_backend(|b| b.write_netblock_switch(
+            &(new.dynamic_switch as u32).to_string()
+        ))?;
+    }
+
+    // ── 文件开关关闭 → 清理保护目录 ──
+    if new.file_switch != self.prev_file_switch {
+        if driver_ready && !new.file_switch {
+            let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
+            pattern_mgr.clear_protect_dir();
+        }
+        self.prev_file_switch = new.file_switch;
+    }
+
+    // ── 勒索保护关闭 → 清理勒索目录 ──
+    if new.extortion_protect != self.prev_extortion_switch {
+        if driver_ready && !new.extortion_protect {
+            let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
+            pattern_mgr.clear_exiport_dir();
+        }
+        self.prev_extortion_switch = new.extortion_protect;
+    }
+
+    // ── 进程日志开关（netlink 0x702，匹配 v2.0） ──
+    if new.proc_switch != self.prev_proc_switch || new.syslog_process_switch != self.prev_syslog_process_switch {
+        log_info!(
+            "[task_fetcher] proc_switch:{}→{} syslog_process:{}→{} → netlink 0x702",
+            self.prev_proc_switch, new.proc_switch,
+            self.prev_syslog_process_switch, new.syslog_process_switch
+        );
+        let buf = [new.syslog_process_switch as u8, new.proc_switch as u8, 0, 0];
+        self.nl_sock.as_ref()
+            .ok_or("Netlink socket not initialized".to_string())?
+            .send_message(0x702, &buf)
+            .map_err(|e| format!("nl_sock netlog_policy: {}", e))?;
+        self.prev_proc_switch = new.proc_switch;
+        self.prev_syslog_process_switch = new.syslog_process_switch;
+    }
+
+    // ── defense_switch ──
     let file_flag_temp = new.file_switch || new.extortion_switch;
     let enable_flag = (file_flag_temp as u32) * 2 + (new.proc_switch as u32);
-    let defense_switch = [
+    let defense_switch: u32 = [
         (new.open_port_switch, 14),
         (new.internet_switch, 13),
         (new.syslog_dns_switch, 12),
@@ -693,11 +742,25 @@ fn apply_config_diff(&mut self, old: &NetInfoConfig, new: &NetInfoConfig) -> Res
         (new.proc_protect, 6),
         (new.file_protect, 5),
         (new.extortion_protect, 4),
-    ]
-        .iter()
-        .fold(0u32, |acc, &(flag, shift)| acc | ((flag as u32) << shift))
-        | enable_flag;
-    self.prev_defense_switch = Some(defense_switch);
+    ].iter().fold(0u32, |acc, &(flag, shift)| acc | ((flag as u32) << shift)) | enable_flag;
+
+    if self.prev_defense_switch != Some(defense_switch) {
+        log_info!("[task_fetcher] defense_switch:{:?}→{} → proc_write /proc/osec/defense_switch",
+            self.prev_defense_switch, defense_switch);
+        self.prev_defense_switch = Some(defense_switch);
+        if driver_ready {
+            self.write_defense_switch("defense_switch", &defense_switch.to_string())?;
+        }
+    }
+
+    // ── eBPF 运行时开关同步：始终调用，driver 模式 no-op，eBPF 模式写 BPF maps ──
+    log_info!(
+        "[task_fetcher] sync_switches file(sw={},prot={}) proc(sw={},prot={})",
+        new.file_switch, new.file_protect, new.proc_switch, new.proc_protect
+    );
+    common::backend::with_backend(|b| {
+        b.sync_switches(new.file_switch, new.proc_switch, new.file_protect, new.proc_protect)
+    })?;
 
     Ok(())
 }

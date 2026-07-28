@@ -42,6 +42,8 @@ pub struct EbpfBackend {
     proc_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
     /// eBPF ring buffer 读取器（从 file_agent 的 event_ringbuf 读取文件拦截/监控事件）
     file_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
+    /// path → (md5, mtime) 缓存（后台扫描填充 + 首次命中时补充）
+    pub path_hash_cache: Arc<RwLock<std::collections::HashMap<String, (String, u64)>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +132,7 @@ impl EbpfBackend {
             applied_rules: Arc::new(Mutex::new(std::collections::HashMap::new())),
             proc_ringbuf: Arc::new(Mutex::new(None)),
             file_ringbuf: Arc::new(Mutex::new(None)),
+            path_hash_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
         })
     }
 
@@ -348,11 +351,45 @@ impl EbpfBackend {
         });
     }
 
+    /// 获取文件 MD5：从 path_hash_cache 查（mtime 校验），miss 时计算并回填
+    fn get_md5_cached(&self, path: &str) -> Option<String> {
+        // 1. 查缓存（带 mtime 校验，与 process_mgr::md5_cache 一致）
+        {
+            let cache = self.path_hash_cache.read().unwrap();
+            if let Some((cached_md5, cached_mtime)) = cache.get(path) {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if let Some(cur_mtime) = meta.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    {
+                        if cur_mtime.as_secs() == *cached_mtime {
+                            return Some(cached_md5.clone());
+                        }
+                    }
+                }
+            }
+        }
+        // 2. miss：读取文件计算 MD5
+        let data = std::fs::read(path).ok()?;
+        let hash = hex::encode(md5::compute(&data).0);
+        if let Some(mtime_secs) = std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+        {
+            self.path_hash_cache.write().unwrap()
+                .insert(path.to_string(), (hash.clone(), mtime_secs));
+        }
+        Some(hash)
+    }
+
     /// 上报进程告警（拦截: n_type=1101, 监控: n_type=1001）
     fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_type: u16, action: &str) {
+        let md5_hash = self.get_md5_cached(path);
         let log = reporter::AuditLogInfo {
             file_path: Some(path.to_string()),
-            md5: None,
+            md5: md5_hash,
             n_type,
             n_level: if n_type >= 1100 { 2 } else { 1 },
             n_time: std::time::SystemTime::now()
@@ -360,7 +397,8 @@ impl EbpfBackend {
             rename_dir: None,
             notice_remark: Some(format!("eBPF进程{}: pid={} uid={}", action, event.pid, event.uid)),
             exception_process: Some(comm.to_string()),
-            peripheral_name: None, peripheral_remark: None, peripheral_eid: None, p_param: None,
+            peripheral_name: None, peripheral_remark: None, peripheral_eid: None,
+            p_param: Some(path.to_string()),
         };
         reporter::broadcast_audit_log(&log);   // gRPC 推送
         reporter::send_to_http_upload(&log);    // HTTP 上报到服务器
@@ -368,9 +406,10 @@ impl EbpfBackend {
 
     /// 上报文件告警（拦截: n_type=3101, 监控: n_type=3001）
     fn report_file_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_type: u16, action: &str) {
+        let md5_hash = self.get_md5_cached(path);
         let log = reporter::AuditLogInfo {
             file_path: Some(path.to_string()),
-            md5: None,
+            md5: md5_hash,
             n_type,
             n_level: if n_type >= 3100 { 2 } else { 1 },
             n_time: std::time::SystemTime::now()
@@ -378,7 +417,8 @@ impl EbpfBackend {
             rename_dir: None,
             notice_remark: Some(format!("eBPF文件{}: pid={}", action, event.pid)),
             exception_process: Some(comm.to_string()),
-            peripheral_name: None, peripheral_remark: None, peripheral_eid: None, p_param: None,
+            peripheral_name: None, peripheral_remark: None, peripheral_eid: None,
+            p_param: Some(path.to_string()),
         };
         reporter::broadcast_audit_log(&log);   // gRPC 推送
         reporter::send_to_http_upload(&log);   // HTTP 上报到服务器
@@ -447,21 +487,30 @@ impl EbpfBackend {
 
     pub fn scan_executables(&self, dirs: &[String], recursive: bool) -> anyhow::Result<usize> {
         let mut map = self.md5_map.write().unwrap();
+        let mut path_cache = self.path_hash_cache.write().unwrap();
         let mut count = 0;
         for dir in dirs {
             let walker = if recursive { walkdir::WalkDir::new(dir) } else { walkdir::WalkDir::new(dir).max_depth(1) };
             for entry in walker.into_iter().filter_map(|e| e.ok()) {
                 let path = entry.path();
                 if !path.is_file() { continue; }
+                let path_str = path.to_string_lossy().to_string();
                 if let Ok(data) = std::fs::read(path) {
                     if data.len() < 4 || &data[..4] != b"\x7fELF" { continue; }
                 } else { continue; }
                 if let Ok(data) = std::fs::read(path) {
                     let hash = hex::encode(md5::compute(&data).0);
+                    let mtime = std::fs::metadata(path)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d: std::time::Duration| d.as_secs())
+                        .unwrap_or(0);
+                    path_cache.insert(path_str.clone(), (hash.clone(), mtime));
                     use std::os::unix::fs::MetadataExt;
                     if let Ok(md) = std::fs::metadata(path) {
                         map.entry(hash).or_insert_with(Vec::new).push(Md5Entry {
-                            inode: md.ino(), dev: md.dev(), path: path.to_string_lossy().to_string(),
+                            inode: md.ino(), dev: md.dev(), path: path_str,
                         });
                         count += 1;
                     }

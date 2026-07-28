@@ -11,5 +11,6 @@ tokio = { version = "1.23", features = ["net", "macros"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
 arc-swap = "1.6.0"
 configparser = "3.1.0"  # 选择适合的版本
+log = "0.4"
 config = { path = "../config" }
 pattern = { path = "../pattern" }

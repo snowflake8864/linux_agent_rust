@@ -449,6 +449,7 @@ dependencies = [
  "arc-swap",
  "config",
  "configparser",
+ "log 0.4.29",
  "pattern",
  "tokio",
  "tokio-rustls 0.26.4",
