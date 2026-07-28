@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 /// 安全后端抽象 — 驱动模式写 /proc/osec ，eBPF 模式写 BPF maps
 pub trait SecurityBackend: Send + Sync {
@@ -61,7 +61,13 @@ where
     F: FnOnce(&dyn SecurityBackend) -> Result<R, String>,
 {
     match BACKEND.get() {
-        Some(b) => f(b.as_ref()),
-        None => Err("SecurityBackend not initialized".to_string()),
+        Some(b) => {
+            log::info!("[with_backend] backend={} calling...", b.name());
+            f(b.as_ref())
+        }
+        None => {
+            log::error!("[with_backend] ❌ BACKEND not initialized!");
+            Err("SecurityBackend not initialized".to_string())
+        }
     }
 }
