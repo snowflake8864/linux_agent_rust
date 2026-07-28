@@ -24,7 +24,7 @@ const SCAN_STATE_PAUSED: u8 = 4;
 const SYSTEM_EXCLUDES: &[&str] = &[
     "/proc", "/sys", "/dev", "/run", "/snap", "/cgroup",
     "/swapfile", "/swap.img", "/var/swap", "/var/swapfile", "/lost+found",
-    "/boot/System.map", "/boot/config",
+    "/boot/System.map", "/boot/config", "/opt/vigilixav/quarantine"
 ];
 
 fn merge_excludes(user_excludes: &[String]) -> Vec<String> {
