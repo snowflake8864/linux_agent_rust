@@ -1,4 +1,4 @@
-use reqwest::{Client, Response, Proxy};
+use reqwest::{Client, Proxy};
 use std::time::Duration;
 use serde::{Deserialize};
 use std::env;
@@ -275,6 +275,66 @@ pub async fn post_data_with_ip_async(
             Err(e) => Err(format!("Request failed: {}", e)),
         }
     }
+    /// 上传文件（multipart/form-data），附带 hash 字段
+    /// 对应 C++ 的 PostDataFile(uploaddraw, zip_file, hash)
+    pub async fn post_file_async(
+        &self,
+        url: &str,
+        file_path: &str,
+        hash: &str,
+        timeout: Duration,
+        token: Option<&str>,
+    ) -> Result<String, String> {
+        use reqwest::multipart;
+
+        let file_name = std::path::Path::new(file_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("sample.zip");
+
+        // 在 blocking 线程中读取文件（zip 文件通常不大）
+        let file_path_owned = file_path.to_string();
+        let file_bytes = tokio::task::spawn_blocking(move || {
+            std::fs::read(&file_path_owned)
+        }).await
+            .map_err(|e| format!("spawn_blocking error: {}", e))?
+            .map_err(|e| format!("Cannot read file {}: {}", file_path, e))?;
+
+        let part = multipart::Part::bytes(file_bytes)
+            .file_name(file_name.to_string())
+            .mime_str("application/zip")
+            .map_err(|e| format!("Invalid MIME: {}", e))?;
+
+        let form = multipart::Form::new()
+            .text("hash", hash.to_string())
+            .part("file", part);
+
+        let mut request = self
+            .client
+            .post(url)
+            .multipart(form)
+            .timeout(timeout);
+
+        if let Some(token_str) = token {
+            request = request.header("Authorization", token_str);
+        }
+
+        let response = request.send().await;
+        match response {
+            Ok(r) => {
+                let status = r.status();
+                let text = r.text().await
+                    .map_err(|e| format!("Failed to read response: {}", e))?;
+                if status.is_success() {
+                    Ok(text)
+                } else {
+                    Err(format!("File upload failed {}: {}", status, text))
+                }
+            }
+            Err(e) => Err(format!("Failed to upload file: {}", e)),
+        }
+    }
+
     pub fn get_base_url(&self) -> Option<&str> {
         self.base_url.as_deref()
     }
