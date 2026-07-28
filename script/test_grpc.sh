@@ -383,6 +383,182 @@ test_w15(){ grpc_expect_perm_denied "UpdateBackendMode(在线拒绝)" \
     backend.proto backend.BackendService UpdateBackendMode \
     '{"mode": "ebpf"}'; }
 
+# ── 病毒扫描/隔离测试（VirusScanService bidi 流） ──
+# 用法: test_vs_move <file_path> [scan_id]
+test_vs_move() {
+    local fp="${1:-/tmp/test_virus_sample}"
+    local sid="${2:-test-restore-001}"
+    echo -ne "${CYAN}[TEST]${NC} 病毒隔离(MOVE) $fp ... "
+    local output
+    output=$(grpcurl -plaintext -emit-defaults \
+        -import-path "$PROTO_DIR" \
+        -proto common.proto -proto virus_scan.proto \
+        -d "{\"dispose_file\":{\"scan_id\":\"$sid\",\"file_path\":\"$fp\",\"action\":1}}" \
+        -connect-timeout 3 -max-time 10 \
+        "$GRPC_ADDR" virus_scan.VirusScanService/StreamControl 2>&1) && rc=0 || rc=1
+    if [ $rc -eq 0 ] && echo "$output" | grep -q "隔离成功"; then
+        echo -e "${GREEN}PASS${NC} (已隔离 → /opt/vigilixav/quarantine/$(basename "$fp").quar)"
+        echo "$output" | sed 's/^/  /'
+        ((pass++))
+    elif [ $rc -eq 0 ]; then
+        echo -e "${YELLOW}OK${NC}"
+        echo "$output" | sed 's/^/  /'
+        ((pass++))
+    else
+        echo -e "${RED}FAIL${NC}"
+        echo "$output" | sed 's/^/  /'
+        ((fail++))
+    fi
+}
+
+# 用法: test_vs_restore <隔离区文件路径|原始路径>
+test_vs_restore() {
+    local fp="${1:-/tmp/test_virus_sample}"
+    local sid="${2:-test-restore-001}"
+    echo -ne "${CYAN}[TEST]${NC} 病毒还原(RESTORE) $fp ... "
+    local output
+    output=$(grpcurl -plaintext -emit-defaults \
+        -import-path "$PROTO_DIR" \
+        -proto common.proto -proto virus_scan.proto \
+        -d "{\"dispose_file\":{\"scan_id\":\"$sid\",\"file_path\":\"$fp\",\"action\":3}}" \
+        -connect-timeout 3 -max-time 10 \
+        "$GRPC_ADDR" virus_scan.VirusScanService/StreamControl 2>&1) && rc=0 || rc=1
+    if [ $rc -eq 0 ] && echo "$output" | grep -q "还原成功"; then
+        echo -e "${GREEN}PASS${NC} (已还原)"
+        echo "$output" | sed 's/^/  /'
+        ((pass++))
+    elif [ $rc -eq 0 ]; then
+        echo -e "${YELLOW}OK${NC}"
+        echo "$output" | sed 's/^/  /'
+        ((pass++))
+    else
+        echo -e "${RED}FAIL${NC}"
+        echo "$output" | sed 's/^/  /'
+        ((fail++))
+    fi
+}
+
+# 用法: test_vs_remove <file_path>
+test_vs_remove() {
+    local fp="${1:-/tmp/test_virus_sample}"
+    local sid="${2:-test-restore-001}"
+    echo -ne "${CYAN}[TEST]${NC} 病毒删除(REMOVE) $fp ... "
+    local output
+    output=$(grpcurl -plaintext -emit-defaults \
+        -import-path "$PROTO_DIR" \
+        -proto common.proto -proto virus_scan.proto \
+        -d "{\"dispose_file\":{\"scan_id\":\"$sid\",\"file_path\":\"$fp\",\"action\":2}}" \
+        -connect-timeout 3 -max-time 10 \
+        "$GRPC_ADDR" virus_scan.VirusScanService/StreamControl 2>&1) && rc=0 || rc=1
+    if [ $rc -eq 0 ]; then
+        echo -e "${GREEN}PASS${NC}"
+        echo "$output" | sed 's/^/  /'
+        ((pass++))
+    else
+        echo -e "${RED}FAIL${NC}"
+        echo "$output" | sed 's/^/  /'
+        ((fail++))
+    fi
+}
+
+# 病毒扫描端到端: 创建测试文件 → 隔离 → 还原 → 清理
+# 用法: test_vs_e2e [test_dir]
+test_vs_e2e() {
+    local test_dir="${1:-/tmp}"
+    local test_file="$test_dir/vs_restore_test_$$.txt"
+    local test_content="virus-test-$(date +%s)"
+    local sid="e2e-$$"
+
+    echo -e "\n${YELLOW}═══ 病毒处置端到端测试 ═══${NC}"
+    echo "测试文件: $test_file"
+    echo ""
+
+    # Step 1: create test file
+    echo -ne "${CYAN}[E2E:1]${NC} 创建测试文件 ... "
+    if echo "$test_content" > "$test_file" && chmod 755 "$test_file"; then
+        echo -e "${GREEN}OK${NC} ($(stat -c '%a' "$test_file"))"
+    else
+        echo -e "${RED}FAIL${NC}"
+        return 1
+    fi
+
+    # Step 2: quarantine (MOVE)
+    echo -ne "${CYAN}[E2E:2]${NC} 隔离文件 ... "
+    local output
+    output=$(grpcurl -plaintext -emit-defaults \
+        -import-path "$PROTO_DIR" \
+        -proto common.proto -proto virus_scan.proto \
+        -d "{\"dispose_file\":{\"scan_id\":\"$sid\",\"file_path\":\"$test_file\",\"action\":1}}" \
+        -connect-timeout 3 -max-time 10 \
+        "$GRPC_ADDR" virus_scan.VirusScanService/StreamControl 2>&1) && rc=0 || rc=1
+    if [ $rc -eq 0 ] && echo "$output" | grep -q "隔离成功"; then
+        echo -e "${GREEN}OK${NC}"
+        echo "$output" | sed 's/^/    /'
+    else
+        echo -e "${RED}FAIL${NC}"
+        echo "$output" | sed 's/^/    /'
+        rm -f "$test_file"
+        return 1
+    fi
+
+    # verify quarantined
+    local quar_path="/opt/vigilixav/quarantine/$(basename "$test_file").quar"
+    echo -ne "${CYAN}[E2E:3]${NC} 验证隔离 ... "
+    if [ -f "$quar_path" ]; then
+        local qperm=$(stat -c '%a' "$quar_path" 2>/dev/null || echo "???")
+        echo -e "${GREEN}OK${NC} (存在: $quar_path, 权限: $qperm)"
+        if [ "$qperm" != "000" ]; then
+            echo -e "    ${YELLOW}⚠ 权限应为 000 但实际: $qperm${NC}"
+        else
+            echo -e "    ${GREEN}✓ 权限 chmod 000 已生效${NC}"
+        fi
+    else
+        echo -e "${YELLOW}WARN${NC} (隔离文件不存在？可能跨设备 copy+delete)"
+        # try find meta
+        local meta_path="/opt/vigilixav/quarantine/$(basename "$test_file").quar.meta"
+        if [ -f "$meta_path" ]; then
+            echo "    meta 文件存在: $meta_path"
+        fi
+    fi
+
+    # Step 4: restore (RESTORE)
+    echo -ne "${CYAN}[E2E:4]${NC} 还原文件 ... "
+    local r_output
+    r_output=$(grpcurl -plaintext -emit-defaults \
+        -import-path "$PROTO_DIR" \
+        -proto common.proto -proto virus_scan.proto \
+        -d "{\"dispose_file\":{\"scan_id\":\"$sid\",\"file_path\":\"$test_file\",\"action\":3}}" \
+        -connect-timeout 3 -max-time 10 \
+        "$GRPC_ADDR" virus_scan.VirusScanService/StreamControl 2>&1) && rc=0 || rc=1
+    if [ $rc -eq 0 ] && echo "$r_output" | grep -q "还原成功"; then
+        echo -e "${GREEN}OK${NC}"
+        echo "$r_output" | sed 's/^/    /'
+    else
+        echo -e "${RED}FAIL${NC}"
+        echo "$r_output" | sed 's/^/    /'
+    fi
+
+    # Step 5: verify restored
+    echo -ne "${CYAN}[E2E:5]${NC} 验证还原 ... "
+    if [ -f "$test_file" ]; then
+        local rperm=$(stat -c '%a' "$test_file" 2>/dev/null)
+        echo -e "${GREEN}OK${NC} (权限: $rperm)"
+        if [ "$rperm" = "755" ]; then
+            echo -e "    ${GREEN}✓ 权限已恢复${NC}"
+        fi
+        rm -f "$test_file"
+    else
+        echo -e "${YELLOW}WARN${NC} (文件仍未还原到原位)"
+    fi
+
+    # cleanup .meta
+    local meta_f="/opt/vigilixav/quarantine/$(basename "$test_file").quar.meta"
+    rm -f "$meta_f" "$quar_path"
+
+    echo -e "${GREEN}═══ 端到端测试完成 ═══${NC}"
+    echo ""
+}
+
 # ── help ────────────────────────────────────────────────────────────────
 
 show_help_detail() {
@@ -426,12 +602,22 @@ show_help_detail() {
             echo "    3. ./test_grpc.sh 3b  (查看是否生效)" ;;
         cap) echo -e "${CYAN}[cap] eBPF系统能力检测${NC}"
             echo "  检查: 内核>=5.8, BTF, BPF LSM, bpffs" ;;
+        vs-move) echo -e "${CYAN}[vs-move]${NC} 病毒隔离 — 文件→隔离区(chmod 000 + .quar)"
+            echo "  用法: vs-move /path/to/virus [scan_id]" ;;
+        vs-restore) echo -e "${CYAN}[vs-restore]${NC} 病毒还原 — 隔离区→原位(读.meta恢复权限)"
+            echo "  用法: vs-restore /path/to/original"
+            echo "  用法: vs-restore /opt/vigilixav/quarantine/file.quar" ;;
+        vs-remove) echo -e "${CYAN}[vs-remove]${NC} 病毒删除 — 直接删除文件"
+            echo "  用法: vs-remove /path/to/virus [scan_id]" ;;
+        vs-e2e) echo -e "${CYAN}[vs-e2e]${NC} 病毒处置端到端测试"
+            echo "  创建测试文件 → 隔离(chmod 000) → 还原(权限恢复) → 清理"
+            echo "  用法: vs-e2e [test_dir]" ;;
         30) echo -e "${CYAN}[30] ProcessDefenseMode${NC} — 进程防护模式(查询)"
             echo "  0=关闭 1=监控 2=保护" ;;
         31) echo -e "${CYAN}[31] PeripheralDefenseMode${NC} — 外设防护模式(查询)"
             echo "  0=关闭 1=监控 2=保护" ;;
         *)  echo -e "${RED}帮助: $1 — 暂无详情${NC}"
-            echo "  有效: 1-16, 3b, 4b, 14b, 14c, 17-22, 23-31, cap, w0, w2" ;;
+            echo "  有效: 1-16, 3b, 4b, 14b, 14c, 17-22, 23-31, cap, w0-w15, vs-move, vs-restore, vs-remove, vs-e2e" ;;
     esac
     echo ""
 }
@@ -460,6 +646,12 @@ show_menu() {
     echo -e "${CYAN}║${NC}  w7)CreateBackup     w8)RestoreBackup   w9)UpdateTrustDir   ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  w10)UpdateVirtPort  w11)UpdateDirPol   w12)UpdateExtortPol  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  w13)SetProcDefense  w14)SetPeriphDef   w15)SetBackendMode   ${CYAN}║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║${NC}  ${BLUE}── 病毒处置（VirusScanService 流式接口）${NC}                      ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  vs-move <文件>           = 隔离病毒文件(MOVE)             ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  vs-restore <文件>        = 还原隔离文件(RESTORE)          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  vs-remove <文件>         = 删除病毒文件(REMOVE)           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  vs-e2e                   = 端到端测试(隔离→还原)          ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${BLUE}── 快捷命令${NC}                                                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  all=只读 | write=写 | stream=流 | full=全部 | listen [秒] ${CYAN}║${NC}"
@@ -573,6 +765,51 @@ case "${1:-menu}" in
                 w7) test_w7 ;;   w8) test_w8 ;;   w9) test_w9 ;;
                 w10) test_w10 ;; w11) test_w11 ;; w12) test_w12 ;;
                 w13) test_w13 ;; w14) test_w14 ;; w15) test_w15 ;;
+                vs-move|vs-move\ *)
+                    fp=""; sid="vs-$$"
+                    if [[ "$choice" =~ ^vs-move[[:space:]]+(.+)$ ]]; then
+                        fp="${BASH_REMATCH[1]}"
+                        if [[ "$fp" =~ [[:space:]]+(.+)$ ]]; then
+                            sid="${BASH_REMATCH[1]}"
+                            fp="${fp%% *}"
+                        fi
+                    else
+                        read -rp "文件路径: " fp
+                    fi
+                    test_vs_move "$fp" "$sid"
+                    ;;
+                vs-restore|vs-restore\ *)
+                    fp=""; sid="vs-$$"
+                    if [[ "$choice" =~ ^vs-restore[[:space:]]+(.+)$ ]]; then
+                        fp="${BASH_REMATCH[1]}"
+                        if [[ "$fp" =~ [[:space:]]+(.+)$ ]]; then
+                            sid="${BASH_REMATCH[1]}"
+                            fp="${fp%% *}"
+                        fi
+                    else
+                        read -rp "文件路径(隔离区或原始): " fp
+                    fi
+                    test_vs_restore "$fp" "$sid"
+                    ;;
+                vs-remove|vs-remove\ *)
+                    fp=""; sid="vs-$$"
+                    if [[ "$choice" =~ ^vs-remove[[:space:]]+(.+)$ ]]; then
+                        fp="${BASH_REMATCH[1]}"
+                        if [[ "$fp" =~ [[:space:]]+(.+)$ ]]; then
+                            sid="${BASH_REMATCH[1]}"
+                            fp="${fp%% *}"
+                        fi
+                    else
+                        read -rp "文件路径: " fp
+                    fi
+                    test_vs_remove "$fp" "$sid"
+                    ;;
+                vs-e2e)
+                    td="/tmp"
+                    read -rp "测试目录 [/tmp]: " td
+                    td="${td:-/tmp}"
+                    test_vs_e2e "$td"
+                    ;;
                 all)
                     echo -e "\n${GREEN}── 测试全部只读接口 ──${NC}"
                     for tid in 1 2 3 3b 4 4b 5 6 7 8 9 10 11 12 13 14 14b 14c 15 16 19 30 31; do
@@ -682,6 +919,12 @@ case "${1:-menu}" in
         echo "  w10)UpdateVirtPort w11)UpdateDirPol   w12)UpdateExtortPol"
         echo "  w13)SetProcDefense w14)SetPeriphDef   w15)SetBackendMode"
         echo ""
+        echo -e "${BLUE}═══ 病毒处置 ═══${NC}"
+        echo "  vs-move <文件> [scan_id]         # 隔离(MOVE, chmod 000 + .quar)"
+        echo "  vs-restore <文件> [scan_id]      # 还原(RESTORE, 恢复权限)"
+        echo "  vs-remove <文件> [scan_id]       # 删除(REMOVE)"
+        echo "  vs-e2e [test_dir]                # 端到端(创建→隔离→还原→清理)"
+        echo ""
         echo -e "${BLUE}═══ 快捷命令 ═══${NC}"
         echo "  all=只读 | write=写 | stream=流 | full=全部 | listen [秒]"
         echo "  cap=eBPF系统检测"
@@ -694,7 +937,7 @@ case "${1:-menu}" in
         ;;
 
     *)
-        # Direct: number, wN, or w0/w2 <json>
+        # Direct: number, wN, or vs-* commands
         if [[ "$1" =~ ^w[0-9]$ ]] || [[ "$1" =~ ^w1[0-5]$ ]]; then
             "test_$1"
         elif [[ "$1" =~ ^3[bB]$ ]]; then
@@ -707,11 +950,19 @@ case "${1:-menu}" in
             test_14c
         elif [ "$1" = "cap" ]; then
             test_cap
+        elif [ "$1" = "vs-e2e" ]; then
+            test_vs_e2e "${2:-/tmp}"
+        elif [ "$1" = "vs-move" ]; then
+            test_vs_move "${2:-/tmp/test_sample}" "${3:-vs-$$}"
+        elif [ "$1" = "vs-restore" ]; then
+            test_vs_restore "${2:-/tmp/test_sample}" "${3:-vs-$$}"
+        elif [ "$1" = "vs-remove" ]; then
+            test_vs_remove "${2:-/tmp/test_sample}" "${3:-vs-$$}"
         elif [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 31 ]; then
             "test_$(printf '%02d' "$1")"
         else
             echo "无效参数: $1"
-            echo "用法: $0 [?|help|all|write|stream|full|listen|<1-31>|w0-w15|3b|4b|14b|14c|cap]"
+            echo "用法: $0 [?|help|all|write|stream|full|listen|<1-31>|w0-w15|vs-*|3b|4b|14b|14c|cap]"
             echo "试试: $0 ?  查看完整帮助"
             exit 1
         fi

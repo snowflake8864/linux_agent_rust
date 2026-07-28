@@ -109,10 +109,27 @@ impl VirusScanService for VirusScanGrpcService {
                                     match scanner {
                                         Some(scanner) => {
                                             // quarantine_dir 由 vigilixd.conf 控制，忽略客户端传入值
-                                            let action = if req.action == 1 {
-                                                crate::vigilixav_scanner::DispositionAction::Move
-                                            } else {
-                                                crate::vigilixav_scanner::DispositionAction::Remove
+                                            let action = match req.action {
+                                                1 => crate::vigilixav_scanner::DispositionAction::Move,
+                                                2 => crate::vigilixav_scanner::DispositionAction::Remove,
+                                                3 => crate::vigilixav_scanner::DispositionAction::Restore,
+                                                unknown => {
+                                                    log_error!("[gRPC] 未知处置动作: {}", unknown);
+                                                    let _ = tx.send(Ok(ServerMessage {
+                                                        event: Some(
+                                                            grpc_gateway::virus_scan::server_message::Event::DisposeResult(
+                                                                grpc_gateway::virus_scan::DisposeFileResponse {
+                                                                    scan_id: req.scan_id,
+                                                                    file_path: req.file_path,
+                                                                    action: unknown,
+                                                                    success: false,
+                                                                    message: format!("未知动作: {}", unknown),
+                                                                },
+                                                            ),
+                                                        ),
+                                                    })).await;
+                                                    continue;
+                                                }
                                             };
                                             let result = scanner.dispose_file(&req.file_path, action).await;
                                             let (success, message) = match result {

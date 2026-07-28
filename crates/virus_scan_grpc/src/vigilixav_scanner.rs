@@ -1,5 +1,7 @@
 // crates/virus_scan_grpc/src/vigilixav_scanner.rs
 use logging::{log_error, log_info};
+use std::fs::Permissions;
+use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -24,6 +26,8 @@ pub enum DispositionAction {
     /// 移动到隔离目录（由 vigilixd.conf 配置决定目标路径，客户端无需指定）
     Move,
     Remove,
+    /// 从隔离目录还原文件到原始位置
+    Restore,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +49,10 @@ impl VigilixAVConnectionPool {
         // 确保隔离目录存在
         if let Err(e) = std::fs::create_dir_all(&quarantine_dir) {
             log_error!("VigilixAV: 无法创建隔离目录 {} - {}", quarantine_dir, e);
+        }
+        // 设置隔离目录权限：700 (rwx------)，仅 root 可读写进入
+        if let Err(e) = std::fs::set_permissions(&quarantine_dir, Permissions::from_mode(0o700)) {
+            log_error!("VigilixAV: 无法设置隔离目录权限 {} - {}", quarantine_dir, e);
         }
         log_info!("VigilixAV: 创建连接池(完全异步模式)，大小={}, 隔离目录={}", pool_size, quarantine_dir);
         Self {
@@ -261,8 +269,13 @@ impl VigilixAVConnectionPool {
     }
     */
 
-    /// 直接在本地执行文件处置（隔离/删除），不走 vigilixd
+    /// 直接在本地执行文件处置（隔离/删除/还原），不走 vigilixd
     /// 本进程以 root 权限运行，无权限限制
+    ///
+    /// 隔离安全措施：
+    ///   - 文件名加 .quar 后缀防止意外执行
+    ///   - chmod 000 彻底禁止读写执行
+    ///   - 保存原始路径和权限到 .meta 文件，支持误操作还原
     pub async fn dispose_file(&self, file_path: &str, action: DispositionAction) -> DispositionResult {
         let file_path_owned = file_path.to_string();
         let quarantine_dir = self.quarantine_dir.clone();
@@ -281,42 +294,11 @@ impl VigilixAVConnectionPool {
                         }
                     }
                 }
+                DispositionAction::Restore => {
+                    Self::restore_from_quarantine(&file_path_owned, &quarantine_dir)
+                }
                 DispositionAction::Move => {
-                    let file_name = std::path::Path::new(&file_path_owned)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-
-                    let dest_path = format!("{}/{}", quarantine_dir, file_name);
-
-                    // 先尝试 rename（同设备快速移动），失败则 copy+delete
-                    match std::fs::rename(&file_path_owned, &dest_path) {
-                        Ok(()) => {
-                            log_info!("VigilixAV: 隔离成功(rename) - {} -> {}", file_path_owned, dest_path);
-                            DispositionResult::Success { message: format!("隔离成功: {} -> {}", file_path_owned, dest_path) }
-                        }
-                        Err(_) => {
-                            // rename 失败（可能跨设备），尝试复制后删除
-                            match std::fs::copy(&file_path_owned, &dest_path) {
-                                Ok(_) => {
-                                    match std::fs::remove_file(&file_path_owned) {
-                                        Ok(()) => {
-                                            log_info!("VigilixAV: 隔离成功(copy+delete) - {} -> {}", file_path_owned, dest_path);
-                                            DispositionResult::Success { message: format!("隔离成功: {} -> {}", file_path_owned, dest_path) }
-                                        }
-                                        Err(e) => {
-                                            log_error!("VigilixAV: 复制成功但删除原文件失败 - {} - {}", file_path_owned, e);
-                                            DispositionResult::Error { message: format!("隔离成功(未删原文件): {}", e) }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    log_error!("VigilixAV: 隔离失败 - {} - {}", file_path_owned, e);
-                                    DispositionResult::Error { message: format!("隔离失败: {}", e) }
-                                }
-                            }
-                        }
-                    }
+                    Self::quarantine_file(&file_path_owned, &quarantine_dir)
                 }
             }
         }).await;
@@ -326,6 +308,203 @@ impl VigilixAVConnectionPool {
             Err(e) => {
                 log_error!("VigilixAV: 处置线程异常 - {} - {}", file_path, e);
                 DispositionResult::Error { message: format!("内部错误: {}", e) }
+            }
+        }
+    }
+
+    /// 将文件隔离到隔离目录
+    fn quarantine_file(file_path: &str, quarantine_dir: &str) -> DispositionResult {
+        let path = std::path::Path::new(file_path);
+        let original_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // 保存原始权限
+        let original_perms = match std::fs::metadata(file_path) {
+            Ok(meta) => meta.permissions().mode(),
+            Err(_) => 0o644, // 默认回退
+        };
+
+        // 生成隔离文件名：原名.quar（冲突时加纳秒时间戳）
+        let (dest_path, quar_name) = loop {
+            let candidate = format!("{}.quar", original_name);
+            let dest = format!("{}/{}", quarantine_dir, candidate);
+            if !std::path::Path::new(&dest).exists() {
+                break (dest, candidate);
+            }
+            // 同名冲突：加纳秒时间戳
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let candidate_ts = format!("{}.{}.quar", original_name, ts);
+            let dest_ts = format!("{}/{}", quarantine_dir, candidate_ts);
+            if !std::path::Path::new(&dest_ts).exists() {
+                break (dest_ts, candidate_ts);
+            }
+        };
+
+        // 先尝试 rename（同设备快速移动），失败则 copy+delete
+        let move_result = match std::fs::rename(file_path, &dest_path) {
+            Ok(()) => {
+                log_info!("VigilixAV: 隔离成功(rename) - {} -> {}", file_path, dest_path);
+                Ok(())
+            }
+            Err(_) => {
+                // rename 失败（可能跨设备），尝试复制后删除
+                match std::fs::copy(file_path, &dest_path) {
+                    Ok(_) => {
+                        match std::fs::remove_file(file_path) {
+                            Ok(()) => {
+                                log_info!("VigilixAV: 隔离成功(copy+delete) - {} -> {}", file_path, dest_path);
+                                Ok(())
+                            }
+                            Err(e) => {
+                                log_error!("VigilixAV: 复制成功但删除原文件失败 - {} - {}", file_path, e);
+                                Err(format!("隔离成功(未删原文件): {}", e))
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log_error!("VigilixAV: 隔离失败 - {} - {}", file_path, e);
+                        Err(format!("隔离失败: {}", e))
+                    }
+                }
+            }
+        };
+
+        match move_result {
+            Ok(()) => {
+                // 写入元数据文件（用于还原）
+                let meta_path = format!("{}.meta", dest_path);
+                let meta_content = serde_json::json!({
+                    "original_path": file_path,
+                    "original_permissions": original_perms,
+                    "quarantined_at": chrono::Utc::now().to_rfc3339(),
+                });
+                if let Ok(json) = serde_json::to_string_pretty(&meta_content) {
+                    if let Err(e) = std::fs::write(&meta_path, &json) {
+                        log_error!("VigilixAV: 写入元数据文件失败 {} - {}", meta_path, e);
+                    }
+                }
+
+                // chmod 000：彻底禁止读/写/执行，防止隔离区病毒被意外激活
+                if let Err(e) = std::fs::set_permissions(&dest_path, Permissions::from_mode(0o000)) {
+                    log_error!("VigilixAV: 设置隔离文件权限失败 {} - {}", dest_path, e);
+                } else {
+                    log_info!("VigilixAV: 隔离文件已加锁(chmod 000) - {}", dest_path);
+                }
+
+                DispositionResult::Success {
+                    message: format!("隔离成功: {} -> {}", file_path, quar_name)
+                }
+            }
+            Err(e) => DispositionResult::Error { message: e },
+        }
+    }
+
+    /// 从隔离目录还原文件
+    fn restore_from_quarantine(file_path: &str, quarantine_dir: &str) -> DispositionResult {
+        // file_path 参数在这里是隔离区文件路径（或原始路径）
+        // 支持两种调用方式：
+        //   1. 传入隔离区文件路径 → 自动找对应的 .meta 文件还原
+        //   2. 传入 .meta 文件路径 → 直接读取还原
+
+        let meta_path = if file_path.ends_with(".meta") {
+            file_path.to_string()
+        } else if file_path.ends_with(".quar") {
+            format!("{}.meta", file_path)
+        } else {
+            // 可能是原始路径，尝试在隔离区查找
+            let name = std::path::Path::new(file_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            format!("{}/{}.quar.meta", quarantine_dir, name)
+        };
+
+        // 读取元数据
+        let meta_content = match std::fs::read_to_string(&meta_path) {
+            Ok(content) => content,
+            Err(e) => {
+                return DispositionResult::Error {
+                    message: format!("无法读取元数据文件 {}: {}", meta_path, e)
+                };
+            }
+        };
+
+        let meta: serde_json::Value = match serde_json::from_str(&meta_content) {
+            Ok(v) => v,
+            Err(e) => {
+                return DispositionResult::Error {
+                    message: format!("元数据格式无效 {}: {}", meta_path, e)
+                };
+            }
+        };
+
+        let original_path = meta["original_path"].as_str().unwrap_or("");
+        let original_perms = meta["original_permissions"].as_u64().unwrap_or(0o644) as u32;
+
+        if original_path.is_empty() {
+            return DispositionResult::Error {
+                message: format!("元数据中缺少 original_path: {}", meta_path)
+            };
+        }
+
+        // 找到对应的隔离文件（.meta → .quar）
+        let quar_path = meta_path.strip_suffix(".meta").unwrap_or(&meta_path).to_string();
+        if !std::path::Path::new(&quar_path).exists() {
+            return DispositionResult::Error {
+                message: format!("隔离文件不存在: {}（可能已被手动删除）", quar_path)
+            };
+        }
+
+        // 确保原始目录存在
+        if let Some(parent) = std::path::Path::new(original_path).parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return DispositionResult::Error {
+                        message: format!("无法创建原始目录 {}: {}", parent.display(), e)
+                    };
+                }
+            }
+        }
+
+        // 移动文件回原始位置
+        match std::fs::rename(&quar_path, original_path) {
+            Ok(()) => {
+                // 恢复原始权限
+                if let Err(e) = std::fs::set_permissions(original_path, Permissions::from_mode(original_perms)) {
+                    log_error!("VigilixAV: 还原权限失败 {} - {}", original_path, e);
+                }
+                // 清理元数据文件
+                let _ = std::fs::remove_file(&meta_path);
+                log_info!("VigilixAV: 还原成功 - {} -> {}", quar_path, original_path);
+                DispositionResult::Success {
+                    message: format!("还原成功: {} -> {}", quar_path, original_path)
+                }
+            }
+            Err(e) => {
+                // rename 失败，尝试 copy+delete
+                match std::fs::copy(&quar_path, original_path) {
+                    Ok(_) => {
+                        if let Err(e2) = std::fs::set_permissions(original_path, Permissions::from_mode(original_perms)) {
+                            log_error!("VigilixAV: 还原权限失败 {} - {}", original_path, e2);
+                        }
+                        let _ = std::fs::remove_file(&quar_path);
+                        let _ = std::fs::remove_file(&meta_path);
+                        log_info!("VigilixAV: 还原成功(copy) - {} -> {}", quar_path, original_path);
+                        DispositionResult::Success {
+                            message: format!("还原成功: {} -> {}", quar_path, original_path)
+                        }
+                    }
+                    Err(e2) => {
+                        DispositionResult::Error {
+                            message: format!("还原失败: {} -> {}: {}", quar_path, original_path, e2)
+                        }
+                    }
+                }
             }
         }
     }
