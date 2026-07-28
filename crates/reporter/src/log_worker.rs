@@ -63,7 +63,8 @@ impl StartBashLog for BootManager {
                             let mut json_str = String::new();
                             match build_alert_log_json(&log_buffer, &mut json_str) {
                                 Ok(()) => {
-                                    //log_info!("生成 JSON: {}", json_str);
+                                    log_info!("[上报] 📤 URL={} JSON({}条)={}",
+                                        url, log_buffer.len(), json_str);
                                     match net_client.post_data_async(
                                         &url,
                                         &json_str,
@@ -71,10 +72,10 @@ impl StartBashLog for BootManager {
                                         self.get_token().await.as_deref(),
                                     ).await {
                                         Ok(response) => {
-                                            log_info!("[上报] ✅ HTTP POST /v1/alertupload 成功({}条) resp={}",
+                                            log_info!("[上报] ✅ HTTP 200({}条) resp={}",
                                                 log_buffer.len(), response);
                                         },
-                                        Err(err) => eprintln!("发送指标失败: {}", err),
+                                        Err(err) => log_error!("[上报] ❌ HTTP 失败: {}", err),
                                     }
 
                                     log_buffer.clear(); // 清空缓冲区
@@ -93,16 +94,19 @@ impl StartBashLog for BootManager {
                 let mut json_str = String::new();
                 match build_alert_log_json(&log_buffer, &mut json_str) {
                     Ok(()) => {
-                        //log_info!("生成 JSON: {}", json_str);
+                        log_info!("[上报] 📤 (shutdown) URL={} JSON({}条)={}",
+                            url, log_buffer.len(), json_str);
                         match net_client.post_data_async(
                             &url,
                             &json_str,
                             Duration::from_secs(10),
                             self.get_token().await.as_deref(),
                         ).await {
-                            //Ok(response) => println!("服务器响应: {}", response),
-                            Ok(response) => {/*log_info!("服务器响应: {}", response)*/},
-                            Err(err) => eprintln!("发送指标失败: {}", err),
+                            Ok(response) => {
+                                log_info!("[上报] ✅ (shutdown) HTTP 200({}条) resp={}",
+                                    log_buffer.len(), response);
+                            },
+                            Err(err) => log_error!("[上报] ❌ (shutdown) HTTP 失败: {}", err),
                         }
 
                         log_buffer.clear(); // 清空缓冲区

@@ -37,16 +37,22 @@ pub struct VigilixAVConnectionPool {
     timeout: Duration,
     semaphore: tokio::sync::Semaphore,
     pool_size: usize,
+    quarantine_dir: String,
 }
 
 impl VigilixAVConnectionPool {
-    pub fn new(connection: VigilixAVConnection, timeout: Duration, pool_size: usize) -> Self {
-        log_info!("VigilixAV: 创建连接池(完全异步模式)，大小={}", pool_size);
+    pub fn new(connection: VigilixAVConnection, timeout: Duration, pool_size: usize, quarantine_dir: String) -> Self {
+        // 确保隔离目录存在
+        if let Err(e) = std::fs::create_dir_all(&quarantine_dir) {
+            log_error!("VigilixAV: 无法创建隔离目录 {} - {}", quarantine_dir, e);
+        }
+        log_info!("VigilixAV: 创建连接池(完全异步模式)，大小={}, 隔离目录={}", pool_size, quarantine_dir);
         Self {
             connection_info: connection,
             timeout,
             semaphore: tokio::sync::Semaphore::new(pool_size),
             pool_size,
+            quarantine_dir,
         }
     }
 
@@ -149,7 +155,11 @@ impl VigilixAVConnectionPool {
         }
     }
 
-    pub async fn dispose_file(&self, file_path: &str, action: DispositionAction) -> DispositionResult {
+    // =========================================================================
+    // 旧版 dispose_file：通过 vigilixd 协议隔离/删除（因 vigilixd 降权运行有权限限制，暂时保留代码）
+    // =========================================================================
+    /*
+    pub async fn dispose_file_via_vigilixd(&self, file_path: &str, action: DispositionAction) -> DispositionResult {
         let timeout_duration = self.timeout;
         let connection_info = self.connection_info.clone();
         let file_path_send = file_path.to_string();
@@ -163,10 +173,10 @@ impl VigilixAVConnectionPool {
 
                     let cmd = match &action {
                         DispositionAction::Move => {
-                            format!("nMOVE {}\0", file_path_send)
+                            format!("nMOVE {}\n", file_path_send)
                         }
                         DispositionAction::Remove => {
-                            format!("nREMOVE {}\0", file_path_send)
+                            format!("nREMOVE {}\n", file_path_send)
                         }
                     };
                     stream.write_all(cmd.as_bytes()).await
@@ -197,10 +207,10 @@ impl VigilixAVConnectionPool {
 
                     let cmd = match &action {
                         DispositionAction::Move => {
-                            format!("nMOVE {}\0", file_path_send)
+                            format!("nMOVE {}\n", file_path_send)
                         }
                         DispositionAction::Remove => {
-                            format!("nREMOVE {}\0", file_path_send)
+                            format!("nREMOVE {}\n", file_path_send)
                         }
                     };
                     stream.write_all(cmd.as_bytes()).await
@@ -246,6 +256,76 @@ impl VigilixAVConnectionPool {
             Err(_) => {
                 log_error!("VigilixAV: 处置超时 - {}", file_path);
                 DispositionResult::Error { message: "VigilixAV: 处置超时".to_string() }
+            }
+        }
+    }
+    */
+
+    /// 直接在本地执行文件处置（隔离/删除），不走 vigilixd
+    /// 本进程以 root 权限运行，无权限限制
+    pub async fn dispose_file(&self, file_path: &str, action: DispositionAction) -> DispositionResult {
+        let file_path_owned = file_path.to_string();
+        let quarantine_dir = self.quarantine_dir.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            match action {
+                DispositionAction::Remove => {
+                    match std::fs::remove_file(&file_path_owned) {
+                        Ok(()) => {
+                            log_info!("VigilixAV: 删除成功 - {}", file_path_owned);
+                            DispositionResult::Success { message: format!("删除成功: {}", file_path_owned) }
+                        }
+                        Err(e) => {
+                            log_error!("VigilixAV: 删除失败 - {} - {}", file_path_owned, e);
+                            DispositionResult::Error { message: format!("删除失败: {}", e) }
+                        }
+                    }
+                }
+                DispositionAction::Move => {
+                    let file_name = std::path::Path::new(&file_path_owned)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    let dest_path = format!("{}/{}", quarantine_dir, file_name);
+
+                    // 先尝试 rename（同设备快速移动），失败则 copy+delete
+                    match std::fs::rename(&file_path_owned, &dest_path) {
+                        Ok(()) => {
+                            log_info!("VigilixAV: 隔离成功(rename) - {} -> {}", file_path_owned, dest_path);
+                            DispositionResult::Success { message: format!("隔离成功: {} -> {}", file_path_owned, dest_path) }
+                        }
+                        Err(_) => {
+                            // rename 失败（可能跨设备），尝试复制后删除
+                            match std::fs::copy(&file_path_owned, &dest_path) {
+                                Ok(_) => {
+                                    match std::fs::remove_file(&file_path_owned) {
+                                        Ok(()) => {
+                                            log_info!("VigilixAV: 隔离成功(copy+delete) - {} -> {}", file_path_owned, dest_path);
+                                            DispositionResult::Success { message: format!("隔离成功: {} -> {}", file_path_owned, dest_path) }
+                                        }
+                                        Err(e) => {
+                                            log_error!("VigilixAV: 复制成功但删除原文件失败 - {} - {}", file_path_owned, e);
+                                            DispositionResult::Error { message: format!("隔离成功(未删原文件): {}", e) }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log_error!("VigilixAV: 隔离失败 - {} - {}", file_path_owned, e);
+                                    DispositionResult::Error { message: format!("隔离失败: {}", e) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }).await;
+
+        match result {
+            Ok(r) => r,
+            Err(e) => {
+                log_error!("VigilixAV: 处置线程异常 - {} - {}", file_path, e);
+                DispositionResult::Error { message: format!("内部错误: {}", e) }
             }
         }
     }

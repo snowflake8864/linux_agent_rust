@@ -3,7 +3,7 @@ set -e
 
 echo "Start packaging osec..."
 
-VERSION="1.1.27"
+VERSION="1.1.30"
 OUTPUT_DIR="output"
 INSTALLER_NAME="${OUTPUT_DIR}/osec-installer-${VERSION}.sh"
 
@@ -40,7 +40,28 @@ cp driver.greatwall-guard/aarch64-unknown-linux-musl/osec_base.ko* package/opt/o
 cp driver.greatwall-guard/mips64el-unknown-linux-gnuabi64/osec_base.ko* package/opt/osec/mips64el-unknown-linux-gnuabi64/ 2>/dev/null || true
 cp driver.greatwall-guard/loongarch64-unknown-linux-musl/osec_base.ko* package/opt/osec/loongarch64-unknown-linux-musl/ 2>/dev/null || true
 
-# ====== 4. Copy common files ======
+# ====== 4. Copy eBPF object files (预编译，需在各架构机器上手动编译) ======
+# 编译方式：到对应架构机器上执行
+#   cd ebpf-probes/bpf
+#   make clean && make ARCH=x86   BPF_OUT_DIR=../../bpf_arch/x86_64      # x86_64/mips64el/loongarch64
+#   make clean && make ARCH=arm64 BPF_OUT_DIR=../../bpf_arch/aarch64     # aarch64
+# 输出到 bpf_arch/{x86_64,aarch64}/ 后，build.sh 自动按架构映射复制到安装包
+echo "Copying eBPF .bpf.o files..."
+# bpf_arch/x86_64 → x86_64 / mips64el / loongarch64 (同属 x86 类)
+# bpf_arch/aarch64 → aarch64
+for arch_dir in x86_64-unknown-linux-musl mips64el-unknown-linux-gnuabi64 loongarch64-unknown-linux-musl; do
+    if ls bpf_arch/x86_64/*.bpf.o >/dev/null 2>&1; then
+        cp -f bpf_arch/x86_64/*.bpf.o "package/opt/osec/${arch_dir}/"
+        echo "  ✅ bpf_arch/x86_64 → ${arch_dir}"
+    fi
+done
+if ls bpf_arch/aarch64/*.bpf.o >/dev/null 2>&1; then
+    cp -f bpf_arch/aarch64/*.bpf.o package/opt/osec/aarch64-unknown-linux-musl/
+    echo "  ✅ bpf_arch/aarch64 → aarch64-unknown-linux-musl"
+fi
+echo "  Done."
+
+# ====== 5. Copy common files (configs, scripts, certs) ======
 cp -f script/net_info.ini package/opt/osec/
 cp -f script/osec.init package/opt/osec/
 cp -f script/agent_manager.init package/opt/osec/
@@ -421,6 +442,26 @@ done
 if [ "\$COPIED_ANY" = "0" ]; then
     echo "WARNING: No kernel module found matching 'osec_base.ko-*' in \$INSTALL_DIR/\$BIN_DIR. Skipping."
 fi
+
+# --- Deploy eBPF objects ---
+echo "Deploying eBPF objects..."
+BPF_FOUND=0
+for f in "\$INSTALL_DIR/\$BIN_DIR"/*.bpf.o; do
+    if [ -f "\$f" ]; then
+        mkdir -p "\$INSTALL_DIR/bpf"
+        cp -f "\$f" "\$INSTALL_DIR/bpf/"
+        echo "  \$(basename "\$f") -> \$INSTALL_DIR/bpf/"
+        BPF_FOUND=1
+    fi
+done
+if [ "\$BPF_FOUND" = "1" ]; then
+    chmod 644 "\$INSTALL_DIR/bpf"/*.bpf.o
+    chown root:root "\$INSTALL_DIR/bpf"/*.bpf.o
+    echo "  ✅ eBPF objects deployed to \$INSTALL_DIR/bpf/"
+else
+    echo "  ⚠ No .bpf.o files found in \$INSTALL_DIR/\$BIN_DIR, eBPF backend may not work"
+fi
+
 # Only deploy agent_manager on install
 if [[ "\$MODE" == "install" ]]; then
     if [ -f "\$INSTALL_DIR/\$BIN_DIR/MagicArmorAgent" ]; then
