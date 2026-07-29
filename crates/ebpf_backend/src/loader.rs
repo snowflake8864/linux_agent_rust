@@ -172,13 +172,29 @@ impl ModularLoader {
         }
 
         // Cgroup connect4 hook (本地连接拦截)
+        // 注意: BPF_CGROUP_INET4_CONNECT 要求 cgroup v2 (unified hierarchy)。
+        // 在 cgroup v1 或 hybrid 模式系统上，/sys/fs/cgroup 不是有效的 cgroup v2 fd，
+        // 此时 attach 会失败。这是正常的——将错误降级为警告，不影响 XDP/TC 功能。
         if let Some(prog) = bpf.program_mut("enforce_connect4") {
-            info!("[EbpfBackend] 🔌 加载 Cgroup connect4...");
-            let cgroup_fd = std::fs::File::open("/sys/fs/cgroup")?;
-            let program: &mut aya::programs::CgroupSockAddr = prog.try_into()?;
-            program.load()?;
-            program.attach(cgroup_fd)?;
-            info!("[EbpfBackend] ✅ Cgroup connect4 attached");
+            let cgroup_path = if std::path::Path::new("/sys/fs/cgroup/unified").exists() {
+                "/sys/fs/cgroup/unified"
+            } else if Self::is_cgroup_v2("/sys/fs/cgroup") {
+                "/sys/fs/cgroup"
+            } else {
+                warn!("[EbpfBackend] ⚠ 系统非 cgroup v2，跳过 Cgroup connect4 挂载（cgroup v1 不支持此钩子）");
+                return Ok(());
+            };
+            info!("[EbpfBackend] 🔌 加载 Cgroup connect4 (cgroup_path={})...", cgroup_path);
+            match (|| -> anyhow::Result<()> {
+                let cgroup_fd = std::fs::File::open(cgroup_path)?;
+                let program: &mut aya::programs::CgroupSockAddr = prog.try_into()?;
+                program.load()?;
+                program.attach(cgroup_fd)?;
+                Ok(())
+            })() {
+                Ok(()) => info!("[EbpfBackend] ✅ Cgroup connect4 attached"),
+                Err(e) => warn!("[EbpfBackend] ⚠ Cgroup connect4 挂载失败（非致命，XDP/TC 仍生效）: {}", e),
+            }
         } else {
             warn!("[EbpfBackend] ⚠ 未找到程序: enforce_connect4");
         }
@@ -227,5 +243,23 @@ impl ModularLoader {
         arr.set(feature_idx, val, 0)?;
         info!("[EbpfBackend] ✅ feature_switches[{}] = {}", feature_idx, val);
         Ok(())
+    }
+
+    /// 检测 /sys/fs/cgroup 是否为 cgroup v2 (unified hierarchy)
+    /// cgroup v2 的 magic number 是 0x63677270 ("cgrp")，
+    /// 通过 statfs 的 f_type 字段来判断
+    fn is_cgroup_v2(path: &str) -> bool {
+        let fd = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        use std::os::unix::io::AsRawFd;
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::fstatfs(fd.as_raw_fd(), &mut stat) };
+        if ret != 0 {
+            return false;
+        }
+        // CGROUP2_SUPER_MAGIC = 0x63677270
+        stat.f_type == 0x63677270
     }
 }
