@@ -213,8 +213,8 @@ impl TaskFetcher {
         api_interface.insert("uploadBackup".to_string(), "v1/uploadBackup".to_string());
         api_interface.insert("getOutreachDetect".to_string(), "v1/getOutreachDetect".to_string());
         api_interface.insert("getNtpConf".to_string(), "v1/getNtpConf".to_string());
-        api_interface.insert("getdraw".to_string(), "/v1/getdraw".to_string());
-        api_interface.insert("uploaddraw".to_string(), "/v1/uploaddraw".to_string());
+        api_interface.insert("getdraw".to_string(), "v1/getdraw".to_string());
+        api_interface.insert("uploaddraw".to_string(), "v1/uploaddraw".to_string());
         let net_client = NetClient::new(
             Some(base_url.to_string()),
             true,
@@ -1952,17 +1952,12 @@ async fn task_usb_upload(&self, task_type: u64) -> Result<(), String> {
     Ok(())
 }
 // 处理 TASK_UPLOADSAMPLE 任务
-// 业务逻辑（对应 C++ CEntClientNetAgent::DoTaskUploadSample）：
-//   1. POST "" -> /v1/getdraw  获取需上传的样本文件列表
-//   2. 逐个 zip -> POST multipart -> /v1/uploaddraw 上传
-//   3. 清理临时 zip 文件
 async fn task_upload_sample(&self, task_type: u64) -> Result<(), String> {
     log_info!("Processing TASK_UPLOADSAMPLE...");
 
     self.report_task_completion(task_type).await
         .map_err(|e| e.to_string())?;
 
-    // ── Step 1: 获取样本文件列表 ──
     let getdraw_url = match self.api_interface.get("getdraw") {
         Some(url) => url,
         None => return Err("URL for getdraw not found".to_string()),
@@ -1982,8 +1977,8 @@ async fn task_upload_sample(&self, task_type: u64) -> Result<(), String> {
         return Err(format!("getdraw bad code: {}", parsed["code"]));
     }
 
-    // ── Step 2: 解析样本列表 ──
     let data = &parsed["data"];
+    log_info!("data{:?}",data);
     let samples: Vec<SampleItem> = serde_json::from_value(data.clone())
         .map_err(|e| format!("parse sample list error: {}", e))?;
 
@@ -1994,35 +1989,41 @@ async fn task_upload_sample(&self, task_type: u64) -> Result<(), String> {
 
     log_info!("Received {} sample files to upload", samples.len());
 
-    // ── Step 3: 获取 uploaddraw API ──
     let uploaddraw_url = match self.api_interface.get("uploaddraw") {
         Some(url) => url,
         None => return Err("URL for uploaddraw not found".to_string()),
     };
     let upload_full = format!("{}/{}", self.base_url, uploaddraw_url);
 
-    // ── Step 4: 逐个打包上传 ──
     for item in &samples {
-        // a. 检查文件是否存在
-        if !Path::new(&item.p_dir).exists() {
-            log_error!("Sample file not found, skip: {}", item.p_dir);
+        // 过滤软连接和非普通文件
+        let meta = match std::fs::symlink_metadata(&item.p_dir) {
+            Ok(m) => m,
+            Err(e) => {
+                log_error!("Sample file stat failed [{}]: {}", item.p_dir, e);
+                continue;
+            }
+        };
+        if meta.file_type().is_symlink() {
+            log_info!("Sample is symlink, skip: {}", item.p_dir);
+            continue;
+        }
+        if !meta.is_file() {
+            log_info!("Sample is not a regular file, skip: {}", item.p_dir);
             continue;
         }
 
-        // b. 打包成 zip
         let zip_path = format!("{}.zip", item.p_dir);
         if let Err(e) = zip_single_file(&item.p_dir, &zip_path) {
             log_error!("Failed to zip sample {}: {}", item.p_dir, e);
             continue;
         }
 
-        // c. 检查 zip 文件是否创建成功
         if !Path::new(&zip_path).exists() {
             log_error!("Zip file not created: {}", zip_path);
             continue;
         }
 
-        // d. 上传 zip 文件（multipart: file + hash）
         match self.net_client.post_file_async(
             &upload_full,
             &zip_path,
@@ -2039,7 +2040,6 @@ async fn task_upload_sample(&self, task_type: u64) -> Result<(), String> {
             }
         }
 
-        // e. 清理临时 zip
         let _ = std::fs::remove_file(&zip_path);
         log_info!("Sample upload done: {}", item.p_dir);
     }
