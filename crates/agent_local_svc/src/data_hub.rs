@@ -479,7 +479,9 @@ impl AgentDataHub {
         }
 
         *guard = new_cfg.clone();
-        let _ = guard.to_ini(&format!("{}/net_info.ini", guard.app_path));
+        let ini_path = format!("{}/net_info.ini", guard.app_path);
+        guard.to_ini(&ini_path)
+            .map_err(|e| format!("写入 {} 失败: {}", ini_path, e))?;
 
         self.notify(PolicyChangeType::ConfigChanged);
         Ok(())
@@ -504,7 +506,9 @@ impl AgentDataHub {
             "usb_protect" => guard.usb_protect = protect_val,
             _ => {}
         }
-        let _ = guard.to_ini(&format!("{}/net_info.ini", guard.app_path));
+        let ini_path = format!("{}/net_info.ini", guard.app_path);
+        guard.to_ini(&ini_path)
+            .map_err(|e| format!("写入 {} 失败: {}", ini_path, e))?;
 
         // 立刻下发 defense_switch 到内核，与在线模式行为一致
         sync_defense_switch_to_kernel(&guard);
@@ -584,7 +588,9 @@ impl AgentDataHub {
         let mut guard = config::net_info::NETINFO_CONFIG.lock().unwrap();
         guard.admission.mode = mode;
         guard.admission_switch = effective;
-        let _ = guard.to_ini(&format!("{}/net_info.ini", guard.app_path));
+        let ini_path = format!("{}/net_info.ini", guard.app_path);
+        guard.to_ini(&ini_path)
+            .map_err(|e| format!("写入 {} 失败: {}", ini_path, e))?;
         Ok(())
     }
 
