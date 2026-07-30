@@ -140,16 +140,16 @@ static PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
 /// 由 gRPC handler 调用：触发后台连通性探测（不阻塞，立即返回）。
 /// 探测到不可达时，写入 /proc/osec/tcp_force_ecn 尝试修复准入状态。
 pub fn trigger_connectivity_probe() {
-    log_info!("[admission] >>> trigger_connectivity_probe() 被调用");
+    //log_info!("[admission] >>> trigger_connectivity_probe() 被调用");
     if PROBE_RUNNING.swap(true, Ordering::Relaxed) {
         log_info!("[admission] >>> trigger_connectivity_probe: 已有探测在跑，跳过");
         return;
     }
-    log_info!("[admission] >>> trigger_connectivity_probe: spawn 异步探测任务");
+    //log_info!("[admission] >>> trigger_connectivity_probe: spawn 异步探测任务");
     tokio::spawn(async move {
-        log_info!("[admission] >>> 异步探测: 开始 check_server_reachable()...");
+        //log_info!("[admission] >>> 异步探测: 开始 check_server_reachable()...");
         if check_server_reachable().await {
-            log_info!("[admission] >>> 异步探测: 服务器可达 → set_online()，不触发 repair");
+            //log_info!("[admission] >>> 异步探测: 服务器可达 → set_online()，不触发 repair");
             set_online();
         } else {
             log_info!("[admission] >>> 异步探测: 服务器不可达 → set_offline() + run_admission_repair()");
