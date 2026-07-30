@@ -70,8 +70,8 @@ pub fn send_to_http_upload(log: &AuditLogInfo) {
             if let Some(ref tx) = *guard {
                 match tx.try_send(log.clone()) {
                     Ok(_) => {
-                        log_info!("[上报] ✅ 告警已推入上报队列 n_type={} path={:?}",
-                            log.n_type, log.file_path);
+                        /*log_info!("[上报] ✅ 告警已推入上报队列 n_type={} path={:?}",
+                            log.n_type, log.file_path);*/
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         log_warn!("[上报] ⚠️ 上报队列满，丢弃告警 n_type={}", log.n_type);

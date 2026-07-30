@@ -48,8 +48,8 @@ impl StartBashLog for BootManager {
                                 }
                                 */
                                 log_buffer.push(log.clone());
-                                log_info!("[上报] 📥 收到告警 n_type={} buffer={}/512",
-                                    log.n_type, log_buffer.len());
+                                /*log_info!("[上报] 📥 收到告警 n_type={} buffer={}/512",
+                                    log.n_type, log_buffer.len());*/
                                 crate::broadcast_audit_log(&log);
                             }
                             None => {
@@ -63,8 +63,8 @@ impl StartBashLog for BootManager {
                             let mut json_str = String::new();
                             match build_alert_log_json(&log_buffer, &mut json_str) {
                                 Ok(()) => {
-                                    log_info!("[上报] 📤 URL={} JSON({}条)={}",
-                                        url, log_buffer.len(), json_str);
+                                    /*log_info!("[上报] 📤 URL={} JSON({}条)={}",
+                                        url, log_buffer.len(), json_str);*/
                                     match net_client.post_data_async(
                                         &url,
                                         &json_str,
