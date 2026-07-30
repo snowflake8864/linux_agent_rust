@@ -614,7 +614,7 @@ impl PatternRulesMgr {
             self.pre_protect_dir_include_exe_patterns != self.protect_dir_include_exe_patterns ||
             self.pre_protect_dir_exclude_exe_patterns != self.protect_dir_exclude_exe_patterns ||
             self.pre_exiport_true_process != self.exiport_true_process ||
-            self.pre_protect_true_process != self.protect_true_process
+            self.pre_protect_true_process != self.protect_true_process ||true
     }
 
     // 备份当前状态
