@@ -339,7 +339,9 @@ impl AgentDataHub {
         }
 
         *guard = new_cfg.clone();
-        let _ = guard.to_ini(&format!("{}/net_info.ini", guard.app_path));
+        let ini_path = format!("{}/net_info.ini", guard.app_path);
+        guard.to_ini(&ini_path)
+            .map_err(|e| format!("写入 {} 失败: {}", ini_path, e))?;
 
         // 下发配置变更到内核（driver走netlink+procfs，eBPF走BPF maps）
         task::apply_config_diff(&old_cfg, &new_cfg)?;
@@ -367,7 +369,9 @@ impl AgentDataHub {
             "usb_protect" => guard.usb_protect = protect_val,
             _ => {}
         }
-        let _ = guard.to_ini(&format!("{}/net_info.ini", guard.app_path));
+        let ini_path = format!("{}/net_info.ini", guard.app_path);
+        guard.to_ini(&ini_path)
+            .map_err(|e| format!("写入 {} 失败: {}", ini_path, e))?;
         self.notify(PolicyChangeType::ConfigChanged);
         Ok(())
     }
@@ -420,9 +424,23 @@ impl AgentDataHub {
         Ok(())
     }
 
-    /// 写入 TCP ECN 控制（通过 SecurityBackend，驱动/ebpf 自适应）
+    /// 写入 /proc/osec/tcp_force_ecn（通过 SecurityBackend，驱动/ebpf 自适应）
     pub(crate) fn write_admission_proc(&self, enable: bool) -> Result<(), String> {
-        common::backend::with_backend(|b| b.write_tcp_force_ecn(enable))
+        // 优先走 backend 抽象（ebpf 写 BPF maps，driver 写 proc）
+        if let Ok(()) = common::backend::with_backend(|b| b.write_tcp_force_ecn(enable)) {
+            return Ok(());
+        }
+        // fallback: 直接写 proc（驱动已加载但 backend 未初始化时可用）
+        let proc_path = "/proc/osec/tcp_force_ecn";
+        if std::path::Path::new(proc_path).exists() {
+            let val = if enable { "1" } else { "0" };
+            std::fs::write(proc_path, val)
+                .map_err(|e| format!("写入 {} 失败: {}", proc_path, e))?;
+            log_info!("[admission] 已写入 {} = {}", proc_path, val);
+        } else {
+            log_info!("[admission] {} 不存在，跳过写入（驱动未加载）", proc_path);
+        }
+        Ok(())
     }
 
     /// 持久化准入模式到 ini
@@ -432,7 +450,9 @@ impl AgentDataHub {
         let mut guard = config::net_info::NETINFO_CONFIG.lock().unwrap();
         guard.admission.mode = mode;
         guard.admission_switch = effective;
-        let _ = guard.to_ini(&format!("{}/net_info.ini", guard.app_path));
+        let ini_path = format!("{}/net_info.ini", guard.app_path);
+        guard.to_ini(&ini_path)
+            .map_err(|e| format!("写入 {} 失败: {}", ini_path, e))?;
         Ok(())
     }
 
