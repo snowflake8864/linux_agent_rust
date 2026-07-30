@@ -241,7 +241,7 @@ impl ProcessPatternRulesMgr {
     // 判断模式是否变更
     fn patterns_has_changed(&self) -> bool {
         self.pre_global_trust_dir_patterns != self.global_trust_dir_patterns ||
-            self.pre_const_file_patterns != self.const_file_patterns
+            self.pre_const_file_patterns != self.const_file_patterns || true
     }
 
     // 备份当前模式
