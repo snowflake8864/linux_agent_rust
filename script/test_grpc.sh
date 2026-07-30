@@ -13,7 +13,7 @@
 #   ./test_grpc.sh w2 <json>         # UpdateProcessPolicy 直接下发
 # ============================================================================
 
-GRPC_ADDR="${GRPC_ADDR:-192.168.135.102:50051}"
+GRPC_ADDR="${GRPC_ADDR:-127.0.0.1:50051}"
 PROTO_DIR="$(dirname "$0")/../crates/grpc_gateway/src/proto"
 PROTO_DIR="$(cd "$PROTO_DIR" 2>/dev/null && pwd || echo "$PROTO_DIR")"
 
