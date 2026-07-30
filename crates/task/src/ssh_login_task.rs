@@ -43,6 +43,7 @@ struct UtmpTimeval {
 }
 
 const UTMP_SIZE: usize = std::mem::size_of::<Utmp>();
+const LOGIN_PROCESS: i16 = 6; // 登录会话（btmp失败登录多用此类型）
 const USER_PROCESS: i16 = 7;  // 登录
 const DEAD_PROCESS: i16 = 8;  // 登出
 
@@ -167,8 +168,10 @@ impl SshLoginCollector {
                 Ok(()) => {
                     let utmp: Utmp = unsafe { std::ptr::read(buffer.as_ptr() as *const _) };
                     
-                    // 只处理登录事件
-                    if utmp.ut_type == USER_PROCESS {
+                    // 处理登录事件: wtmp用USER_PROCESS(7), btmp失败登录多用LOGIN_PROCESS(6)
+                    let is_login = utmp.ut_type == USER_PROCESS
+                        || (is_btmp && utmp.ut_type == LOGIN_PROCESS);
+                    if is_login {
                         if let Some(log) = self.parse_utmp_entry(&utmp, is_btmp) {
                             logs.push(log);
                         }
@@ -212,8 +215,12 @@ impl SshLoginCollector {
             return None;
         }
 
-        // 验证IP格式
-        if !self.is_valid_ip(&ip) {
+        // 验证IP格式，并过滤回环地址（127.0.0.1/::1等无上报意义）
+        let parsed_ip = match ip.parse::<std::net::IpAddr>() {
+            Ok(addr) => addr,
+            Err(_) => return None,
+        };
+        if parsed_ip.is_loopback() {
             return None;
         }
 
@@ -225,11 +232,6 @@ impl SshLoginCollector {
             log_type: 5,
             time: utmp.ut_tv.tv_sec as i64,
         })
-    }
-
-    /// 验证IP地址格式
-    fn is_valid_ip(&self, ip: &str) -> bool {
-        ip.parse::<std::net::IpAddr>().is_ok()
     }
 
     /// 过滤已上报的记录
