@@ -1058,7 +1058,7 @@ pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
     // ==================== 2. 下载并解压更新包 ====================
     log_info!("🔽 开始下载更新包: {}", download_link);
     let zip_bytes = self.net_client
-        .download_file_async(download_link, Duration::from_secs(120), token_str)
+        .download_file_async(download_link, Duration::from_secs(600), None)
         .await
         .map_err(|e| format!("下载更新包失败: {}", e))?;
 
