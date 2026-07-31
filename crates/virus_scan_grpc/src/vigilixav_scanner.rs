@@ -273,8 +273,6 @@ impl VigilixAVConnectionPool {
     /// 本进程以 root 权限运行，无权限限制
     ///
     /// 隔离安全措施：
-    ///   - 文件名加 .quar 后缀防止意外执行
-    ///   - chmod 000 彻底禁止读写执行
     ///   - 保存原始路径和权限到 .meta 文件，支持误操作还原
     pub async fn dispose_file(&self, file_path: &str, action: DispositionAction) -> DispositionResult {
         let file_path_owned = file_path.to_string();
@@ -326,19 +324,22 @@ impl VigilixAVConnectionPool {
             Err(_) => 0o644, // 默认回退
         };
 
-        // 生成隔离文件名：原名.quar（冲突时加纳秒时间戳）
+        // 生成隔离文件名：时间戳_原名（冲突时加纳秒后缀）
+        let timestamp_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let (dest_path, quar_name) = loop {
-            let candidate = format!("{}.quar", original_name);
+            let candidate = format!("{}_{}", timestamp_now, original_name);
             let dest = format!("{}/{}", quarantine_dir, candidate);
             if !std::path::Path::new(&dest).exists() {
                 break (dest, candidate);
             }
-            // 同名冲突：加纳秒时间戳
-            let ts = std::time::SystemTime::now()
+            let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
-            let candidate_ts = format!("{}.{}.quar", original_name, ts);
+            let candidate_ts = format!("{}_{}.{}", timestamp_now, original_name, nanos);
             let dest_ts = format!("{}/{}", quarantine_dir, candidate_ts);
             if !std::path::Path::new(&dest_ts).exists() {
                 break (dest_ts, candidate_ts);
@@ -406,22 +407,29 @@ impl VigilixAVConnectionPool {
 
     /// 从隔离目录还原文件
     fn restore_from_quarantine(file_path: &str, quarantine_dir: &str) -> DispositionResult {
-        // file_path 参数在这里是隔离区文件路径（或原始路径）
-        // 支持两种调用方式：
-        //   1. 传入隔离区文件路径 → 自动找对应的 .meta 文件还原
-        //   2. 传入 .meta 文件路径 → 直接读取还原
+        // file_path 参数可以是：
+        //   1. .meta 文件路径 → 直接读取还原
+        //   2. 隔离区文件路径（任意名称）→ 通过同名 .meta 还原
+        //   3. 原始文件路径 → 扫描隔离目录匹配 original_path
 
         let meta_path = if file_path.ends_with(".meta") {
             file_path.to_string()
-        } else if file_path.ends_with(".quar") {
-            format!("{}.meta", file_path)
         } else {
-            // 可能是原始路径，尝试在隔离区查找
-            let name = std::path::Path::new(file_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            format!("{}/{}.quar.meta", quarantine_dir, name)
+            // 策略1：尝试 file_path + ".meta"（表示直接传了隔离文件路径）
+            let candidate = format!("{}.meta", file_path);
+            if std::path::Path::new(&candidate).exists() {
+                candidate
+            } else {
+                // 策略2：扫描隔离目录，匹配 original_path
+                match Self::find_meta_by_original_path(file_path, quarantine_dir) {
+                    Some(p) => p,
+                    None => {
+                        return DispositionResult::Error {
+                            message: format!("在隔离目录中未找到文件 {} 对应的元数据", file_path)
+                        };
+                    }
+                }
+            }
         };
 
         // 读取元数据
@@ -452,7 +460,7 @@ impl VigilixAVConnectionPool {
             };
         }
 
-        // 找到对应的隔离文件（.meta → .quar）
+        // 找到对应的隔离文件（.meta 去掉后缀即为隔离文件路径）
         let quar_path = meta_path.strip_suffix(".meta").unwrap_or(&meta_path).to_string();
         if !std::path::Path::new(&quar_path).exists() {
             return DispositionResult::Error {
@@ -507,6 +515,36 @@ impl VigilixAVConnectionPool {
                 }
             }
         }
+    }
+
+    /// 在隔离目录中扫描所有 .meta 文件，找到 original_path 匹配的那个
+    fn find_meta_by_original_path(original_path: &str, quarantine_dir: &str) -> Option<String> {
+        let dir = match std::fs::read_dir(quarantine_dir) {
+            Ok(d) => d,
+            Err(_) => return None,
+        };
+
+        for entry in dir.flatten() {
+            let path = entry.path();
+            let path_str = path.to_string_lossy();
+            if !path_str.ends_with(".meta") {
+                continue;
+            }
+            // 读取 meta 文件内容（使用 Path 直接读取）
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let meta: serde_json::Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if meta.get("original_path").and_then(|v| v.as_str()) == Some(original_path) {
+                return Some(path.to_string_lossy().to_string());
+            }
+        }
+
+        None
     }
 
     pub async fn ping(&self) -> Result<(), String> {

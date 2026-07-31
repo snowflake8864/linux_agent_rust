@@ -4,6 +4,7 @@ use serde::{Deserialize};
 use std::env;
 use tokio::net::lookup_host;
 use url::Url;
+use futures::StreamExt;
 
 #[derive(Deserialize)]
 struct ResponseData {
@@ -180,15 +181,56 @@ impl NetClient {
        }
    }
     /// 异步下载文件内容（返回字节数组）
+    /// 带自动重试：网络异常时最多重试 5 次，指数退避 (1s/2s/4s/8s/16s)
+    /// HTTP 4xx 错误（403/404）不重试，直接返回
     pub async fn download_file_async(
         &self,
         url: &str,
         timeout: Duration,
         token: Option<&str>,
     ) -> Result<Vec<u8>, String> {
-        let mut request = self
-            .client
-            .get(url)
+        const MAX_RETRIES: u32 = 5;
+
+        let mut last_err = String::new();
+
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let wait_secs = 1u64 << (attempt - 1); // 1s, 2s, 4s, 8s, 16s
+                eprintln!(
+                    "⚠ download_file_async 第{}/{}次重试，等待{}秒后重试... url={}",
+                    attempt, MAX_RETRIES, wait_secs, url
+                );
+                tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+            }
+
+            match self.try_download(url, timeout, token).await {
+                Ok(bytes) => {
+                    if attempt > 0 {
+                        eprintln!("✅ download_file_async 重试成功 (第{}次尝试)", attempt + 1);
+                    }
+                    return Ok(bytes);
+                }
+                Err(e) => {
+                    last_err = e;
+                    // HTTP 4xx 客户端错误（如 403/404）不重试，直接返回
+                    if last_err.starts_with("HTTP_CLIENT_ERROR:") {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Err(format!("下载失败（已重试{}次）: {}", MAX_RETRIES, last_err))
+    }
+
+    /// 单次下载尝试（内部方法），带进度输出（类 wget 风格）
+    async fn try_download(
+        &self,
+        url: &str,
+        timeout: Duration,
+        token: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        let mut request = self.client.get(url)
             .timeout(timeout);
 
         // 如果有 token，加入 Header
@@ -196,8 +238,7 @@ impl NetClient {
             request = request.header("Authorization", format!("{}", token_str));
         }
 
-        // 发送请求
-        let response = request.send().await.map_err(|e| format!("请求失败: {}", e))?;
+        let response = request.send().await.map_err(|e| format!("请求发送失败: {}", e))?;
 
         // 检查状态码
         let status = response.status();
@@ -206,16 +247,66 @@ impl NetClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<无法读取错误信息>".to_string());
+
+            // 4xx 客户端错误标为不可重试
+            if status.as_u16() >= 400 && status.as_u16() < 500 {
+                return Err(format!("HTTP_CLIENT_ERROR: 下载失败 (HTTP {}): {}", status, err_text));
+            }
             return Err(format!("下载失败 (HTTP {}): {}", status, err_text));
         }
 
-        // 读取整个文件内容
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| format!("读取响应数据失败: {}", e))?;
+        // 流式读取 body，输出进度
+        let total = response.content_length();
+        let mut buf = Vec::with_capacity(total.unwrap_or(0) as usize);
+        let mut downloaded: u64 = 0;
+        let start = std::time::Instant::now();
+        let mut last_report = start;
+        let url_basename = url.rsplit_once('/')
+            .map(|(_, name)| name)
+            .unwrap_or(url);
 
-        Ok(bytes.to_vec())
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.map_err(|e| format!("读取响应数据失败: {}", e))?;
+            buf.extend_from_slice(&chunk);
+            downloaded += chunk.len() as u64;
+
+            // 每秒最多输出一次进度
+            let now = std::time::Instant::now();
+            let elapsed_since_report = now.duration_since(last_report).as_millis();
+            if elapsed_since_report >= 1000 || downloaded == total.unwrap_or(u64::MAX) {
+                last_report = now;
+                let elapsed = now.duration_since(start).as_secs_f64();
+                let speed = if elapsed > 0.0 { downloaded as f64 / elapsed } else { 0.0 };
+
+                if let Some(total_bytes) = total {
+                    let pct = if total_bytes > 0 { (downloaded as f64 / total_bytes as f64) * 100.0 } else { 100.0 };
+                    let eta = if speed > 0.0 { (total_bytes - downloaded) as f64 / speed } else { 0.0 };
+                    eprint!(
+                        "\r  {}  {:3.0}%  {}/{}  {:.1}{}/s  eta {:.0}s    ",
+                        url_basename,
+                        pct,
+                        human_bytes(downloaded),
+                        human_bytes(total_bytes),
+                        human_speed(speed),
+                        if eta > 60.0 { "m" } else { "" },
+                        if eta > 60.0 { eta / 60.0 } else { eta },
+                    );
+                } else {
+                    eprint!(
+                        "\r  {}  {}  {:.1}{}/s  (未知大小)    ",
+                        url_basename,
+                        human_bytes(downloaded),
+                        human_speed(speed),
+                        if speed > 1024.0 { "M" } else { "K" },
+                    );
+                }
+            }
+        }
+        eprintln!(); // 换行
+
+        Ok(buf)
     }
 
 pub async fn post_data_with_ip_async(
@@ -337,6 +428,28 @@ pub async fn post_data_with_ip_async(
 
     pub fn get_base_url(&self) -> Option<&str> {
         self.base_url.as_deref()
+    }
+}
+
+// ---- 下载进度显示用工具函数 ----
+
+fn human_bytes(n: u64) -> String {
+    if n >= 1_073_741_824 {
+        format!("{:.1}G", n as f64 / 1_073_741_824.0)
+    } else if n >= 1_048_576 {
+        format!("{:.1}M", n as f64 / 1_048_576.0)
+    } else if n >= 1024 {
+        format!("{:.0}K", n as f64 / 1024.0)
+    } else {
+        format!("{}B", n)
+    }
+}
+
+fn human_speed(bytes_per_sec: f64) -> f64 {
+    if bytes_per_sec >= 1_048_576.0 {
+        bytes_per_sec / 1_048_576.0
+    } else {
+        bytes_per_sec / 1024.0
     }
 }
 
