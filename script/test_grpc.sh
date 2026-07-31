@@ -380,6 +380,26 @@ test_w14(){ grpc_expect_perm_denied "SetPeripheralDefense(在线拒绝)" \
     '{"mode": 1}'; }
 
 test_w15(){ grpc_expect_perm_denied "UpdateBackendMode(在线拒绝)" \
+    backend.proto backend.BackendService/SetBackendMode \
+    '{"mode":1}'; }
+
+test_w16(){ grpc_expect_perm_denied "TriggerLocalUpdate(在线拒绝)" \
+    task_local.proto task_local.LocalTaskService/TriggerLocalUpdate \
+    '{"zipPath":""}'; }
+
+# 实际本地升级测试（需离线模式）
+test_local_upgrade() {
+    grpc_call "触发本地升级(扫描 /opt/osec/upgrade/)" \
+        task_local.proto task_local.LocalTaskService TriggerLocalUpdate \
+        '{"zipPath":""}'
+}
+
+test_local_upgrade_file() {
+    local fp="${1:-/opt/osec/upgrade/update.zip}"
+    grpc_call "触发本地升级(指定文件: $fp)" \
+        task_local.proto task_local.LocalTaskService TriggerLocalUpdate \
+        "{\"zipPath\":\"$fp\"}"
+}
     backend.proto backend.BackendService UpdateBackendMode \
     '{"mode": "ebpf"}'; }
 
@@ -646,6 +666,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}  w7)CreateBackup     w8)RestoreBackup   w9)UpdateTrustDir   ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  w10)UpdateVirtPort  w11)UpdateDirPol   w12)UpdateExtortPol  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  w13)SetProcDefense  w14)SetPeriphDef   w15)SetBackendMode   ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  w16)LocalUpgrade    ${BLUE}upgrade${NC}=触发本地升级(离线)             ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${BLUE}── 病毒处置（VirusScanService 流式接口）${NC}                      ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  vs-move <文件>           = 隔离病毒文件(MOVE)             ${CYAN}║${NC}"
@@ -765,6 +786,8 @@ case "${1:-menu}" in
                 w7) test_w7 ;;   w8) test_w8 ;;   w9) test_w9 ;;
                 w10) test_w10 ;; w11) test_w11 ;; w12) test_w12 ;;
                 w13) test_w13 ;; w14) test_w14 ;; w15) test_w15 ;;
+                w16) test_w16 ;;
+                upgrade) test_local_upgrade ;;
                 vs-move|vs-move\ *)
                     fp=""; sid="vs-$$"
                     if [[ "$choice" =~ ^vs-move[[:space:]]+(.+)$ ]]; then
@@ -819,7 +842,7 @@ case "${1:-menu}" in
                     ;;
                 write)
                     echo -e "\n${RED}── 测试全部写接口（预期全部 PERMISSION_DENIED）──${NC}"
-                    for i in $(seq 0 15); do
+                    for i in $(seq 0 16); do
                         "test_w${i}" 2>/dev/null || true
                     done
                     print_result
@@ -846,7 +869,7 @@ case "${1:-menu}" in
                         "test_${tid}" 2>/dev/null || true
                     done
                     test_17; test_18
-                    for i in $(seq 0 15); do
+                    for i in $(seq 0 16); do
                         "test_w${i}" 2>/dev/null || true
                     done
                     print_result
@@ -882,7 +905,7 @@ case "${1:-menu}" in
         echo -e "${GREEN}监听结束${NC}"
         ;;
     write)
-        for i in $(seq 0 15); do
+        for i in $(seq 0 16); do
             "test_w${i}" 2>/dev/null || true
         done
         print_result
@@ -892,7 +915,7 @@ case "${1:-menu}" in
             "test_${tid}" 2>/dev/null || true
         done
         test_17; test_18
-        for i in $(seq 0 15); do
+        for i in $(seq 0 16); do
             "test_w${i}" 2>/dev/null || true
         done
         print_result
@@ -918,6 +941,7 @@ case "${1:-menu}" in
         echo "  w7)CreateBackup   w8)RestoreBackup    w9)UpdateTrustDir"
         echo "  w10)UpdateVirtPort w11)UpdateDirPol   w12)UpdateExtortPol"
         echo "  w13)SetProcDefense w14)SetPeriphDef   w15)SetBackendMode"
+        echo "  w16)LocalUpgrade   upgrade=触发本地升级(离线)"
         echo ""
         echo -e "${BLUE}═══ 病毒处置 ═══${NC}"
         echo "  vs-move <文件> [scan_id]         # 隔离(MOVE, chmod 000 + .quar)"
