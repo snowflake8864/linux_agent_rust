@@ -698,7 +698,7 @@ pub async fn run(
                 match net_client.post_data_async(&url, "", Duration::from_secs(100), token_str).await {
                     Ok(response) => {
                         set_online();
-                        log_info!("gettask response: {}", response);
+                        //log_info!("gettask response: {}", response);
                         let parsed: Value = match serde_json::from_str(&response) {
                             Ok(parsed) => parsed,
                             Err(e) => {
