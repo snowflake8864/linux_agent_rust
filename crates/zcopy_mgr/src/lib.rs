@@ -87,17 +87,30 @@ impl OsecOpenportReport {
 
 #[repr(C)]
 pub struct OsecDnsReport {
-    type_: u32,
-    src_ip: u32,
-    src_port: u16,
-    dest_ip: u32,
-    dest_port: u16,
-    pid: u32,
-    comm: [u8; 128],
-    is_ipv6: u8, // 位字段：is_ipv6 占 1 位，ip_cnt 占 4 位
-    ip_cnt: u8,
-    ip_addrs: IpAddrArrayUnion,
-    dns_name: [u8; 255],
+    pub type_: u32,
+    pub src_ip: u32,
+    pub src_port: u16,
+    pub dest_ip: u32,
+    pub dest_port: u16,
+    pub pid: u32,
+    pub comm: [u8; 128],
+    /// C 位域: uint8_t is_ipv6:1, ip_cnt:4; 共享1个字节
+    /// bit0 = is_ipv6, bit1-4 = ip_cnt
+    pub flags: u8,
+    pub ip_addrs: IpAddrArrayUnion,
+    pub dns_name: [u8; 255],
+}
+
+impl OsecDnsReport {
+    /// 提取 bit0: is_ipv6 — 0=IPv4, 1=IPv6
+    pub fn is_ipv6(&self) -> bool {
+        (self.flags & 0x01) != 0
+    }
+
+    /// 提取 bit1-4: ip_cnt — DNS 解析出的 IP 地址数量
+    pub fn ip_cnt(&self) -> u8 {
+        (self.flags >> 1) & 0x0F
+    }
 }
 
 /*
@@ -413,8 +426,8 @@ impl fmt::Debug for IpV4Addr {
 
 #[repr(C)]
 pub union IpAddrArrayUnion {
-    ipv4: [u32; 12],
-    ipv6: [u8; 48],
+    pub ipv4: [u32; 12],
+    pub ipv6: [u8; 48],
 }
 
 // 手动实现 Debug for IpAddrArrayUnion
@@ -507,8 +520,8 @@ impl fmt::Debug for OsecDnsReport {
             .field("dest_port", &self.dest_port)
             .field("pid", &self.pid)
             .field("comm", &self.comm)
-            .field("is_ipv6", &self.is_ipv6)
-            .field("ip_cnt", &self.ip_cnt)
+            .field("is_ipv6", &self.is_ipv6())
+            .field("ip_cnt", &self.ip_cnt())
             .field("ip_addrs", &self.ip_addrs)
             .field("dns_name", &self.dns_name)
             .finish()

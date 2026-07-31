@@ -19,6 +19,7 @@ use reporter::file_audit::FileAuditHandler;
 use reporter::process_audit::ProcessAuditHandler;
 use reporter::net_service_log::NetServiceLogHandler;
 use reporter::fake_port_audit::FakePortAuditHandler;
+use reporter::dnslog_audit::DnsLogAuditHandler;
 use reporter::self_protect::SelfProtectAuditHandler;
 use hostinfo::net_app::handler::NetAppHandler;
 use docker::monitor::KernelDockerHandler;
@@ -312,7 +313,8 @@ pub async fn register_user_event_handlers(
     let service_port_log_handler = Arc::new(NetServiceLogHandler::new(zcopy_mgr.clone(), boot_manager.clone()));
     let service_port_log_handler_in = service_port_log_handler.clone();
     let service_port_log_handler_out = service_port_log_handler.clone();
-    let fake_port_log_handler = FakePortAuditHandler::new(zcopy_mgr, boot_manager.clone());
+    let fake_port_log_handler = FakePortAuditHandler::new(zcopy_mgr.clone(), boot_manager.clone());
+    let dns_log_handler = DnsLogAuditHandler::new(zcopy_mgr, boot_manager.clone());
     let self_protect_handler = SelfProtectAuditHandler::new(boot_manager);
 
     let mut handler = event_handler.lock().await;
@@ -384,9 +386,22 @@ pub async fn register_user_event_handlers(
         NLPolicyType::NL_POLICY_NET_PORT_ZCOPY_NOTIFY,
         move |data, len| {
             let handler = fake_port_log_handler.clone();
-            let data = data.to_vec(); 
+            let data = data.to_vec();
             Box::pin(async move {
                 handler.handle_fake_port_zcopy_oper(&data, len).await
+            })
+        },
+    )
+    .await;
+
+    handler
+    .register_event_handler(
+        NLPolicyType::NL_POLICY_NET_DNS_PORT_ZCOPY_NOTIFY,
+        move |data, len| {
+            let handler = dns_log_handler.clone();
+            let data = data.to_vec();
+            Box::pin(async move {
+                handler.handle_dns_zcopy_oper(&data, len).await
             })
         },
     )

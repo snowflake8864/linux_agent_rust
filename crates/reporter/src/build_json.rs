@@ -1,7 +1,7 @@
 use serde::Serialize;
 use logging::{log_info, log_error};
 use serde_json;
-use crate::{AuditLogInfo,AuditProcess, EdrProcessLog, SysNetLog,OpenPortLog,SelfProtectLogInfo};
+use crate::{AuditLogInfo,AuditProcess, EdrProcessLog, SysNetLog,OpenPortLog, DnsLog, SelfProtectLogInfo};
 use process_mgr::get_md5_global;
 
 /*
@@ -281,6 +281,37 @@ pub fn build_open_port_json(logs: &[OpenPortLog], str_json: &mut String) -> Resu
     });
 
     // Step 3: 将整个对象序列化为字符串
+    match serde_json::to_string(&root) {
+        Ok(final_json) => {
+            str_json.clear();
+            str_json.push_str(&final_json);
+            Ok(())
+        }
+        Err(e) => {
+            log::error!("最终 JSON 序列化失败: {}", e);
+            Err(format!("Final serialization failed: {}", e))
+        }
+    }
+}
+
+pub fn build_dns_log_json(logs: &[DnsLog], str_json: &mut String) -> Result<(), String> {
+    if logs.is_empty() {
+        log::error!("没有有效的DNS日志条目可添加到 JSON。");
+        return Err("No valid DNS log entries".to_string());
+    }
+
+    let logs_json_str = match serde_json::to_string(logs) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("序列化DNS日志数组失败: {}", e);
+            return Err(format!("JSON serialization failed: {}", e));
+        }
+    };
+
+    let root = serde_json::json!({
+        "list": logs_json_str
+    });
+
     match serde_json::to_string(&root) {
         Ok(final_json) => {
             str_json.clear();
