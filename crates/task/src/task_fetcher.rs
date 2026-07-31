@@ -829,6 +829,7 @@ pub async fn run(
 
     // Initialize local task channel (for offline gRPC task submissions)
     let mut local_task_rx = init_local_task_rx();
+    let mut local_upgrade_rx = grpc_gateway::notify::init_local_upgrade_rx();
 
     loop {
         let new_cron_time = {
@@ -904,6 +905,14 @@ pub async fn run(
                     }
                 } else {
                     log_info!("[本地任务] 未知 task ID: {}", task_id);
+                }
+            }
+            // Local upgrade trigger (from gRPC LocalTaskService::TriggerLocalUpdate)
+            Some(zip_path) = local_upgrade_rx.recv() => {
+                let arg = if zip_path.is_empty() { None } else { Some(zip_path) };
+                log_info!("[本地升级] 收到 gRPC 触发，zip_path={:?}", arg);
+                if let Err(e) = task_fetcher.task_update_from_local(arg).await {
+                    log_info!("[本地升级] 失败: {}", e);
                 }
             }
         }
@@ -3042,6 +3051,73 @@ async fn upload_ip_jump_result(&self, source_ip: &str, target_ip: &str, gateway:
         }
     Ok(())
 }
+
+    /// 本地升级触发（gRPC TriggerLocalUpdate 入口）。
+    /// `zip_path`: Some("/path/to/xxx.zip") 指定具体文件，None 则自动扫描 /opt/osec/upgrade/。
+    /// 跳过服务器下载步骤，直接将本地 zip 当作已下载的升级包处理。
+    /// 本地升级（测试用）：从 upgrade/ 目录取 zip → 解压 → 通知 agent_manager 执行脚本。
+    /// 不杀进程、不替换二进制、不走 systemctl，纯脚本升级路径。
+    pub async fn task_update_from_local(&self, zip_path: Option<String>) -> Result<(), String> {
+        let temp_dir = "/tmp/osec_update";
+        let _ = fs::remove_dir_all(temp_dir);
+        fs::create_dir_all(temp_dir).map_err(|e| e.to_string())?;
+
+        // ── 1. 获取 zip 包（指定路径 或 自动扫描 upgrade/）──
+        let (zip_bytes, alias) = match zip_path {
+            Some(ref path) => {
+                log_info!("[本地升级] 使用指定升级包: {}", path);
+                if !Path::new(path).exists() {
+                    return Err(format!("指定的升级包不存在: {}", path));
+                }
+                let bytes = fs::read(path)
+                    .map_err(|e| format!("读取升级包失败: {}", e))?;
+                let name = Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("update.zip")
+                    .to_string();
+                (bytes, name)
+            }
+            None => {
+                const LOCAL_UPGRADE_DIR: &str = "/opt/osec/upgrade";
+                match find_local_upgrade_zip(LOCAL_UPGRADE_DIR) {
+                    Some((found_path, zip_name)) => {
+                        log_info!("[本地升级] 在 {} 中发现升级包: {}", LOCAL_UPGRADE_DIR, found_path);
+                        let bytes = fs::read(&found_path)
+                            .map_err(|e| format!("读取升级包失败: {}", e))?;
+                        let _ = fs::remove_file(&found_path);
+                        log_info!("[本地升级] 已清理: {}", found_path);
+                        (bytes, zip_name)
+                    }
+                    None => {
+                        return Err(format!(
+                            "{} 目录中未找到 .zip 升级包",
+                            LOCAL_UPGRADE_DIR
+                        ));
+                    }
+                }
+            }
+        };
+
+        // ── 2. 解压到 /tmp/osec_update ──
+        let zip_path_temp = format!("{}/{}", temp_dir, alias);
+        fs::write(&zip_path_temp, &zip_bytes).map_err(|e| e.to_string())?;
+
+        let reader = Cursor::new(&zip_bytes);
+        let mut archive = ZipArchive::new(reader).map_err(|e| e.to_string())?;
+        archive.extract(temp_dir).map_err(|e| e.to_string())?;
+        log_info!("[本地升级] ✅ 升级包已解压到: {}", temp_dir);
+
+        // ── 3. 通知 agent_manager 执行脚本 ──
+        if let Err(e) = send_command_to_agent("update").await {
+            log_info!("[本地升级] 发送 update 命令给 agent_manager 失败: {}", e);
+            return Err(e);
+        }
+        log_info!("[本地升级] ✅ 已通知 agent_manager 执行升级脚本（agent_manager 会自行 find_upgrade_scripts + run_scripts_and_cleanup）");
+
+        log_info!("[本地升级] 🚀 task_update_from_local 完成");
+        Ok(())
+    }
 }
 
 pub fn build_closetask_json(tasklist: u64) -> String {
@@ -3525,6 +3601,28 @@ pub async fn replace_binary_with_arch_check(temp_dir: &str) -> Result<(), String
     log_info!("    路径: {}", target_path);
 
     Ok(())
+}
+
+/// 扫描本地目录，返回第一个找到的 .zip 文件 (完整路径, 文件名)。
+/// 供 task_update_from_local() 自动扫描 /opt/osec/upgrade/ 时使用。
+fn find_local_upgrade_zip(dir: &str) -> Option<(String, String)> {
+    let d = Path::new(dir);
+    if !d.exists() || !d.is_dir() {
+        log_info!("[本地升级] 目录不存在: {}", dir);
+        return None;
+    }
+    let entries = fs::read_dir(d).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.to_lowercase().ends_with(".zip") {
+                log_info!("[本地升级] 在 {} 中找到升级包: {}", dir, name);
+                return Some((path.to_string_lossy().to_string(), name.to_string()));
+            }
+        }
+    }
+    log_info!("[本地升级] {} 目录中未找到 .zip 文件", dir);
+    None
 }
 
 

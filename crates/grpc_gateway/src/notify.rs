@@ -70,6 +70,31 @@ pub fn submit_local_task(task_id: i32) -> bool {
 }
 
 // ============================================================================
+// Local upgrade submission (gRPC LocalTaskService → task_fetcher)
+// 对应 TriggerLocalUpdate RPC：从本地 upgrade/ 目录触发升级，无需服务器参与下载
+// ============================================================================
+
+/// Sender for locally triggered upgrade (zip path or empty string for auto-scan).
+pub static LOCAL_UPGRADE_TX: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
+
+/// Called by task_fetcher::run() to set itself as the receiver.
+pub fn init_local_upgrade_rx() -> mpsc::UnboundedReceiver<String> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    LOCAL_UPGRADE_TX.set(tx).ok();
+    rx
+}
+
+/// Called by gRPC LocalTaskService to trigger a local upgrade.
+/// `zip_path` 为空字符串时自动扫描 /opt/osec/upgrade/ 目录。
+/// Returns false if task_fetcher hasn't initialized the channel yet.
+pub fn submit_local_upgrade(zip_path: String) -> bool {
+    match LOCAL_UPGRADE_TX.get() {
+        Some(tx) => tx.send(zip_path).is_ok(),
+        None => false,
+    }
+}
+
+// ============================================================================
 // DirPolicy / ExtortPolicy caches (populated by task_fetcher, read by gRPC)
 // ============================================================================
 

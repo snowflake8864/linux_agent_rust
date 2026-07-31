@@ -5,6 +5,7 @@ import "common.proto";
 
 service LocalTaskService {
     rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+    rpc TriggerLocalUpdate(TriggerLocalUpdateRequest) returns (TriggerLocalUpdateResponse);
 }
 
 // 对应 HTTP: {"code":"000000", "data":{"tasklist":[6,19,33,4]}}
@@ -22,4 +23,15 @@ message TaskResult {
     int32 task_id = 1;
     bool success = 2;
     string message = 3;
+}
+
+// 本地升级触发：从本地 upgrade/ 目录 zip 包直接升级，跳过服务器下载
+// zip_path 为空则自动扫描 /opt/osec/upgrade/
+message TriggerLocalUpdateRequest {
+    string zip_path = 1;
+}
+
+message TriggerLocalUpdateResponse {
+    bool success = 1;
+    string message = 2;
 }
