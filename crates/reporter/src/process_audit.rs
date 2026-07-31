@@ -323,9 +323,9 @@ let cstr = unsafe { CStr::from_ptr(proc_info.path.as_ptr() as *const std::os::ra
                 peripheral_eid: None,
                 p_param: None,
             });
-        } else {
+        /*} else {
             log::info!("[process_audit] 跳过告警: type_={}, level={}, path={}",
-                proc_info.type_, flags.level, p_dir);
+                proc_info.type_, flags.level, p_dir);*/
         }
     }
 
