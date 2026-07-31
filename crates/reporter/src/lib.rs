@@ -6,6 +6,7 @@ use logging::{log_info, log_warn, log_error};
 pub mod file_audit;
 pub mod process_audit;
 pub mod fake_port_audit;
+pub mod dnslog_audit;
 pub mod self_protect;
 pub mod netlink_msg;
 pub mod net_service_log;
@@ -20,7 +21,7 @@ pub fn set_audit_log_tx(tx: mpsc::Sender<AuditLogInfo>) {
     let _ = AUDIT_LOG_TX.set(Mutex::new(Some(tx)));
 }
 pub mod build_json;
-pub use build_json::{build_alert_log_json,build_auto_process_list_json,build_batch_process_edr_json, build_open_port_json, build_self_protect_alert_log_json};
+pub use build_json::{build_alert_log_json,build_auto_process_list_json,build_batch_process_edr_json, build_open_port_json, build_dns_log_json, build_self_protect_alert_log_json};
 
 use std::fs;
 use std::path::PathBuf;
@@ -232,6 +233,17 @@ pub struct OpenPortLog {
     pub redirect_port: i32,
 }
 
+#[derive(Serialize, Debug)]
+pub struct DnsLog {
+    pub uid: Option<String>,
+    pub p_id: i32,
+    pub p_dir: Option<String>,
+    pub domain_name: Option<String>,
+    pub res_ip: Option<String>,
+    pub time: i32,
+    pub log_type: i32,
+    pub hash: Option<String>,
+}
 
 #[derive(Serialize, Debug)]
 pub struct SelfProtectLogInfo {
