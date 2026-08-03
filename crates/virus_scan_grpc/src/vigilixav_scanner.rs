@@ -50,8 +50,8 @@ impl VigilixAVConnectionPool {
         if let Err(e) = std::fs::create_dir_all(&quarantine_dir) {
             log_error!("VigilixAV: 无法创建隔离目录 {} - {}", quarantine_dir, e);
         }
-        // 设置隔离目录权限：700 (rwx------)，仅 root 可读写进入
-        if let Err(e) = std::fs::set_permissions(&quarantine_dir, Permissions::from_mode(0o700)) {
+        // 设置隔离目录权限：1777 (rwxrwxrwt)，所有用户可读写，sticky bit 防误删
+        if let Err(e) = std::fs::set_permissions(&quarantine_dir, Permissions::from_mode(0o1777)) {
             log_error!("VigilixAV: 无法设置隔离目录权限 {} - {}", quarantine_dir, e);
         }
         log_info!("VigilixAV: 创建连接池(完全异步模式)，大小={}, 隔离目录={}", pool_size, quarantine_dir);
