@@ -67,11 +67,6 @@ async fn main() -> io::Result<()> {
 
     log_info!("程序开始启动=========");
 
-    // 清理上次升级残留（升级脚本可能 restart agent_manager，导致末尾清理未执行）
-    if fs::remove_dir_all("/tmp/osec_update").is_ok() {
-        log_info!("[agent_manager] 启动时清理残留目录: /tmp/osec_update");
-    }
-
     let (cmd_tx, cmd_rx) = mpsc::channel::<AgentCommand>(16);
     tokio::spawn(unix_socket_server::start_unix_socket_server(
         "/tmp/osec_agent.sock",
