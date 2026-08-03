@@ -377,18 +377,19 @@ impl VigilixAVConnectionPool {
 
         match move_result {
             Ok(()) => {
-                // 写入元数据文件（用于还原）
-                let meta_path = format!("{}.meta", dest_path);
-                let meta_content = serde_json::json!({
-                    "original_path": file_path,
-                    "original_permissions": original_perms,
-                    "quarantined_at": chrono::Utc::now().to_rfc3339(),
-                });
-                if let Ok(json) = serde_json::to_string_pretty(&meta_content) {
-                    if let Err(e) = std::fs::write(&meta_path, &json) {
-                        log_error!("VigilixAV: 写入元数据文件失败 {} - {}", meta_path, e);
-                    }
-                }
+                // TODO: 暂不生成 .meta 文件
+                // // 写入元数据文件（用于还原）
+                // let meta_path = format!("{}.meta", dest_path);
+                // let meta_content = serde_json::json!({
+                //     "original_path": file_path,
+                //     "original_permissions": original_perms,
+                //     "quarantined_at": chrono::Utc::now().to_rfc3339(),
+                // });
+                // if let Ok(json) = serde_json::to_string_pretty(&meta_content) {
+                //     if let Err(e) = std::fs::write(&meta_path, &json) {
+                //         log_error!("VigilixAV: 写入元数据文件失败 {} - {}", meta_path, e);
+                //     }
+                // }
 
                 // chmod 000：彻底禁止读/写/执行，防止隔离区病毒被意外激活
                 if let Err(e) = std::fs::set_permissions(&dest_path, Permissions::from_mode(0o000)) {
