@@ -118,6 +118,42 @@ fn calc_cpu_use_state(o: &CpuUseState, n: &CpuUseState) -> f32 {
     }
 }
 
+fn get_memory_from_proc_meminfo() -> Option<(u64, u64)> {
+    let file = File::open("/proc/meminfo").ok()?;
+    let reader = BufReader::new(file);
+
+    let mut total_kb: Option<u64> = None;
+    let mut mem_free: Option<u64> = None;
+    let mut mem_buffer: Option<u64> = None;
+    let mut mem_cache: Option<u64> = None;
+
+    for line in reader.lines().map(|l| l.ok()).flatten() {
+        if line.starts_with("MemTotal:") {
+            total_kb = line.split_whitespace().nth(1)?.parse().ok();
+        } else if line.starts_with("MemFree:") {
+            mem_free = line.split_whitespace().nth(1)?.parse().ok();
+        } else if line.starts_with("Buffers:") {
+            mem_buffer = line.split_whitespace().nth(1)?.parse().ok();
+        } else if line.starts_with("Cached:") {
+            mem_cache = line.split_whitespace().nth(1)?.parse().ok();
+        }
+        if total_kb.is_some() && mem_free.is_some() && mem_buffer.is_some() && mem_cache.is_some() {
+            break;
+        }
+    }
+
+    match (total_kb, mem_free, mem_buffer, mem_cache) {
+        (Some(total), Some(free), Some(buffer), Some(cache)) => {
+            let used = total
+                .saturating_sub(free)
+                .saturating_sub(buffer)
+                .saturating_sub(cache);
+            Some((total, used))
+        }
+        _ => None,
+    }
+}
+
 fn compute_process_md5(file_path: &str) -> String {
     if file_path.is_empty() || !Path::new(file_path).exists() {
         return String::new();
@@ -195,11 +231,14 @@ pub fn get_system_metrics() -> Option<String> {
 */
     let bytes_to_kb = |bytes: u64| (bytes + 1023) / 1024; // 四舍五入
 
-    let total_memory_kb = bytes_to_kb(sys.total_memory());
+    let (total_memory_kb, used_memory_kb) = get_memory_from_proc_meminfo().unwrap_or({
+        let total = bytes_to_kb(sys.total_memory());
+        let used = bytes_to_kb(sys.used_memory());
+        (total, used)
+    });
+
     let available_memory_kb = bytes_to_kb(sys.available_memory());
     let free_memory_kb = bytes_to_kb(sys.free_memory());
-
-    let used_memory_kb = total_memory_kb.saturating_sub(available_memory_kb);
 
     let mem_size = format!("{}KB", total_memory_kb); // 或转为 MiB 显示
     let mem_usage = if total_memory_kb > 0 {
