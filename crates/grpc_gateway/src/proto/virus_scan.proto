@@ -206,14 +206,9 @@ enum DisposeAction {
     REMOVE = 2;  // 删除感染文件
     RESTORE = 3; // 从隔离目录还原文件
 }
-
-// ============================================================================
-// 处置感染文件请求（由终端 A 发起）
-// ============================================================================
-// 当 Agent 检测到病毒后，终端 A 可通过此消息要求 Agent 对感染文件执行处置操作
 message DisposeFileRequest {
-    string scan_id = 1;        // 扫描任务 ID
-    string file_path = 2;      // 要处置的文件完整路径
+    string scan_id = 1;        // 扫描任务 ID（处置操作不依赖此字段，可填空串）
+    string file_path = 2;      // 要处置的文件完整路径（RESTORE 时见上方约定）
     DisposeAction action = 3;   // 处置动作：MOVE（隔离）或 REMOVE（删除）
     string quarantine_dir = 4;  // 隔离目录（action=MOVE 时需要，如 "/opt/vigilixav/quarantine"）
 }

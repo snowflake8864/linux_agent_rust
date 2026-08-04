@@ -71,3 +71,77 @@ where
         }
     }
 }
+
+/// 空后端 — 当驱动和 eBPF 都不可用时使用，所有安全操作均为空操作，
+/// 程序仍然可以正常运行（策略下发、心跳上报等非内核功能不受影响）
+pub struct NoopBackend;
+
+impl SecurityBackend for NoopBackend {
+    fn is_active(&self) -> bool {
+        false
+    }
+    fn name(&self) -> &str {
+        "noop"
+    }
+
+    fn add_md5_rules(&self, _data: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn notify_process_update(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn get_process_whitelist(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn get_process_blacklist(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn write_tcp_force_ecn(&self, _enable: bool) -> Result<(), String> {
+        Ok(())
+    }
+    fn write_ipv4_block_policies(&self, _ips: &[String]) -> Result<(), String> {
+        Ok(())
+    }
+    fn write_ipv6_block_policies(&self, _ips: &[String]) -> Result<(), String> {
+        Ok(())
+    }
+    fn write_net_rules(&self, _rules: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn write_netblock_switch(&self, _value: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn write_defense_switch(&self, _rule_type: &str, _value: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn write_dpi_file_patterns(&self, _data: &str, _clear: bool, _build: bool) -> Result<(), String> {
+        Ok(())
+    }
+    fn write_dpi_rules(&self, _data: &str, _clear: bool) -> Result<(), String> {
+        Ok(())
+    }
+    fn write_process_dpi_patterns(&self, _data: &str, _clear: bool, _build: bool) -> Result<(), String> {
+        Ok(())
+    }
+    fn write_process_dpi_rules(&self, _data: &str, _clear: bool) -> Result<(), String> {
+        Ok(())
+    }
+    fn write_dpi_true_process(&self, _data: &str, _clear: bool) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn emit_docker_event(&self, _kind: u8, _flag: u8, _pid: i32) -> Result<(), String> {
+        Ok(())
+    }
+    fn clear_docker_rt(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn write_business_ports(&self, _ports: &[u16]) -> Result<(), String> {
+        Ok(())
+    }
+    fn write_self_protection(&self, _num: u32) -> Result<(), String> {
+        Ok(())
+    }
+}

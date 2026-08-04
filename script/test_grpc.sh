@@ -400,8 +400,6 @@ test_local_upgrade_file() {
         task_local.proto task_local.LocalTaskService TriggerLocalUpdate \
         "{\"zipPath\":\"$fp\"}"
 }
-    backend.proto backend.BackendService UpdateBackendMode \
-    '{"mode": "ebpf"}'; }
 
 # ── 病毒扫描/隔离测试（VirusScanService bidi 流） ──
 # 用法: test_vs_move <file_path> [scan_id]
@@ -417,8 +415,17 @@ test_vs_move() {
         -connect-timeout 3 -max-time 10 \
         "$GRPC_ADDR" virus_scan.VirusScanService/StreamControl 2>&1) && rc=0 || rc=1
     if [ $rc -eq 0 ] && echo "$output" | grep -q "隔离成功"; then
-        echo -e "${GREEN}PASS${NC} (已隔离 → /opt/vigilixav/quarantine/$(basename "$fp").quar)"
+        # 提取隔离文件名 (格式: 隔离成功: /path -> {dev}_{ino}_{name})
+        local qname=$(echo "$output" | grep -oP '-> \K\S+' | tail -1)
+        echo -e "${GREEN}PASS${NC} (隔离名: $qname)"
         echo "$output" | sed 's/^/  /'
+        # 验证 .meta 存在
+        local meta_path="/opt/vigilixav/quarantine/${qname}.meta"
+        if [ -f "$meta_path" ]; then
+            echo -e "    ${GREEN}✓ .meta 已生成: $meta_path${NC}"
+        else
+            echo -e "    ${YELLOW}⚠ .meta 未找到${NC}"
+        fi
         ((pass++))
     elif [ $rc -eq 0 ]; then
         echo -e "${YELLOW}OK${NC}"
@@ -431,7 +438,7 @@ test_vs_move() {
     fi
 }
 
-# 用法: test_vs_restore <隔离区文件路径|原始路径>
+# 用法: test_vs_restore <隔离文件名|原始路径|virus:病毒名|scan:all>
 test_vs_restore() {
     local fp="${1:-/tmp/test_virus_sample}"
     local sid="${2:-test-restore-001}"
@@ -458,6 +465,76 @@ test_vs_restore() {
     fi
 }
 
+# 用法: test_vs_restore_by_id <dev_ino_name>
+test_vs_restore_by_id() {
+    local qname="${1}"
+    local sid="${2:-vs-$$}"
+    test_vs_restore "$qname" "$sid"
+}
+
+# 用法: test_vs_restore_bulk <virus_name>
+test_vs_restore_bulk() {
+    local vname="${1:-Eicar-Signature}"
+    local sid="${2:-vs-$$}"
+    test_vs_restore "virus:$vname" "$sid"
+}
+
+# 用法: test_vs_restore_all
+test_vs_restore_all() {
+    local sid="${1:-vs-$$}"
+    test_vs_restore "scan:all" "$sid"
+}
+
+# 查看隔离区 .meta 内容
+test_vs_meta() {
+    local qname="${1}"
+    local quarantine_dir="/opt/vigilixav/quarantine"
+    if [ -n "$qname" ]; then
+        local meta_path="$quarantine_dir/${qname}.meta"
+        if [ -f "$meta_path" ]; then
+            echo -e "${CYAN}── .meta: $meta_path ──${NC}"
+            cat "$meta_path" | python3 -m json.tool 2>/dev/null || cat "$meta_path"
+        else
+            echo -e "${RED}未找到: $meta_path${NC}"
+        fi
+    else
+        echo -e "${CYAN}── 隔离区所有 .meta ──${NC}"
+        for m in "$quarantine_dir"/*.meta; do
+            [ -f "$m" ] || continue
+            echo -e "\n${GREEN}── $(basename "$m") ──${NC}"
+            python3 -m json.tool "$m" 2>/dev/null || cat "$m"
+        done
+    fi
+}
+
+# 列出隔离区所有文件及关键信息
+test_vs_list() {
+    local quarantine_dir="/opt/vigilixav/quarantine"
+    echo -e "${CYAN}── 隔离区文件列表 ──${NC}"
+    local count=0
+    for m in "$quarantine_dir"/*.meta; do
+        [ -f "$m" ] || continue
+        ((count++))
+        local dev=$(python3 -c "import json; print(json.load(open('$m')).get('dev','?'))" 2>/dev/null)
+        local ino=$(python3 -c "import json; print(json.load(open('$m')).get('ino','?'))" 2>/dev/null)
+        local orig=$(python3 -c "import json; print(json.load(open('$m')).get('original_path','?'))" 2>/dev/null)
+        local vname=$(python3 -c "import json; print(json.load(open('$m')).get('virus_name','?'))" 2>/dev/null)
+        local uid=$(python3 -c "import json; print(json.load(open('$m')).get('uid','?'))" 2>/dev/null)
+        local gid=$(python3 -c "import json; print(json.load(open('$m')).get('gid','?'))" 2>/dev/null)
+        local mode=$(python3 -c "import json; print(json.load(open('$m')).get('mode','?'))" 2>/dev/null)
+        local qfile="${m%.meta}"
+        local exists=""
+        [ -f "$qfile" ] && exists="✓" || exists="✗"
+        echo -e "  ${GREEN}[$count]${NC} dev=$dev ino=$ino file=$exists"
+        echo -e "       原始: $orig"
+        echo -e "       病毒: $vname  属主: $uid:$gid  权限: $mode"
+    done
+    if [ "$count" -eq 0 ]; then
+        echo "  (空)"
+    fi
+    echo -e "${CYAN}── 共 $count 个隔离文件 ──${NC}"
+}
+
 # 用法: test_vs_remove <file_path>
 test_vs_remove() {
     local fp="${1:-/tmp/test_virus_sample}"
@@ -481,29 +558,34 @@ test_vs_remove() {
     fi
 }
 
-# 病毒扫描端到端: 创建测试文件 → 隔离 → 还原 → 清理
+# 病毒扫描端到端: 创建测试文件 → 隔离 → 验证 → 按ID还原 → 验证权限属主 → 清理
 # 用法: test_vs_e2e [test_dir]
 test_vs_e2e() {
     local test_dir="${1:-/tmp}"
     local test_file="$test_dir/vs_restore_test_$$.txt"
     local test_content="virus-test-$(date +%s)"
     local sid="e2e-$$"
+    local quarantine_dir="/opt/vigilixav/quarantine"
 
     echo -e "\n${YELLOW}═══ 病毒处置端到端测试 ═══${NC}"
     echo "测试文件: $test_file"
     echo ""
 
     # Step 1: create test file
-    echo -ne "${CYAN}[E2E:1]${NC} 创建测试文件 ... "
-    if echo "$test_content" > "$test_file" && chmod 755 "$test_file"; then
-        echo -e "${GREEN}OK${NC} ($(stat -c '%a' "$test_file"))"
+    echo -ne "${CYAN}[E2E:1/7]${NC} 创建测试文件 ... "
+    local my_uid=$(id -u)
+    local my_gid=$(id -g)
+    if echo "$test_content" > "$test_file" && chmod 755 "$test_file" && chown $my_uid:$my_gid "$test_file" 2>/dev/null; then
+        local orig_perm=$(stat -c '%a' "$test_file")
+        local orig_owner=$(stat -c '%u:%g' "$test_file")
+        echo -e "${GREEN}OK${NC} (权限:$orig_perm 属主:$orig_owner)"
     else
         echo -e "${RED}FAIL${NC}"
         return 1
     fi
 
     # Step 2: quarantine (MOVE)
-    echo -ne "${CYAN}[E2E:2]${NC} 隔离文件 ... "
+    echo -ne "${CYAN}[E2E:2/7]${NC} 隔离文件(gRPC MOVE) ... "
     local output
     output=$(grpcurl -plaintext -emit-defaults \
         -import-path "$PROTO_DIR" \
@@ -511,9 +593,10 @@ test_vs_e2e() {
         -d "{\"dispose_file\":{\"scan_id\":\"$sid\",\"file_path\":\"$test_file\",\"action\":1}}" \
         -connect-timeout 3 -max-time 10 \
         "$GRPC_ADDR" virus_scan.VirusScanService/StreamControl 2>&1) && rc=0 || rc=1
+    local qname
     if [ $rc -eq 0 ] && echo "$output" | grep -q "隔离成功"; then
-        echo -e "${GREEN}OK${NC}"
-        echo "$output" | sed 's/^/    /'
+        qname=$(echo "$output" | grep -oP '-> \K\S+' | tail -1)
+        echo -e "${GREEN}OK${NC} (隔离名: $qname)"
     else
         echo -e "${RED}FAIL${NC}"
         echo "$output" | sed 's/^/    /'
@@ -521,59 +604,95 @@ test_vs_e2e() {
         return 1
     fi
 
-    # verify quarantined
-    local quar_path="/opt/vigilixav/quarantine/$(basename "$test_file").quar"
-    echo -ne "${CYAN}[E2E:3]${NC} 验证隔离 ... "
-    if [ -f "$quar_path" ]; then
-        local qperm=$(stat -c '%a' "$quar_path" 2>/dev/null || echo "???")
-        echo -e "${GREEN}OK${NC} (存在: $quar_path, 权限: $qperm)"
-        if [ "$qperm" != "000" ]; then
-            echo -e "    ${YELLOW}⚠ 权限应为 000 但实际: $qperm${NC}"
+    # Step 3: verify quarantine
+    local quar_file="$quarantine_dir/$qname"
+    local meta_file="$quarantine_dir/$qname.meta"
+    echo -ne "${CYAN}[E2E:3/7]${NC} 验证隔离结果 ... "
+    local all_ok=true
+    if [ -f "$quar_file" ]; then
+        local qperm=$(stat -c '%a' "$quar_file" 2>/dev/null || echo "???")
+        if [ "$qperm" = "000" ]; then
+            echo -ne "${GREEN}chmod✓${NC} "
         else
-            echo -e "    ${GREEN}✓ 权限 chmod 000 已生效${NC}"
+            echo -ne "${YELLOW}chmod=$qperm${NC} "
+            all_ok=false
         fi
     else
-        echo -e "${YELLOW}WARN${NC} (隔离文件不存在？可能跨设备 copy+delete)"
-        # try find meta
-        local meta_path="/opt/vigilixav/quarantine/$(basename "$test_file").quar.meta"
-        if [ -f "$meta_path" ]; then
-            echo "    meta 文件存在: $meta_path"
-        fi
+        echo -ne "${RED}文件缺失${NC} "
+        all_ok=false
+    fi
+    if [ -f "$meta_file" ]; then
+        echo -ne "${GREEN}.meta✓${NC} "
+        # verify .meta content
+        local m_uid=$(python3 -c "import json; print(json.load(open('$meta_file')).get('uid'))" 2>/dev/null)
+        local m_gid=$(python3 -c "import json; print(json.load(open('$meta_file')).get('gid'))" 2>/dev/null)
+        local m_mode=$(python3 -c "import json; print(json.load(open('$meta_file')).get('mode'))" 2>/dev/null)
+        local m_dev=$(python3 -c "import json; print(json.load(open('$meta_file')).get('dev'))" 2>/dev/null)
+        local m_ino=$(python3 -c "import json; print(json.load(open('$meta_file')).get('ino'))" 2>/dev/null)
+        echo -ne "(uid=$m_uid gid=$m_gid mode=$m_mode dev=$m_dev ino=$m_ino) "
+    else
+        echo -ne "${RED}.meta缺失${NC} "
+        all_ok=false
+    fi
+    if $all_ok; then
+        echo -e "${GREEN}PASS${NC}"
+    else
+        echo ""
     fi
 
-    # Step 4: restore (RESTORE)
-    echo -ne "${CYAN}[E2E:4]${NC} 还原文件 ... "
+    # Step 4: verify original file is gone
+    echo -ne "${CYAN}[E2E:4/7]${NC} 验证原文件已移除 ... "
+    if [ ! -f "$test_file" ]; then
+        echo -e "${GREEN}OK${NC} (已移除)"
+    else
+        echo -e "${YELLOW}WARN${NC} (原文件仍在，可能跨设备 copy)"
+    fi
+
+    # Step 5: restore by quarantine filename (dev_ino_name)
+    echo -ne "${CYAN}[E2E:5/7]${NC} 还原文件(按隔离名 $qname) ... "
     local r_output
     r_output=$(grpcurl -plaintext -emit-defaults \
         -import-path "$PROTO_DIR" \
         -proto common.proto -proto virus_scan.proto \
-        -d "{\"dispose_file\":{\"scan_id\":\"$sid\",\"file_path\":\"$test_file\",\"action\":3}}" \
+        -d "{\"dispose_file\":{\"scan_id\":\"$sid\",\"file_path\":\"$qname\",\"action\":3}}" \
         -connect-timeout 3 -max-time 10 \
         "$GRPC_ADDR" virus_scan.VirusScanService/StreamControl 2>&1) && rc=0 || rc=1
     if [ $rc -eq 0 ] && echo "$r_output" | grep -q "还原成功"; then
         echo -e "${GREEN}OK${NC}"
-        echo "$r_output" | sed 's/^/    /'
     else
         echo -e "${RED}FAIL${NC}"
         echo "$r_output" | sed 's/^/    /'
     fi
 
-    # Step 5: verify restored
-    echo -ne "${CYAN}[E2E:5]${NC} 验证还原 ... "
+    # Step 6: verify restored
+    echo -ne "${CYAN}[E2E:6/7]${NC} 验证还原结果 ... "
     if [ -f "$test_file" ]; then
         local rperm=$(stat -c '%a' "$test_file" 2>/dev/null)
-        echo -e "${GREEN}OK${NC} (权限: $rperm)"
+        local rowner=$(stat -c '%u:%g' "$test_file" 2>/dev/null)
+        echo -e "${GREEN}OK${NC} (权限:$rperm 属主:$rowner)"
         if [ "$rperm" = "755" ]; then
             echo -e "    ${GREEN}✓ 权限已恢复${NC}"
+        else
+            echo -e "    ${YELLOW}⚠ 权限: 期望755 实际$rperm${NC}"
+        fi
+        if [ "$rowner" = "$orig_owner" ]; then
+            echo -e "    ${GREEN}✓ 属主已恢复 ($rowner)${NC}"
+        else
+            echo -e "    ${YELLOW}⚠ 属主: 期望$orig_owner 实际$rowner${NC}"
         fi
         rm -f "$test_file"
     else
-        echo -e "${YELLOW}WARN${NC} (文件仍未还原到原位)"
+        echo -e "${RED}FAIL${NC} (文件未还原)"
     fi
 
-    # cleanup .meta
-    local meta_f="/opt/vigilixav/quarantine/$(basename "$test_file").quar.meta"
-    rm -f "$meta_f" "$quar_path"
+    # Step 7: cleanup check (.meta should be gone, quar file should be gone)
+    echo -ne "${CYAN}[E2E:7/7]${NC} 验证清理 ... "
+    if [ ! -f "$meta_file" ] && [ ! -f "$quar_file" ]; then
+        echo -e "${GREEN}OK${NC} (.meta和隔离文件已清理)"
+    else
+        echo -e "${YELLOW}WARN${NC} (残余文件)"
+        rm -f "$meta_file" "$quar_file"
+    fi
 
     echo -e "${GREEN}═══ 端到端测试完成 ═══${NC}"
     echo ""
@@ -622,22 +741,38 @@ show_help_detail() {
             echo "    3. ./test_grpc.sh 3b  (查看是否生效)" ;;
         cap) echo -e "${CYAN}[cap] eBPF系统能力检测${NC}"
             echo "  检查: 内核>=5.8, BTF, BPF LSM, bpffs" ;;
-        vs-move) echo -e "${CYAN}[vs-move]${NC} 病毒隔离 — 文件→隔离区(chmod 000 + .quar)"
+        vs-move) echo -e "${CYAN}[vs-move]${NC} 病毒隔离 — 文件→隔离区({dev}_{ino}_{name} + .meta + chmod 000)"
+            echo "  gRPC: dispose_file { file_path:\"/path/to/virus\", action:1(MOVE) }"
             echo "  用法: vs-move /path/to/virus [scan_id]" ;;
-        vs-restore) echo -e "${CYAN}[vs-restore]${NC} 病毒还原 — 隔离区→原位(读.meta恢复权限)"
-            echo "  用法: vs-restore /path/to/original"
-            echo "  用法: vs-restore /opt/vigilixav/quarantine/file.quar" ;;
+        vs-restore) echo -e "${CYAN}[vs-restore]${NC} 病毒还原 — 隔离区→原位(chown + chmod 恢复)"
+            echo "  gRPC: dispose_file { file_path, action:3(RESTORE) }"
+            echo "  file_path 支持格式:"
+            echo "    {dev}_{ino}_{name}      = 按文件ID精确还原"
+            echo "    /original/path          = 按原始路径反查还原"
+            echo "    virus:{virus_name}      = 批量还原同名病毒"
+            echo "    scan:all                = 还原隔离区全部文件"
+            echo "  用法: vs-restore 2049_123456_virus.exe"
+            echo "  用法: vs-restore virus:Eicar-Signature"
+            echo "  用法: vs-restore scan:all" ;;
+        vs-bulk) echo -e "${CYAN}[vs-bulk]${NC} 批量还原 — 按病毒名还原所有匹配文件"
+            echo "  用法: vs-bulk Eicar-Signature" ;;
+        vs-all) echo -e "${CYAN}[vs-all]${NC} 全部还原 — 还原隔离区所有文件"
+            echo "  用法: vs-all" ;;
+        vs-list) echo -e "${CYAN}[vs-list]${NC} 查看隔离区 — 列出所有隔离文件及元数据"
+            echo "  用法: vs-list" ;;
+        vs-meta) echo -e "${CYAN}[vs-meta]${NC} 查看 .meta — 查看元数据JSON内容"
+            echo "  用法: vs-meta [隔离文件名]  (不传则显示全部)" ;;
         vs-remove) echo -e "${CYAN}[vs-remove]${NC} 病毒删除 — 直接删除文件"
             echo "  用法: vs-remove /path/to/virus [scan_id]" ;;
         vs-e2e) echo -e "${CYAN}[vs-e2e]${NC} 病毒处置端到端测试"
-            echo "  创建测试文件 → 隔离(chmod 000) → 还原(权限恢复) → 清理"
+            echo "  创建测试文件 → 隔离({dev}_{ino}_{name}+.meta+chmod) → 按ID还原(chown+chmod) → 清理"
             echo "  用法: vs-e2e [test_dir]" ;;
         30) echo -e "${CYAN}[30] ProcessDefenseMode${NC} — 进程防护模式(查询)"
             echo "  0=关闭 1=监控 2=保护" ;;
         31) echo -e "${CYAN}[31] PeripheralDefenseMode${NC} — 外设防护模式(查询)"
             echo "  0=关闭 1=监控 2=保护" ;;
         *)  echo -e "${RED}帮助: $1 — 暂无详情${NC}"
-            echo "  有效: 1-16, 3b, 4b, 14b, 14c, 17-22, 23-31, cap, w0-w15, vs-move, vs-restore, vs-remove, vs-e2e" ;;
+            echo "  有效: 1-16, 3b, 4b, 14b, 14c, 17-22, 23-31, cap, w0-w16, vs-move, vs-restore, vs-bulk, vs-all, vs-list, vs-meta, vs-remove, vs-e2e" ;;
     esac
     echo ""
 }
@@ -669,10 +804,14 @@ show_menu() {
     echo -e "${CYAN}║${NC}  w16)LocalUpgrade    ${BLUE}upgrade${NC}=触发本地升级(离线)             ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${BLUE}── 病毒处置（VirusScanService 流式接口）${NC}                      ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  vs-move <文件>           = 隔离病毒文件(MOVE)             ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  vs-restore <文件>        = 还原隔离文件(RESTORE)          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  vs-remove <文件>         = 删除病毒文件(REMOVE)           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  vs-e2e                   = 端到端测试(隔离→还原)          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  vs-move <文件>        = 隔离文件(MOVE→{dev}_{ino}_{name}+.meta)${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  vs-restore <标识>     = 还原(支持ID/原路径/virus:名/scan:all) ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  vs-bulk <病毒名>      = 按病毒名批量还原                       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  vs-all                = 还原隔离区全部                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  vs-list               = 列出所有隔离文件及元数据               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  vs-meta [隔离名]      = 查看.meta JSON内容                     ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  vs-remove <文件>      = 删除病毒文件(REMOVE)                   ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  vs-e2e                = 端到端测试(隔离→还原→验证权限属主)    ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${BLUE}── 快捷命令${NC}                                                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  all=只读 | write=写 | stream=流 | full=全部 | listen [秒] ${CYAN}║${NC}"
@@ -810,9 +949,35 @@ case "${1:-menu}" in
                             fp="${fp%% *}"
                         fi
                     else
-                        read -rp "文件路径(隔离区或原始): " fp
+                        read -rp "文件标识(隔离名/原路径/virus:名/scan:all): " fp
                     fi
                     test_vs_restore "$fp" "$sid"
+                    ;;
+                vs-bulk|vs-bulk\ *)
+                    vname=""; sid="vs-$$"
+                    if [[ "$choice" =~ ^vs-bulk[[:space:]]+(.+)$ ]]; then
+                        vname="${BASH_REMATCH[1]}"
+                        if [[ "$vname" =~ [[:space:]]+(.+)$ ]]; then
+                            sid="${BASH_REMATCH[1]}"
+                            vname="${vname%% *}"
+                        fi
+                    else
+                        read -rp "病毒名: " vname
+                    fi
+                    test_vs_restore_bulk "$vname" "$sid"
+                    ;;
+                vs-all|vs-all\ *)
+                    sid="vs-$$"
+                    [[ "$choice" =~ vs-all[[:space:]]+(.+)$ ]] && sid="${BASH_REMATCH[1]}"
+                    test_vs_restore_all "$sid"
+                    ;;
+                vs-list)
+                    test_vs_list
+                    ;;
+                vs-meta|vs-meta\ *)
+                    qname=""
+                    [[ "$choice" =~ vs-meta[[:space:]]+(.+)$ ]] && qname="${BASH_REMATCH[1]}"
+                    test_vs_meta "$qname"
                     ;;
                 vs-remove|vs-remove\ *)
                     fp=""; sid="vs-$$"
@@ -944,10 +1109,14 @@ case "${1:-menu}" in
         echo "  w16)LocalUpgrade   upgrade=触发本地升级(离线)"
         echo ""
         echo -e "${BLUE}═══ 病毒处置 ═══${NC}"
-        echo "  vs-move <文件> [scan_id]         # 隔离(MOVE, chmod 000 + .quar)"
-        echo "  vs-restore <文件> [scan_id]      # 还原(RESTORE, 恢复权限)"
+        echo "  vs-move <文件> [scan_id]         # 隔离(MOVE→{dev}_{ino}_{name}+.meta+chmod 000)"
+        echo "  vs-restore <标识> [scan_id]      # 还原(支持: 隔离名/原路径/virus:名/scan:all)"
+        echo "  vs-bulk <病毒名> [scan_id]       # 按病毒名批量还原"
+        echo "  vs-all [scan_id]                 # 还原隔离区全部"
+        echo "  vs-list                          # 列出隔离区所有文件及元数据"
+        echo "  vs-meta [隔离名]                 # 查看.meta JSON内容"
         echo "  vs-remove <文件> [scan_id]       # 删除(REMOVE)"
-        echo "  vs-e2e [test_dir]                # 端到端(创建→隔离→还原→清理)"
+        echo "  vs-e2e [test_dir]                # 端到端(创建→隔离→按ID还原→验证权限属主→清理)"
         echo ""
         echo -e "${BLUE}═══ 快捷命令 ═══${NC}"
         echo "  all=只读 | write=写 | stream=流 | full=全部 | listen [秒]"
@@ -980,6 +1149,14 @@ case "${1:-menu}" in
             test_vs_move "${2:-/tmp/test_sample}" "${3:-vs-$$}"
         elif [ "$1" = "vs-restore" ]; then
             test_vs_restore "${2:-/tmp/test_sample}" "${3:-vs-$$}"
+        elif [ "$1" = "vs-bulk" ]; then
+            test_vs_restore_bulk "${2:-Eicar-Signature}" "${3:-vs-$$}"
+        elif [ "$1" = "vs-all" ]; then
+            test_vs_restore_all "${2:-vs-$$}"
+        elif [ "$1" = "vs-list" ]; then
+            test_vs_list
+        elif [ "$1" = "vs-meta" ]; then
+            test_vs_meta "${2}"
         elif [ "$1" = "vs-remove" ]; then
             test_vs_remove "${2:-/tmp/test_sample}" "${3:-vs-$$}"
         elif [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 31 ]; then
