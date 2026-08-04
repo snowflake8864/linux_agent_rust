@@ -1,7 +1,8 @@
 // crates/virus_scan_grpc/src/vigilixav_scanner.rs
 use logging::{log_error, log_info};
+use std::ffi::CString;
 use std::fs::Permissions;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -273,10 +274,12 @@ impl VigilixAVConnectionPool {
     /// 本进程以 root 权限运行，无权限限制
     ///
     /// 隔离安全措施：
-    ///   - 保存原始路径和权限到 .meta 文件，支持误操作还原
-    pub async fn dispose_file(&self, file_path: &str, action: DispositionAction) -> DispositionResult {
+    ///   - 文件命名: {dev}_{ino}_{原始名}，以 (dev, ino) 作为唯一标识
+    ///   - 保存原始路径、权限、属主到 .meta 文件，支持完整还原
+    pub async fn dispose_file(&self, file_path: &str, action: DispositionAction, virus_name: Option<&str>) -> DispositionResult {
         let file_path_owned = file_path.to_string();
         let quarantine_dir = self.quarantine_dir.clone();
+        let virus_name_owned = virus_name.map(|s| s.to_string());
 
         let result = tokio::task::spawn_blocking(move || {
             match action {
@@ -296,7 +299,7 @@ impl VigilixAVConnectionPool {
                     Self::restore_from_quarantine(&file_path_owned, &quarantine_dir)
                 }
                 DispositionAction::Move => {
-                    Self::quarantine_file(&file_path_owned, &quarantine_dir)
+                    Self::quarantine_file(&file_path_owned, &quarantine_dir, virus_name_owned.as_deref())
                 }
             }
         }).await;
@@ -311,40 +314,42 @@ impl VigilixAVConnectionPool {
     }
 
     /// 将文件隔离到隔离目录
-    fn quarantine_file(file_path: &str, quarantine_dir: &str) -> DispositionResult {
+    /// 文件名格式: {dev}_{ino}_{原始名}，以 (dev, ino) 作为唯一标识
+    fn quarantine_file(file_path: &str, quarantine_dir: &str, virus_name: Option<&str>) -> DispositionResult {
         let path = std::path::Path::new(file_path);
         let original_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        // 保存原始权限
-        let original_perms = match std::fs::metadata(file_path) {
-            Ok(meta) => meta.permissions().mode(),
-            Err(_) => 0o644, // 默认回退
+        // 获取文件完整元数据
+        let meta = match std::fs::metadata(file_path) {
+            Ok(m) => m,
+            Err(e) => {
+                return DispositionResult::Error {
+                    message: format!("无法获取文件元数据 {}: {}", file_path, e)
+                };
+            }
         };
 
-        // 生成隔离文件名：时间戳_原名（冲突时加纳秒后缀）
-        let timestamp_now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let (dest_path, quar_name) = loop {
-            let candidate = format!("{}_{}", timestamp_now, original_name);
-            let dest = format!("{}/{}", quarantine_dir, candidate);
-            if !std::path::Path::new(&dest).exists() {
-                break (dest, candidate);
-            }
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let candidate_ts = format!("{}_{}.{}", timestamp_now, original_name, nanos);
-            let dest_ts = format!("{}/{}", quarantine_dir, candidate_ts);
-            if !std::path::Path::new(&dest_ts).exists() {
-                break (dest_ts, candidate_ts);
-            }
-        };
+        let dev = meta.dev();
+        let ino = meta.ino();
+        let uid = meta.uid();
+        let gid = meta.gid();
+        let mode = meta.permissions().mode();
+        let file_size = meta.len();
+
+        // 隔离文件名: {dev}_{ino}_{原始名}
+        let quar_name = format!("{}_{}_{}", dev, ino, original_name);
+        let dest_path = format!("{}/{}", quarantine_dir, quar_name);
+
+        // 如果同名文件已存在，说明同 (dev, ino) 的文件已隔离过，跳过
+        if std::path::Path::new(&dest_path).exists() {
+            log_info!("VigilixAV: 文件已隔离 (dev={}, ino={}), 跳过 - {}", dev, ino, file_path);
+            return DispositionResult::Success {
+                message: format!("已隔离(重复): {} -> {}", file_path, quar_name)
+            };
+        }
 
         // 先尝试 rename（同设备快速移动），失败则 copy+delete
         let move_result = match std::fs::rename(file_path, &dest_path) {
@@ -377,25 +382,32 @@ impl VigilixAVConnectionPool {
 
         match move_result {
             Ok(()) => {
-                // TODO: 暂不生成 .meta 文件
-                // // 写入元数据文件（用于还原）
-                // let meta_path = format!("{}.meta", dest_path);
-                // let meta_content = serde_json::json!({
-                //     "original_path": file_path,
-                //     "original_permissions": original_perms,
-                //     "quarantined_at": chrono::Utc::now().to_rfc3339(),
-                // });
-                // if let Ok(json) = serde_json::to_string_pretty(&meta_content) {
-                //     if let Err(e) = std::fs::write(&meta_path, &json) {
-                //         log_error!("VigilixAV: 写入元数据文件失败 {} - {}", meta_path, e);
-                //     }
-                // }
-
                 // chmod 000：彻底禁止读/写/执行，防止隔离区病毒被意外激活
                 if let Err(e) = std::fs::set_permissions(&dest_path, Permissions::from_mode(0o000)) {
                     log_error!("VigilixAV: 设置隔离文件权限失败 {} - {}", dest_path, e);
                 } else {
                     log_info!("VigilixAV: 隔离文件已加锁(chmod 000) - {}", dest_path);
+                }
+
+                // 写入 .meta 元数据文件（用于精确还原）
+                let meta_path = format!("{}.meta", dest_path);
+                let meta_content = serde_json::json!({
+                    "dev": dev,
+                    "ino": ino,
+                    "original_path": file_path,
+                    "uid": uid,
+                    "gid": gid,
+                    "mode": mode,
+                    "file_size": file_size,
+                    "virus_name": virus_name.unwrap_or(""),
+                    "quarantined_at": chrono::Utc::now().to_rfc3339(),
+                });
+                if let Ok(json) = serde_json::to_string_pretty(&meta_content) {
+                    if let Err(e) = std::fs::write(&meta_path, &json) {
+                        log_error!("VigilixAV: 写入元数据文件失败 {} - {}", meta_path, e);
+                    } else {
+                        log_info!("VigilixAV: 元数据已保存 - {}", meta_path);
+                    }
                 }
 
                 DispositionResult::Success {
@@ -407,35 +419,63 @@ impl VigilixAVConnectionPool {
     }
 
     /// 从隔离目录还原文件
+    /// file_path 支持多种格式：
+    ///   - "{dev}_{ino}_{name}" : 按 (dev, ino) 精确还原单个文件
+    ///   - "/original/path"     : 按原始路径反查还原
+    ///   - "virus:{virus_name}" : 批量还原所有同名病毒
+    ///   - "scan:all"           : 批量还原隔离区全部文件
     fn restore_from_quarantine(file_path: &str, quarantine_dir: &str) -> DispositionResult {
-        // file_path 参数可以是：
-        //   1. .meta 文件路径 → 直接读取还原
-        //   2. 隔离区文件路径（任意名称）→ 通过同名 .meta 还原
-        //   3. 原始文件路径 → 扫描隔离目录匹配 original_path
+        // ── 批量模式 ──
+        if file_path.starts_with("virus:") {
+            let virus_name = &file_path["virus:".len()..];
+            return Self::restore_all_by_virus(virus_name, quarantine_dir);
+        }
+        if file_path == "scan:all" {
+            return Self::restore_all(quarantine_dir);
+        }
 
-        let meta_path = if file_path.ends_with(".meta") {
-            file_path.to_string()
-        } else {
-            // 策略1：尝试 file_path + ".meta"（表示直接传了隔离文件路径）
-            let candidate = format!("{}.meta", file_path);
-            if std::path::Path::new(&candidate).exists() {
-                candidate
-            } else {
-                // 策略2：扫描隔离目录，匹配 original_path
-                match Self::find_meta_by_original_path(file_path, quarantine_dir) {
-                    Some(p) => p,
-                    None => {
-                        return DispositionResult::Error {
-                            message: format!("在隔离目录中未找到文件 {} 对应的元数据", file_path)
-                        };
-                    }
-                }
+        // ── 单文件模式：找到对应的 .meta ──
+        let meta_path = match Self::find_meta_for_restore(file_path, quarantine_dir) {
+            Some(p) => p,
+            None => {
+                return DispositionResult::Error {
+                    message: format!("在隔离目录中未找到文件 {} 对应的元数据", file_path)
+                };
             }
         };
 
-        // 读取元数据
-        let meta_content = match std::fs::read_to_string(&meta_path) {
-            Ok(content) => content,
+        Self::restore_one_meta(&meta_path)
+    }
+
+    /// 查找用于还原的 .meta 文件
+    fn find_meta_for_restore(file_path: &str, quarantine_dir: &str) -> Option<String> {
+        // 策略1：file_path 本身就是 .meta 路径
+        if file_path.ends_with(".meta") && std::path::Path::new(file_path).exists() {
+            return Some(file_path.to_string());
+        }
+
+        // 策略2：file_path 在隔离目录中且同名 .meta 存在
+        let candidate = format!("{}/{}.meta", quarantine_dir, file_path);
+        if std::path::Path::new(&candidate).exists() {
+            return Some(candidate);
+        }
+
+        // 策略3：file_path 可能是 {dev}_{ino}_{...} 格式，解析 (dev, ino) 查找
+        let parts: Vec<&str> = file_path.split('_').collect();
+        if parts.len() >= 2 {
+            if let (Ok(dev), Ok(ino)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                return Self::find_meta_by_dev_inode(dev, ino, quarantine_dir);
+            }
+        }
+
+        // 策略4：file_path 是原始路径，扫 .meta 匹配 original_path
+        Self::find_meta_by_original_path(file_path, quarantine_dir)
+    }
+
+    /// 还原单个 .meta 对应的隔离文件
+    fn restore_one_meta(meta_path: &str) -> DispositionResult {
+        let meta_content = match std::fs::read_to_string(meta_path) {
+            Ok(c) => c,
             Err(e) => {
                 return DispositionResult::Error {
                     message: format!("无法读取元数据文件 {}: {}", meta_path, e)
@@ -453,7 +493,9 @@ impl VigilixAVConnectionPool {
         };
 
         let original_path = meta["original_path"].as_str().unwrap_or("");
-        let original_perms = meta["original_permissions"].as_u64().unwrap_or(0o644) as u32;
+        let mode = meta["mode"].as_u64().unwrap_or(0o644) as u32;
+        let uid = meta["uid"].as_u64().unwrap_or(0) as u32;
+        let gid = meta["gid"].as_u64().unwrap_or(0) as u32;
 
         if original_path.is_empty() {
             return DispositionResult::Error {
@@ -461,8 +503,8 @@ impl VigilixAVConnectionPool {
             };
         }
 
-        // 找到对应的隔离文件（.meta 去掉后缀即为隔离文件路径）
-        let quar_path = meta_path.strip_suffix(".meta").unwrap_or(&meta_path).to_string();
+        // 找到对应的隔离文件（.meta 去掉后缀）
+        let quar_path = meta_path.strip_suffix(".meta").unwrap_or(meta_path).to_string();
         if !std::path::Path::new(&quar_path).exists() {
             return DispositionResult::Error {
                 message: format!("隔离文件不存在: {}（可能已被手动删除）", quar_path)
@@ -481,57 +523,153 @@ impl VigilixAVConnectionPool {
         }
 
         // 移动文件回原始位置
-        match std::fs::rename(&quar_path, original_path) {
-            Ok(()) => {
-                // 恢复原始权限
-                if let Err(e) = std::fs::set_permissions(original_path, Permissions::from_mode(original_perms)) {
-                    log_error!("VigilixAV: 还原权限失败 {} - {}", original_path, e);
-                }
-                // 清理元数据文件
-                let _ = std::fs::remove_file(&meta_path);
-                log_info!("VigilixAV: 还原成功 - {} -> {}", quar_path, original_path);
-                DispositionResult::Success {
-                    message: format!("还原成功: {} -> {}", quar_path, original_path)
-                }
-            }
-            Err(e) => {
+        let move_ok = match std::fs::rename(&quar_path, original_path) {
+            Ok(()) => true,
+            Err(_) => {
                 // rename 失败，尝试 copy+delete
                 match std::fs::copy(&quar_path, original_path) {
                     Ok(_) => {
-                        if let Err(e2) = std::fs::set_permissions(original_path, Permissions::from_mode(original_perms)) {
-                            log_error!("VigilixAV: 还原权限失败 {} - {}", original_path, e2);
-                        }
                         let _ = std::fs::remove_file(&quar_path);
-                        let _ = std::fs::remove_file(&meta_path);
-                        log_info!("VigilixAV: 还原成功(copy) - {} -> {}", quar_path, original_path);
-                        DispositionResult::Success {
-                            message: format!("还原成功: {} -> {}", quar_path, original_path)
-                        }
+                        log_info!("VigilixAV: 还原(copy) - {} -> {}", quar_path, original_path);
+                        true
                     }
                     Err(e2) => {
-                        DispositionResult::Error {
+                        log_error!("VigilixAV: 还原失败 - {} -> {}: {}", quar_path, original_path, e2);
+                        return DispositionResult::Error {
                             message: format!("还原失败: {} -> {}: {}", quar_path, original_path, e2)
-                        }
+                        };
                     }
                 }
+            }
+        };
+
+        if !move_ok {
+            return DispositionResult::Error {
+                message: "还原移动失败".to_string()
+            };
+        }
+
+        // 恢复属主（chown uid:gid）
+        Self::chown_file(original_path, uid, gid);
+
+        // 恢复权限（chmod mode）
+        if let Err(e) = std::fs::set_permissions(original_path, Permissions::from_mode(mode)) {
+            log_error!("VigilixAV: 还原权限失败 {} - {}", original_path, e);
+        }
+
+        // 清理元数据文件
+        let _ = std::fs::remove_file(meta_path);
+        log_info!("VigilixAV: 还原成功 - {} -> {}", quar_path, original_path);
+
+        DispositionResult::Success {
+            message: format!("还原成功: {}", original_path)
+        }
+    }
+
+    /// 批量还原所有同一病毒名的隔离文件
+    fn restore_all_by_virus(virus_name: &str, quarantine_dir: &str) -> DispositionResult {
+        let metas = Self::find_all_meta_by_virus(virus_name, quarantine_dir);
+        if metas.is_empty() {
+            return DispositionResult::Error {
+                message: format!("未找到病毒 {} 的隔离文件", virus_name)
+            };
+        }
+
+        let total = metas.len();
+        let mut ok = 0usize;
+        let mut failed = Vec::new();
+
+        for meta_path in &metas {
+            match Self::restore_one_meta(meta_path) {
+                DispositionResult::Success { .. } => ok += 1,
+                DispositionResult::Error { message } => failed.push(message),
+            }
+        }
+
+        if failed.is_empty() {
+            DispositionResult::Success {
+                message: format!("批量还原完成: {}/{}", ok, total)
+            }
+        } else {
+            DispositionResult::Error {
+                message: format!("批量还原: {}/{}, 失败: {:?}", ok, total, failed)
             }
         }
     }
 
-    /// 在隔离目录中扫描所有 .meta 文件，找到 original_path 匹配的那个
-    fn find_meta_by_original_path(original_path: &str, quarantine_dir: &str) -> Option<String> {
-        let dir = match std::fs::read_dir(quarantine_dir) {
-            Ok(d) => d,
-            Err(_) => return None,
-        };
+    /// 还原隔离区全部文件
+    fn restore_all(quarantine_dir: &str) -> DispositionResult {
+        let metas = Self::find_all_meta(quarantine_dir);
+        if metas.is_empty() {
+            return DispositionResult::Error {
+                message: "隔离区中没有可还原的文件".to_string()
+            };
+        }
 
+        let total = metas.len();
+        let mut ok = 0usize;
+
+        for meta_path in &metas {
+            match Self::restore_one_meta(meta_path) {
+                DispositionResult::Success { .. } => ok += 1,
+                _ => {}
+            }
+        }
+
+        DispositionResult::Success {
+            message: format!("全部还原完成: {}/{}", ok, total)
+        }
+    }
+
+    /// chown(path, uid, gid)
+    fn chown_file(path: &str, uid: u32, gid: u32) {
+        if uid == 0 && gid == 0 {
+            return; // 本来就不是 root，跳过也没什么意义；本来就是 root 也不需要改
+        }
+        let c_path = match CString::new(path) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let ret = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EPERM) {
+                log_error!("VigilixAV: chown({}, {}, {}) 失败: {}", path, uid, gid, err);
+            }
+        } else {
+            log_info!("VigilixAV: chown({}, {}, {}) ok", path, uid, gid);
+        }
+    }
+
+    /// 按 (dev, ino) 查找 .meta 文件
+    fn find_meta_by_dev_inode(dev: u64, ino: u64, quarantine_dir: &str) -> Option<String> {
+        let dir = std::fs::read_dir(quarantine_dir).ok()?;
         for entry in dir.flatten() {
             let path = entry.path();
             let path_str = path.to_string_lossy();
             if !path_str.ends_with(".meta") {
                 continue;
             }
-            // 读取 meta 文件内容（使用 Path 直接读取）
+            let content = std::fs::read_to_string(&path).ok()?;
+            let meta: serde_json::Value = serde_json::from_str(&content).ok()?;
+            if meta.get("dev").and_then(|v| v.as_u64()) == Some(dev)
+                && meta.get("ino").and_then(|v| v.as_u64()) == Some(ino)
+            {
+                return Some(path_str.to_string());
+            }
+        }
+        None
+    }
+
+    /// 在隔离目录中扫描所有 .meta 文件，找到 original_path 匹配的那个
+    fn find_meta_by_original_path(original_path: &str, quarantine_dir: &str) -> Option<String> {
+        let dir = std::fs::read_dir(quarantine_dir).ok()?;
+        for entry in dir.flatten() {
+            let path = entry.path();
+            let path_str = path.to_string_lossy();
+            if !path_str.ends_with(".meta") {
+                continue;
+            }
             let content = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -541,11 +679,50 @@ impl VigilixAVConnectionPool {
                 Err(_) => continue,
             };
             if meta.get("original_path").and_then(|v| v.as_str()) == Some(original_path) {
-                return Some(path.to_string_lossy().to_string());
+                return Some(path_str.to_string());
             }
         }
-
         None
+    }
+
+    /// 查找所有匹配 virus_name 的 .meta 文件
+    fn find_all_meta_by_virus(virus_name: &str, quarantine_dir: &str) -> Vec<String> {
+        let dir = match std::fs::read_dir(quarantine_dir) {
+            Ok(d) => d,
+            Err(_) => return vec![],
+        };
+        let mut result = Vec::new();
+        for entry in dir.flatten() {
+            let path = entry.path();
+            let path_str = path.to_string_lossy();
+            if !path_str.ends_with(".meta") {
+                continue;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let meta: serde_json::Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if meta.get("virus_name").and_then(|v| v.as_str()) == Some(virus_name) {
+                result.push(path_str.to_string());
+            }
+        }
+        result
+    }
+
+    /// 查找隔离目录中所有 .meta 文件
+    fn find_all_meta(quarantine_dir: &str) -> Vec<String> {
+        let dir = match std::fs::read_dir(quarantine_dir) {
+            Ok(d) => d,
+            Err(_) => return vec![],
+        };
+        dir.flatten()
+            .filter(|e| e.path().to_string_lossy().ends_with(".meta"))
+            .map(|e| e.path().to_string_lossy().to_string())
+            .collect()
     }
 
     pub async fn ping(&self) -> Result<(), String> {

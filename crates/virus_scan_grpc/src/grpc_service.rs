@@ -131,7 +131,7 @@ impl VirusScanService for VirusScanGrpcService {
                                                     continue;
                                                 }
                                             };
-                                            let result = scanner.dispose_file(&req.file_path, action).await;
+                                            let result = scanner.dispose_file(&req.file_path, action, None).await;
                                             let (success, message) = match result {
                                                 crate::vigilixav_scanner::DispositionResult::Success { message } => {
                                                     (true, message)
