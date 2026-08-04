@@ -1425,7 +1425,7 @@ async fn task_down_black(&self, task_type: u64) -> Result<(), String> {
                 }
 
                 let mut mgr = POLICY_MANAGER.lock().unwrap();
-                mgr.set_policy_process(&hash_list, false);
+                mgr.set_policy_process(&hash_list, false, Some(false));
             } else {
                 eprintln!("Error: Invalid response code: {}", parsed["code"]);
                 // 返回错误的 Result 类型
@@ -1482,7 +1482,7 @@ pub async fn task_down_white(&self, task_type: u64) -> Result<(), String> {
                 }
 
                 let mut mgr = POLICY_MANAGER.lock().unwrap();
-                mgr.set_policy_process(&hash_list,true);
+                mgr.set_policy_process(&hash_list, true, Some(false));
                 //println!("hash_list:{:?}",hash_list);
             }
         }

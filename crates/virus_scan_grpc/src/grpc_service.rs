@@ -227,4 +227,43 @@ impl VirusScanService for VirusScanGrpcService {
 
         Ok(Response::new(Box::pin(rx) as GrpcStream))
     }
+
+    async fn list_quarantine(
+        &self,
+        request: Request<grpc_gateway::virus_scan::QuarantineQuery>,
+    ) -> Result<Response<grpc_gateway::virus_scan::QuarantineList>, Status> {
+        let q = request.into_inner();
+        let filter = q.filter.as_str();
+
+        let rows = if filter.starts_with("virus:") {
+            let vname = &filter["virus:".len()..];
+            local_store::quarantine::list_by_virus(vname)
+                .map_err(|e| Status::internal(format!("查询隔离区失败: {}", e)))?
+        } else if filter == "all" {
+            local_store::quarantine::list_all()
+                .map_err(|e| Status::internal(format!("查询隔离区失败: {}", e)))?
+        } else {
+            local_store::quarantine::list_quarantined()
+                .map_err(|e| Status::internal(format!("查询隔离区失败: {}", e)))?
+        };
+
+        let total = rows.len() as i32;
+        let entries = rows.into_iter().map(|r| grpc_gateway::virus_scan::QuarantineEntry {
+            id: r.id,
+            dev: r.dev,
+            ino: r.ino,
+            original_path: r.original_path,
+            quar_name: r.quar_name,
+            virus_name: r.virus_name,
+            uid: r.uid,
+            gid: r.gid,
+            mode: r.mode,
+            file_size: r.file_size,
+            quarantined_at: r.quarantined_at,
+            restored: r.restored,
+            restored_at: r.restored_at,
+        }).collect();
+
+        Ok(Response::new(grpc_gateway::virus_scan::QuarantineList { entries, total }))
+    }
 }

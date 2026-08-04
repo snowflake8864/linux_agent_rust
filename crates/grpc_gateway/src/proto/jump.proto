@@ -44,18 +44,28 @@ message PwJumpResponse {
 
 message JumpStatus {
     // IP 跳变状态
-    string current_ip = 1;              // 当前主 IP
+    string current_ip = 1;              // 当前主 IP（来自服务器 newestJumpInfo.ip_jump.ip）
     bool   ip_jump_active = 2;          // 是否正在周期跳变
     uint32 active_time = 3;             // 周期间隔（秒），0=单次已完成
     uint32 aging_time = 4;              // 老化时间（分钟）
     uint32 mode = 5;                    // 1=Keep，2=Replace
-    string source_ip = 6;              // 跳变源 IP
-    string target_ip = 7;              // 跳变目标 IP/CIDR
+    string source_ip = 6;               // 跳变源 IP
+    string target_ip = 7;               // 跳变目标 IP/CIDR
     string gateway = 8;                 // 网关
     string last_ip_jump_time = 9;       // 上次 IP 跳变时间
 
     // 密码跳变状态
-    string current_password = 10;       // 跳变后的新密码
+    string current_password = 10;       // 跳变后的新密码（来自服务器 newestJumpInfo.pw_jump.pw）
     string last_pw_jump_user = 11;      // 被修改密码的用户名
     string last_pw_jump_time = 12;      // 上次密码跳变时间
+
+    // 来自服务器 /v1/newestJumpInfo 的补充信息
+    uint32 ip_scheme = 13;              // IP 跳变方案编号
+    string ip_cycle_label = 14;         // IP 跳变频率描述（如"每周"）
+    string ip_timing_label = 15;        // IP 跳变时机描述（如"周一凌晨"）
+    string ip_way_label = 16;           // IP 跳变方式描述（如"顺序"）
+
+    uint32 pw_scheme = 17;              // 口令跳变方案编号
+    string pw_cycle_label = 18;         // 口令跳变频率描述
+    string pw_timing_label = 19;        // 口令跳变时机描述
 }

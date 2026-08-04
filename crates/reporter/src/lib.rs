@@ -124,6 +124,58 @@ pub fn broadcast_audit_log(log: &AuditLogInfo) {
         p_param: log.p_param.clone().unwrap_or_default(),
         n_type: log.n_type as u32,
     });
+
+    // 持久化到 alert.db（受 [SQLITE_DB] ENABLED 和 [DB_POLICY] ALERT_LOG 双重开关控制）
+    persist_alert_to_db(log, alert_type);
+}
+
+/// 将告警持久化到 SQLite alert.db
+/// 仅当 [SQLITE_DB] ENABLED=1 且 [DB_POLICY] ALERT_LOG=1 时写入
+fn persist_alert_to_db(log: &AuditLogInfo, alert_type: i32) {
+    if !local_store::sqlite_db_enabled() {
+        return;
+    }
+    let db_policy_enabled = config::net_info::NETINFO_CONFIG
+        .lock()
+        .map(|c| c.db_policy.alert_log)
+        .unwrap_or(false);
+    if !db_policy_enabled {
+        return;
+    }
+
+    let now = chrono::Local::now().timestamp();
+    // path:   进程/文件=可执行路径, 外设=peripheral_name
+    // identifier: 进程/文件/勒索=md5, 外设=peripheral_eid
+    let row = local_store::alert_log::AlertLogRow {
+        id: 0,
+        alert_type,
+        level: log.n_level as i32,
+        process: log.exception_process.clone().unwrap_or_default(),
+        path: match alert_type {
+            3 => log.peripheral_name.clone().unwrap_or_default(),
+            _ => log.file_path.clone().unwrap_or_default(),
+        },
+        pid: 0,
+        detail: log.notice_remark.clone().unwrap_or_default(),
+        identifier: match alert_type {
+            1 | 2 | 5 => log.md5.clone().unwrap_or_default(),
+            3 => log.peripheral_eid.clone().unwrap_or_default(),
+            _ => String::new(),
+        },
+        n_type: log.n_type as u32,
+        handle_status: local_store::alert_log::HANDLE_STATUS_PENDING,
+        handle_status_label: "未处理".to_string(),
+        handle_user: String::new(),
+        handled_at: 0,
+        created_at: now,
+    };
+    let max_rows = config::net_info::NETINFO_CONFIG
+        .lock()
+        .map(|c| c.db_policy.alert_max_rows)
+        .unwrap_or(0);
+    if let Err(e) = local_store::alert_log::insert(&row, max_rows) {
+        log_error!("[alert] 写入 alert.db 失败: {}", e);
+    }
 }
 
 /// Broadcast SysNetLog (network communication log) to gRPC AlertService.

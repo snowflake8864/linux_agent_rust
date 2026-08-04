@@ -45,7 +45,8 @@ impl ProcessPolicyManager {
     }
 
 
-    pub fn set_policy_process(&mut self, process_list: &[String], is_white: bool) {
+    /// save_to_db: Some(true)=离线本地表, Some(false)=在线基线表, None=不写DB
+    pub fn set_policy_process(&mut self, process_list: &[String], is_white: bool, save_to_db: Option<bool>) {
         let mut is_changed = false;
 
         if is_white {
@@ -126,6 +127,82 @@ impl ProcessPolicyManager {
                 self.prev_black_set = self.black_set.clone();
                 Self::notify_kernel_update();
                 log_info!("[process_policy] 黑名单已下发内核 ({} 条)", self.black_set.len());
+            }
+        }
+
+        // 持久化黑白名单到 SQLite（受 [SQLITE_DB] 和 [DB_POLICY] 开关控制）
+        // save_to_db: Some(true)=离线本地表, Some(false)=在线基线表, None=不写
+        if let Some(local) = save_to_db {
+            self.try_save_policy_to_db(is_white, local);
+        }
+    }
+
+    /// 尝试将进程名单持久化到 DB（如果开关已开启）
+    /// local: true=离线本地表(process_policy_local), false=在线基线表(process_policy)
+    fn try_save_policy_to_db(&self, is_white: bool, local: bool) {
+        if !local_store::sqlite_db_enabled() {
+            return;
+        }
+        let db_ok = config::net_info::NETINFO_CONFIG
+            .lock()
+            .map(|c| c.db_policy.process_policy)
+            .unwrap_or(false);
+        if !db_ok {
+            return;
+        }
+        let white: Vec<String> = self.white_set.iter().cloned().collect();
+        let black: Vec<String> = self.black_set.iter().cloned().collect();
+        let result = if local {
+            local_store::process_policy::save_all_local(&white, &black)
+        } else {
+            local_store::process_policy::save_all(&white, &black)
+        };
+        if let Err(e) = result {
+            logging::log_error!("[process_policy] 持久化到{}(local={}) 失败: {}",
+                if local { "离线本地表" } else { "在线基线表" }, local, e);
+        }
+        // 同步到 known_executables 表
+        let target = if is_white { &white } else { &black };
+        if let Err(e) = local_store::known_executables::update_policy_status(target, is_white) {
+            logging::log_error!("[known_executables] 同步策略状态失败: {}", e);
+        }
+    }
+
+    /// 从 SQLite 加载黑白名单到内存（启动时调用，不写 kernel）
+    /// local: true=从离线本地表加载, false=从在线基线表加载
+    pub fn load_policy_from_db_if_enabled(&mut self, local: bool) {
+        if !local_store::sqlite_db_enabled() {
+            return;
+        }
+        let db_ok = config::net_info::NETINFO_CONFIG
+            .lock()
+            .map(|c| c.db_policy.process_policy)
+            .unwrap_or(false);
+        if !db_ok {
+            return;
+        }
+        let result = if local {
+            local_store::process_policy::load_all_local()
+        } else {
+            local_store::process_policy::load_all()
+        };
+        match result {
+            Ok(entries) => {
+                self.white_set.clear();
+                self.black_set.clear();
+                for (hash, is_white) in entries {
+                    if is_white {
+                        self.white_set.insert(hash);
+                    } else {
+                        self.black_set.insert(hash);
+                    }
+                }
+                log::info!("[process_policy] 从 SQLite({}) 加载: 白名单 {} 条, 黑名单 {} 条",
+                    if local { "local" } else { "online" },
+                    self.white_set.len(), self.black_set.len());
+            }
+            Err(e) => {
+                logging::log_error!("[process_policy] 从 DB 加载失败: {}", e);
             }
         }
     }

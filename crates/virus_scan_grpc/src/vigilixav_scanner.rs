@@ -9,6 +9,122 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
+/// 检查是否启用 SQLite 隔离元数据（替代 .meta 文件）
+fn quarantine_db_enabled() -> bool {
+    config::net_info::NETINFO_CONFIG
+        .lock()
+        .map(|c| c.sqlite_db.enabled && c.db_policy.quarantine)
+        .unwrap_or(false)
+}
+
+/// 将老的 .meta 文件迁移到 quarantine.db（首次启用时调用，幂等）
+/// 迁移成功后删除 .meta 文件
+pub fn migrate_meta_to_db(quarantine_dir: &str) {
+    if !quarantine_db_enabled() {
+        return;
+    }
+    let dir = match std::fs::read_dir(quarantine_dir) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let mut migrated = 0usize;
+    for entry in dir.flatten() {
+        let path = entry.path();
+        let path_str = path.to_string_lossy();
+        if !path_str.ends_with(".meta") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let meta: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let dev = meta["dev"].as_u64().unwrap_or(0);
+        let ino = meta["ino"].as_u64().unwrap_or(0);
+        if dev == 0 || ino == 0 {
+            continue;
+        }
+        // 检查 DB 是否已有此记录
+        if let Ok(Some(_)) = local_store::quarantine::find_by_dev_ino(dev, ino) {
+            // 已存在，直接删 .meta
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        let row = local_store::quarantine::QuarantineRow {
+            dev,
+            ino,
+            original_path: meta["original_path"].as_str().unwrap_or("").to_string(),
+            quar_name: path_str.strip_suffix(".meta").unwrap_or(&path_str)
+                .split('/').last().unwrap_or("").to_string(),
+            virus_name: meta["virus_name"].as_str().unwrap_or("").to_string(),
+            uid: meta["uid"].as_u64().unwrap_or(0) as u32,
+            gid: meta["gid"].as_u64().unwrap_or(0) as u32,
+            mode: meta["mode"].as_u64().unwrap_or(0) as u32,
+            file_size: meta["file_size"].as_u64().unwrap_or(0),
+            quarantined_at: meta["quarantined_at"].as_str().unwrap_or("").to_string(),
+            ..Default::default()
+        };
+        match local_store::quarantine::insert(&row) {
+            Ok(true) => {
+                let _ = std::fs::remove_file(&path);
+                migrated += 1;
+                log_info!("[quarantine] 迁移 .meta → DB: {}", row.quar_name);
+            }
+            Ok(false) => {
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(e) => {
+                log_error!("[quarantine] 迁移失败 {}: {}", path_str, e);
+            }
+        }
+    }
+    if migrated > 0 {
+        log_info!("[quarantine] .meta 迁移完成: {} 条", migrated);
+    }
+}
+
+/// 列出隔离中的文件列表（从 DB 或 .meta 扫描）
+pub fn list_quarantined_files(quarantine_dir: &str) -> Vec<String> {
+    if quarantine_db_enabled() {
+        match local_store::quarantine::list_quarantined() {
+            Ok(rows) => rows.into_iter()
+                .map(|r| format!("{}  |  {}  |  {}  |  {}",
+                    r.quar_name, r.virus_name, r.original_path, r.quarantined_at))
+                .collect(),
+            Err(e) => vec![format!("DB 查询失败: {}", e)],
+        }
+    } else {
+        // 传统模式：扫描 .meta 文件
+        let dir = match std::fs::read_dir(quarantine_dir) {
+            Ok(d) => d,
+            Err(e) => return vec![format!("无法读取隔离目录: {}", e)],
+        };
+        let mut result = Vec::new();
+        for entry in dir.flatten() {
+            let path_str = entry.path().to_string_lossy().to_string();
+            if path_str.ends_with(".meta") {
+                if let Ok(content) = std::fs::read_to_string(&path_str) {
+                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
+                        let name = path_str.strip_suffix(".meta").unwrap_or("")
+                            .split('/').last().unwrap_or("");
+                        let virus = meta["virus_name"].as_str().unwrap_or("");
+                        let orig = meta["original_path"].as_str().unwrap_or("");
+                        let time = meta["quarantined_at"].as_str().unwrap_or("");
+                        result.push(format!("{}  |  {}  |  {}  |  {}", name, virus, orig, time));
+                    }
+                }
+            }
+        }
+        if result.is_empty() {
+            result.push("隔离区为空".to_string());
+        }
+        result
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum VigilixAVConnection {
     Tcp { host: String, port: u16 },
@@ -287,6 +403,8 @@ impl VigilixAVConnectionPool {
                     match std::fs::remove_file(&file_path_owned) {
                         Ok(()) => {
                             log_info!("VigilixAV: 删除成功 - {}", file_path_owned);
+                            // 如果是隔离目录中的文件，清理 DB 记录
+                            Self::cleanup_quarantine_record(&file_path_owned);
                             DispositionResult::Success { message: format!("删除成功: {}", file_path_owned) }
                         }
                         Err(e) => {
@@ -389,24 +507,47 @@ impl VigilixAVConnectionPool {
                     log_info!("VigilixAV: 隔离文件已加锁(chmod 000) - {}", dest_path);
                 }
 
-                // 写入 .meta 元数据文件（用于精确还原）
-                let meta_path = format!("{}.meta", dest_path);
-                let meta_content = serde_json::json!({
-                    "dev": dev,
-                    "ino": ino,
-                    "original_path": file_path,
-                    "uid": uid,
-                    "gid": gid,
-                    "mode": mode,
-                    "file_size": file_size,
-                    "virus_name": virus_name.unwrap_or(""),
-                    "quarantined_at": chrono::Utc::now().to_rfc3339(),
-                });
-                if let Ok(json) = serde_json::to_string_pretty(&meta_content) {
-                    if let Err(e) = std::fs::write(&meta_path, &json) {
-                        log_error!("VigilixAV: 写入元数据文件失败 {} - {}", meta_path, e);
-                    } else {
-                        log_info!("VigilixAV: 元数据已保存 - {}", meta_path);
+                // 写入隔离元数据
+                if quarantine_db_enabled() {
+                    // SQLite 模式 — 写入 quarantine.db
+                    let row = local_store::quarantine::QuarantineRow {
+                        dev,
+                        ino,
+                        original_path: file_path.to_string(),
+                        quar_name: quar_name.clone(),
+                        virus_name: virus_name.unwrap_or("").to_string(),
+                        uid,
+                        gid,
+                        mode,
+                        file_size,
+                        quarantined_at: chrono::Utc::now().to_rfc3339(),
+                        ..Default::default()
+                    };
+                    match local_store::quarantine::insert(&row) {
+                        Ok(true) => log_info!("VigilixAV: 隔离元数据已写入 quarantine.db - {}", quar_name),
+                        Ok(false) => log_info!("VigilixAV: 隔离记录已存在(DB) - {}", quar_name),
+                        Err(e) => log_error!("VigilixAV: quarantine.db 写入失败: {}", e),
+                    }
+                } else {
+                    // 传统模式 — 写入 .meta 文件
+                    let meta_path = format!("{}.meta", dest_path);
+                    let meta_content = serde_json::json!({
+                        "dev": dev,
+                        "ino": ino,
+                        "original_path": file_path,
+                        "uid": uid,
+                        "gid": gid,
+                        "mode": mode,
+                        "file_size": file_size,
+                        "virus_name": virus_name.unwrap_or(""),
+                        "quarantined_at": chrono::Utc::now().to_rfc3339(),
+                    });
+                    if let Ok(json) = serde_json::to_string_pretty(&meta_content) {
+                        if let Err(e) = std::fs::write(&meta_path, &json) {
+                            log_error!("VigilixAV: 写入元数据文件失败 {} - {}", meta_path, e);
+                        } else {
+                            log_info!("VigilixAV: 元数据已保存 - {}", meta_path);
+                        }
                     }
                 }
 
@@ -428,13 +569,23 @@ impl VigilixAVConnectionPool {
         // ── 批量模式 ──
         if file_path.starts_with("virus:") {
             let virus_name = &file_path["virus:".len()..];
+            if quarantine_db_enabled() {
+                return Self::restore_all_by_virus_db(virus_name, quarantine_dir);
+            }
             return Self::restore_all_by_virus(virus_name, quarantine_dir);
         }
         if file_path == "scan:all" {
+            if quarantine_db_enabled() {
+                return Self::restore_all_db(quarantine_dir);
+            }
             return Self::restore_all(quarantine_dir);
         }
 
-        // ── 单文件模式：找到对应的 .meta ──
+        // ── 单文件模式 ──
+        if quarantine_db_enabled() {
+            return Self::restore_one_from_db(file_path, quarantine_dir);
+        }
+        // 传统模式：找到对应的 .meta
         let meta_path = match Self::find_meta_for_restore(file_path, quarantine_dir) {
             Some(p) => p,
             None => {
@@ -443,8 +594,165 @@ impl VigilixAVConnectionPool {
                 };
             }
         };
-
         Self::restore_one_meta(&meta_path)
+    }
+
+    /// SQLite 模式：从 quarantine.db 查找并还原单个文件
+    fn restore_one_from_db(file_path: &str, quarantine_dir: &str) -> DispositionResult {
+        // 先去掉隔离目录前缀（如果有的话），提取纯文件名
+        // 用 starts_with + 切片，比 strip_prefix 链更可靠
+        let pure_name = {
+            let f = file_path.trim_start_matches('/');
+            let q = quarantine_dir.trim_start_matches('/').trim_end_matches('/');
+            let with_slash = format!("{}/", q);
+            if f.starts_with(&with_slash) {
+                &f[with_slash.len()..]
+            } else if f.starts_with(q) {
+                &f[q.len()..]
+            } else {
+                // 可能只是文件名，直接用
+                f
+            }
+            .trim_start_matches('/')
+        };
+
+        log_info!("VigilixAV: restore_one_from_db 入参={} 纯名={}", file_path, pure_name);
+
+        // 策略1：解析 {dev}_{ino}_{...} 格式
+        let parts: Vec<&str> = pure_name.split('_').collect();
+        if parts.len() >= 2 {
+            if let (Ok(dev), Ok(ino)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                log_info!("VigilixAV: 策略1 解析 dev={} ino={}", dev, ino);
+                match local_store::quarantine::find_by_dev_ino(dev, ino) {
+                    Ok(Some(row)) => {
+                        log_info!("VigilixAV: 策略1 命中 id={} quar_name={}", row.id, row.quar_name);
+                        return Self::restore_db_row(&row, quarantine_dir);
+                    }
+                    Ok(None) => log_info!("VigilixAV: 策略1 未命中 (dev={} ino={})", dev, ino),
+                    Err(e) => log_error!("VigilixAV: quarantine.db 查询失败: {}", e),
+                }
+            } else {
+                log_info!("VigilixAV: 策略1 解析失败 parts[0]={} parts[1]={}", parts[0], parts[1]);
+            }
+        } else {
+            log_info!("VigilixAV: 策略1 跳过（parts.len={}）", parts.len());
+        }
+
+        // 策略2：按原始路径查找
+        log_info!("VigilixAV: 策略2 find_by_original_path({})", file_path);
+        match local_store::quarantine::find_by_original_path(file_path) {
+            Ok(rows) if !rows.is_empty() => {
+                log_info!("VigilixAV: 策略2 命中 {} 条", rows.len());
+                return Self::restore_db_row(&rows[0], quarantine_dir);
+            }
+            Ok(rows) => log_info!("VigilixAV: 策略2 未命中（{} 条）", rows.len()),
+            Err(e) => log_error!("VigilixAV: quarantine.db 查询失败: {}", e),
+        }
+
+        DispositionResult::Error {
+            message: format!("在 quarantine.db 中未找到文件 {} 对应的隔离记录 (pure_name={}, db已查)", file_path, pure_name)
+        }
+    }
+
+    /// 从 quarantine.db 行还原文件
+    fn restore_db_row(row: &local_store::quarantine::QuarantineRow, quarantine_dir: &str) -> DispositionResult {
+        let quar_path = format!("{}/{}", quarantine_dir, row.quar_name);
+        let original_path = &row.original_path;
+
+        if !std::path::Path::new(&quar_path).exists() {
+            return DispositionResult::Error {
+                message: format!("隔离文件不存在: {}（可能已被手动删除，但 DB 记录还在）", quar_path)
+            };
+        }
+
+        // 确保原始目录存在
+        if let Some(parent) = std::path::Path::new(original_path).parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return DispositionResult::Error {
+                        message: format!("无法创建原始目录 {}: {}", parent.display(), e)
+                    };
+                }
+            }
+        }
+
+        // 移动文件回原始位置
+        match std::fs::rename(&quar_path, original_path) {
+            Ok(()) => {}
+            Err(_) => {
+                match std::fs::copy(&quar_path, original_path) {
+                    Ok(_) => { let _ = std::fs::remove_file(&quar_path); }
+                    Err(e2) => {
+                        return DispositionResult::Error {
+                            message: format!("还原失败: {} -> {}: {}", quar_path, original_path, e2)
+                        };
+                    }
+                }
+            }
+        }
+
+        // 恢复属主和权限
+        Self::chown_file(original_path, row.uid, row.gid);
+        if let Err(e) = std::fs::set_permissions(original_path, Permissions::from_mode(row.mode)) {
+            log_error!("VigilixAV: 还原权限失败 {} - {}", original_path, e);
+        }
+
+        // 标记 DB 记录为已还原
+        let _ = local_store::quarantine::mark_restored(row.id);
+        log_info!("VigilixAV: 还原成功(DB) - {} -> {}", quar_path, original_path);
+
+        DispositionResult::Success {
+            message: format!("还原成功: {}", original_path)
+        }
+    }
+
+    /// SQLite 模式：批量还原所有同一病毒名的隔离文件
+    fn restore_all_by_virus_db(virus_name: &str, quarantine_dir: &str) -> DispositionResult {
+        let rows = match local_store::quarantine::list_by_virus(virus_name) {
+            Ok(r) => r,
+            Err(e) => return DispositionResult::Error { message: format!("查询失败: {}", e) },
+        };
+        if rows.is_empty() {
+            return DispositionResult::Error {
+                message: format!("未找到病毒 {} 的隔离文件", virus_name)
+            };
+        }
+        let total = rows.len();
+        let mut ok = 0usize;
+        let mut failed = Vec::new();
+        for row in &rows {
+            match Self::restore_db_row(row, quarantine_dir) {
+                DispositionResult::Success { .. } => ok += 1,
+                DispositionResult::Error { message } => failed.push(message),
+            }
+        }
+        if failed.is_empty() {
+            DispositionResult::Success { message: format!("批量还原完成: {}/{}", ok, total) }
+        } else {
+            DispositionResult::Error { message: format!("批量还原: {}/{}, 失败: {:?}", ok, total, failed) }
+        }
+    }
+
+    /// SQLite 模式：还原隔离区全部文件
+    fn restore_all_db(quarantine_dir: &str) -> DispositionResult {
+        let rows = match local_store::quarantine::list_quarantined() {
+            Ok(r) => r,
+            Err(e) => return DispositionResult::Error { message: format!("查询失败: {}", e) },
+        };
+        if rows.is_empty() {
+            return DispositionResult::Error {
+                message: "隔离区中没有可还原的文件".to_string()
+            };
+        }
+        let total = rows.len();
+        let mut ok = 0usize;
+        for row in &rows {
+            match Self::restore_db_row(row, quarantine_dir) {
+                DispositionResult::Success { .. } => ok += 1,
+                _ => {}
+            }
+        }
+        DispositionResult::Success { message: format!("全部还原完成: {}/{}", ok, total) }
     }
 
     /// 查找用于还原的 .meta 文件
@@ -559,10 +867,35 @@ impl VigilixAVConnectionPool {
 
         // 清理元数据文件
         let _ = std::fs::remove_file(meta_path);
+        // 同时清理 quarantine.db 中对应记录（如果存在）
+        Self::cleanup_quarantine_record(&quar_path);
         log_info!("VigilixAV: 还原成功 - {} -> {}", quar_path, original_path);
 
         DispositionResult::Success {
             message: format!("还原成功: {}", original_path)
+        }
+    }
+
+    /// 清理 quarantine.db 中对应的隔离记录
+    /// 从隔离文件路径解析 (dev, ino)，删除 DB 记录
+    fn cleanup_quarantine_record(quarantine_file_path: &str) {
+        if !quarantine_db_enabled() {
+            return;
+        }
+        // 从文件名解析: /opt/vigilixav/quarantine/{dev}_{ino}_{name}
+        let file_name = std::path::Path::new(quarantine_file_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let parts: Vec<&str> = file_name.split('_').collect();
+        if parts.len() >= 2 {
+            if let (Ok(dev), Ok(ino)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                match local_store::quarantine::delete_by_dev_ino(dev, ino) {
+                    Ok(true) => log_info!("VigilixAV: quarantine.db 记录已删除 (dev={}, ino={})", dev, ino),
+                    Ok(false) => {} // 记录不存在，正常
+                    Err(e) => log_error!("VigilixAV: quarantine.db 清理失败: {}", e),
+                }
+            }
         }
     }
 

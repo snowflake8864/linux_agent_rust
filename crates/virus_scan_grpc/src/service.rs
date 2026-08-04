@@ -114,7 +114,10 @@ impl StartVirusScanGrpcService for BootManager {
                 };
 
                 let quarantine_dir = "/opt/vigilixav/quarantine".to_string();
-                let pool = Arc::new(VigilixAVConnectionPool::new(connection, timeout, vigilixav_pool_size, quarantine_dir));
+                let pool = Arc::new(VigilixAVConnectionPool::new(connection, timeout, vigilixav_pool_size, quarantine_dir.clone()));
+
+                // 如果启用了 SQLite 隔离，自动迁移老 .meta 文件到 DB
+                crate::vigilixav_scanner::migrate_meta_to_db(&quarantine_dir);
 
                 // 首次 ping 可能因 vigilixd 还在加载病毒库而失败，重试多次（总计约 30s）
                 let mut last_err = String::new();
@@ -175,143 +178,132 @@ impl StartVirusScanGrpcService for BootManager {
 
             log_info!("病毒扫描 gRPC 服务正在启动: {}", addr);
 
+            // 读取 gRPC 子服务开关（一次性读取，避免反复 lock）
+            let (grpc_svc, jump_enabled_cfg, admission_enabled_cfg) = {
+                let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
+                (cfg.grpc_svc.clone(), cfg.jump.enabled, cfg.admission.enabled)
+            };
+
+            // 链式注册：先从 Server 转到 Router（通过第一个 add_service），然后条件追加
+            // AlertService + BackendService 始终注册作为 Router 的锚点
             let mut builder = Server::builder()
                 .http2_keepalive_interval(Some(Duration::from_secs(30)))
                 .http2_keepalive_timeout(Some(Duration::from_secs(15)))
-                .add_service(grpc_gateway::virus_scan::virus_scan_service_server::VirusScanServiceServer::new(grpc_service))
-                // ============================================================
-                // 漏洞扫描服务 (如需关闭，注释掉下面几行)
-                // ============================================================
-                .add_service(grpc_gateway::vuln_scan::vuln_scan_service_server::VulnScanServiceServer::new(
-                    crate::VulnScanGrpcService::new(self.clone(), vuln_base_url),
-                ))
-                // ============================================================
-                // 新增：本地管理 gRPC 服务（在线只读，离线读写）
-                // ============================================================
-                .add_service(
-                    grpc_gateway::agent_status::agent_status_service_server::AgentStatusServiceServer::new(
-                        AgentStatusServiceImpl { data_hub: data_hub.clone() },
-                    )
-                )
-                // ============================================================
-                // 本地管理 gRPC 服务（在线只读，离线读写）
-                // ============================================================
-                .add_service(
-                    grpc_gateway::alert::alert_service_server::AlertServiceServer::new(
-                        AlertServiceImpl { data_hub: data_hub.clone() },
-                    )
-                )
-                .add_service(
-                    grpc_gateway::config::config_service_server::ConfigServiceServer::new(
-                        ConfigServiceImpl { data_hub: data_hub.clone() },
-                    )
-                )
-                .add_service(
-                    grpc_gateway::task_local::local_task_service_server::LocalTaskServiceServer::new(
-                        LocalTaskServiceImpl { data_hub: data_hub.clone() },
-                    )
-                )
-                .add_service(
-                    grpc_gateway::process_policy::process_policy_service_server::ProcessPolicyServiceServer::new(
-                        ProcessPolicyServiceImpl { data_hub: data_hub.clone() },
-                    )
-                )
-                .add_service(
-                    grpc_gateway::peripheral_policy::peripheral_policy_service_server::PeripheralPolicyServiceServer::new(
-                        PeripheralPolicyServiceImpl { data_hub: data_hub.clone() },
-                    )
-                )
-                .add_service(
-                    grpc_gateway::ip_policy::ip_policy_service_server::IpPolicyServiceServer::new(
-                        IpPolicyServiceImpl { data_hub: data_hub.clone() },
-                    )
-                )
-                .add_service(
-                    grpc_gateway::data_query::data_query_service_server::DataQueryServiceServer::new(
-                        DataQueryServiceImpl { data_hub: data_hub.clone() },
-                    )
-                )
-                .add_service(
-                    grpc_gateway::outreach_detect::outreach_detect_service_server::OutreachDetectServiceServer::new(
-                        OutreachDetectServiceImpl { data_hub: data_hub.clone() },
-                    )
-                )
-                .add_service(
-                    grpc_gateway::policy_watch::policy_watch_service_server::PolicyWatchServiceServer::new(
-                        PolicyWatchServiceImpl { data_hub: data_hub.clone() },
-                    )
-                )
-                // Stub services
-                .add_service(
-                    grpc_gateway::dir_policy::dir_policy_service_server::DirPolicyServiceServer::new(
-                        DirPolicyServiceImpl {
-                            data_hub: data_hub.clone(),
-                            pattern_mgr: pattern_mgr.clone(),
-                        },
-                    )
-                )
-                .add_service(
-                    grpc_gateway::extort_policy::extort_policy_service_server::ExtortPolicyServiceServer::new(
-                        ExtortPolicyServiceImpl {
-                            data_hub: data_hub.clone(),
-                            pattern_mgr: pattern_mgr.clone(),
-                        },
-                    )
-                )
-                .add_service(
-                    grpc_gateway::jump::jump_service_server::JumpServiceServer::new(
-                        JumpServiceImpl { data_hub: data_hub.clone() },
-                    )
-                )
-                .add_service(
-                    grpc_gateway::backup::backup_service_server::BackupServiceServer::new(
-                        BackupServiceImpl { data_hub: data_hub.clone() },
-                    )
-                )
-                .add_service(
-                    grpc_gateway::trust_dir::trust_dir_service_server::TrustDirServiceServer::new(
-                        TrustDirServiceImpl { data_hub: data_hub.clone() },
-                    )
-                )
-                .add_service(
-                    grpc_gateway::virtual_port::virtual_port_service_server::VirtualPortServiceServer::new(
-                        VirtualPortServiceImpl { data_hub: data_hub.clone() },
-                    )
-                )
-                .add_service(
-                    grpc_gateway::protection_mode::process_defense_service_server::ProcessDefenseServiceServer::new(
-                        ProcessDefenseServiceImpl { data_hub: data_hub.clone() },
-                    )
-                )
-                .add_service(
-                    grpc_gateway::protection_mode::peripheral_defense_service_server::PeripheralDefenseServiceServer::new(
-                        PeripheralDefenseServiceImpl { data_hub: data_hub.clone() },
-                    )
-                );
+                .add_service(grpc_gateway::alert::alert_service_server::AlertServiceServer::new(
+                    AlertServiceImpl { data_hub: data_hub.clone() }))
+                .add_service(grpc_gateway::backend::backend_service_server::BackendServiceServer::new(
+                    BackendServiceImpl { data_hub: data_hub.clone() }))
+                .add_service(grpc_gateway::policy_watch::policy_watch_service_server::PolicyWatchServiceServer::new(
+                    PolicyWatchServiceImpl { data_hub: data_hub.clone() }));
 
-                // 准入服务：仅在 ENABLED=1 时注册
-                let admission_enabled = {
-                    let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
-                    cfg.admission.enabled
-                };
-                if admission_enabled {
-                    builder = builder.add_service(
-                        grpc_gateway::admission::admission_service_server::AdmissionServiceServer::new(
-                            AdmissionServiceImpl { data_hub: data_hub.clone() },
-                        )
-                    );
-                    log_info!("[gRPC] AdmissionService 已注册");
-                } else {
-                    log_info!("[gRPC] AdmissionService 未启用（ENABLED=0），跳过注册");
-                }
-
-                // BackendService — 始终注册
+            // [GRPC] VIRUS_SCAN && [VIGILIXAV] ENABLED
+            if grpc_svc.virus_scan && vigilixav_enabled {
                 builder = builder.add_service(
-                    grpc_gateway::backend::backend_service_server::BackendServiceServer::new(
-                        BackendServiceImpl { data_hub: data_hub.clone() },
-                    )
-                );
-                log_info!("[gRPC] BackendService 已注册");
+                    grpc_gateway::virus_scan::virus_scan_service_server::VirusScanServiceServer::new(grpc_service));
+                log_info!("[gRPC] VirusScanService 已注册");
+            } else {
+                log_info!("[gRPC] VirusScanService 跳过（VIRUS_SCAN={}, VIGILIXAV={}）", grpc_svc.virus_scan, vigilixav_enabled);
+            }
+
+            // [GRPC] VULN_SCAN
+            if grpc_svc.vuln_scan {
+                builder = builder.add_service(
+                    grpc_gateway::vuln_scan::vuln_scan_service_server::VulnScanServiceServer::new(
+                        crate::VulnScanGrpcService::new(self.clone(), vuln_base_url)));
+                log_info!("[gRPC] VulnScanService 已注册");
+            } else {
+                log_info!("[gRPC] VulnScanService 跳过（VULN_SCAN=0）");
+            }
+
+            // [GRPC] AGENT_STATUS
+            if grpc_svc.agent_status {
+                builder = builder.add_service(
+                    grpc_gateway::agent_status::agent_status_service_server::AgentStatusServiceServer::new(
+                        AgentStatusServiceImpl { data_hub: data_hub.clone() }));
+            }
+
+            // [GRPC] CONFIG
+            if grpc_svc.config {
+                builder = builder.add_service(
+                    grpc_gateway::config::config_service_server::ConfigServiceServer::new(
+                        ConfigServiceImpl { data_hub: data_hub.clone() }));
+            }
+
+            // [GRPC] TASK
+            if grpc_svc.task {
+                builder = builder.add_service(
+                    grpc_gateway::task_local::local_task_service_server::LocalTaskServiceServer::new(
+                        LocalTaskServiceImpl { data_hub: data_hub.clone() }));
+            }
+
+            // [GRPC] POLICY — 进程 + 外设 + IP 策略
+            if grpc_svc.policy {
+                builder = builder
+                    .add_service(grpc_gateway::process_policy::process_policy_service_server::ProcessPolicyServiceServer::new(
+                        ProcessPolicyServiceImpl { data_hub: data_hub.clone() }))
+                    .add_service(grpc_gateway::peripheral_policy::peripheral_policy_service_server::PeripheralPolicyServiceServer::new(
+                        PeripheralPolicyServiceImpl { data_hub: data_hub.clone() }))
+                    .add_service(grpc_gateway::ip_policy::ip_policy_service_server::IpPolicyServiceServer::new(
+                        IpPolicyServiceImpl { data_hub: data_hub.clone() }));
+                log_info!("[gRPC] PolicyServices 已注册");
+            }
+
+            // [GRPC] DATA_QUERY
+            if grpc_svc.data_query {
+                builder = builder.add_service(
+                    grpc_gateway::data_query::data_query_service_server::DataQueryServiceServer::new(
+                        DataQueryServiceImpl { data_hub: data_hub.clone() }));
+            }
+
+            // OutreachDetect — 始终注册
+            builder = builder.add_service(
+                grpc_gateway::outreach_detect::outreach_detect_service_server::OutreachDetectServiceServer::new(
+                    OutreachDetectServiceImpl { data_hub: data_hub.clone() }));
+
+            // Stub services（始终注册）
+            builder = builder
+                .add_service(grpc_gateway::dir_policy::dir_policy_service_server::DirPolicyServiceServer::new(
+                    DirPolicyServiceImpl { data_hub: data_hub.clone(), pattern_mgr: pattern_mgr.clone() }))
+                .add_service(grpc_gateway::extort_policy::extort_policy_service_server::ExtortPolicyServiceServer::new(
+                    ExtortPolicyServiceImpl { data_hub: data_hub.clone(), pattern_mgr: pattern_mgr.clone() }));
+
+            // [GRPC] JUMP && [JUMP] ENABLED  ← 跨段依赖
+            if grpc_svc.jump && jump_enabled_cfg {
+                builder = builder.add_service(
+                    grpc_gateway::jump::jump_service_server::JumpServiceServer::new(
+                        JumpServiceImpl { data_hub: data_hub.clone() }));
+                log_info!("[gRPC] JumpService 已注册");
+            } else {
+                log_info!("[gRPC] JumpService 跳过（GRPC.JUMP={}, JUMP.ENABLED={}）", grpc_svc.jump, jump_enabled_cfg);
+            }
+
+            // [GRPC] BACKUP
+            if grpc_svc.backup {
+                builder = builder.add_service(
+                    grpc_gateway::backup::backup_service_server::BackupServiceServer::new(
+                        BackupServiceImpl { data_hub: data_hub.clone() }));
+            }
+
+            // TrustDir / VirtualPort / ProtectionMode — 始终注册
+            builder = builder
+                .add_service(grpc_gateway::trust_dir::trust_dir_service_server::TrustDirServiceServer::new(
+                    TrustDirServiceImpl { data_hub: data_hub.clone() }))
+                .add_service(grpc_gateway::virtual_port::virtual_port_service_server::VirtualPortServiceServer::new(
+                    VirtualPortServiceImpl { data_hub: data_hub.clone() }))
+                .add_service(grpc_gateway::protection_mode::process_defense_service_server::ProcessDefenseServiceServer::new(
+                    ProcessDefenseServiceImpl { data_hub: data_hub.clone() }))
+                .add_service(grpc_gateway::protection_mode::peripheral_defense_service_server::PeripheralDefenseServiceServer::new(
+                    PeripheralDefenseServiceImpl { data_hub: data_hub.clone() }));
+
+            // [ADMISSION] ENABLED
+            if admission_enabled_cfg {
+                builder = builder.add_service(
+                    grpc_gateway::admission::admission_service_server::AdmissionServiceServer::new(
+                        AdmissionServiceImpl { data_hub: data_hub.clone() }));
+                log_info!("[gRPC] AdmissionService 已注册");
+            } else {
+                log_info!("[gRPC] AdmissionService 跳过（ADMISSION.ENABLED=0）");
+            }
 
                 // ============================================================
                 builder.serve(addr)

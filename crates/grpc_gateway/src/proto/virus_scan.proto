@@ -31,6 +31,9 @@ service VirusScanService {
     //   - PauseScanResponse: 暂停操作结果
     //   - ResumeScanResponse: 恢复操作结果
     rpc StreamControl(stream ClientMessage) returns (stream ServerMessage);
+
+    // 查询隔离区文件列表
+    rpc ListQuarantine(QuarantineQuery) returns (QuarantineList);
 }
 
 // ============================================================================
@@ -222,4 +225,30 @@ message DisposeFileResponse {
     DisposeAction action = 3;   // 执行的动作
     bool success = 4;          // 是否成功
     string message = 5;        // 结果描述（成功: "MOVED OK / REMOVED OK"，失败: 错误原因）
+}
+
+// 隔离区查询
+message QuarantineQuery {
+    string filter = 1;         // 空=全部未还原, "all"=含已还原, "virus:xxx"=按病毒名
+}
+
+message QuarantineEntry {
+    int64  id = 1;
+    uint64 dev = 2;
+    uint64 ino = 3;
+    string original_path = 4;
+    string quar_name = 5;
+    string virus_name = 6;
+    uint32 uid = 7;
+    uint32 gid = 8;
+    uint32 mode = 9;
+    uint64 file_size = 10;
+    string quarantined_at = 11;
+    bool   restored = 12;
+    string restored_at = 13;
+}
+
+message QuarantineList {
+    repeated QuarantineEntry entries = 1;
+    int32 total = 2;
 }
