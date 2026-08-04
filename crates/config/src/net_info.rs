@@ -82,6 +82,15 @@ pub struct NetInfoConfig {
     pub install_time: i64,
     // 准入功能配置
     pub admission: AdmissionConfig,
+    // SQLite 数据库配置
+    pub sqlite_db: SqliteDbConfig,
+    pub db_policy: DbPolicyConfig,
+    // 跳变配置
+    pub jump: JumpConfig,
+    // gRPC 子服务开关
+    pub grpc_svc: GrpcServices,
+    // 系统组件开关
+    pub system: SystemConfig,
     // 后端模式: "driver" | "ebpf"
     pub backend_mode: String,
     // eBPF 模块开关: 控制加载哪些 .bpf.o（[EBPF] 段）
@@ -107,6 +116,115 @@ impl Default for AdmissionConfig {
             mode: 2,              // 默认自动检测
             retry_interval: 60,   // 默认60秒重试
             max_retries: 3,       // 默认3次
+        }
+    }
+}
+
+/// SQLite 基础设施配置，对应 ini 中的 [SQLITE_DB] 段
+/// ENABLED=1 时创建 /opt/osec/db 目录并初始化 WAL 模式连接
+/// ENABLED=0 时所有上层 DB 功能不可用（dsqlite_db crate 不初始化）
+#[derive(Debug, Clone)]
+pub struct SqliteDbConfig {
+    pub enabled: bool,
+}
+
+impl Default for SqliteDbConfig {
+    fn default() -> Self {
+        SqliteDbConfig { enabled: false }
+    }
+}
+
+/// DB 业务策略配置，对应 ini 中的 [DB_POLICY] 段
+/// 仅当 [SQLITE_DB] ENABLED=1 时生效
+/// 每个字段独立控制对应模块是否启用 SQLite 持久化
+#[derive(Debug, Clone)]
+pub struct DbPolicyConfig {
+    pub alert_log: bool,            // ALERT_LOG — 告警日志持久化
+    pub process_policy: bool,       // PROCESS_POLICY — 进程黑白名单双表
+    pub known_executables: bool,    // KNOWN_EXECUTABLES — 非标准目录可执行文件记录
+    pub jump_status: bool,          // JUMP_STATUS — IP跳变状态
+    pub peripheral_policy: bool,    // PERIPHERAL_POLICY — USB外设黑白名单双表
+    pub quarantine: bool,           // QUARANTINE — 病毒隔离/还原元数据（替代.meta文件）
+    pub alert_max_rows: u32,        // ALERT_MAX_ROWS — 告警保留条数，0=不限制
+}
+
+impl Default for DbPolicyConfig {
+    fn default() -> Self {
+        DbPolicyConfig {
+            alert_log: false,
+            process_policy: false,
+            known_executables: false,
+            jump_status: false,
+            peripheral_policy: false,
+            quarantine: false,
+            alert_max_rows: 0,
+        }
+    }
+}
+
+/// 跳变配置，对应 ini 中的 [JUMP] 段
+/// ENABLED=0 时所有跳变功能不可用（gRPC JumpService 也不注册）
+#[derive(Debug, Clone)]
+pub struct JumpConfig {
+    pub enabled: bool,      // ENABLED — 跳变总闸
+    pub ip_jump: bool,      // IP_JUMP — IP 跳变
+    pub pw_jump: bool,      // PW_JUMP — 口令跳变
+}
+
+impl Default for JumpConfig {
+    fn default() -> Self {
+        JumpConfig { enabled: false, ip_jump: true, pw_jump: true }
+    }
+}
+
+/// gRPC 子服务开关，对应 ini 中 [GRPC] 段的子服务配置
+/// 仅当 [GRPC] ENABLED=1 时生效
+#[derive(Debug, Clone)]
+pub struct GrpcServices {
+    pub virus_scan: bool,    // VIRUS_SCAN — 病毒扫描服务（还要 VIGILIXAV）
+    pub vuln_scan: bool,     // VULN_SCAN — 漏洞扫描服务
+    pub jump: bool,          // JUMP — 跳变服务（还要 [JUMP] ENABLED）
+    pub config: bool,        // CONFIG — 配置读写服务
+    pub policy: bool,        // POLICY — 策略管理服务
+    pub data_query: bool,    // DATA_QUERY — 数据查询服务
+    pub backup: bool,        // BACKUP — 备份还原服务
+    pub task: bool,          // TASK — 本地任务服务
+    pub agent_status: bool,  // AGENT_STATUS — 状态上报服务
+}
+
+impl Default for GrpcServices {
+    fn default() -> Self {
+        GrpcServices {
+            virus_scan:   true,
+            vuln_scan:    false,
+            jump:         false,
+            config:       true,
+            policy:       true,
+            data_query:   true,
+            backup:       true,
+            task:         true,
+            agent_status: true,
+        }
+    }
+}
+
+/// 系统组件开关，对应 ini 中的 [SYSTEM] 段
+/// 控制非核心系统组件的启动
+#[derive(Debug, Clone)]
+pub struct SystemConfig {
+    pub docker_monitor: bool,      // DOCKER_MONITOR — Docker 容器监控
+    pub usb_hotplug: bool,         // USB_HOTPLUG — USB 热插拔监听
+    pub connectivity_probe: bool,  // CONNECTIVITY_PROBE — 周期连通性探测
+    pub ntp_sync: bool,            // NTP_SYNC — NTP 时间同步
+}
+
+impl Default for SystemConfig {
+    fn default() -> Self {
+        SystemConfig {
+            docker_monitor: true,       // 默认开，兼容旧版
+            usb_hotplug: true,          // 默认开，兼容旧版
+            connectivity_probe: true,   // 核心功能，默认开
+            ntp_sync: true,             // 默认开，兼容旧版
         }
     }
 }
@@ -408,7 +526,35 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("GRPC", "ALERT_PUSH") {
             config.grpc_alert_push = matches!(value.trim(), "1");
         } else {
-            config.grpc_alert_push = true; // 默认开启，兼容旧配置
+            config.grpc_alert_push = false; // 默认关闭
+        }
+        // [GRPC] 子服务开关
+        if let Some(value) = ini.get("GRPC", "VIRUS_SCAN") {
+            config.grpc_svc.virus_scan = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("GRPC", "VULN_SCAN") {
+            config.grpc_svc.vuln_scan = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("GRPC", "JUMP") {
+            config.grpc_svc.jump = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("GRPC", "CONFIG") {
+            config.grpc_svc.config = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("GRPC", "POLICY") {
+            config.grpc_svc.policy = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("GRPC", "DATA_QUERY") {
+            config.grpc_svc.data_query = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("GRPC", "BACKUP") {
+            config.grpc_svc.backup = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("GRPC", "TASK") {
+            config.grpc_svc.task = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("GRPC", "AGENT_STATUS") {
+            config.grpc_svc.agent_status = matches!(value.trim(), "1");
         }
 
         // [VIGILIXAV] — VigilixAV 病毒扫描配置
@@ -469,6 +615,59 @@ impl NetInfoConfig {
         }
         if let Some(value) = ini.get("EBPF", "NET_AGENT") {
             config.ebpf_net_agent = matches!(value.trim(), "1");
+        }
+
+        // [SQLITE_DB] — SQLite 基础设施开关，默认关闭
+        if let Some(value) = ini.get("SQLITE_DB", "ENABLED") {
+            config.sqlite_db.enabled = matches!(value.trim(), "1");
+        }
+
+        // [DB_POLICY] — DB 业务特性开关，每个功能独立控制
+        if let Some(value) = ini.get("DB_POLICY", "ALERT_LOG") {
+            config.db_policy.alert_log = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("DB_POLICY", "PROCESS_POLICY") {
+            config.db_policy.process_policy = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("DB_POLICY", "KNOWN_EXECUTABLES") {
+            config.db_policy.known_executables = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("DB_POLICY", "JUMP_STATUS") {
+            config.db_policy.jump_status = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("DB_POLICY", "PERIPHERAL_POLICY") {
+            config.db_policy.peripheral_policy = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("DB_POLICY", "QUARANTINE") {
+            config.db_policy.quarantine = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("DB_POLICY", "ALERT_MAX_ROWS") {
+            config.db_policy.alert_max_rows = value.trim().parse().unwrap_or(0);
+        }
+
+        // [JUMP] — 跳变功能，默认关闭
+        if let Some(value) = ini.get("JUMP", "ENABLED") {
+            config.jump.enabled = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("JUMP", "IP_JUMP") {
+            config.jump.ip_jump = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("JUMP", "PW_JUMP") {
+            config.jump.pw_jump = matches!(value.trim(), "1");
+        }
+
+        // [SYSTEM] — 系统组件开关
+        if let Some(value) = ini.get("SYSTEM", "DOCKER_MONITOR") {
+            config.system.docker_monitor = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("SYSTEM", "USB_HOTPLUG") {
+            config.system.usb_hotplug = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("SYSTEM", "CONNECTIVITY_PROBE") {
+            config.system.connectivity_probe = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("SYSTEM", "NTP_SYNC") {
+            config.system.ntp_sync = matches!(value.trim(), "1");
         }
 
         config
@@ -563,6 +762,15 @@ impl NetInfoConfig {
         writeln!(file, "BATCH_SIZE={}", self.grpc_batch_size)?;
         writeln!(file, "ALLOW_CONFIG_WRITE_ONLINE={}", self.grpc_allow_config_write_online as u8)?;
         writeln!(file, "ALERT_PUSH={}", self.grpc_alert_push as u8)?;
+        writeln!(file, "VIRUS_SCAN={}", self.grpc_svc.virus_scan as u8)?;
+        writeln!(file, "VULN_SCAN={}", self.grpc_svc.vuln_scan as u8)?;
+        writeln!(file, "JUMP={}", self.grpc_svc.jump as u8)?;
+        writeln!(file, "CONFIG={}", self.grpc_svc.config as u8)?;
+        writeln!(file, "POLICY={}", self.grpc_svc.policy as u8)?;
+        writeln!(file, "DATA_QUERY={}", self.grpc_svc.data_query as u8)?;
+        writeln!(file, "BACKUP={}", self.grpc_svc.backup as u8)?;
+        writeln!(file, "TASK={}", self.grpc_svc.task as u8)?;
+        writeln!(file, "AGENT_STATUS={}", self.grpc_svc.agent_status as u8)?;
         writeln!(file, "[VIGILIXAV]")?;
         writeln!(file, "ENABLED={}", self.vigilixav_enabled as u8)?;
         writeln!(file, "HOST={}", self.vigilixav_host)?;
@@ -595,6 +803,33 @@ impl NetInfoConfig {
         writeln!(file, "FILE_AGENT={}", self.ebpf_file_agent as u8)?;
         writeln!(file, "PROC_AGENT={}", self.ebpf_proc_agent as u8)?;
         writeln!(file, "NET_AGENT={}", self.ebpf_net_agent as u8)?;
+
+        // [SQLITE_DB] 段 — SQLite 基础设施开关
+        writeln!(file, "[SQLITE_DB]")?;
+        writeln!(file, "ENABLED={}", self.sqlite_db.enabled as u8)?;
+
+        // [DB_POLICY] 段 — DB 业务特性开关
+        writeln!(file, "[DB_POLICY]")?;
+        writeln!(file, "ALERT_LOG={}", self.db_policy.alert_log as u8)?;
+        writeln!(file, "PROCESS_POLICY={}", self.db_policy.process_policy as u8)?;
+        writeln!(file, "KNOWN_EXECUTABLES={}", self.db_policy.known_executables as u8)?;
+        writeln!(file, "JUMP_STATUS={}", self.db_policy.jump_status as u8)?;
+        writeln!(file, "PERIPHERAL_POLICY={}", self.db_policy.peripheral_policy as u8)?;
+        writeln!(file, "QUARANTINE={}", self.db_policy.quarantine as u8)?;
+        writeln!(file, "ALERT_MAX_ROWS={}", self.db_policy.alert_max_rows)?;
+
+        // [JUMP] 段 — 跳变功能开关
+        writeln!(file, "[JUMP]")?;
+        writeln!(file, "ENABLED={}", self.jump.enabled as u8)?;
+        writeln!(file, "IP_JUMP={}", self.jump.ip_jump as u8)?;
+        writeln!(file, "PW_JUMP={}", self.jump.pw_jump as u8)?;
+
+        // [SYSTEM] 段 — 系统组件开关
+        writeln!(file, "[SYSTEM]")?;
+        writeln!(file, "DOCKER_MONITOR={}", self.system.docker_monitor as u8)?;
+        writeln!(file, "USB_HOTPLUG={}", self.system.usb_hotplug as u8)?;
+        writeln!(file, "CONNECTIVITY_PROBE={}", self.system.connectivity_probe as u8)?;
+        writeln!(file, "NTP_SYNC={}", self.system.ntp_sync as u8)?;
 
         Ok(())
     }

@@ -73,6 +73,32 @@ async fn main() -> std::io::Result<()> {
     // 初始化 BootManager
     let init = BootManager::init().await;
 
+    // 初始化 SQLite 数据库（受 [SQLITE_DB] 和 [DB_POLICY] 开关控制）
+    local_store::init_all();
+
+    // 从 DB 恢复策略到内存（仅 SQLite 开关开启时生效）
+    // 在线模式 → 从在线基线表加载；离线模式 → 从离线本地表加载
+    {
+        let cfg = NETINFO_CONFIG.lock().unwrap();
+        let db_enabled = cfg.sqlite_db.enabled;
+        let is_offline = cfg.is_offline_mode;
+        let load_process = cfg.db_policy.process_policy;
+        let load_peripheral = cfg.db_policy.peripheral_policy;
+        drop(cfg);
+        if db_enabled {
+            if load_process {
+                process_mgr::POLICY_MANAGER.lock().unwrap().load_policy_from_db_if_enabled(is_offline);
+            }
+            if load_peripheral {
+                if is_offline {
+                    agent_local_svc::AgentDataHub::load_peripheral_policy_from_db_local();
+                } else {
+                    agent_local_svc::AgentDataHub::load_peripheral_policy_from_db();
+                }
+            }
+        }
+    }
+
     // 创建通信通道
     let (file_audit_log_tx, file_audit_log_rx) = mpsc::channel::<AuditLogInfo>(512);
     reporter::set_audit_log_tx(file_audit_log_tx.clone());
@@ -380,45 +406,65 @@ async fn main() -> std::io::Result<()> {
         logging::log_error!("无法创建 socket，跳过内核事件处理");
     }
 
+    // 读取系统组件开关
+    let (sys_usb, sys_docker) = {
+        let cfg = NETINFO_CONFIG.lock().unwrap();
+        (cfg.system.usb_hotplug, cfg.system.docker_monitor)
+    };
+
     // 创建USB热插拔信号通道
     let (usb_hotplug_tx, usb_hotplug_rx) = mpsc::channel::<bool>(100);
 
-    let usb_monitor_handle = tokio::spawn({
-        let mut init = init.clone();
-        let tx = file_audit_log_tx.clone();
-        async move {
-            init.start_usb_services(tx, usb_hotplug_tx)
-                .await
-                .map_err(|e| {
-                    logging::log_error!("start_usb_services 失败: {}", e);
-                    std::io::Error::new(std::io::ErrorKind::Other, e)
-                })
-        }
-    });
+    let usb_monitor_handle = if sys_usb {
+        Some(tokio::spawn({
+            let mut init = init.clone();
+            let tx = file_audit_log_tx.clone();
+            async move {
+                init.start_usb_services(tx, usb_hotplug_tx)
+                    .await
+                    .map_err(|e| {
+                        logging::log_error!("start_usb_services 失败: {}", e);
+                        std::io::Error::new(std::io::ErrorKind::Other, e)
+                    })
+            }
+        }))
+    } else {
+        log_info!("[SYSTEM] USB_HOTPLUG=0，跳过 USB 服务启动");
+        None
+    };
 
-    let usb_hotplug_handler_handle = tokio::spawn({
-        let mut init = init.clone();
-        async move {
-            init.start_usb_hotplug_handler(usb_hotplug_rx)
-                .await
-                .map_err(|e| {
-                    logging::log_error!("start_usb_hotplug_handler 失败: {}", e);
-                    std::io::Error::new(std::io::ErrorKind::Other, e)
-                })
-        }
-    });
+    let usb_hotplug_handler_handle = if sys_usb {
+        Some(tokio::spawn({
+            let mut init = init.clone();
+            async move {
+                init.start_usb_hotplug_handler(usb_hotplug_rx)
+                    .await
+                    .map_err(|e| {
+                        logging::log_error!("start_usb_hotplug_handler 失败: {}", e);
+                        std::io::Error::new(std::io::ErrorKind::Other, e)
+                    })
+            }
+        }))
+    } else {
+        None
+    };
 
-    let start_docker_monitor_handle = tokio::spawn({
-        let mut init = init.clone();
-        async move {
-            init.start_docker_monitor_services()
-                .await
-                .map_err(|e| {
-                    logging::log_error!("start_docker_monitor_services 失败: {}", e);
-                    std::io::Error::new(std::io::ErrorKind::Other, e)
-                })
-        }
-    });
+    let start_docker_monitor_handle = if sys_docker {
+        Some(tokio::spawn({
+            let mut init = init.clone();
+            async move {
+                init.start_docker_monitor_services()
+                    .await
+                    .map_err(|e| {
+                        logging::log_error!("start_docker_monitor_services 失败: {}", e);
+                        std::io::Error::new(std::io::ErrorKind::Other, e)
+                    })
+            }
+        }))
+    } else {
+        log_info!("[SYSTEM] DOCKER_MONITOR=0，跳过 Docker 监控服务启动");
+        None
+    };
 
     // 启动病毒扫描 gRPC 服务
     let virus_scan_handle = tokio::spawn({

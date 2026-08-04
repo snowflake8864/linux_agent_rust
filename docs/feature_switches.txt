@@ -1,0 +1,652 @@
+================================================================================
+                     MagicArmor 功能开关配置说明
+================================================================================
+
+版本: 3.0.1+
+配置文件: /opt/osec/net_info.ini
+程序启动时读取一次，修改后需重启 MagicArmor_0 进程生效。
+
+================================================================================
+一、核心原则
+================================================================================
+
+1. 开关关闭 → 对应代码路径完全不执行
+   - gRPC 开关关 → 不注册服务（不监听对应 RPC）
+   - 功能开关关 → 函数入口直接 return Err
+   - DB 开关关 → 不写不读，不建表
+
+2. 依赖链上溯
+   - 父节点关闭 → 子树全部失效（不管子节点开关是 0 还是 1）
+   - 例如: [SQLITE_DB] ENABLED=0 → [DB_POLICY] 下所有子开关无效
+   - 例如: [JUMP] ENABLED=0 → [GRPC] JUMP=1 也无效
+   - 跨段依赖: [GRPC] VIRUS_SCAN=1 还需 [VIGILIXAV] ENABLED=1
+
+3. 向后兼容
+   - 新增段/字段全部取默认值，老配置文件可直接使用
+   - 默认值和旧版行为一致
+
+
+================================================================================
+二、字段详解（按 ini 段逐项说明）
+================================================================================
+
+──────────────────────────────────────────────────────────────────────────────
+[CLIENTINFO] — 客户端标识
+──────────────────────────────────────────────────────────────────────────────
+
+MID                             客户端唯一标识（16 位 hex）
+                                服务器注册时下发，不可手动修改
+
+──────────────────────────────────────────────────────────────────────────────
+[SERVERINFO] — 服务器连接 & 安全防护
+──────────────────────────────────────────────────────────────────────────────
+
+■ 服务器连接
+
+USER_ID                         用户 ID，服务器下发的加密凭证
+SERVERIPPORT                    服务器地址，格式: https://IP:PORT 或 http://IP:PORT
+SERVER_IP                       服务器 IP（从 SERVERIPPORT 提取，也可单独指定）
+SERVER_PORT                     服务器端口（从 SERVERIPPORT 提取，也可单独指定）
+COMTIME                         通信间隔（秒），定期向服务器拉取任务/策略，默认 60
+FASTTIME                        快速通信间隔（秒），有紧急任务时的轮询间隔
+CRONTIME                        定时任务间隔（秒），基线/硬件/外联探测的执行间隔
+OFFLINE_MODE                    离线模式: 0=在线(从服务器拉策略) 1=离线(用本地策略)
+VERSION                         客户端版本号，上报给服务器
+INSTALL_TIME                    安装时间（Unix 时间戳），服务器下发的
+
+■ 进程防护 (process protect)
+
+PROC_PROTECT                    进程防护模式: 0=黑名单模式 1=白名单模式
+                                决定了策略下发时的行为
+PROC_SWITCH                     进程防护运行时开关: 0=暂停 1=启用
+                                PROTECT/SWITCH 组合: 0/0=关闭, 1/1=白名单, 0/1=黑名单
+
+■ 文件防篡改 (file protect)
+
+FILE_PROTECT                    文件防篡改模式: 0=黑名单 1=白名单
+FILE_SWITCH                     文件防篡改运行时开关: 0=暂停 1=启用
+SCANFILETIME                    全盘文件扫描间隔（秒），0=不扫描
+SCANPROCTIME                    全盘进程扫描间隔（秒），0=不扫描
+
+■ USB 外设防护
+
+USB_PROTECT                     USB 外设防护模式: 0=黑名单 1=白名单
+USB_SWITCH                      USB 外设防护运行时开关: 0=暂停 1=启用
+
+■ 勒索软件防护 (extortion/ransomware)
+
+EXTORTION_PROTECT               勒索防护模式: 0=黑名单 1=白名单
+EXTORTION_SWITCH                勒索防护运行时开关: 0=暂停 1=启用
+
+■ 自保护
+
+SELF_PROTECT_SWITCH             自保护开关: 0=关闭 1=启用
+                                启用后: 内核模块防卸载、进程防杀
+
+■ 端口防护
+
+OPEN_PORT_SWITCH                端口开放检测: 0=关闭 1=启用
+                                检测本机非授权端口开放事件
+
+■ 动态模块
+
+DYNAMIC_SWITCH                  动态模块加载: 0=关闭 1=启用
+                                运行时动态加载/卸载内核模块
+
+■ 模块开关
+
+MODULE_SWITCH                   内核模块开关（位掩码），控制哪些子模块加载
+
+■ 准入相关
+
+ADMISSION_SWITCH                准入功能开关: 0=关闭 1=启用
+                                配合 [ADMISSION] ENABLED 使用
+
+■ 互联网访问控制
+
+INTERNET_SWITCH                 互联网访问控制: 0=阻断外网 1=允许
+                                启用后上报外联日志；关闭后阻断所有外网流量
+
+■ 日志上报
+
+DNS_SWITCH                      DNS 查询日志开关: 0=关闭 1=启用
+INTERNAL_COMMUNICATION_SWITCH   内网通信日志: 0=关闭 1=启用
+EXTERNAL_COMMUNICATION_SWITCH   外网通信日志: 0=关闭 1=启用
+SYSLOG_PROCESS_SWITCH           进程创建日志: 0=关闭 1=启用
+SYSLOG_LOGIN_SWITCH             SSH 登录日志: 0=关闭 1=启用
+
+■ 定时采集
+
+BASELINE_SWITCH                 基线采集: 0=关闭 1=启用
+                                采集: 软件清单、系统账户、计划任务
+BASELINE_TIME                   基线采集间隔（秒），默认 3600
+HARDWARE_SWITCH                 硬件信息采集: 0=关闭 1=启用
+                                采集: CPU、内存、磁盘、网卡
+HARDWARE_TIME                   硬件采集间隔（秒），默认 3600
+OUTREACH_SWITCH                 外联探测: 0=关闭 1=启用
+                                探测本机向外的网络连接
+OUTREACH_TIME                   外联探测间隔（秒），默认 3600
+
+■ 日志传输
+
+LOGIPPORT                       日志服务器地址（IP:PORT），空=不上报
+LOGPROTO                        日志传输协议: 1=TCP 2=UDP
+LOGSENT                         日志发送模式: 0=实时 1=批量
+CLI_SERVER_PORT                 本地 CLI 端口
+
+──────────────────────────────────────────────────────────────────────────────
+[HOSTINFO] — 主机信息（程序启动时自动采集，通常无需手动填写）
+──────────────────────────────────────────────────────────────────────────────
+
+MACID                           主网卡 MAC 地址（启动时自动获取）
+DEV_UID                         设备唯一 ID（/etc/.vedasystem 生成）
+IPS                             本机 IP 列表
+IFCFG                           主网卡接口名（根据 SERVER_IP 路由自动检测）
+OS                              操作系统版本
+MEMSIZE                         内存大小
+CPU                             CPU 型号/核心数
+HDSIZE                          磁盘大小
+AUTH                            认证凭证，默认 "123123"
+HOSTNAME                        主机名
+
+──────────────────────────────────────────────────────────────────────────────
+[BACKEND] — 后端模式
+──────────────────────────────────────────────────────────────────────────────
+
+MODE                            后端偏好: "driver" 或 "ebpf"
+                                这不是硬开关，而是偏好——
+                                driver 加载失败会自动 fallback 到 eBPF
+                                eBPF 也失败则无后端，程序仍运行但安全功能缺失
+
+──────────────────────────────────────────────────────────────────────────────
+[EBPF] — eBPF 子模块开关（仅 MODE=ebpf 且 eBPF 后端成功加载时生效）
+──────────────────────────────────────────────────────────────────────────────
+
+FILE_AGENT                      文件事件代理（file_agent.bpf.o）: 0=不加载 1=加载
+                                负责文件创建/修改/删除事件的采集
+PROC_AGENT                      进程事件代理（proc_agent.bpf.o）: 0=不加载 1=加载
+                                负责进程创建/退出的采集
+NET_AGENT                       网络事件代理（net_agent.bpf.o）: 0=不加载 1=加载
+                                负责 DNS/网络通信事件的采集
+
+──────────────────────────────────────────────────────────────────────────────
+[SQLITE_DB] — SQLite 基础设施（★ 所有 DB 功能的父开关）
+──────────────────────────────────────────────────────────────────────────────
+
+ENABLED                         SQLite 总闸: 0=不创建 DB 目录 1=创建 /opt/osec/db/
+                                设为 0 时，[DB_POLICY] 下所有子开关全部无效
+                                设为 1 时，仅子开关=1 的模块才会建表
+                                默认 0（向后兼容，老用户升级后不会产生 DB 文件）
+
+──────────────────────────────────────────────────────────────────────────────
+[DB_POLICY] — DB 业务模块开关（需 [SQLITE_DB] ENABLED=1）
+──────────────────────────────────────────────────────────────────────────────
+
+ALERT_LOG                       告警日志持久化到 alert.db
+                                0=不写不读 1=告警产生时写入，支持历史查询和处置
+                                开启后: reporter 广播告警的同时写入 DB
+                                        gRPC GetAlertLogs/HandleAlert 可用
+
+PROCESS_POLICY                  进程黑白名单持久化到 process_policy.db
+                                0=仅内存 1=双表持久化（在线基线+离线本地）
+                                开启后: 策略下发时同步写 DB
+                                        启动时从 DB 恢复策略到内存
+
+KNOWN_EXECUTABLES               非标准目录可执行文件记录到 known_executables.db
+                                0=不记录 1=UIO 事件发现的 exe 写入 DB
+                                开启后: process_audit 发现非标准路径 exe 时 upsert
+
+JUMP_STATUS                     IP/口令跳变状态持久化到 jump.db
+                                0=不持久化 1=重启后自动恢复上次跳变状态
+                                还需 [JUMP] ENABLED=1
+
+PERIPHERAL_POLICY               USB 外设黑白名单持久化到 peripheral_policy.db
+                                0=仅内存 1=双表持久化（在线基线+离线本地）
+
+QUARANTINE                      病毒隔离/还原元数据持久化到 quarantine.db ★ 新增
+                                0=继续用 .meta 文件 1=改用 SQLite 记录隔离信息
+                                替代 /opt/vigilixav/quarantine/*.meta
+                                支持按病毒名/路径/时间高效查询隔离清单
+
+ALERT_MAX_ROWS                  告警保留条数上限
+                                0=不限制 >0=超过上限时自动删除最早的记录
+
+──────────────────────────────────────────────────────────────────────────────
+[GRPC] — gRPC 服务
+──────────────────────────────────────────────────────────────────────────────
+
+■ 基础配置
+
+ENABLED                         gRPC 总闸: 0=不监听 1=启动 gRPC 服务器
+                                关闭时，以下所有子服务开关无效
+DEV_MODE                        gRPC 开发模式: 0=监听 GRPC_ADDR 1=监听 DEV_GRPC_ADDR
+GRPC_ADDR                       gRPC 正式地址，默认 127.0.0.1:50051
+DEV_GRPC_ADDR                   gRPC 开发地址，默认 0.0.0.0:50051（允许远程连接）
+BATCH_SIZE                      gRPC 批处理大小
+ALLOW_CONFIG_WRITE_ONLINE       在线模式允许修改配置: 0=拒绝 1=允许（离线模式始终允许）
+
+■ 子服务开关（需 [GRPC] ENABLED=1）
+
+ALERT_PUSH                      告警实时推送: 0=关闭 1=开启
+                                关闭时: 告警只写 DB/HTTP 上报，不通过 gRPC stream 推送给客户端
+                                开启时: reporter 广播告警后同时推送到 SubscribeAlerts 流
+                                ★ 默认 0，开启后客户端才能收到实时告警
+
+VIRUS_SCAN                      gRPC 病毒扫描服务: 0=不注册 1=注册
+                                还需 [VIGILIXAV] ENABLED=1 才实际注册
+                                包含: StartScan/StopScan/SubscribeScan/DisposeFile
+
+VULN_SCAN                       gRPC 漏洞扫描服务: 0=不注册 1=注册
+                                默认关闭，90% 部署场景不需要
+
+JUMP                            gRPC 跳变服务: 0=不注册 1=注册
+                                还需 [JUMP] ENABLED=1 才实际注册
+                                包含: GetJumpStatus/ExecuteIpJump/ExecutePwJump
+
+CONFIG                          gRPC 配置管理服务: 0=不注册 1=注册
+                                包含: GetConfig/UpdateConfig
+
+POLICY                          gRPC 策略服务组: 0=不注册 1=注册
+                                包含: ProcessPolicy + PeripheralPolicy + IpPolicy 三个 service
+
+DATA_QUERY                      gRPC 数据查询服务: 0=不注册 1=注册
+                                包含: ProcessList/PortList/UsbDeviceList/ExecutableList
+
+BACKUP                          gRPC 备份还原服务: 0=不注册 1=注册
+                                包含: ListBackups/CreateBackup/RestoreBackup
+
+TASK                            gRPC 本地任务服务: 0=不注册 1=注册
+                                包含: ListTasks/CreateTask 等
+
+AGENT_STATUS                    gRPC 状态上报服务: 0=不注册 1=注册
+                                包含: GetAgentStatus（版本/在线状态/运行时间）
+
+■ 以下服务始终注册（无子开关，随 [GRPC] ENABLED 控制）:
+  AlertService (订阅/查询/处置), OutreachDetectService, PolicyWatchService,
+  DirPolicyService, ExtortPolicyService, TrustDirService, VirtualPortService,
+  ProcessDefenseService, PeripheralDefenseService, BackendService
+  AdmissionService (受 [ADMISSION] ENABLED 控制)
+
+──────────────────────────────────────────────────────────────────────────────
+[VIGILIXAV] — 病毒扫描引擎（VigilixAV / ClamAV 兼容）
+──────────────────────────────────────────────────────────────────────────────
+
+ENABLED                         病毒扫描总闸: 0=不启用 1=启用
+                                启用后: 创建连接池、启动 vigilixav.service
+                                关闭时: gRPC VirusScanService 不注册、扫描/隔离/还原不可用
+
+HOST                            VigilixAV 服务 IP，默认 127.0.0.1
+PORT                            VigilixAV 服务端口，默认 3310（ClamAV 标准端口）
+TIMEOUT                         扫描超时（秒），默认 60
+POOL_SIZE                       连接池大小（并发扫描数），默认 10
+CONNECTION_TYPE                 连接类型: "tcp" 或 "unix"/"socket"
+                                tcp → TCP 连接 HOST:PORT
+                                unix → Unix Domain Socket 连接 SOCKET_PATH
+SOCKET_PATH                     Unix socket 路径，默认 /opt/clamav/var/run/clamd.sock
+                                仅 CONNECTION_TYPE=unix 时生效
+
+──────────────────────────────────────────────────────────────────────────────
+[ADMISSION] — 准入控制
+──────────────────────────────────────────────────────────────────────────────
+
+ENABLED                         准入控制总闸: 0=关闭 1=启用
+                                还需要 [SERVERINFO] ADMISSION_SWITCH=1
+
+MODE                            准入模式: 0=关准入 1=开准入 2=自动检测
+                                自动检测: 周期 ping 服务器，网络异常时自动切入准入
+
+RETRY_INTERVAL                  自动检测网络异常时重试间隔（秒），默认 60
+MAX_RETRIES                     每轮最多重试次数，默认 3
+
+──────────────────────────────────────────────────────────────────────────────
+[JUMP] — 网络跳变（IP 跳变 + 口令跳变）★ 新段
+──────────────────────────────────────────────────────────────────────────────
+
+ENABLED                         跳变总闸: 0=所有跳变功能不可用 1=启用
+                                关闭时: execute_ip_jump/execute_pw_jump 直接返回错误
+                                        gRPC JumpService 不注册
+                                        jump.db 不读写
+
+IP_JUMP                         IP 跳变: 0=关闭 1=开启
+                                需 [JUMP] ENABLED=1
+                                开启后: 可按策略更换本机 IP 地址
+
+PW_JUMP                         口令跳变: 0=关闭 1=开启
+                                需 [JUMP] ENABLED=1
+                                开启后: 可按策略更换系统用户密码
+
+──────────────────────────────────────────────────────────────────────────────
+[SYSTEM] — 系统组件 ★ 新段
+──────────────────────────────────────────────────────────────────────────────
+
+DOCKER_MONITOR                  Docker 容器监控: 0=不启动 1=启动
+                                启动后监听 Docker 事件（容器创建/销毁）
+                                默认 1，兼容旧版
+
+USB_HOTPLUG                     USB 热插拔监听: 0=不启动 1=启动
+                                启动后监听 USB 设备的插入/拔出事件
+                                默认 1，兼容旧版
+
+CONNECTIVITY_PROBE              周期连通性探测: 0=关闭 1=开启
+                                定期 ping 服务器，判断在线/离线状态
+                                默认 1，在线模式的基础判断
+
+NTP_SYNC                        NTP 时间同步: 0=不同步 1=同步
+                                从服务器获取 NTP 地址并同步系统时间
+                                默认 1，兼容旧版
+
+
+================================================================================
+三、依赖拓扑图
+================================================================================
+
+程序始终运行（除非 /var/run/osec_backend.pid 锁冲突）
+│
+├── [BACKEND] MODE=driver       ← 偏好，自动 fallback: driver → eBPF → 无后端
+│   └── [EBPF] FILE/PROC/NET    ← 仅 eBPF 生效时
+│
+├── [SQLITE_DB] ENABLED         ← ★ SQLite 总闸
+│   └── [DB_POLICY]             ← 仅 ENABLED=1 时生效
+│       ├── ALERT_LOG           → 告警写入/查询
+│       ├── PROCESS_POLICY      → 进程黑白名单双表
+│       ├── KNOWN_EXECUTABLES   → UIO 可执行文件记录
+│       ├── JUMP_STATUS         → 跳变状态恢复（还要 [JUMP] ENABLED）
+│       ├── PERIPHERAL_POLICY   → USB 黑白名单双表
+│       ├── QUARANTINE          → 病毒隔离元数据（替代 .meta）
+│       └── ALERT_MAX_ROWS      → 告警保留条数
+│
+├── [GRPC] ENABLED              ← ★ gRPC 总闸
+│   ├── ALERT_PUSH              → 告警实时推送
+│   ├── VIRUS_SCAN              → 病毒扫描（还要 VIGILIXAV）
+│   ├── VULN_SCAN               → 漏洞扫描
+│   ├── JUMP                    → 跳变服务（还要 [JUMP] ENABLED）
+│   ├── CONFIG                  → 配置读写
+│   ├── POLICY                  → 进程+外设+IP 策略
+│   ├── DATA_QUERY              → 数据查询
+│   ├── BACKUP                  → 备份还原
+│   ├── TASK                    → 本地任务
+│   └── AGENT_STATUS            → 状态上报
+│
+├── [VIGILIXAV] ENABLED         ← ★ 病毒引擎总闸
+│
+├── [JUMP] ENABLED              ← ★ 跳变总闸
+│   ├── IP_JUMP
+│   └── PW_JUMP
+│
+├── [ADMISSION] ENABLED         ← 准入控制
+│
+├── [SYSTEM]                    ← 系统组件
+│   ├── DOCKER_MONITOR
+│   ├── USB_HOTPLUG
+│   ├── CONNECTIVITY_PROBE
+│   └── NTP_SYNC
+│
+├── 安全防护 [SERVERINFO]
+│   ├── PROC_PROTECT + PROC_SWITCH    → 进程防护
+│   ├── FILE_PROTECT + FILE_SWITCH    → 文件防篡改
+│   ├── USB_PROTECT + USB_SWITCH      → USB 外设
+│   ├── EXTORTION_PROTECT + SWITCH    → 勒索防护
+│   ├── SELF_PROTECT_SWITCH           → 自保护
+│   ├── OPEN_PORT_SWITCH              → 端口检测
+│   └── INTERNET_SWITCH               → 互联网控制
+│
+├── 审计日志 [SERVERINFO]
+│   ├── DNS_SWITCH                    → DNS 查询日志
+│   ├── INTERNAL_COMMUNICATION_SWITCH → 内网通信日志
+│   ├── EXTERNAL_COMMUNICATION_SWITCH → 外网通信日志
+│   ├── SYSLOG_PROCESS_SWITCH         → 进程创建日志
+│   └── SYSLOG_LOGIN_SWITCH           → SSH 登录日志
+│
+└── 定时采集 [SERVERINFO]
+    ├── BASELINE_SWITCH + TIME        → 基线采集
+    ├── HARDWARE_SWITCH + TIME        → 硬件采集
+    ├── OUTREACH_SWITCH + TIME        → 外联探测
+    ├── SCANFILETIME                  → 文件扫描（0=关）
+    └── SCANPROCTIME                  → 进程扫描（0=关）
+
+
+================================================================================
+四、跨段依赖速查表
+================================================================================
+
+功能                              生效条件
+──────────────────────────────────────────────────────────────────────
+gRPC 服务器启动                   [GRPC] ENABLED=1
+gRPC VirusScanService              GRPC && VIRUS_SCAN && VIGILIXAV
+gRPC VulnScanService               GRPC && VULN_SCAN
+gRPC JumpService                   GRPC && JUMP && [JUMP] ENABLED
+gRPC ConfigService                 GRPC && CONFIG
+gRPC 策略服务组                    GRPC && POLICY
+gRPC DataQueryService              GRPC && DATA_QUERY
+gRPC BackupService                 GRPC && BACKUP
+告警 gRPC 实时推送                 GRPC && ALERT_PUSH
+告警 SQLite 写入                   SQLITE_DB && ALERT_LOG
+告警 SQLite 查询/处置              SQLITE_DB && ALERT_LOG
+IP 跳变执行                        [JUMP] ENABLED && IP_JUMP
+口令跳变执行                       [JUMP] ENABLED && PW_JUMP
+跳变状态 DB 持久化                 SQLITE_DB && JUMP_STATUS && [JUMP] ENABLED
+进程策略 DB 读/写                  SQLITE_DB && PROCESS_POLICY
+外设策略 DB 读/写                  SQLITE_DB && PERIPHERAL_POLICY
+可执行文件 DB 记录                 SQLITE_DB && KNOWN_EXECUTABLES
+病毒隔离元数据 DB                  SQLITE_DB && QUARANTINE
+病毒扫描（VigilixAV引擎）          [VIGILIXAV] ENABLED
+准入控制                           [ADMISSION] ENABLED && ADMISSION_SWITCH
+Docker 监控                        [SYSTEM] DOCKER_MONITOR
+USB 热插拔监听                     [SYSTEM] USB_HOTPLUG
+连通性探测                         [SYSTEM] CONNECTIVITY_PROBE
+NTP 时间同步                       [SYSTEM] NTP_SYNC
+
+
+================================================================================
+五、完整配置示例（含所有字段和默认值）
+================================================================================
+
+[CLIENTINFO]
+MID=1234567812345678
+
+[SERVERINFO]
+USER_ID=
+SERVERIPPORT=https://192.168.17.251:443
+SERVER_IP=192.168.17.251
+SERVER_PORT=443
+COMTIME=60
+FASTTIME=10
+CRONTIME=15
+OFFLINE_MODE=0
+VERSION=3.0.1_T6_B1
+INSTALL_TIME=0
+
+# 进程防护 (process protect)
+PROC_PROTECT=0
+PROC_SWITCH=0
+
+# 文件防篡改 (file protect)
+FILE_PROTECT=1
+FILE_SWITCH=1
+SCANFILETIME=0
+SCANPROCTIME=0
+
+# USB 外设防护
+USB_PROTECT=0
+USB_SWITCH=0
+
+# 勒索软件防护 (extortion)
+EXTORTION_PROTECT=0
+EXTORTION_SWITCH=0
+
+# 自保护
+SELF_PROTECT_SWITCH=0
+
+# 端口防护
+OPEN_PORT_SWITCH=0
+
+# 动态模块
+DYNAMIC_SWITCH=0
+MODULE_SWITCH=0
+
+# 互联网控制
+INTERNET_SWITCH=1
+
+# 准入
+ADMISSION_SWITCH=0
+
+# 审计日志
+DNS_SWITCH=0
+INTERNAL_COMMUNICATION_SWITCH=0
+EXTERNAL_COMMUNICATION_SWITCH=0
+SYSLOG_PROCESS_SWITCH=0
+SYSLOG_LOGIN_SWITCH=0
+
+# 定时采集
+BASELINE_SWITCH=0
+BASELINE_TIME=3600
+HARDWARE_SWITCH=0
+HARDWARE_TIME=3600
+OUTREACH_SWITCH=0
+OUTREACH_TIME=3600
+
+# 日志传输
+LOGIPPORT=
+LOGPROTO=2
+LOGSENT=0
+CLI_SERVER_PORT=0
+
+[HOSTINFO]
+MACID=52:54:00:c6:ae:7b
+
+[BACKEND]
+MODE=driver
+
+[EBPF]
+FILE_AGENT=1
+PROC_AGENT=1
+NET_AGENT=1
+
+[SQLITE_DB]
+ENABLED=0
+
+[DB_POLICY]
+ALERT_LOG=0
+PROCESS_POLICY=0
+KNOWN_EXECUTABLES=0
+JUMP_STATUS=0
+PERIPHERAL_POLICY=0
+QUARANTINE=0
+ALERT_MAX_ROWS=5000
+
+[GRPC]
+ENABLED=1
+DEV_MODE=1
+GRPC_ADDR=127.0.0.1:50051
+DEV_GRPC_ADDR=0.0.0.0:50051
+BATCH_SIZE=100
+ALLOW_CONFIG_WRITE_ONLINE=1
+ALERT_PUSH=0
+VIRUS_SCAN=1
+VULN_SCAN=0
+JUMP=0
+CONFIG=1
+POLICY=1
+DATA_QUERY=1
+BACKUP=1
+TASK=1
+AGENT_STATUS=1
+
+[VIGILIXAV]
+ENABLED=0
+HOST=127.0.0.1
+PORT=3310
+TIMEOUT=60
+POOL_SIZE=10
+CONNECTION_TYPE=tcp
+SOCKET_PATH=/opt/clamav/var/run/clamd.sock
+
+[ADMISSION]
+ENABLED=0
+MODE=2
+RETRY_INTERVAL=60
+MAX_RETRIES=3
+
+[JUMP]
+ENABLED=0
+IP_JUMP=1
+PW_JUMP=1
+
+[SYSTEM]
+DOCKER_MONITOR=1
+USB_HOTPLUG=1
+CONNECTIVITY_PROBE=1
+NTP_SYNC=1
+
+
+================================================================================
+六、典型场景配置
+================================================================================
+
+▼ 最小化部署（无 gRPC、无 SQLite、无病毒引擎）
+  所有新增开关保持默认值即可。
+
+▼ 启用告警持久化（客户端可查询历史）
+  [SQLITE_DB] ENABLED=1
+  [DB_POLICY]   ALERT_LOG=1, ALERT_MAX_ROWS=10000
+
+▼ 启用完整策略持久化（离线模式必备）
+  [SQLITE_DB] ENABLED=1
+  [DB_POLICY]   ALERT_LOG=1, PROCESS_POLICY=1, JUMP_STATUS=1, PERIPHERAL_POLICY=1
+  [GRPC]        POLICY=1, CONFIG=1
+
+▼ 启用 IP 跳变
+  [JUMP]        ENABLED=1, IP_JUMP=1
+  [GRPC]        JUMP=1
+  [SQLITE_DB]   ENABLED=1
+  [DB_POLICY]   JUMP_STATUS=1
+
+▼ 完整功能（生产环境推荐）
+  [SQLITE_DB]   ENABLED=1
+  [DB_POLICY]   ALERT_LOG=1, PROCESS_POLICY=1, JUMP_STATUS=1, PERIPHERAL_POLICY=1, QUARANTINE=1
+  [GRPC]        ENABLED=1, ALERT_PUSH=1, VIRUS_SCAN=1, CONFIG=1, POLICY=1, DATA_QUERY=1
+  [VIGILIXAV]   ENABLED=1
+  [JUMP]        ENABLED=1, IP_JUMP=1, PW_JUMP=1
+
+▼ 静默模式（无 gRPC、无 SQLite，仅内核防护 + HTTP 上报）
+  [GRPC]        ENABLED=0
+  [SQLITE_DB]   ENABLED=0
+
+
+================================================================================
+七、代码层面的控制方式
+================================================================================
+
+层级              控制方式                  示例
+──────────────────────────────────────────────────────────────────────
+main.rs 启动      开关关 → 不 spawn task    DOCKER_MONITOR=0 → tokio::spawn 不执行
+gRPC 注册         开关关 → 不 add_service   VULN_SCAN=0 → builder 跳过该 service
+函数入口          开关关 → return Err        [JUMP] ENABLED=0 → execute_ip_jump 直接返回
+DB 写入路径       开关关 → 直接 return      ALERT_LOG=0 → persist_alert_to_db 第一行就返回
+
+依赖链判断：
+  功能可用 = 自己开关 ON
+           && 父段开关 ON
+           && 父段的父段 ON（递归）
+           && 所有跨段依赖 ON
+
+
+================================================================================
+八、涉及的源码文件
+================================================================================
+
+crates/config/src/net_info.rs              所有开关结构体定义、INI 解析和写入
+crates/sqlite_db/src/db.rs                  SQLite 连接管理（WAL、目录创建）
+crates/local_store/src/lib.rs               init_all() — 按开关选择性建表
+crates/local_store/src/alert_log.rs         alert.db CRUD
+crates/local_store/src/process_policy.rs    process_policy.db 双表
+crates/local_store/src/known_executables.rs known_executables.db
+crates/local_store/src/jump_status.rs       jump.db
+crates/local_store/src/peripheral_policy.rs peripheral_policy.db 双表
+crates/local_store/src/quarantine.rs        quarantine.db — 病毒隔离元数据（新）
+crates/main/src/main.rs                     启动时读开关，控制组件 spawn
+crates/virus_scan_grpc/src/service.rs       按子开关注册 gRPC 服务
+crates/reporter/src/lib.rs                  告警广播 + DB 持久化
+crates/agent_local_svc/src/alert_impl.rs    告警历史查询/处置 RPC
+crates/agent_local_svc/src/data_hub.rs      跳变开关检查 + 策略/跳变 DB 读写
+crates/process_mgr/src/policy_mgr.rs        进程策略 DB 加载/保存

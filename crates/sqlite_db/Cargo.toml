@@ -1,0 +1,9 @@
+[package]
+name = "sqlite_db"
+version = "0.1.0"
+edition = "2021"
+description = "SQLite基础设施层 — 统一管理DB目录、WAL连接、表迁移，不包含任何业务逻辑"
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+log = "0.4"

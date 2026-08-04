@@ -257,6 +257,19 @@ test_30() { grpc_call "进程防护模式(查询)" \
 test_31() { grpc_call "外设防护模式(查询)" \
     protection_mode.proto protection_mode.PeripheralDefenseService GetPeripheralDefenseMode; }
 
+# ─ 告警历史查询/处置 (AlertService 新增 RPC)
+test_32() { grpc_call "告警日志-分页查询" \
+    alert.proto alert.AlertService GetAlertLogs \
+    '{"handle_status":-1, "page":1, "page_size":10}'; }
+
+test_33() { grpc_call "告警处置-单条标记" \
+    alert.proto alert.AlertService HandleAlert \
+    '{"id":1, "handle_status":1, "handle_user":"admin"}'; }
+
+test_34() { grpc_call "告警处置-批量标记" \
+    alert.proto alert.AlertService BatchHandleAlerts \
+    '{"ids":[1,2,3], "handle_status":2, "handle_user":"admin"}'; }
+
 # ─ 后端模式
 test_23() { grpc_call "后端模式(查询)" \
     backend.proto backend.BackendService GetBackendMode '{}'; }
@@ -509,29 +522,59 @@ test_vs_meta() {
 
 # 列出隔离区所有文件及关键信息
 test_vs_list() {
-    local quarantine_dir="/opt/vigilixav/quarantine"
-    echo -e "${CYAN}── 隔离区文件列表 ──${NC}"
+    local filter="${1:-}"
+    local qdir="/opt/vigilixav/quarantine"
+    local label="隔离中"
+    [ "$filter" = "all" ] && label="全部(含已还原)"
+    [ "${filter:0:6}" = "virus:" ] && label="病毒: ${filter:6}"
+    echo -e "${CYAN}── 隔离区文件列表 (${label}) ──${NC}"
+
+    # 通过 gRPC ListQuarantine 查询（Rust 进程直接读 DB，不依赖 sqlite3 命令）
+    local output
+    local req_data='{}'
+    [ -n "$filter" ] && req_data="{\"filter\":\"$filter\"}"
+    output=$(grpcurl -plaintext -emit-defaults \
+        -import-path "$PROTO_DIR" \
+        -proto common.proto -proto virus_scan.proto \
+        -d "$req_data" \
+        -connect-timeout 3 -max-time 10 \
+        "$GRPC_ADDR" virus_scan.VirusScanService/ListQuarantine 2>&1) || true
+
     local count=0
-    for m in "$quarantine_dir"/*.meta; do
-        [ -f "$m" ] || continue
-        ((count++))
-        local dev=$(python3 -c "import json; print(json.load(open('$m')).get('dev','?'))" 2>/dev/null)
-        local ino=$(python3 -c "import json; print(json.load(open('$m')).get('ino','?'))" 2>/dev/null)
-        local orig=$(python3 -c "import json; print(json.load(open('$m')).get('original_path','?'))" 2>/dev/null)
-        local vname=$(python3 -c "import json; print(json.load(open('$m')).get('virus_name','?'))" 2>/dev/null)
-        local uid=$(python3 -c "import json; print(json.load(open('$m')).get('uid','?'))" 2>/dev/null)
-        local gid=$(python3 -c "import json; print(json.load(open('$m')).get('gid','?'))" 2>/dev/null)
-        local mode=$(python3 -c "import json; print(json.load(open('$m')).get('mode','?'))" 2>/dev/null)
-        local qfile="${m%.meta}"
-        local exists=""
-        [ -f "$qfile" ] && exists="✓" || exists="✗"
-        echo -e "  ${GREEN}[$count]${NC} dev=$dev ino=$ino file=$exists"
-        echo -e "       原始: $orig"
-        echo -e "       病毒: $vname  属主: $uid:$gid  权限: $mode"
-    done
-    if [ "$count" -eq 0 ]; then
-        echo "  (空)"
+    if echo "$output" | grep -q '"entries"'; then
+        # 用 python3 解析: 显示行→stderr, 计数→stdout
+        count=$(python3 -c "
+import json, sys, os
+data = json.load(sys.stdin)
+entries = data.get('entries', [])
+for i, e in enumerate(entries):
+    qfile = os.path.join('$qdir', e.get('quarName', ''))
+    exists = '✓' if os.path.isfile(qfile) else '✗'
+    status = ' [已还原]' if e.get('restored') else ''
+    sys.stderr.write(f\"  [{i+1}] dev={e['dev']} ino={e['ino']} file={exists}{status}\n\")
+    sys.stderr.write(f\"       原始: {e.get('originalPath','?')}\n\")
+    sys.stderr.write(f\"       病毒: {e.get('virusName','?')}  属主: {e.get('uid','?')}:{e.get('gid','?')}  权限: {e.get('mode','?')}\n\")
+print(len(entries))
+" <<< "$output")
+        [ -z "$count" ] && count=0
+    else
+        echo "  (gRPC 调用失败或隔离区为空)"
+        echo "$output" | head -3 | sed 's/^/  /'
+        count=0
     fi
+
+    if [ "$count" -eq 0 ] && ! echo "$output" | grep -q '"entries"'; then
+        # gRPC 不可用，回退扫描 .meta 文件
+        for m in "$qdir"/*.meta; do
+            [ -f "$m" ] || continue
+            ((count++))
+            local qfile="${m%.meta}"
+            local exists=""; [ -f "$qfile" ] && exists="✓" || exists="✗"
+            echo -e "  ${GREEN}[$count]${NC} file=$exists  (.meta fallback: $m)"
+        done
+    fi
+
+    [ "$count" -eq 0 ] && echo "  (空)"
     echo -e "${CYAN}── 共 $count 个隔离文件 ──${NC}"
 }
 
@@ -758,8 +801,10 @@ show_help_detail() {
             echo "  用法: vs-bulk Eicar-Signature" ;;
         vs-all) echo -e "${CYAN}[vs-all]${NC} 全部还原 — 还原隔离区所有文件"
             echo "  用法: vs-all" ;;
-        vs-list) echo -e "${CYAN}[vs-list]${NC} 查看隔离区 — 列出所有隔离文件及元数据"
-            echo "  用法: vs-list" ;;
+        vs-list) echo -e "${CYAN}[vs-list]${NC} 查看隔离区 — 列出隔离文件及元数据"
+            echo "  用法: vs-list            # 只看隔离中的"
+            echo "  用法: vs-list all        # 含已还原"
+            echo "  用法: vs-list virus:xxx  # 按病毒名" ;;
         vs-meta) echo -e "${CYAN}[vs-meta]${NC} 查看 .meta — 查看元数据JSON内容"
             echo "  用法: vs-meta [隔离文件名]  (不传则显示全部)" ;;
         vs-remove) echo -e "${CYAN}[vs-remove]${NC} 病毒删除 — 直接删除文件"
@@ -791,6 +836,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}  11)VirtualPort  12)BackupList    13)JumpStatus               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  14)ProcessList 14b)白名单 14c)黑名单 15)PortList 16)UsbDev  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  17)PolicyWatch(流) 18)Alert(流)   19)准入查询   29)ExeList  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  30)进程防护 31)外设防护 32)AlertLogs  33)处置单条 34)处置批量 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  20)准入-OFF    21)准入-ON        22)准入-AUTO               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  30)进程防护查询 31)外设防护查询                              ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════╣${NC}"
@@ -974,6 +1020,13 @@ case "${1:-menu}" in
                 vs-list)
                     test_vs_list
                     ;;
+                vs-list\ all)
+                    test_vs_list "all"
+                    ;;
+                vs-list\ virus:*)
+                    local vname="${choice#vs-list virus:}"
+                    test_vs_list "virus:$vname"
+                    ;;
                 vs-meta|vs-meta\ *)
                     qname=""
                     [[ "$choice" =~ vs-meta[[:space:]]+(.+)$ ]] && qname="${BASH_REMATCH[1]}"
@@ -1095,6 +1148,7 @@ case "${1:-menu}" in
         echo "  11)VirtualPort  12)BackupList       13)JumpStatus"
         echo "  14)ProcessList  14b)ProcList(白)    14c)ProcList(黑)   15)PortList"
         echo "  16)UsbDevList   17)PolicyWatch(流)  18)Alert(流)      19)准入查询"
+        echo "  30)进程防护    31)外设防护        32)AlertLogs       33)处置单条    34)处置批量"
         echo "  20)准入-OFF     21)准入-ON          22)准入-AUTO      23)后端模式"
         echo "  26)查询后端     27)设ebpf           28)设driver       29)ExeList"
         echo "  30)进程防护查询 31)外设防护查询"
@@ -1154,7 +1208,7 @@ case "${1:-menu}" in
         elif [ "$1" = "vs-all" ]; then
             test_vs_restore_all "${2:-vs-$$}"
         elif [ "$1" = "vs-list" ]; then
-            test_vs_list
+            test_vs_list "${2:-}"
         elif [ "$1" = "vs-meta" ]; then
             test_vs_meta "${2}"
         elif [ "$1" = "vs-remove" ]; then

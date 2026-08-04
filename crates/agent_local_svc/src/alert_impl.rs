@@ -4,7 +4,13 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use grpc_gateway::alert::{alert_service_server::AlertService, AlertEvent, AlertFilter};
+use grpc_gateway::alert::{
+    alert_service_server::AlertService,
+    AlertEvent, AlertFilter,
+    AlertLogQuery, AlertLogResponse, AlertLogItem,
+    AlertHandleRequest, AlertHandleResponse,
+    BatchHandleRequest, BatchHandleResponse,
+};
 use crate::data_hub::AgentDataHub;
 
 type AlertStream = Pin<
@@ -49,5 +55,161 @@ impl AlertService for AlertServiceImpl {
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    /// 查询历史告警日志（分页）。
+    /// 客户端启动时调用一次获取历史数据，随后通过 SubscribeAlerts 接收新告警。
+    /// 仅当 [SQLITE_DB] ENABLED=1 且 [DB_POLICY] ALERT_LOG=1 时可用。
+    async fn get_alert_logs(
+        &self,
+        request: Request<AlertLogQuery>,
+    ) -> Result<Response<AlertLogResponse>, Status> {
+        if !local_store::sqlite_db_enabled() {
+            return Err(Status::unavailable("SQLite 基础设施未启用 ([SQLITE_DB] ENABLED=0)"));
+        }
+        let db_ok = config::net_info::NETINFO_CONFIG
+            .lock()
+            .map(|c| c.db_policy.alert_log)
+            .unwrap_or(false);
+        if !db_ok {
+            return Err(Status::unavailable("告警日志持久化未启用 ([DB_POLICY] ALERT_LOG=0)"));
+        }
+
+        let q = request.into_inner();
+        let page = if q.page == 0 { 1 } else { q.page };
+        let page_size = if q.page_size == 0 { 20 } else { q.page_size };
+        // handle_status: -1 表示全部; alert_type: -1/0 表示全部
+        let status_filter = if q.handle_status < 0 { None } else { Some(q.handle_status) };
+        let type_filter = if q.alert_type <= 0 { None } else { Some(q.alert_type) };
+
+        let filter = local_store::alert_log::AlertQueryFilter {
+            handle_status: status_filter,
+            alert_type: type_filter,
+            identifier: if q.identifier.is_empty() { None } else { Some(&q.identifier) },
+            handle_status_label: if q.handle_status_label.is_empty() { None } else { Some(&q.handle_status_label) },
+            start_time: if q.start_time > 0 { Some(q.start_time) } else { None },
+            end_time: if q.end_time > 0 { Some(q.end_time) } else { None },
+        };
+
+        let rows = local_store::alert_log::query_page(&filter, page, page_size)
+            .map_err(|e| Status::internal(format!("query alert_log 失败: {}", e)))?;
+
+        let total = local_store::alert_log::count(&filter)
+            .map_err(|e| Status::internal(format!("count alert_log 失败: {}", e)))?;
+
+        let items = rows.into_iter().map(|r| AlertLogItem {
+            id: r.id,
+            alert_type: r.alert_type,
+            level: r.level,
+            process: r.process,
+            path: r.path,
+            pid: r.pid,
+            detail: r.detail,
+            handle_status: r.handle_status,
+            handle_status_label: r.handle_status_label,
+            handle_user: r.handle_user,
+            handled_at: r.handled_at,
+            created_at: r.created_at,
+            n_type: r.n_type,
+            identifier: r.identifier,
+        }).collect();
+
+        Ok(Response::new(AlertLogResponse { items, total }))
+    }
+
+    /// 处置告警：标记为已处理或已忽略。
+    /// handle_status 只接受 1=已处理 / 2=已忽略，传其他值返回 INVALID_ARGUMENT。
+    async fn handle_alert(
+        &self,
+        request: Request<AlertHandleRequest>,
+    ) -> Result<Response<AlertHandleResponse>, Status> {
+        if !local_store::sqlite_db_enabled() {
+            return Err(Status::unavailable("SQLite 基础设施未启用"));
+        }
+
+        let req = request.into_inner();
+
+        if req.id <= 0 {
+            return Ok(Response::new(AlertHandleResponse {
+                success: false,
+                message: "id 无效".to_string(),
+                affected: 0,
+            }));
+        }
+
+        let label = match req.handle_status {
+            1 => "已处理",
+            2 => "已忽略",
+            _ => return Err(Status::invalid_argument(
+                format!("handle_status 只能是 1(已处理) 或 2(已忽略)，收到: {}", req.handle_status),
+            )),
+        };
+
+        let affected = local_store::alert_log::update_handle_status(
+            req.id,
+            req.handle_status,
+            label,
+            &req.handle_user,
+        ).map_err(|e| Status::internal(format!("更新处置状态失败: {}", e)))?;
+
+        let success = affected > 0;
+        let message = if success {
+            format!("告警 #{} 已标记为 {}", req.id, label)
+        } else {
+            format!("告警 #{} 不存在或状态未变更", req.id)
+        };
+
+        Ok(Response::new(AlertHandleResponse {
+            success,
+            message,
+            affected: affected as i32,
+        }))
+    }
+
+    async fn batch_handle_alerts(
+        &self,
+        request: Request<BatchHandleRequest>,
+    ) -> Result<Response<BatchHandleResponse>, Status> {
+        if !local_store::sqlite_db_enabled() {
+            return Err(Status::unavailable("SQLite 基础设施未启用"));
+        }
+
+        let req = request.into_inner();
+
+        if req.ids.is_empty() {
+            return Ok(Response::new(BatchHandleResponse {
+                success: false,
+                message: "ids 不能为空".to_string(),
+                total: 0,
+                success_count: 0,
+                fail_count: 0,
+                failed_ids: vec![],
+            }));
+        }
+
+        let label = match req.handle_status {
+            1 => "已处理",
+            2 => "已忽略",
+            _ => return Err(Status::invalid_argument(
+                format!("handle_status 只能是 1(已处理) 或 2(已忽略)，收到: {}", req.handle_status),
+            )),
+        };
+
+        let total = req.ids.len() as i32;
+        let (success_count, fail_count, failed_ids) = local_store::alert_log::batch_update_handle_status(
+            &req.ids,
+            req.handle_status,
+            label,
+            &req.handle_user,
+        ).map_err(|e| Status::internal(format!("批量处置失败: {}", e)))?;
+
+        Ok(Response::new(BatchHandleResponse {
+            success: fail_count == 0,
+            message: format!("成功处置 {} 条，失败 {} 条", success_count, fail_count),
+            total,
+            success_count,
+            fail_count,
+            failed_ids,
+        }))
     }
 }

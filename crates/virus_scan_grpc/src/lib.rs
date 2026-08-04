@@ -8,7 +8,7 @@ pub mod grpc_service;
 pub mod service;
 pub mod vuln_service;
 
-pub use vigilixav_scanner::{VigilixAVConnectionPool, VigilixAVConfig, ScanResult, DispositionAction, DispositionResult};
+pub use vigilixav_scanner::{VigilixAVConnectionPool, VigilixAVConfig, ScanResult, DispositionAction, DispositionResult, list_quarantined_files, migrate_meta_to_db};
 pub use scan_task_mgr::ScanTaskManager;
 pub use grpc_service::VirusScanGrpcService;
 pub use vuln_service::VulnScanGrpcService;

@@ -171,7 +171,40 @@ pub static ADMISSION_DETECTING: AtomicBool = AtomicBool::new(false);
 /// 网络是否异常 — 由 grpc_gateway::agent_mode::ADMISSION_NETWORK_ANOMALY 统一管理，这里 re-export
 
 /// Global jump status — updated by execute_ip_jump / execute_pw_jump.
-pub static JUMP_STATUS: LazyLock<Mutex<JumpStatus>> = LazyLock::new(|| Mutex::new(JumpStatus::default()));
+/// On first access, attempts to restore from local_store (if DB is enabled).
+pub static JUMP_STATUS: LazyLock<Mutex<JumpStatus>> = LazyLock::new(|| {
+    // 尝试从 SQLite 恢复（需要 [SQLITE_DB] && [DB_POLICY] JUMP_STATUS && [JUMP] ENABLED）
+    if let Ok(db_ok) = config::net_info::NETINFO_CONFIG.lock()
+        .map(|c| c.sqlite_db.enabled && c.db_policy.jump_status && c.jump.enabled)
+    {
+        if db_ok {
+            if let Ok(Some(row)) = local_store::jump_status::load() {
+                let js = JumpStatus {
+                    current_ip: row.current_ip,
+                    source_ip: row.source_ip,
+                    target_ip: row.target_ip,
+                    gateway: row.gateway,
+                    mode: row.mode,
+                    current_password: row.current_password,
+                    last_ip_jump_time: row.last_ip_jump_time,
+                    last_pw_jump_time: row.last_pw_jump_time,
+                    last_pw_jump_user: row.last_pw_jump_user,
+                    ip_scheme: row.ip_scheme,
+                    ip_cycle_label: row.ip_cycle_label,
+                    ip_timing_label: row.ip_timing_label,
+                    ip_way_label: row.ip_way_label,
+                    pw_scheme: row.pw_scheme,
+                    pw_cycle_label: row.pw_cycle_label,
+                    pw_timing_label: row.pw_timing_label,
+                    ..Default::default()
+                };
+                log::info!("[JUMP_STATUS] 从 SQLite 恢复跳变状态");
+                return Mutex::new(js);
+            }
+        }
+    }
+    Mutex::new(JumpStatus::default())
+});
 
 /// Central data access hub for gRPC handlers.
 /// Wraps existing global variables and provides change notification.
@@ -557,8 +590,8 @@ impl AgentDataHub {
                     .filter(|h| !hashes.contains(h)).collect();
                 let blacklist: Vec<String> = mgr.get_black_list().into_iter()
                     .filter(|h| !hashes.contains(h)).collect();
-                mgr.set_policy_process(&whitelist, true);
-                mgr.set_policy_process(&blacklist, false);
+                mgr.set_policy_process(&whitelist, true, Some(true));
+                mgr.set_policy_process(&blacklist, false, Some(true));
                 drop(mgr);
                 self.notify(PolicyChangeType::ProcessPolicyChanged);
                 return Ok(());
@@ -573,7 +606,7 @@ impl AgentDataHub {
                         merged.push(h.clone());
                     }
                 }
-                mgr.set_policy_process(&merged, is_white);
+                mgr.set_policy_process(&merged, is_white, Some(true));
                 drop(mgr);
                 self.notify(PolicyChangeType::ProcessPolicyChanged);
                 Ok(())
@@ -600,6 +633,8 @@ impl AgentDataHub {
             _ => return Err(format!("无效 action: {}", action)),
         }
         self.notify(PolicyChangeType::PeripheralPolicyChanged);
+        // 持久化外设黑白名单到离线本地表（受开关控制）
+        save_peripheral_policy_to_db();
         Ok(())
     }
 
@@ -635,6 +670,13 @@ impl AgentDataHub {
         target_ip: &str,
         mode: u32,
     ) -> Result<(String, String, String, u8, String), String> {
+        // 检查跳变开关：[JUMP] ENABLED=0 → 整个功能不可用
+        if !jump_enabled() {
+            return Err("IP跳变功能未启用 ([JUMP] ENABLED=0)".to_string());
+        }
+        if !jump_ip_enabled() {
+            return Err("IP跳变功能未启用 ([JUMP] IP_JUMP=0)".to_string());
+        }
         let ifcfg = {
             config::net_info::NETINFO_CONFIG.lock().unwrap().ifcfg.clone()
         };
@@ -675,6 +717,7 @@ impl AgentDataHub {
         }
 
         self.notify(PolicyChangeType::JumpStatusChanged);
+        save_jump_status_to_db();
         Ok((info.source_ip, info.target_ip, info.gateway, info.status, info.reason))
     }
 
@@ -833,6 +876,13 @@ impl AgentDataHub {
         &self,
         new_password: &str,
     ) -> Result<(u8, String), String> {
+        // 检查跳变开关：[JUMP] ENABLED=0 → 整个功能不可用
+        if !jump_enabled() {
+            return Err("口令跳变功能未启用 ([JUMP] ENABLED=0)".to_string());
+        }
+        if !jump_pw_enabled() {
+            return Err("口令跳变功能未启用 ([JUMP] PW_JUMP=0)".to_string());
+        }
         let mgr = rules_jump_mgr::PasswordManager::new();
         let mut info = rules_jump_mgr::PutPwJumpInfo {
             user: String::new(),
@@ -862,6 +912,7 @@ impl AgentDataHub {
         }
 
         self.notify(PolicyChangeType::JumpStatusChanged);
+        save_jump_status_to_db();
         Ok((info.status, info.reason))
     }
 
@@ -903,11 +954,156 @@ impl AgentDataHub {
         log_info!("[backend] 模式已更新: {} -> {} (重启={})", effective, new_mode, need_restart);
         Ok(need_restart)
     }
+
+    // ── 外设策略 DB 持久化 ──
+
+    /// 从 SQLite 在线基线表加载外设黑白名单到内存
+    pub fn load_peripheral_policy_from_db() {
+        Self::load_peripheral_policy_from(false)
+    }
+
+    /// 从 SQLite 离线本地表加载外设黑白名单到内存
+    pub fn load_peripheral_policy_from_db_local() {
+        Self::load_peripheral_policy_from(true)
+    }
+
+    fn load_peripheral_policy_from(local: bool) {
+        if !local_store::sqlite_db_enabled() {
+            return;
+        }
+        let db_ok = config::net_info::NETINFO_CONFIG
+            .lock()
+            .map(|c| c.db_policy.peripheral_policy)
+            .unwrap_or(false);
+        if !db_ok {
+            return;
+        }
+        let result = if local {
+            local_store::peripheral_policy::load_all_local()
+        } else {
+            local_store::peripheral_policy::load_all()
+        };
+        match result {
+            Ok(rows) => {
+                let mut white = vec![];
+                let mut black = vec![];
+                for row in rows {
+                    let info = udisk::device::UsbInfo::new(
+                        row.peripheral_eid, row.peripheral_name,
+                        row.intro, row.type_, false,
+                    );
+                    if row.is_white { white.push(info); } else { black.push(info); }
+                }
+                let mut guard = udisk::list::SHARED_USB_LIST.lock().unwrap();
+                *guard = udisk::list::BlackWhiteList::from_vecs(black, white);
+                log::info!(
+                    "[peripheral_policy] 从 DB({}) 加载: {} 白, {} 黑",
+                    if local { "local" } else { "online" },
+                    guard.get_whitelist().len(), guard.get_blacklist().len()
+                );
+            }
+            Err(e) => {
+                logging::log_error!("[peripheral_policy] 从 DB 加载失败: {}", e);
+            }
+        }
+    }
+}
+
+/// 将当前外设黑白名单持久化到 SQLite 离线本地表
+fn save_peripheral_policy_to_db() {
+    let db_ok = config::net_info::NETINFO_CONFIG
+        .lock()
+        .map(|c| c.sqlite_db.enabled && c.db_policy.peripheral_policy)
+        .unwrap_or(false);
+    if !db_ok {
+        return;
+    }
+    let guard = udisk::list::SHARED_USB_LIST.lock().unwrap();
+    let white: Vec<local_store::peripheral_policy::PeripheralPolicyRow> = guard
+        .get_whitelist().iter()
+        .map(|d| local_store::peripheral_policy::PeripheralPolicyRow {
+            peripheral_eid: d.perpheral_eid.clone(),
+            peripheral_name: d.perpheral_name.clone(),
+            intro: d.intro.clone(),
+            type_: d.type_.clone(),
+            is_white: true,
+        }).collect();
+    let black: Vec<local_store::peripheral_policy::PeripheralPolicyRow> = guard
+        .get_blacklist().iter()
+        .map(|d| local_store::peripheral_policy::PeripheralPolicyRow {
+            peripheral_eid: d.perpheral_eid.clone(),
+            peripheral_name: d.perpheral_name.clone(),
+            intro: d.intro.clone(),
+            type_: d.type_.clone(),
+            is_white: false,
+        }).collect();
+    if let Err(e) = local_store::peripheral_policy::save_all_local(&white, &black) {
+        logging::log_error!("[peripheral_policy] 持久化到离线本地表失败: {}", e);
+    }
 }
 
 impl Default for AgentDataHub {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 跳变总闸：[JUMP] ENABLED
+fn jump_enabled() -> bool {
+    config::net_info::NETINFO_CONFIG
+        .lock()
+        .map(|c| c.jump.enabled)
+        .unwrap_or(false)
+}
+
+/// IP 跳变：[JUMP] ENABLED && IP_JUMP
+fn jump_ip_enabled() -> bool {
+    config::net_info::NETINFO_CONFIG
+        .lock()
+        .map(|c| c.jump.enabled && c.jump.ip_jump)
+        .unwrap_or(false)
+}
+
+/// 口令跳变：[JUMP] ENABLED && PW_JUMP
+fn jump_pw_enabled() -> bool {
+    config::net_info::NETINFO_CONFIG
+        .lock()
+        .map(|c| c.jump.enabled && c.jump.pw_jump)
+        .unwrap_or(false)
+}
+
+/// 将当前 JUMP_STATUS 持久化到 SQLite（如果 DB 和 JUMP 开关已开启）
+fn save_jump_status_to_db() {
+    // 依赖链：[SQLITE_DB] && [DB_POLICY] JUMP_STATUS && [JUMP] ENABLED
+    let db_ok = config::net_info::NETINFO_CONFIG
+        .lock()
+        .map(|c| c.sqlite_db.enabled && c.db_policy.jump_status && c.jump.enabled)
+        .unwrap_or(false);
+    if !db_ok {
+        return;
+    }
+    let js = JUMP_STATUS.lock().unwrap();
+    let row = local_store::jump_status::JumpStatusRow {
+        current_ip: js.current_ip.clone(),
+        source_ip: js.source_ip.clone(),
+        target_ip: js.target_ip.clone(),
+        gateway: js.gateway.clone(),
+        mode: js.mode,
+        current_password: js.current_password.clone(),
+        last_ip_jump_time: js.last_ip_jump_time.clone(),
+        last_pw_jump_time: js.last_pw_jump_time.clone(),
+        last_pw_jump_user: js.last_pw_jump_user.clone(),
+        ip_scheme: js.ip_scheme,
+        ip_cycle_label: js.ip_cycle_label.clone(),
+        ip_timing_label: js.ip_timing_label.clone(),
+        ip_way_label: js.ip_way_label.clone(),
+        pw_scheme: js.pw_scheme,
+        pw_cycle_label: js.pw_cycle_label.clone(),
+        pw_timing_label: js.pw_timing_label.clone(),
+        ..Default::default()
+    };
+    if let Err(e) = local_store::jump_status::upsert(&row) {
+        logging::log_error!("[jump_status] 持久化失败: {}", e);
     }
 }
 

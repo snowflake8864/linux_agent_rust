@@ -24,3 +24,4 @@ uuid = { version = "1" }
 log = "0.4"
 clamav-client = "2.2.0"
 libc = "0.2"
+local_store = { path = "../local_store" }

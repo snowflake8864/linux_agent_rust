@@ -27,6 +27,8 @@ members = [
     "crates/grpc_gateway",
     "crates/agent_local_svc",
     "crates/ebpf_backend",
+    "crates/sqlite_db",
+    "crates/local_store",
 ]
 
 [profile.dev]
