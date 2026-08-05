@@ -90,13 +90,51 @@ impl NetClient {
                     Ok(response_text)
                 } else if status_code.is_client_error() {
                     Ok(response_text)
-                } 
+                }
                 else {
                     Err(format!("POST request failed with status: {} - {}", status_code, response_text))
                 }
             }
             Err(e) => Err(format!("Failed to send POST request: {}", e)),
         }
+    }
+
+    /// 带指数退避重试的 POST 请求
+    /// - 网络错误 / 5xx 服务端错误：最多重试 max_retries 次
+    /// - 4xx 客户端错误：不重试，直接返回 Ok(body)
+    /// - 退避间隔：1s, 2s, 4s, 8s ...
+    pub async fn post_data_async_with_retry(
+        &self,
+        url: &str,
+        json_data: &str,
+        timeout: Duration,
+        token: Option<&str>,
+        max_retries: u32,
+    ) -> Result<String, String> {
+        let mut last_err = String::new();
+
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                let delay = Duration::from_secs(1_u64 << (attempt - 1));
+                eprintln!(
+                    "[net_client] POST {} retry {}/{} after {:?}: {}",
+                    url, attempt, max_retries, delay, last_err,
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            match self.post_data_async(url, json_data, timeout, token).await {
+                Ok(body) => return Ok(body),
+                Err(e) => {
+                    last_err = e;
+                }
+            }
+        }
+
+        Err(format!(
+            "POST {} failed after {} retries: {}",
+            url, max_retries, last_err,
+        ))
     }
 
    pub async fn get_data_async(
