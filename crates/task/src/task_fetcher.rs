@@ -695,7 +695,7 @@ pub async fn run(
         tokio::select! {
             _ = task_interval.tick() => {
                 let url = format!("{}/v1/gettask", task_fetcher.base_url);
-                match net_client.post_data_async(&url, "", Duration::from_secs(100), token_str).await {
+                match net_client.post_data_async_with_retry(&url, "", Duration::from_secs(100), token_str, 5).await {
                     Ok(response) => {
                         set_online();
                         //log_info!("gettask response: {}", response);
@@ -707,7 +707,6 @@ pub async fn run(
                                 continue;
                             }
                         };
-
                         if parsed["code"] == "000000" {
                             let task_list = parsed["data"]["tasklist"]
                                 .as_array()
@@ -730,7 +729,8 @@ pub async fn run(
                             }
                         } else if parsed["code"] == "401" {
                             let msg = parsed["msg"].as_str().unwrap_or("Unknown error");
-                            log_info!("token 无效:{:?}, msg:{}",token_str, msg);
+                            let data = parsed["data"].as_object().ok_or("Missing 'data' object in response")?;
+                            log_info!("token 无效:{:?}, msg:{}, data:{:?}",token_str, msg, data);
                             return Err("token 无效".to_string());
                         } else {
                             let code = parsed["code"].as_str().unwrap_or("unknown");
