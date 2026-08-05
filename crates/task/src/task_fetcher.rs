@@ -846,7 +846,7 @@ pub async fn run(
         tokio::select! {
             _ = task_interval.tick() => {
                 let url = format!("{}/v1/gettask", task_fetcher.base_url);
-                match net_client.post_data_async(&url, "", Duration::from_secs(100), token_str).await {
+                match net_client.post_data_async_with_retry(&url, "", Duration::from_secs(100), token_str, 5).await {
                     Ok(response) => {
                         set_online();
                         let parsed: Value = match serde_json::from_str(&response) {
