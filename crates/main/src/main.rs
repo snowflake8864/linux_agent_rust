@@ -68,7 +68,16 @@ async fn main() -> std::io::Result<()> {
     log_info!("程序开始启动");
 
     // 卸载现有内核驱动（driver 模式才会用，ebpf 模式跳过）
-    let _ = unload_driver().ok();
+    // 如果卸载失败，记录失败次数，后续可能跳过驱动加载
+    match unload_driver() {
+        Err(e) => {
+            kernel_module::increment_driver_fail_count();
+            log_error!("驱动卸载失败: {} (fail_count={})", e, kernel_module::read_driver_fail_count());
+        }
+        Ok(()) => {
+            log_info!("驱动卸载检查完成");
+        }
+    }
 
     // 初始化 BootManager
     let init = BootManager::init().await;
@@ -186,12 +195,26 @@ async fn main() -> std::io::Result<()> {
                 ebpf
             }
             _ => {
-                // driver 模式：先尝试加载驱动，失败 fallback 到 eBPF
-                let mut init_clone = init.clone();
-                let mod_ver = init_clone.load_kernel_driver().await.unwrap_or_else(|e| {
-                    log_error!("驱动加载失败: {}", e);
+                // driver 模式：先检查失败计数，超过上限则跳过驱动，直接 fallback eBPF
+                let mod_ver = if kernel_module::should_skip_driver() {
+                    log_warn!("驱动连续失败已达 {} 次上限，跳过内核驱动加载，尝试 eBPF",
+                        kernel_module::read_driver_fail_count());
                     String::new()
-                });
+                } else {
+                    let mut init_clone = init.clone();
+                    match init_clone.load_kernel_driver().await {
+                        Ok(ver) => {
+                            kernel_module::reset_driver_fail_count();
+                            ver
+                        }
+                        Err(e) => {
+                            log_error!("驱动加载失败: {}", e);
+                            let count = kernel_module::increment_driver_fail_count();
+                            log_warn!("驱动失败次数: {}/{}", count, kernel_module::MAX_DRIVER_FAILURES);
+                            String::new()
+                        }
+                    }
+                };
 
                 if !mod_ver.is_empty() {
                     log_info!("驱动加载成功: {}", mod_ver);

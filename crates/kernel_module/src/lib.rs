@@ -157,24 +157,9 @@ impl LoadKernelDriver for BootManager {
             let mut failed_drivers = HashSet::new();
             loop {
                 if is_driver_loaded() {
-                    /*
-                    if !Path::new("/opt/osec/lib").exists() {
-                        log_error!("/opt/osec/lib not found. Driver may be loaded from old system path.");
-                        log_error!("Please ensure the agent is deployed correctly under /opt/osec/");
-                        log_error!("Exiting to avoid conflicts.");
-                        std::process::exit(1);
-                    }
-                    */
-                    log_error!("Exiting to avoid conflicts,restart process");
-                    std::process::exit(1);
-                    /*
-                    //log_info!("Driver already loaded and /opt/osec/lib exists, skipping");
-                    if let Ok(driver_name) = find_only_driver_in_opt_osec() {
-                        return Ok(driver_name);
-                    } else {
-                        return Ok(String::new());
-                    }
-                    */
+                    let msg = "Driver already loaded and cannot be unloaded, skip kernel driver loading";
+                    log_error!("{}", msg);
+                    return Err(msg.to_string());
                 }
                 match try_load_driver_with_cache(&kernel_version, &mut failed_drivers).await {
                     Ok(driver_name) => {
@@ -271,12 +256,67 @@ fn find_only_driver_in_opt_osec() -> Result<String, String> {
 }
 
 pub fn unload_driver() -> Result<(), String> {
-    match Command::new("rmmod").arg("osec_base").status() {
-        Ok(status) if status.success() => log_info!("Successfully unloaded existing osec_base driver"),
-        Ok(_) => log_info!("rmmod failed, maybe driver not loaded"),
-        Err(e) => return Err(format!("rmmod execution error: {}", e)),
+    if !is_driver_loaded() {
+        log_info!("osec_base driver not loaded, skip unload");
+        return Ok(());
     }
-    Ok(())
+
+    // Driver IS loaded, attempt to unload
+    match Command::new("rmmod").arg("osec_base").status() {
+        Ok(status) if status.success() => {
+            // rmmod 返回成功，再确认一次 /proc/modules
+            if is_driver_loaded() {
+                let msg = "rmmod returned success but osec_base still in /proc/modules";
+                log_error!("{}", msg);
+                Err(msg.to_string())
+            } else {
+                log_info!("Successfully unloaded existing osec_base driver");
+                Ok(())
+            }
+        }
+        Ok(status) => {
+            let msg = format!("rmmod osec_base failed with exit code: {}", status);
+            log_error!("{}", msg);
+            Err(msg)
+        }
+        Err(e) => {
+            let msg = format!("rmmod execution error: {}", e);
+            log_error!("{}", msg);
+            Err(msg)
+        }
+    }
+}
+
+// ── 驱动失败计数（持久化到文件，跨重启累计）──
+
+const DRIVER_FAIL_COUNT_FILE: &str = "/opt/osec/driver_fail_count";
+pub const MAX_DRIVER_FAILURES: u32 = 3;
+
+/// 读取持久化的驱动失败次数
+pub fn read_driver_fail_count() -> u32 {
+    match fs::read_to_string(DRIVER_FAIL_COUNT_FILE) {
+        Ok(content) => content.trim().parse::<u32>().unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+/// 失败计数 +1，返回新值
+pub fn increment_driver_fail_count() -> u32 {
+    let count = read_driver_fail_count() + 1;
+    let _ = fs::write(DRIVER_FAIL_COUNT_FILE, count.to_string());
+    log_warn!("Driver fail count incremented to {}", count);
+    count
+}
+
+/// 成功后重置计数
+pub fn reset_driver_fail_count() {
+    let _ = fs::remove_file(DRIVER_FAIL_COUNT_FILE);
+    log_info!("Driver fail count reset");
+}
+
+/// 失败次数是否已达到上限，应跳过驱动加载
+pub fn should_skip_driver() -> bool {
+    read_driver_fail_count() >= MAX_DRIVER_FAILURES
 }
 
 fn get_kernel_version() -> Result<String, String> {
