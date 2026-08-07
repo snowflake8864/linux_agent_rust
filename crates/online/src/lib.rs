@@ -8,7 +8,7 @@ use tokio::time::{interval, Duration, Interval};
 use tokio::sync::mpsc;
 use std::fs;
 use chrono::Utc;
-use logging::log_info;
+use logging::{log_info, log_error};
 use config::net_info::NETINFO_CONFIG;
 use grpc_gateway::agent_mode::set_online;
 use agent_local_svc::{set_offline_and_check_admission, update_token};
@@ -142,6 +142,9 @@ impl StartOnline for BootManager {
     fn start_services(&mut self, token_tx: mpsc::Sender<String>, mut host_is_offline_rx: mpsc::Receiver<bool>) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
 
+            // EACCES (os error 13) 连续失败计数器，内核层不可恢复时退出进程
+            let mut auth_fail_count: u32 = 0;
+
             loop {
                 let base_url = self.get_base_url();
 
@@ -156,6 +159,7 @@ impl StartOnline for BootManager {
                 //let mut local_interval = interval(Duration::from_secs(30));
                 match BaseOnline::run(&mut net_client).await {
                     Ok(token) => {
+                        auth_fail_count = 0; // 成功后重置
                         if let Err(err) = token_tx.send(token.clone()).await {
                             eprintln!("发送 token 失败: {}", err);
                             continue;
@@ -258,8 +262,23 @@ impl StartOnline for BootManager {
                         }
                     }
                     Err(err) => {
-                        eprintln!("获取 token 时发生错误: {}", err);
+                        let err_str = err.to_string();
+                        let is_eacces = err_str.contains("os error 13") || err_str.contains("Permission denied");
+
+                        if is_eacces {
+                            auth_fail_count = auth_fail_count.saturating_add(1);
+                            eprintln!("获取 token EACCES 错误 (连续 {}): {}", auth_fail_count, err);
+                        } else {
+                            auth_fail_count = 0;
+                            eprintln!("获取 token 时发生错误: {}", err);
+                        }
                         set_offline_and_check_admission(); // 无法获取 token，服务器不可达+检查准入
+
+                        if auth_fail_count >= 3 {
+                            log_error!("连续 {} 次 os error 13，内核层不可恢复，退出进程等待 systemd 拉起", auth_fail_count);
+                            eprintln!("FATAL: 连续 {} 次 os error 13，退出进程", auth_fail_count);
+                            std::process::exit(1);
+                        }
                         continue;
                     }
                 }
