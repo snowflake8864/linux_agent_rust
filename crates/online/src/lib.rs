@@ -8,7 +8,7 @@ use tokio::time::{interval, Duration, Interval};
 use tokio::sync::mpsc;
 use std::fs;
 use chrono::Utc;
-use logging::log_info;
+use logging::{log_info, log_error};
 use config::net_info::NETINFO_CONFIG;
 use grpc_gateway::agent_mode::set_online;
 use agent_local_svc::{set_offline_and_check_admission, update_token};
@@ -266,8 +266,21 @@ impl StartOnline for BootManager {
                         }
                     }
                     Err(err) => {
-                        auth_fail_count = auth_fail_count.saturating_add(1);
-                        if auth_fail_count <= 2 {
+                        let err_str = err.to_string();
+                        let is_eacces = err_str.contains("os error 13") || err_str.contains("Permission denied");
+
+                        if is_eacces {
+                            auth_fail_count = auth_fail_count.saturating_add(1);
+                            eprintln!("获取 token EACCES 错误 (连续 {}): {}", auth_fail_count, err);
+                        }
+
+                        if auth_fail_count >= 3 {
+                            log_error!("连续 {} 次 os error 13，内核层不可恢复，退出进程等待 systemd 拉起", auth_fail_count);
+                            eprintln!("FATAL: 连续 {} 次 os error 13，退出进程", auth_fail_count);
+                            std::process::exit(1);
+                        }
+
+                        if auth_fail_count <= 2 && !is_eacces {
                             eprintln!("获取 token 时发生错误: {}", err);
                         }
                         set_offline_and_check_admission();
