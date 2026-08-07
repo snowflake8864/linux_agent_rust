@@ -3,7 +3,9 @@ use tokio::signal::unix::{signal as unix_signal, SignalKind};
 use online::StartOnline;
 use task::{TaskService, TimerTask};
 use kernel_event::{StartKernelHandler, EventHandler,send_data_to_kernel};
-use kernel_module::{LoadKernelDriver, unload_driver, ensure_kernel_hold};
+use kernel_module::{LoadKernelDriver, unload_driver, ensure_kernel_hold,
+    read_driver_fail_count, increment_driver_fail_count, reset_driver_fail_count,
+    should_skip_driver, MAX_DRIVER_FAILURES};
 use common::manager::boot::BootManager;
 use reporter::{AuditLogInfo, StartBashLog};
 use tokio::sync::mpsc;
@@ -66,7 +68,15 @@ async fn main() -> std::io::Result<()> {
     log_info!("程序开始启动");
 
     // 卸载现有内核驱动
-    let _ = unload_driver().ok();
+    match unload_driver() {
+        Err(e) => {
+            increment_driver_fail_count();
+            log_error!("驱动卸载失败: {} (fail_count={})", e, read_driver_fail_count());
+        }
+        Ok(()) => {
+            log_info!("驱动卸载检查完成");
+        }
+    }
 
     // 初始化 BootManager
     let init = BootManager::init().await;
@@ -79,11 +89,27 @@ async fn main() -> std::io::Result<()> {
     // 加载内核驱动并更新 mod_ver
     {
         let mut cfg = NETINFO_CONFIG.lock().unwrap();
-        let mut init = init.clone();
-        let mod_ver = init.load_kernel_driver().await.unwrap_or_else(|e| {
-            logging::log_error!("驱动加载失败: {}", e);
+
+        let mod_ver = if should_skip_driver() {
+            log_warn!("驱动连续失败已达 {} 次上限，跳过内核驱动加载，程序以降级模式运行",
+                read_driver_fail_count());
             String::new()
-        });
+        } else {
+            let mut init = init.clone();
+            match init.load_kernel_driver().await {
+                Ok(ver) => {
+                    reset_driver_fail_count();
+                    ver
+                }
+                Err(e) => {
+                    log_error!("驱动加载失败: {}", e);
+                    let count = increment_driver_fail_count();
+                    log_warn!("驱动失败次数: {}/{}，以降级模式运行", count, MAX_DRIVER_FAILURES);
+                    String::new()
+                }
+            }
+        };
+
         cfg.mod_ver = mod_ver;
         log_info!("load kernel driver: {}", cfg.mod_ver);
         let _ = cfg.to_ini(&format!("{}/net_info.ini", cfg.app_path));
