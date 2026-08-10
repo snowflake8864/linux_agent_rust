@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Mutex, LazyLock, atomic::{AtomicBool, AtomicU8, Ordering}};
 
 use logging::{log_info, log_error};
@@ -142,7 +143,7 @@ static PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
 pub fn trigger_connectivity_probe() {
     //log_info!("[admission] >>> trigger_connectivity_probe() 被调用");
     if PROBE_RUNNING.swap(true, Ordering::Relaxed) {
-        log_info!("[admission] >>> trigger_connectivity_probe: 已有探测在跑，跳过");
+        //log_info!("[admission] >>> trigger_connectivity_probe: 已有探测在跑，跳过");
         return;
     }
     //log_info!("[admission] >>> trigger_connectivity_probe: spawn 异步探测任务");
@@ -152,9 +153,17 @@ pub fn trigger_connectivity_probe() {
             //log_info!("[admission] >>> 异步探测: 服务器可达 → set_online()，不触发 repair");
             set_online();
         } else {
-            log_info!("[admission] >>> 异步探测: 服务器不可达 → set_offline() + run_admission_repair()");
+            log_info!("[admission] >>> 异步探测: 服务器不可达 → set_offline()");
             let _ = set_offline();
-            run_admission_repair();
+            let admission_enabled = config::net_info::NETINFO_CONFIG
+                .lock()
+                .map(|c| c.admission.enabled)
+                .unwrap_or(false);
+            if admission_enabled {
+                run_admission_repair();
+            } else {
+                log_info!("[admission] >>> 准入功能未启用，跳过 repair");
+            }
         }
         PROBE_RUNNING.store(false, Ordering::Relaxed);
     });
@@ -622,19 +631,31 @@ impl AgentDataHub {
         action: i32,
     ) -> Result<(), String> {
         let usb_protect = config::net_info::NETINFO_CONFIG.lock().unwrap().usb_protect;
-        let mut guard = udisk::list::SHARED_USB_LIST.lock().unwrap();
-        match action {
-            0 => {
-                let eids: Vec<String> = devices.iter().map(|d| d.perpheral_eid.clone()).collect();
-                guard.remove_from_both(&eids);
+        {
+            let mut guard = udisk::list::SHARED_USB_LIST.lock().unwrap();
+            match action {
+                0 => {
+                    let eids: Vec<String> = devices.iter().map(|d| d.perpheral_eid.clone()).collect();
+                    guard.remove_from_both(&eids);
+                }
+                1 => guard.update_whitelist(devices.to_vec()),
+                2 => guard.update_blacklist(devices.to_vec(), usb_protect),
+                _ => return Err(format!("无效 action: {}", action)),
             }
-            1 => guard.update_whitelist(devices.to_vec()),
-            2 => guard.update_blacklist(devices.to_vec(), usb_protect),
-            _ => return Err(format!("无效 action: {}", action)),
-        }
+        } // SHARED_USB_LIST 锁在此释放，避免 save_peripheral_policy_to_db 内部再次加锁死锁
         self.notify(PolicyChangeType::PeripheralPolicyChanged);
         // 持久化外设黑白名单到离线本地表（受开关控制）
         save_peripheral_policy_to_db();
+
+        // 黑名单 + usb_protect 开启时，物理禁用设备（锁已释放，不会死锁）
+        if action == 2 && usb_protect {
+            let eids: Vec<String> = devices.iter().map(|d| d.perpheral_eid.clone()).collect();
+            log_info!("[peripheral_policy] usb_protect 开启，禁用 {} 个黑名单设备", eids.len());
+            std::thread::spawn(move || {
+                udisk::monitor::handle_blacklist_update(&eids);
+            });
+        }
+
         Ok(())
     }
 
@@ -967,6 +988,59 @@ impl AgentDataHub {
         Self::load_peripheral_policy_from(true)
     }
 
+    /// 合并加载在线表和离线本地表，确保用户本地修改不丢失
+    pub fn load_peripheral_policy_merged() {
+        // 先加载在线表（服务器策略），再加载本地表（用户修改）覆盖同名 eid
+        Self::load_peripheral_policy_from(false);
+        Self::merge_peripheral_policy_from_local();
+    }
+
+    fn merge_peripheral_policy_from_local() {
+        if !local_store::sqlite_db_enabled() {
+            return;
+        }
+        let db_ok = config::net_info::NETINFO_CONFIG
+            .lock()
+            .map(|c| c.db_policy.peripheral_policy)
+            .unwrap_or(false);
+        if !db_ok {
+            return;
+        }
+        let result = local_store::peripheral_policy::load_all_local();
+        match result {
+            Ok(rows) => {
+                let mut guard = udisk::list::SHARED_USB_LIST.lock().unwrap();
+                let online_eids: HashSet<String> = guard
+                    .get_whitelist().iter()
+                    .chain(guard.get_blacklist().iter())
+                    .map(|d| d.perpheral_eid.clone())
+                    .collect();
+                for row in rows {
+                    // 只合并在线表中不存在的设备，避免本地过期数据覆盖服务器权威策略
+                    if online_eids.contains(&row.peripheral_eid) {
+                        continue;
+                    }
+                    let info = udisk::device::UsbInfo::new(
+                        row.peripheral_eid, row.peripheral_name,
+                        row.intro, row.type_, false,
+                    );
+                    if row.is_white {
+                        guard.update_whitelist_single(info);
+                    } else {
+                        guard.update_blacklist_single(info);
+                    }
+                }
+                log::info!(
+                    "[peripheral_policy] 从 DB(local) 合并: {} 白, {} 黑",
+                    guard.get_whitelist().len(), guard.get_blacklist().len()
+                );
+            }
+            Err(e) => {
+                logging::log_error!("[peripheral_policy] 从 DB(local) 合并失败: {}", e);
+            }
+        }
+    }
+
     fn load_peripheral_policy_from(local: bool) {
         if !local_store::sqlite_db_enabled() {
             return;
@@ -1011,9 +1085,11 @@ impl AgentDataHub {
 
 /// 将当前外设黑白名单持久化到 SQLite 离线本地表
 fn save_peripheral_policy_to_db() {
+    // 只要 SQLite 已启用就保存；不再受 db_policy.peripheral_policy 开关限制
+    // （该开关只控制启动时是否"加载"，用户显式修改策略后必须持久化）
     let db_ok = config::net_info::NETINFO_CONFIG
         .lock()
-        .map(|c| c.sqlite_db.enabled && c.db_policy.peripheral_policy)
+        .map(|c| c.sqlite_db.enabled)
         .unwrap_or(false);
     if !db_ok {
         return;
@@ -1037,6 +1113,10 @@ fn save_peripheral_policy_to_db() {
             type_: d.type_.clone(),
             is_white: false,
         }).collect();
+    // 同时写在线表和离线表，避免在线重启后 load_all 读不到 save_all_local 写入的数据
+    if let Err(e) = local_store::peripheral_policy::save_all(&white, &black) {
+        logging::log_error!("[peripheral_policy] 持久化到在线表失败: {}", e);
+    }
     if let Err(e) = local_store::peripheral_policy::save_all_local(&white, &black) {
         logging::log_error!("[peripheral_policy] 持久化到离线本地表失败: {}", e);
     }
