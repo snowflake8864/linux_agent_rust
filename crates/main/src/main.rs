@@ -4,6 +4,7 @@ use online::StartOnline;
 use task::{TaskService, TimerTask};
 use kernel_event::{StartKernelHandler, EventHandler,send_data_to_kernel};
 use kernel_module::{LoadKernelDriver, unload_driver, ensure_kernel_hold, DriverBackend};
+#[cfg(feature = "ebpf")]
 use ebpf_backend::{EbpfBackend, capability::EbpfCapability};
 use common::backend::{SecurityBackend, NoopBackend, set_backend};
 use common::manager::boot::BootManager;
@@ -132,6 +133,7 @@ async fn main() -> std::io::Result<()> {
         log_info!("后端模式: {}", backend_mode);
 
         let backend: Arc<dyn SecurityBackend> = match backend_mode.as_str() {
+            #[cfg(feature = "ebpf")]
             "ebpf" => {
                 // 纯 eBPF 模式：不加载驱动，直接初始化 eBPF
                 log_info!("===== 进入 eBPF 模式 =====");
@@ -234,60 +236,69 @@ async fn main() -> std::io::Result<()> {
 
                     Arc::new(DriverBackend::new())
                 } else {
-                    // 驱动失败，fallback 到 eBPF
-                    log_warn!("驱动加载失败，尝试 fallback 到 eBPF 模式");
-                    let cap = EbpfCapability::check();
-                    if !cap.all_ok() {
-                        for reason in cap.fail_reasons() {
-                            log_error!("eBPF 能力检测失败: {}", reason);
-                        }
-                        log_warn!("驱动和 eBPF 均不可用，以空后端模式继续运行");
-                        cfg.mod_ver = "noop".to_string();
-                        Arc::new(NoopBackend)
-                    } else {
-                        match EbpfBackend::new(
-                            "/opt/osec/bpf",
-                            file_enabled, cfg.file_switch, cfg.file_protect,
-                            proc_enabled, cfg.proc_switch, cfg.proc_protect,
-                            net_enabled,
-                            &cfg.ifcfg, "xdp",
-                        ) {
-                            Ok(raw_ebpf) => {
-                                let ebpf = Arc::new(raw_ebpf);
-                                if let Err(e) = ebpf.init() {
-                                    log_error!("EbpfBackend fallback init 失败: {}", e);
-                                    log_warn!("eBPF 初始化失败，以空后端模式继续运行");
+                    // 驱动失败，fallback 到 eBPF（如果编译时启用）
+                    #[cfg(feature = "ebpf")]
+                    {
+                        log_warn!("驱动加载失败，尝试 fallback 到 eBPF 模式");
+                        let cap = EbpfCapability::check();
+                        if !cap.all_ok() {
+                            for reason in cap.fail_reasons() {
+                                log_error!("eBPF 能力检测失败: {}", reason);
+                            }
+                            log_warn!("驱动和 eBPF 均不可用，以空后端模式继续运行");
+                            cfg.mod_ver = "noop".to_string();
+                            Arc::new(NoopBackend)
+                        } else {
+                            match EbpfBackend::new(
+                                "/opt/osec/bpf",
+                                file_enabled, cfg.file_switch, cfg.file_protect,
+                                proc_enabled, cfg.proc_switch, cfg.proc_protect,
+                                net_enabled,
+                                &cfg.ifcfg, "xdp",
+                            ) {
+                                Ok(raw_ebpf) => {
+                                    let ebpf = Arc::new(raw_ebpf);
+                                    if let Err(e) = ebpf.init() {
+                                        log_error!("EbpfBackend fallback init 失败: {}", e);
+                                        log_warn!("eBPF 初始化失败，以空后端模式继续运行");
+                                        cfg.mod_ver = "noop".to_string();
+                                        Arc::new(NoopBackend)
+                                    } else {
+                                        // 后台扫描 + ringbuf reader
+                                        let ebpf_fb = ebpf.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            let dirs: Vec<String> = ["/bin","/usr/bin","/usr/sbin","/usr/local/bin","/usr/lib/systemd"]
+                                                .iter().map(|s| s.to_string()).collect();
+                                            let _ = ebpf_fb.scan_executables(&dirs, true);
+                                        });
+                                        ebpf.start_proc_event_reader();
+                                        ebpf.start_file_event_reader();
+
+                                        // 准入控制：ECN-Echo
+                                        if admission_enabled && admission_mode == 1 {
+                                            if let Err(e) = ebpf.write_tcp_force_ecn(true) {
+                                                log_error!("eBPF ECN 设置失败: {}", e);
+                                            }
+                                        }
+
+                                        cfg.mod_ver = "ebpf-fallback".to_string();
+                                        ebpf
+                                    }
+                                }
+                                Err(e) => {
+                                    log_error!("EbpfBackend fallback 创建失败: {}", e);
+                                    log_warn!("eBPF 创建失败，以空后端模式继续运行");
                                     cfg.mod_ver = "noop".to_string();
                                     Arc::new(NoopBackend)
-                                } else {
-                                    // 后台扫描 + ringbuf reader
-                                    let ebpf_fb = ebpf.clone();
-                                    tokio::task::spawn_blocking(move || {
-                                        let dirs: Vec<String> = ["/bin","/usr/bin","/usr/sbin","/usr/local/bin","/usr/lib/systemd"]
-                                            .iter().map(|s| s.to_string()).collect();
-                                        let _ = ebpf_fb.scan_executables(&dirs, true);
-                                    });
-                                    ebpf.start_proc_event_reader();
-                                    ebpf.start_file_event_reader();
-
-                                    // 准入控制：ECN-Echo
-                                    if admission_enabled && admission_mode == 1 {
-                                        if let Err(e) = ebpf.write_tcp_force_ecn(true) {
-                                            log_error!("eBPF ECN 设置失败: {}", e);
-                                        }
-                                    }
-
-                                    cfg.mod_ver = "ebpf-fallback".to_string();
-                                    ebpf
                                 }
                             }
-                            Err(e) => {
-                                log_error!("EbpfBackend fallback 创建失败: {}", e);
-                                log_warn!("eBPF 创建失败，以空后端模式继续运行");
-                                cfg.mod_ver = "noop".to_string();
-                                Arc::new(NoopBackend)
-                            }
                         }
+                    }
+                    #[cfg(not(feature = "ebpf"))]
+                    {
+                        log_warn!("驱动加载失败，eBPF 未编译，以空后端模式继续运行");
+                        cfg.mod_ver = "noop".to_string();
+                        Arc::new(NoopBackend)
                     }
                 }
             }
