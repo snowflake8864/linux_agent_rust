@@ -15,6 +15,11 @@ resolver = "2"
 [[bin]]
 name = "MagicArmor_0"
 path = "src/main.rs"
+
+[features]
+default = ["ebpf"]
+ebpf = ["dep:ebpf_backend"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 openssl-sys = { version = "0.9", features = ["vendored"] } # 关键修复点
@@ -40,7 +45,7 @@ virus_scan_grpc = { path = "../virus_scan_grpc" }
 net_client = { path = "../net_client" }
 grpc_gateway = { path = "../grpc_gateway" }
 agent_local_svc = { path = "../agent_local_svc" }
-ebpf_backend = { path = "../ebpf_backend" }
+ebpf_backend = { path = "../ebpf_backend", optional = true }
 local_store = { path = "../local_store" }
 process_mgr = { path = "../process_mgr" }
 tonic = "0.14"
