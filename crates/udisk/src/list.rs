@@ -100,13 +100,15 @@ impl BlackWhiteList {
         self.blacklist = new_blacklist;
         self.black_eids = new_black_eids;
 
-        // 禁用新增黑名单设备
+        // 禁用新增黑名单设备 — 已移除 sysfs 物理禁用逻辑
+        // 原因：std::thread::spawn 写 /sys/.../authorized=0 会与 libusb 事件循环竞态，
+        // 导致内核层卡死（handle_events 无法返回），进而 gRPC accept loop 阻塞，进程 Ctrl+C 也无法终止。
+        // 黑名单策略层拦截已足够生效；若需物理禁用，由 device_arrived + usb_protect 在 libusb 上下文中安全完成。
         if !added_to_blacklist.is_empty() {
-            log_info!("检测到 {} 个新增黑名单设备，尝试禁用...", added_to_blacklist.len());
-            let blacklist_clone = added_to_blacklist.clone();
-            std::thread::spawn(move || {
-                crate::monitor::handle_blacklist_update(&blacklist_clone);
-            });
+            log_info!(
+                "检测到 {} 个新增黑名单设备，已加入策略（不执行物理禁用，避免 libusb 竞态卡死）",
+                added_to_blacklist.len()
+            );
         }
     }
 
@@ -117,6 +119,26 @@ impl BlackWhiteList {
         self.blacklist.retain(|u| !remove_set.contains(u.perpheral_eid.as_str()));
         self.white_eids = self.whitelist.iter().map(|u| u.perpheral_eid.clone()).collect();
         self.black_eids = self.blacklist.iter().map(|u| u.perpheral_eid.clone()).collect();
+    }
+
+    /// Add a single device to whitelist (merging: blacklist takes priority).
+    pub fn update_whitelist_single(&mut self, device: UsbInfo) {
+        self.blacklist.retain(|d| d.perpheral_eid != device.perpheral_eid);
+        self.black_eids.remove(&device.perpheral_eid);
+        if !self.white_eids.contains(&device.perpheral_eid) {
+            self.white_eids.insert(device.perpheral_eid.clone());
+            self.whitelist.push(device);
+        }
+    }
+
+    /// Add a single device to blacklist (merging: blacklist takes priority).
+    pub fn update_blacklist_single(&mut self, device: UsbInfo) {
+        self.whitelist.retain(|d| d.perpheral_eid != device.perpheral_eid);
+        self.white_eids.remove(&device.perpheral_eid);
+        if !self.black_eids.contains(&device.perpheral_eid) {
+            self.black_eids.insert(device.perpheral_eid.clone());
+            self.blacklist.push(device);
+        }
     }
 
 }

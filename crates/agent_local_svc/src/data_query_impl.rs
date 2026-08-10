@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use grpc_gateway::common::Empty;
@@ -8,6 +9,7 @@ use grpc_gateway::data_query::{
 };
 use grpc_gateway::peripheral_policy::UsbDevice;
 use crate::data_hub::AgentDataHub;
+use config::net_info::NETINFO_CONFIG;
 
 pub struct DataQueryServiceImpl {
     pub data_hub: Arc<AgentDataHub>,
@@ -88,22 +90,76 @@ impl DataQueryService for DataQueryServiceImpl {
 
     async fn get_usb_device_list(
         &self,
-        _request: Request<ProcessFilter>,
+        request: Request<ProcessFilter>,
     ) -> Result<Response<UsbDeviceList>, Status> {
-        // Get combined devices from both whitelist and blacklist with policy_status
-        let combined = self.data_hub.get_combined_peripheral_policy();
+        let filter = request.into_inner();
 
-        let devices: Vec<UsbDevice> = combined
-            .into_iter()
-            .map(|(d, status)| UsbDevice {
-                peripheral_eid: d.perpheral_eid,
-                peripheral_name: d.perpheral_name,
-                intro: d.intro,
-                r#type: d.type_,
+        // usb_switch 关闭时直接返回空，不扫描硬件也不查策略
+        let usb_switch = NETINFO_CONFIG.lock().map(|c| c.usb_switch).unwrap_or(false);
+        if !usb_switch {
+            return Ok(Response::new(UsbDeviceList { devices: vec![] }));
+        }
+
+        // 从硬件扫描获取所有当前插入的 USB 设备
+        let scanned = udisk::monitor::get_all_local_usb_devices();
+
+        // 获取策略列表（白名单/黑名单），用于标记 policy_status
+        let white_devices = self.data_hub.get_peripheral_policy(true);
+        let black_devices = self.data_hub.get_peripheral_policy(false);
+
+        let white_set: HashSet<String> = white_devices.iter().map(|d| d.perpheral_eid.clone()).collect();
+        let black_set: HashSet<String> = black_devices.iter().map(|d| d.perpheral_eid.clone()).collect();
+
+        // 用硬件扫描结果 + 策略设备合并，以 eid 去重
+        // 策略中的设备即使已被禁用也能显示
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut devices: Vec<UsbDevice> = Vec::new();
+
+        // 先从硬件扫描结果构建
+        for d in &scanned {
+            let policy_status = if white_set.contains(&d.perpheral_eid) {
+                PolicyStatus::PolicyWhitelist as i32
+            } else if black_set.contains(&d.perpheral_eid) {
+                PolicyStatus::PolicyBlacklist as i32
+            } else {
+                PolicyStatus::PolicyNone as i32
+            };
+            devices.push(UsbDevice {
+                peripheral_eid: d.perpheral_eid.clone(),
+                peripheral_name: d.perpheral_name.clone(),
+                intro: d.intro.clone(),
+                r#type: d.type_.clone(),
                 allow: d.allow,
-                policy_status: status as i32,
-            })
-            .collect();
+                policy_status,
+            });
+            seen.insert(d.perpheral_eid.clone());
+        }
+
+        // 补上策略中有但硬件扫描不到的（如被禁用设备），policy_status 来自策略
+        for d in white_devices.iter().chain(black_devices.iter()) {
+            if seen.contains(&d.perpheral_eid) {
+                continue;
+            }
+            let policy_status = if white_set.contains(&d.perpheral_eid) {
+                PolicyStatus::PolicyWhitelist as i32
+            } else {
+                PolicyStatus::PolicyBlacklist as i32
+            };
+            devices.push(UsbDevice {
+                peripheral_eid: d.perpheral_eid.clone(),
+                peripheral_name: d.perpheral_name.clone(),
+                intro: d.intro.clone(),
+                r#type: d.type_.clone(),
+                allow: d.allow,
+                policy_status,
+            });
+        }
+
+        // filter_status 过滤接口保持可用（0=全部, 1=白名单, 2=黑名单, 3=无策略）
+        if filter.filter_status > 0 {
+            let target = if filter.filter_status == 3 { 0 } else { filter.filter_status };
+            devices.retain(|d| d.policy_status == target);
+        }
 
         Ok(Response::new(UsbDeviceList { devices }))
     }

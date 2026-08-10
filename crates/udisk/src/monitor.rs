@@ -627,25 +627,31 @@ impl StartUsbService for BootManager {
             };
             let url = format!("{}/v1/addperipherals", net_client.get_base_url().unwrap_or_default());
 
-            let current_devices = get_all_local_usb_devices();
-            loop {
-                if let Some(_) = self.get_token().await {
-                    let devices = current_devices.clone();
-                    upload_usb_info(&devices, &net_client, &url, self).await;
-                    break;
-                } else {
-                    sleep(Duration::from_secs(2)).await;
-                }
-            }
-            
+            // 立即启动 USB monitor，不等 token（离线时 token 永远不会来）
+            // device_arrived / device_left 回调依赖此 monitor，物理阻断需要它
             let monitor = UsbMonitor::new_with_signal(SHARED_USB_LIST.clone(), usb_audit_log_tx, hotplug_signal_tx)
                 .map_err(|e| format!("创建监控器失败: {:?}", e))?;
-            
+
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = monitor.run() {
                     log::error!("USB 监控运行失败: {:?}", e);
                 }
             });
+
+            // 等拿到 token 后补传一次初始设备列表（不阻塞 monitor 启动）
+            // 离线模式下不需要 token，直接跳过
+            let is_offline = NETINFO_CONFIG.lock().map(|c| c.is_offline_mode).unwrap_or(false);
+            if !is_offline {
+                let current_devices = get_all_local_usb_devices();
+                loop {
+                    if let Some(_) = self.get_token().await {
+                        upload_usb_info(&current_devices, &net_client, &url, self).await;
+                        break;
+                    } else {
+                        sleep(Duration::from_secs(2)).await;
+                    }
+                }
+            }
 
             Ok("USB服务正常退出".to_string())
         })
