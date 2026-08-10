@@ -1512,6 +1512,7 @@ version = "0.10.6"
 dependencies = [
  "common",
  "levenshtein",
+ "libc",
  "log 0.4.29",
  "logging",
  "tokio",
