@@ -182,17 +182,23 @@ show_test_help() {
                echo "          $0 w15 {\"mode\": 1}  # 监控"
                echo "          $0 w15 {\"mode\": 2}  # 保护"
                echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED" ;;
-        w16)   echo -e "${CYAN}[w16] DeleteBackup${NC} — 删除 LVM 快照（写）"
-               echo "    参数: {\"backup_id\": \"snap_name_or_suffix\"}"
-               echo "    实际调用 lvremove 删除 LVM 快照"
-               echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED"
-               echo "    注意: 如快照不存在则返回 NOT_FOUND"
-               echo ""
-               echo -e "    ${YELLOW}测试模式:${NC} w16        → 验证在线拒绝（固定 test_bak）"
-               echo -e "    ${GREEN}执行模式:${NC} w16 {\"backup_id\":\"root_snap_6_20260626_155713\"} → 实际删除指定快照" ;;
+          w16)   echo -e "${CYAN}[w16] TriggerLocalUpdate${NC} — 触发本地升级（自动扫描/指定包）"
+              echo "    行为: 自动扫描 /opt/osec/upgrade/ 目录并触发升级，或指定 zipPath" 
+              echo "    用法: $0 w16                # 自动扫描并触发本地升级"
+              echo "          $0 w16 {\"zipPath\":\"/opt/osec/upgrade/update.zip\"}  # 指定升级包"
+              echo "" ;;
+
+          w17)   echo -e "${CYAN}[w17] DeleteBackup${NC} — 删除 LVM 快照（写）"
+              echo "    参数: {\"backup_id\": \"snap_name_or_suffix\"}"
+              echo "    实际调用 lvremove 删除 LVM 快照"
+              echo "    ⚠️  仅离线可用，在线返回 PERMISSION_DENIED"
+              echo "    注意: 如快照不存在则返回 NOT_FOUND"
+              echo ""
+              echo -e "    ${YELLOW}测试模式:${NC} w17        → 验证在线拒绝（固定 test_bak）"
+              echo -e "    ${GREEN}执行模式:${NC} w17 {\"backup_id\":\"root_snap_6_20260626_155713\"} → 实际删除指定快照" ;;
 
         *)     echo -e "${RED}未知测试编号: $tid${NC}"
-               echo "有效范围: 1-30, s1, w1-w16"
+                echo "有效范围: 1-30, s1, w1-w17"
                echo "输入 ? 查看完整菜单，输入 <编号> ? 查看单项说明" ;;
     esac
     echo ""
@@ -590,16 +596,19 @@ test_w14() { grpc_expect_perm_denied "进程防护模式（在线拒绝）" \
 
 test_w15() { grpc_expect_perm_denied "外设防护模式（在线拒绝）" \
     protection_mode.proto protection_mode.PeripheralDefenseService UpdatePeripheralDefenseMode \
-<<<<<<< Updated upstream
     '{"mode": 2}'; }
 
-test_w16() { grpc_expect_perm_denied "删除备份（在线拒绝）" \
+test_w16() { grpc_call "TriggerLocalUpdate(自动扫描 /opt/osec/upgrade/)" \
+    task_local.proto task_local.LocalTaskService TriggerLocalUpdate \
+    '{"zipPath":""}'; }
+
+test_w17() { grpc_expect_perm_denied "删除备份（在线拒绝）" \
     backup.proto backup.BackupService DeleteBackup \
     '{"backup_id":"test_bak"}'; }
 
 # ── 写接口实际执行（离线模式下手动操作）───────────────────────────────
-# 用法: exec_w16 '{"backup_id":"root_snap_6_20260626_155713"}'
-# 菜单用法: w16 {"backup_id":"root_snap_6_20260626_155713"}
+# 用法: exec_w17 '{"backup_id":"root_snap_6_20260626_155713"}'
+# 菜单用法: w17 {"backup_id":"root_snap_6_20260626_155713"}
 #
 # 注意: 因为 bash ${1:-default} 中 default 含 {} 会导致解析错误，
 # 所以改用变量 + set-default 模式。
@@ -619,7 +628,7 @@ _DEF_W12='{"rules": [{"dir":"/opt","pid":0,"typ":1}]}'
 _DEF_W13='{"rules": [{"file_type":"doc","typ":1}]}'
 _DEF_W14='{"mode": 2}'
 _DEF_W15='{"mode": 2}'
-_DEF_W16='{"backup_id":"test_bak"}'
+_DEF_W17='{"backup_id":"test_bak"}'
 
 exec_w1()  { grpc_call "更新配置"       config.proto         config.ConfigService                UpdateConfig               "${1:-$_DEF_W1}"; }
 exec_w2()  { grpc_call "更新进程策略"    process_policy.proto process_policy.ProcessPolicyService  UpdateProcessPolicy         "${1:-$_DEF_W2}"; }
@@ -636,30 +645,9 @@ exec_w12() { grpc_call "更新目录保护策略" dir_policy.proto      dir_poli
 exec_w13() { grpc_call "更新勒索保护策略" extort_policy.proto   extort_policy.ExtortPolicyService     UpdateExtortPolicy          "${1:-$_DEF_W13}"; }
 exec_w14() { grpc_call "进程防护模式"    protection_mode.proto protection_mode.ProcessDefenseService  UpdateProcessDefenseMode    "${1:-$_DEF_W14}"; }
 exec_w15() { grpc_call "外设防护模式"    protection_mode.proto protection_mode.PeripheralDefenseService UpdatePeripheralDefenseMode "${1:-$_DEF_W15}"; }
-exec_w16() { grpc_call "删除备份"       backup.proto          backup.BackupService                 DeleteBackup                "${1:-$_DEF_W16}"; }
+exec_w17() { grpc_call "删除备份"       backup.proto          backup.BackupService                 DeleteBackup                "${1:-$_DEF_W17}"; }
 
 # ── 菜单 ───────────────────────────────────────────────────────────────
-=======
-    '{"mode": 1}'; }
-
-test_w15(){ grpc_expect_perm_denied "UpdateBackendMode(在线拒绝)" \
-    backend.proto backend.BackendService/SetBackendMode \
-    '{"mode":1}'; }
-
-# w16: 触发本地升级（在线/离线均可，无需服务器）
-test_w16() {
-    grpc_call "TriggerLocalUpdate(自动扫描 /opt/osec/upgrade/)" \
-        task_local.proto task_local.LocalTaskService TriggerLocalUpdate \
-        '{"zipPath":""}'
-}
-
-test_w16_file() {
-    local fp="${1:-/opt/osec/upgrade/update.zip}"
-    grpc_call "TriggerLocalUpdate(指定文件: $fp)" \
-        task_local.proto task_local.LocalTaskService TriggerLocalUpdate \
-        "{\"zipPath\":\"$fp\"}"
-}
->>>>>>> Stashed changes
 
 show_menu() {
     echo ""
@@ -691,10 +679,10 @@ show_menu() {
     echo -e "${CYAN}║${NC}   w9) RestoreBackup    w10) UpdateTrustDir                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  w11) UpdateVirtualPort w12) UpdateDirPolicy                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  w13) UpdateExtortPolicy w14) ProcessDefenseMode            ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  w15) PeripheralDefenseMode  w16) DeleteBackup                ${CYAN}║${NC}"
+        echo -e "${CYAN}║${NC}  w15) PeripheralDefenseMode  w16) TriggerLocalUpdate  w17) DeleteBackup                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}wN {json} 离线时实际执行写操作${NC}                                ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  例: w16 {\"backup_id\":\"snap_name\"}  → 实际删除快照           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  例: w17 {\"backup_id\":\"snap_name\"}  → 实际删除快照           ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}all${NC}    测试全部只读接口 (1-30)                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${RED}write${NC}  测试全部写接口（验证在线拒绝）                    ${CYAN}║${NC}"
@@ -706,7 +694,6 @@ show_menu() {
     echo ""
 }
 
-<<<<<<< Updated upstream
 run_all_readonly() {
     for i in $(seq -w 1 30); do
         fn="test_$(printf '%02d' $((10#$i)))"
@@ -725,162 +712,15 @@ run_all_readonly() {
     test_25f   # 历史告警-按时间范围
     test_25g   # 历史告警-组合过滤
     test_26b   # 历史告警-identifier+未处理
-=======
-# ── help ────────────────────────────────────────────────────────────────
-
-show_help_detail() {
-    echo ""
-    case "$1" in
-        1)  echo -e "${CYAN}[1] AgentStatus${NC} — Agent运行状态"
-            echo "    返回: mod_ver, agent_mode(online/offline), protection_days, hostname, dev_uid 等" ;;
-        2)  echo -e "${CYAN}[2] Config${NC} — 当前Agent配置（net_info.ini 中的策略字段）"
-            echo "    返回: crontime, file_switch, proc_switch, extortion_protect 等 29 个字段" ;;
-        3)  echo -e "${CYAN}[3] ProcessPolicy(白)${NC} — 进程白名单 hash 列表"
-            echo "    gRPC: GetProcessPolicy {\"is_white\": 1}" ;;
-        3b) echo -e "${CYAN}[3b] ProcessPolicy(黑)${NC} — 进程黑名单 hash 列表"
-            echo "    gRPC: GetProcessPolicy {\"is_white\": 0}" ;;
-        4)  echo -e "${CYAN}[4] PeripheralPolicy(白)${NC} — 外设白名单"
-            echo "    gRPC: GetPeripheralPolicy {\"is_white\": 1}" ;;
-        4b) echo -e "${CYAN}[4b] PeripheralPolicy(黑)${NC} — 外设黑名单"
-            echo "    gRPC: GetPeripheralPolicy {\"is_white\": 0}" ;;
-        14) echo -e "${CYAN}[14] ProcessList${NC} — 进程列表"
-            echo "    filter_status: 0=全部 1=白名单 2=黑名单 3=未知" ;;
-        14b)echo -e "${CYAN}[14b] ProcessList(白)${NC} — 进程列表(仅白名单)" ;;
-        14c)echo -e "${CYAN}[14c] ProcessList(黑)${NC} — 进程列表(仅黑名单)" ;;
-        w0) echo -e "${CYAN}[w0] UpdateConfig${NC} — ★ 配置下发（ini + 内核）"
-            echo ""
-            echo -e "  行为: 受 ${YELLOW}[GRPC] ALLOW_CONFIG_WRITE_ONLINE${NC} 控制"
-            echo "    ALLOW=0(default): 在线拒绝 (PERMISSION_DENIED)"
-            echo "    ALLOW=1         : 在线允许，完整下发到内核/BPF"
-            echo ""
-            echo "  测试在线拒绝:  输入 w0"
-            echo "  直接下发:      输入 w0 {\"crontime\":60,\"file_switch\":true}"
-            echo "  示例:"
-            echo "    w0 {\"crontime\": 60}"
-            echo "    w0 {\"crontime\":60,\"proc_switch\":false,\"file_switch\":true}" ;;
-        w2) echo -e "${CYAN}[w2] UpdateProcessPolicy${NC} — 进程黑白名单(eBPF在线下发)"
-            echo ""
-            echo "  直接下发:  w2 {\"hash_list\":[\"<MD5>\"],\"action\":2}"
-            echo "  action: 0=白名单(放行) 1=黑名单(监控) 2=黑名单(保护)"
-            echo ""
-            echo "  示例:"
-            echo "    1. md5sum /usr/bin/ls"
-            echo "    2. w2 {\"hash_list\":[\"abc123\"],\"action\":2}"
-            echo "    3. ./test_grpc.sh 3b  (查看是否生效)" ;;
-        w16) echo -e "${CYAN}[w16] TriggerLocalUpdate${NC} — ★ 触发本地升级（在线/离线均可）"
-            echo ""
-            echo -e "  行为: ${GREEN}无在线限制${NC}，在线/离线模式均可触发"
-            echo "    zipPath 为空 → 自动扫描 /opt/osec/upgrade/ 目录取最新 .zip"
-            echo "    zipPath 非空 → 使用指定的升级包路径"
-            echo ""
-            echo "  升级流程: 不解压、不杀进程、不走 systemctl"
-            echo "            zip → 解压到 /tmp/osec_update → 通知 agent_manager 执行脚本"
-            echo ""
-            echo "  直接调用:"
-            echo "    w16                        # 测试: 自动扫描 /opt/osec/upgrade/"
-            echo "    w16 {\"zipPath\":\"\"}         # 同上，自动扫描"
-            echo "    w16 {\"zipPath\":\"/opt/osec/upgrade/update.zip\"}  # 指定升级包"
-            echo ""
-            echo "  示例（复制即用）:"
-            echo "    # 1. 把升级包放到 /opt/osec/upgrade/ 下"
-            echo "    cp my-update.zip /opt/osec/upgrade/"
-            echo "    # 2. 触发升级（自动扫描）"
-            echo "    w16 {\"zipPath\":\"\"}"
-            echo ""
-            echo "    # 或直接指定文件路径"
-            echo "    w16 {\"zipPath\":\"/home/user/my-update.zip\"}" ;;
-        cap) echo -e "${CYAN}[cap] eBPF系统能力检测${NC}"
-            echo "  检查: 内核>=5.8, BTF, BPF LSM, bpffs" ;;
-        vs-move) echo -e "${CYAN}[vs-move]${NC} 病毒隔离 — 文件→隔离区({dev}_{ino}_{name} + .meta + chmod 000)"
-            echo "  gRPC: dispose_file { file_path:\"/path/to/virus\", action:1(MOVE) }"
-            echo "  用法: vs-move /path/to/virus [scan_id]" ;;
-        vs-restore) echo -e "${CYAN}[vs-restore]${NC} 病毒还原 — 隔离区→原位(chown + chmod 恢复)"
-            echo "  gRPC: dispose_file { file_path, action:3(RESTORE) }"
-            echo "  file_path 支持格式:"
-            echo "    {dev}_{ino}_{name}      = 按文件ID精确还原"
-            echo "    /original/path          = 按原始路径反查还原"
-            echo "    virus:{virus_name}      = 批量还原同名病毒"
-            echo "    scan:all                = 还原隔离区全部文件"
-            echo "  用法: vs-restore 2049_123456_virus.exe"
-            echo "  用法: vs-restore virus:Eicar-Signature"
-            echo "  用法: vs-restore scan:all" ;;
-        vs-bulk) echo -e "${CYAN}[vs-bulk]${NC} 批量还原 — 按病毒名还原所有匹配文件"
-            echo "  用法: vs-bulk Eicar-Signature" ;;
-        vs-all) echo -e "${CYAN}[vs-all]${NC} 全部还原 — 还原隔离区所有文件"
-            echo "  用法: vs-all" ;;
-        vs-list) echo -e "${CYAN}[vs-list]${NC} 查看隔离区 — 列出隔离文件及元数据"
-            echo "  用法: vs-list            # 只看隔离中的"
-            echo "  用法: vs-list all        # 含已还原"
-            echo "  用法: vs-list virus:xxx  # 按病毒名" ;;
-        vs-meta) echo -e "${CYAN}[vs-meta]${NC} 查看 .meta — 查看元数据JSON内容"
-            echo "  用法: vs-meta [隔离文件名]  (不传则显示全部)" ;;
-        vs-remove) echo -e "${CYAN}[vs-remove]${NC} 病毒删除 — 直接删除文件"
-            echo "  用法: vs-remove /path/to/virus [scan_id]" ;;
-        vs-e2e) echo -e "${CYAN}[vs-e2e]${NC} 病毒处置端到端测试"
-            echo "  创建测试文件 → 隔离({dev}_{ino}_{name}+.meta+chmod) → 按ID还原(chown+chmod) → 清理"
-            echo "  用法: vs-e2e [test_dir]" ;;
-        30) echo -e "${CYAN}[30] ProcessDefenseMode${NC} — 进程防护模式(查询)"
-            echo "  0=关闭 1=监控 2=保护" ;;
-        31) echo -e "${CYAN}[31] PeripheralDefenseMode${NC} — 外设防护模式(查询)"
-            echo "  0=关闭 1=监控 2=保护" ;;
-        *)  echo -e "${RED}帮助: $1 — 暂无详情${NC}"
-            echo "  有效: 1-16, 3b, 4b, 14b, 14c, 17-22, 23-31, cap, w0-w16, vs-move, vs-restore, vs-bulk, vs-all, vs-list, vs-meta, vs-remove, vs-e2e" ;;
-    esac
-    echo ""
->>>>>>> Stashed changes
 }
 
 run_all_write() {
     test_w1; test_w2; test_w3; test_w4; test_w5; test_w6; test_w7; test_w8
-    test_w9; test_w10; test_w11; test_w12; test_w13; test_w14; test_w15; test_w16
+    test_w9; test_w10; test_w11; test_w12; test_w13; test_w14; test_w15; test_w17
 }
 
-<<<<<<< Updated upstream
 run_all_stream() {
     test_17; test_18; test_s1
-=======
-show_menu() {
-    echo ""
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}     ${YELLOW}gRPC 接口测试  —  ${GRPC_ADDR}${NC}                       ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}── 只读接口（始终可用）${NC}                                    ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   1)AgentStatus   2)Config        3)ProcPolicy(白) 3b)黑名单${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   4)Periph(白)    4b)Periph(黑)    5)IpBlock       6)IpBlack ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   7)Outreach      8)DirPolicy      9)Extort       10)TrustDir ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  11)VirtualPort  12)BackupList    13)JumpStatus               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  14)ProcessList 14b)白名单 14c)黑名单 15)PortList 16)UsbDev  ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  17)PolicyWatch(流) 18)Alert(流)   19)准入查询   29)ExeList  ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  30)进程防护 31)外设防护 32)AlertLogs  33)处置单条 34)处置批量 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  20)准入-OFF    21)准入-ON        22)准入-AUTO               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  30)进程防护查询 31)外设防护查询                              ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${RED}── 写接口（仅离线可用，在线应返回 PERMISSION_DENIED）${NC}        ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  w0)UpdateConfig ★(ALLOW_CONFIG_WRITE_ONLINE控制)${NC}           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  w1)UpdateProcPolicy  w2)UpdatePeriph    w3)UpdateIpBlock   ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  w4)SubmitTask       w5)ExecuteIpJump   w6)ExecutePwJump    ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  w7)CreateBackup     w8)RestoreBackup   w9)UpdateTrustDir   ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  w10)UpdateVirtPort  w11)UpdateDirPol   w12)UpdateExtortPol  ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  w13)SetProcDefense  w14)SetPeriphDef   w15)SetBackendMode   ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  w16)LocalUpgrade ★  ${GREEN}在线/离线均可${NC}  upgrade=触发本地升级    ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${BLUE}── 病毒处置（VirusScanService 流式接口）${NC}                      ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  vs-move <文件>        = 隔离文件(MOVE→{dev}_{ino}_{name}+.meta)${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  vs-restore <标识>     = 还原(支持ID/原路径/virus:名/scan:all) ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  vs-bulk <病毒名>      = 按病毒名批量还原                       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  vs-all                = 还原隔离区全部                          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  vs-list               = 列出所有隔离文件及元数据               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  vs-meta [隔离名]      = 查看.meta JSON内容                     ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  vs-remove <文件>      = 删除病毒文件(REMOVE)                   ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  vs-e2e                = 端到端测试(隔离→还原→验证权限属主)    ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${BLUE}── 快捷命令${NC}                                                ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  all=只读 | write=写 | stream=流 | full=全部 | listen [秒] ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  cap=eBPF检测 | 23=后端状态 | 26=查询后端 27=ebpf 28=drv  ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ?=帮助 | <id> ?=详情 | w0 <json>=直接下发 | q=退出       ${CYAN}║${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
-    echo ""
->>>>>>> Stashed changes
 }
 
 # ── main ───────────────────────────────────────────────────────────────
@@ -971,7 +811,6 @@ case "${1:-menu}" in
             fi
 
             case "$choice" in
-<<<<<<< Updated upstream
                 1)  test_01 ;; 2)  test_02 ;; 3)  test_03 ;; 4)  test_04 ;;
                 5)  test_05 ;; 6)  test_06 ;; 7)  test_07 ;; 8)  test_08 ;;
                 9)  test_09 ;; 10) test_10 ;; 11) test_11 ;; 12) test_12 ;;
@@ -990,117 +829,7 @@ case "${1:-menu}" in
                 w1)  test_w1  ;; w2)  test_w2  ;; w3)  test_w3  ;; w4)  test_w4  ;;
                 w5)  test_w5  ;; w6)  test_w6  ;; w7)  test_w7  ;; w8)  test_w8  ;;
                 w9)  test_w9  ;; w10) test_w10 ;; w11) test_w11 ;; w12) test_w12 ;;
-                w13) test_w13 ;; w14) test_w14 ;; w15) test_w15 ;; w16) test_w16 ;;
-=======
-                1)  test_01 ;;             2)  test_02 ;;
-                3)  test_03 ;;             3b|3B) test_03b ;;
-                4)  test_04 ;;             4b|4B) test_04b ;;
-                5)  test_05 ;;             6)  test_06 ;;
-                7)  test_07 ;;             8)  test_08 ;;
-                9)  test_09 ;;             10) test_10 ;;
-                11) test_11 ;;             12) test_12 ;;      13) test_13 ;;
-                14) test_14 ;;             14b|14B) test_14b ;; 14c|14C) test_14c ;;
-                15) test_15 ;;             16) test_16 ;;
-                17) test_17 ;;             18) test_18 ;;
-                19) test_19 ;;             20) test_20 ;;
-                21) test_21 ;;             22) test_22 ;;
-                23) test_23 ;;             24) test_24 ;;      25) test_25 ;;
-                26) test_26 ;;             27) test_27 ;;      28) test_28 ;;
-                29) test_29 ;;
-                30) test_30 ;;             31) test_31 ;;
-                cap) test_cap ;;
-                w0) test_w0_deny ;;
-                w1) test_w1 ;;   w2) test_w2 ;;   w3) test_w3 ;;
-                w4) test_w4 ;;   w5) test_w5 ;;   w6) test_w6 ;;
-                w7) test_w7 ;;   w8) test_w8 ;;   w9) test_w9 ;;
-                w10) test_w10 ;; w11) test_w11 ;; w12) test_w12 ;;
-                w13) test_w13 ;; w14) test_w14 ;; w15) test_w15 ;;
-                w16)
-                    test_w16 ;;
-                w16\ *)
-                    fp="${choice#w16 }"
-                    test_w16_file "$fp"
-                    ;;
-                upgrade) test_local_upgrade ;;
-                vs-move|vs-move\ *)
-                    fp=""; sid="vs-$$"
-                    if [[ "$choice" =~ ^vs-move[[:space:]]+(.+)$ ]]; then
-                        fp="${BASH_REMATCH[1]}"
-                        if [[ "$fp" =~ [[:space:]]+(.+)$ ]]; then
-                            sid="${BASH_REMATCH[1]}"
-                            fp="${fp%% *}"
-                        fi
-                    else
-                        read -rp "文件路径: " fp
-                    fi
-                    test_vs_move "$fp" "$sid"
-                    ;;
-                vs-restore|vs-restore\ *)
-                    fp=""; sid="vs-$$"
-                    if [[ "$choice" =~ ^vs-restore[[:space:]]+(.+)$ ]]; then
-                        fp="${BASH_REMATCH[1]}"
-                        if [[ "$fp" =~ [[:space:]]+(.+)$ ]]; then
-                            sid="${BASH_REMATCH[1]}"
-                            fp="${fp%% *}"
-                        fi
-                    else
-                        read -rp "文件标识(隔离名/原路径/virus:名/scan:all): " fp
-                    fi
-                    test_vs_restore "$fp" "$sid"
-                    ;;
-                vs-bulk|vs-bulk\ *)
-                    vname=""; sid="vs-$$"
-                    if [[ "$choice" =~ ^vs-bulk[[:space:]]+(.+)$ ]]; then
-                        vname="${BASH_REMATCH[1]}"
-                        if [[ "$vname" =~ [[:space:]]+(.+)$ ]]; then
-                            sid="${BASH_REMATCH[1]}"
-                            vname="${vname%% *}"
-                        fi
-                    else
-                        read -rp "病毒名: " vname
-                    fi
-                    test_vs_restore_bulk "$vname" "$sid"
-                    ;;
-                vs-all|vs-all\ *)
-                    sid="vs-$$"
-                    [[ "$choice" =~ vs-all[[:space:]]+(.+)$ ]] && sid="${BASH_REMATCH[1]}"
-                    test_vs_restore_all "$sid"
-                    ;;
-                vs-list)
-                    test_vs_list
-                    ;;
-                vs-list\ all)
-                    test_vs_list "all"
-                    ;;
-                vs-list\ virus:*)
-                    local vname="${choice#vs-list virus:}"
-                    test_vs_list "virus:$vname"
-                    ;;
-                vs-meta|vs-meta\ *)
-                    qname=""
-                    [[ "$choice" =~ vs-meta[[:space:]]+(.+)$ ]] && qname="${BASH_REMATCH[1]}"
-                    test_vs_meta "$qname"
-                    ;;
-                vs-remove|vs-remove\ *)
-                    fp=""; sid="vs-$$"
-                    if [[ "$choice" =~ ^vs-remove[[:space:]]+(.+)$ ]]; then
-                        fp="${BASH_REMATCH[1]}"
-                        if [[ "$fp" =~ [[:space:]]+(.+)$ ]]; then
-                            sid="${BASH_REMATCH[1]}"
-                            fp="${fp%% *}"
-                        fi
-                    else
-                        read -rp "文件路径: " fp
-                    fi
-                    test_vs_remove "$fp" "$sid"
-                    ;;
-                vs-e2e)
-                    td="/tmp"
-                    read -rp "测试目录 [/tmp]: " td
-                    td="${td:-/tmp}"
-                    test_vs_e2e "$td"
-                    ;;
->>>>>>> Stashed changes
+                w13) test_w13 ;; w14) test_w14 ;; w15) test_w15 ;; w16) test_w16 ;; w17) test_w17 ;;
                 all)
                     echo -e "\n${GREEN}── 测试全部只读接口 (1-30) ──${NC}"
                     run_all_readonly
@@ -1177,11 +906,11 @@ case "${1:-menu}" in
                     echo "   w9) RestoreBackup      w10) UpdateTrustDir"
                     echo "  w11) UpdateVirtualPort  w12) UpdateDirPolicy"
                     echo "  w13) UpdateExtortPolicy w14) ProcessDefenseMode"
-                    echo "  w15) PeripheralDefenseMode  w16) DeleteBackup"
+                    echo "  w15) PeripheralDefenseMode  w16) TriggerLocalUpdate  w17) DeleteBackup"
                     echo ""
                     echo -e "${CYAN}── 快捷命令 ──${NC}"
                     echo "  all    测试全部只读 (1-30)"
-                    echo "  write  测试全部写 (w1-w16, 需离线模式)"
+                    echo "  write  测试全部写 (w1-w17, 需离线模式)"
                     echo "  stream 测试全部流式 (17, 18, s1)"
                     echo "  full   测试全部 (读写+流)"
                     echo "  listen [秒]  监听告警流"
@@ -1190,13 +919,13 @@ case "${1:-menu}" in
                     echo ""
                     echo -e "${CYAN}── 查看详细说明 ──${NC}"
                     echo "  输入 \"<编号> ?\" 查看单个接口的详细说明"
-                    echo "  例如: w16 ?   → 查看 DeleteBackup 的参数、行为、注意事项"
+                    echo "  例如: w17 ?   → 查看 DeleteBackup 的参数、行为、注意事项"
                     echo "        1 ?     → 查看 AgentStatus 返回内容说明"
                     echo "        w8 ?    → 查看 CreateBackup 详细说明"
                     echo ""
                     echo -e "${CYAN}── 实际执行写操作（离线模式）──${NC}"
                     echo "  输入 \"w<N> {json}\" 离线时实际执行写操作"
-                    echo "  例如: w16 {\"backup_id\":\"root_snap_6_20260626_155713\"}"
+                    echo "  例如: w17 {\"backup_id\":\"root_snap_6_20260626_155713\"}"
                     echo "        w8  {\"name\":\"my_backup\"}"
                     echo ""
                     ;;
@@ -1205,7 +934,7 @@ case "${1:-menu}" in
                     check_online_status
                     case $? in
                         0) echo -e "当前状态: ${GREEN}在线${NC} (写操作应被拒绝)" ;;
-                        1) echo -e "当前状态: ${RED}离线${NC} (写操作允许通过, w1-w16 测试将失败)" ;;
+                        1) echo -e "当前状态: ${RED}离线${NC} (写操作允许通过, w1-w17 测试将失败)" ;;
                         2) echo -e "当前状态: ${YELLOW}无法判断${NC} (连接失败或状态未知)" ;;
                     esac
                     ;;
@@ -1237,7 +966,7 @@ case "${1:-menu}" in
     full)
         check_online_status
         if [ $? -ne 0 ]; then
-            echo -e "${YELLOW}⚠ 当前离线模式，w1-w16 写接口测试可能失败（非 PERMISSION_DENIED 错误）${NC}"
+            echo -e "${YELLOW}⚠ 当前离线模式，w1-w17 写接口测试可能失败（非 PERMISSION_DENIED 错误）${NC}"
         fi
         run_all_readonly
         run_all_stream
@@ -1260,27 +989,16 @@ case "${1:-menu}" in
         echo "  无参数           进入交互式菜单（推荐）"
         echo "  menu            同无参数"
         echo ""
-<<<<<<< Updated upstream
         echo "  交互菜单内可用命令:"
         echo "    1-30, s1       测试指定只读/流式接口"
         echo "    03b,14b/14c/14d,23b  filter_status 过滤测试"
-        echo "    w1-w16          测试指定写接口"
+        echo "    w1-w17          测试指定写接口"
         echo "    all/write/stream/full  批量测试"
         echo "    stat            快速查看 Agent 在线状态"
         echo "    listen [秒]     监听告警流"
         echo "    <编号> ?        查看单个接口的详细说明"
         echo "    ?|h             显示菜单"
         echo "    q               退出"
-=======
-        echo -e "${RED}═══ 写接口 ═══${NC}"
-        echo "  w0)UpdateConfig ★(受 ALLOW_CONFIG_WRITE_ONLINE 控制)"
-        echo "  w1)UpdateProcPol  w2)UpdatePeriph     w3)UpdateIpBlock"
-        echo "  w4)SubmitTask     w5)IpJump           w6)PwJump"
-        echo "  w7)CreateBackup   w8)RestoreBackup    w9)UpdateTrustDir"
-        echo "  w10)UpdateVirtPort w11)UpdateDirPol   w12)UpdateExtortPol"
-        echo "  w13)SetProcDefense w14)SetPeriphDef   w15)SetBackendMode"
-        echo "  w16)LocalUpgrade ★  upgrade=触发本地升级（在线/离线均可）"
->>>>>>> Stashed changes
         echo ""
         echo "── 命令行直接调用 ──"
         echo "  $0 1             直接测试 AgentStatus"
@@ -1289,29 +1007,21 @@ case "${1:-menu}" in
         echo "  $0 s1            直接测试 VirusScan 双向流"
         echo "  $0 w8            直接测试 CreateBackup"
         echo "  $0 all           测试全部只读接口 (1-30)"
-        echo "  $0 write         测试全部写接口 (w1-w16)"
+        echo "  $0 write         测试全部写接口 (w1-w17)"
         echo "  $0 stream        测试流式接口 (17, 18, s1)"
         echo "  $0 full          测试全部接口（读写+流）"
         echo "  $0 listen [秒]   监听告警流（默认300秒）"
         echo ""
         echo "── 写接口说明 ──"
-        echo "  w1-w16 测试仅在 Agent ${RED}在线${NC}时验证 PERMISSION_DENIED 拒绝。"
+        echo "  w1-w17 测试仅在 Agent ${RED}在线${NC}时验证 PERMISSION_DENIED 拒绝。"
         echo "  若 Agent 当前离线，写操作会通过 require_offline 检查，实际执行时"
         echo "  可能因参数无效/资源不存在等原因返回其他错误（非 PERMISSION_DENIED）。"
         echo "  使用 'stat' 命令或测试编号 1 查看当前在线状态。"
         echo ""
-<<<<<<< Updated upstream
         echo "── 详细说明 ──"
         echo "  交互菜单中输入 '<编号> ?' 查看单个接口的参数、行为和注意事项。"
         echo "  例如: w16 ?  → DeleteBackup 详细说明"
         echo "        1 ?    → AgentStatus 返回内容说明"
-=======
-        echo -e "${BLUE}═══ 直接下发 ═══${NC}"
-        echo "  w0 {\"crontime\":60,\"file_switch\":true}     # UpdateConfig"
-        echo "  w2 {\"hash_list\":[\"<MD5>\"],\"action\":2}  # UpdateProcessPolicy"
-        echo "  w16 {\"zipPath\":\"\"}                          # TriggerLocalUpdate 自动扫描"
-        echo "  w16 {\"zipPath\":\"/path/to/update.zip\"}     # TriggerLocalUpdate 指定文件"
->>>>>>> Stashed changes
         echo ""
         echo "环境变量:"
         echo "  GRPC_ADDR       目标地址（默认 127.0.0.1:50051）"
@@ -1328,7 +1038,7 @@ case "${1:-menu}" in
             "test_$(printf '%02d' "$arg")"
         else
             echo "无效参数: $1"
-            echo "用法: $0 [?|help|all|write|stream|full|listen|<1-30>|s1|w1-w16|menu]"
+            echo "用法: $0 [?|help|all|write|stream|full|listen|<1-30>|s1|w1-w17|menu]"
             echo "试试: $0 ?  查看完整帮助"
             exit 1
         fi
