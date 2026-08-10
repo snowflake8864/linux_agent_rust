@@ -262,29 +262,176 @@ pub fn unload_driver() -> Result<(), String> {
     }
 
     // Driver IS loaded, attempt to unload
+    match do_rmmod() {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            // rmmod 失败，大概率是引用计数不为0（EBUSY）
+            log_warn!("首次 rmmod 失败: {}，尝试诊断引用计数问题", e);
+        }
+    }
+
+    // ── 诊断：检查驱动引用计数 ──
+    let refcnt = read_module_refcnt("osec_base");
+    log_info!("osec_base refcnt = {}", refcnt);
+
+    // ── 诊断：查找持有 /proc/osec/ 和 /sys/osec/ 引用的进程 ──
+    let holders = find_osec_file_holders();
+    if holders.is_empty() {
+        log_info!("未发现进程持有 /proc/osec/ 或 /sys/osec/ 的文件描述符");
+    } else {
+        log_warn!("发现 {} 个进程持有 osec 文件引用:", holders.len());
+        for (pid, paths) in &holders {
+            log_warn!("  pid={} : {}", pid, paths.join(", "));
+        }
+
+        // 杀掉这些进程
+        let my_pid = std::process::id();
+        for (pid, _) in &holders {
+            if *pid == my_pid {
+                log_info!("  跳过自身 pid={}", pid);
+                continue;
+            }
+            log_warn!("  尝试杀掉 pid={} 以释放引用", pid);
+            kill_process(*pid);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    // ── 再次检查 refcnt ──
+    let refcnt_after = read_module_refcnt("osec_base");
+    log_info!("处理后 osec_base refcnt = {}", refcnt_after);
+
+    // ── 重试 rmmod ──
+    match do_rmmod() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // 仍然失败，输出完整诊断信息
+            log_error!("重试 rmmod 仍然失败: {}", e);
+            log_osec_holders();
+            Err(format!("rmmod osec_base failed after cleanup: {} (refcnt={})", e, read_module_refcnt("osec_base")))
+        }
+    }
+}
+
+/// 执行 rmmod + 二次确认，返回 Ok(()) 或 Err
+fn do_rmmod() -> Result<(), String> {
     match Command::new("rmmod").arg("osec_base").status() {
         Ok(status) if status.success() => {
-            // rmmod 返回成功，再确认一次 /proc/modules
+            // 二次确认 /proc/modules
             if is_driver_loaded() {
-                let msg = "rmmod returned success but osec_base still in /proc/modules";
-                log_error!("{}", msg);
-                Err(msg.to_string())
+                Err("rmmod returned success but osec_base still in /proc/modules".to_string())
             } else {
                 log_info!("Successfully unloaded existing osec_base driver");
                 Ok(())
             }
         }
-        Ok(status) => {
-            let msg = format!("rmmod osec_base failed with exit code: {}", status);
-            log_error!("{}", msg);
-            Err(msg)
+        Ok(status) => Err(format!("rmmod osec_base failed with exit code: {}", status)),
+        Err(e) => Err(format!("rmmod execution error: {}", e)),
+    }
+}
+
+/// 读取内核模块引用计数 (from /sys/module/<name>/refcnt)
+fn read_module_refcnt(name: &str) -> i32 {
+    let path = format!("/sys/module/{}/refcnt", name);
+    match fs::read_to_string(&path) {
+        Ok(s) => s.trim().parse::<i32>().unwrap_or(-1),
+        Err(_) => -1,
+    }
+}
+
+/// 扫描 /proc/*/fd/*，返回所有持有 /proc/osec/ 或 /sys/osec/ 文件描述符的 (pid, [path])
+fn find_osec_file_holders() -> Vec<(u32, Vec<String>)> {
+    let mut result: Vec<(u32, Vec<String>)> = Vec::new();
+    let my_pid = std::process::id();
+
+    let proc_dir = match fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return result,
+    };
+
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // 只处理数字目录 (pid)
+        let pid: u32 = match name_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // 跳过自己
+        if pid == my_pid {
+            continue;
         }
-        Err(e) => {
-            let msg = format!("rmmod execution error: {}", e);
-            log_error!("{}", msg);
-            Err(msg)
+
+        // 读取 /proc/<pid>/fd/ 下的所有符号链接
+        let fd_dir = entry.path().join("fd");
+        let fds = match fs::read_dir(&fd_dir) {
+            Ok(d) => d,
+            Err(_) => continue, // 权限不够或进程已退出
+        };
+
+        let mut matched_paths: Vec<String> = Vec::new();
+        for fd_entry in fds.flatten() {
+            // 读取符号链接的目标
+            match fs::read_link(fd_entry.path()) {
+                Ok(target) => {
+                    let target_str = target.to_string_lossy().to_string();
+                    if target_str.starts_with("/proc/osec") || target_str.starts_with("/sys/osec") {
+                        matched_paths.push(target_str);
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+
+        if !matched_paths.is_empty() {
+            result.push((pid, matched_paths));
         }
     }
+
+    // 按 pid 排序，便于阅读
+    result.sort_by_key(|(pid, _)| *pid);
+    result
+}
+
+/// 杀掉指定进程 (SIGKILL)
+fn kill_process(pid: u32) {
+    let pid_i32 = pid as i32;
+    // 先尝试 SIGTERM (优雅退出)
+    unsafe {
+        if libc::kill(pid_i32, libc::SIGTERM) == 0 {
+            log_info!("  已发送 SIGTERM 到 pid={}", pid);
+        } else {
+            // SIGTERM 失败（可能权限不够或进程不存在），尝试 SIGKILL
+            let err = std::io::Error::last_os_error();
+            log_warn!("  SIGTERM 到 pid={} 失败: {}，尝试 SIGKILL", pid, err);
+            if libc::kill(pid_i32, libc::SIGKILL) == 0 {
+                log_info!("  已发送 SIGKILL 到 pid={}", pid);
+            } else {
+                let err2 = std::io::Error::last_os_error();
+                log_error!("  杀掉 pid={} 失败: {}", pid, err2);
+            }
+        }
+    }
+}
+
+/// 诊断输出：打印当前持有 osec 文件引用的所有进程
+fn log_osec_holders() {
+    let holders = find_osec_file_holders();
+    if holders.is_empty() {
+        log_info!("[诊断] 无进程持有 /proc/osec/ 或 /sys/osec/ 的文件描述符");
+    } else {
+        log_error!("[诊断] {} 个进程仍持有 osec 文件引用:", holders.len());
+        for (pid, paths) in &holders {
+            // 尝试读取进程名
+            let comm = fs::read_to_string(format!("/proc/{}/comm", pid))
+                .unwrap_or_else(|_| "?".to_string());
+            log_error!("  pid={} comm={} : {}", pid, comm.trim(), paths.join(", "));
+        }
+    }
+    // 同时输出 lsmod 信息
+    log_info!("[诊断] refcnt={}", read_module_refcnt("osec_base"));
 }
 
 // ── 驱动失败计数（持久化到文件，跨重启累计）──
