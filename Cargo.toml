@@ -26,7 +26,8 @@ members = [
      "crates/agent_manager",
     "crates/grpc_gateway",
     "crates/agent_local_svc",
-    "crates/ebpf_backend",
+    # ebpf_backend 不作为 workspace 默认成员（通过 optional feature 按需编译）
+    # "crates/ebpf_backend",
     "crates/sqlite_db",
     "crates/local_store",
 ]
