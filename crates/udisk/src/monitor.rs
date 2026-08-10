@@ -642,30 +642,34 @@ impl StartUsbService for BootManager {
             });
 
             // 2. 后台等待 token 后上传设备列表到服务器（不阻塞监控启动）
-            let base_url = self.get_base_url();
-            let net_client = match NetClient::new(Some(base_url), true) {
-                Ok(client) => Arc::new(client),
-                Err(err) => {
-                    eprintln!("创建 NetClient 失败: {}", err);
-                    return Err("创建 NetClient 失败".to_string());
-                }
-            };
-            let url = format!(
-                "{}/v1/addperipherals",
-                net_client.get_base_url().unwrap_or_default()
-            );
-
-            let boot_mgr_clone = self.clone();
-            tokio::spawn(async move {
-                loop {
-                    if let Some(_) = boot_mgr_clone.get_token().await {
-                        upload_usb_info(&current_devices, &net_client, &url, &boot_mgr_clone).await;
-                        break;
-                    } else {
-                        sleep(Duration::from_secs(2)).await;
+            // 离线模式下不需要 token，直接跳过
+            let is_offline = NETINFO_CONFIG.lock().map(|c| c.is_offline_mode).unwrap_or(false);
+            if !is_offline {
+                let base_url = self.get_base_url();
+                let net_client = match NetClient::new(Some(base_url), true) {
+                    Ok(client) => Arc::new(client),
+                    Err(err) => {
+                        eprintln!("创建 NetClient 失败: {}", err);
+                        return Err("创建 NetClient 失败".to_string());
                     }
-                }
-            });
+                };
+                let url = format!(
+                    "{}/v1/addperipherals",
+                    net_client.get_base_url().unwrap_or_default()
+                );
+
+                let boot_mgr_clone = self.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if let Some(_) = boot_mgr_clone.get_token().await {
+                            upload_usb_info(&current_devices, &net_client, &url, &boot_mgr_clone).await;
+                            break;
+                        } else {
+                            sleep(Duration::from_secs(2)).await;
+                        }
+                    }
+                });
+            }
 
             Ok("USB服务正常退出".to_string())
         })

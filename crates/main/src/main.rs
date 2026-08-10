@@ -180,13 +180,23 @@ async fn main() -> std::io::Result<()> {
         let cfg = NETINFO_CONFIG.lock().unwrap();
         let db_enabled = cfg.db_policy.enabled;
         let is_offline = cfg.is_offline_mode;
+        let usb_protect = cfg.usb_protect;
         drop(cfg);
         if db_enabled {
             process_mgr::POLICY_MANAGER.lock().unwrap().load_policy_from_db(is_offline);
-            if is_offline {
-                agent_local_svc::AgentDataHub::load_peripheral_policy_from_db_local();
-            } else {
-                agent_local_svc::AgentDataHub::load_peripheral_policy_from_db();
+            // 合并加载在线表 + 本地表，避免在线启动时丢失用户本地策略修改
+            agent_local_svc::AgentDataHub::load_peripheral_policy_merged();
+        }
+
+        // 启动时若 usb_protect 开启，物理禁用所有已加载的黑名单设备
+        if usb_protect {
+            let black_eids: Vec<String> = {
+                let guard = udisk::list::SHARED_USB_LIST.lock().unwrap();
+                guard.get_blacklist().iter().map(|d| d.perpheral_eid.clone()).collect()
+            };
+            if !black_eids.is_empty() {
+                log_info!("[startup] usb_protect 开启，禁用 {} 个已加载黑名单设备", black_eids.len());
+                udisk::monitor::handle_blacklist_update(&black_eids);
             }
         }
     }

@@ -1864,36 +1864,60 @@ async fn task_get_black_peripherals(&self, task_type: u64) -> Result<(), String>
 
                 // 先读 config 避免在持有 SHARED_USB_LIST 锁时再锁 config 导致 AB-BA 死锁
                 let usb_protect = config::net_info::NETINFO_CONFIG.lock().unwrap().usb_protect;
-                let mut guard = SHARED_USB_LIST.lock().unwrap();
-                guard.update_blacklist(blacklist, usb_protect);
 
-                // 持久化到在线表（仅 DB_POLICY 启用时）
-                if config::net_info::NETINFO_CONFIG.lock().unwrap().db_policy.enabled {
-                    let db_white: Vec<local_store::peripheral_policy::PeripheralPolicyRow> = guard
-                        .get_whitelist()
-                        .iter()
-                        .map(|d| local_store::peripheral_policy::PeripheralPolicyRow {
-                            peripheral_eid: d.perpheral_eid.clone(),
-                            peripheral_name: d.perpheral_name.clone(),
-                            intro: d.intro.clone(),
-                            type_: d.type_.clone(),
-                            is_white: true,
-                        })
-                        .collect();
-                    let db_black: Vec<local_store::peripheral_policy::PeripheralPolicyRow> = guard
-                        .get_blacklist()
-                        .iter()
-                        .map(|d| local_store::peripheral_policy::PeripheralPolicyRow {
-                            peripheral_eid: d.perpheral_eid.clone(),
-                            peripheral_name: d.perpheral_name.clone(),
-                            intro: d.intro.clone(),
-                            type_: d.type_.clone(),
-                            is_white: false,
-                        })
-                        .collect();
-                    if let Err(e) = local_store::peripheral_policy::save_all(&db_white, &db_black) {
-                        logging::log_error!("[peripheral_policy] task_fetcher 持久化失败: {}", e);
+                // 黑名单设备的 eid（用于锁释放后物理禁用）
+                let new_black_eids: Vec<String> = blacklist.iter().map(|d| d.perpheral_eid.clone()).collect();
+
+                let (db_white, db_black) = {
+                    let mut guard = SHARED_USB_LIST.lock().unwrap();
+                    guard.update_blacklist(blacklist, usb_protect);
+
+                    // 在锁内构建持久化数据，释放锁后再写 DB，避免死锁
+                    if config::net_info::NETINFO_CONFIG.lock().unwrap().db_policy.enabled {
+                        let w: Vec<local_store::peripheral_policy::PeripheralPolicyRow> = guard
+                            .get_whitelist()
+                            .iter()
+                            .map(|d| local_store::peripheral_policy::PeripheralPolicyRow {
+                                peripheral_eid: d.perpheral_eid.clone(),
+                                peripheral_name: d.perpheral_name.clone(),
+                                intro: d.intro.clone(),
+                                type_: d.type_.clone(),
+                                is_white: true,
+                            })
+                            .collect();
+                        let b: Vec<local_store::peripheral_policy::PeripheralPolicyRow> = guard
+                            .get_blacklist()
+                            .iter()
+                            .map(|d| local_store::peripheral_policy::PeripheralPolicyRow {
+                                peripheral_eid: d.perpheral_eid.clone(),
+                                peripheral_name: d.perpheral_name.clone(),
+                                intro: d.intro.clone(),
+                                type_: d.type_.clone(),
+                                is_white: false,
+                            })
+                            .collect();
+                        (Some(w), Some(b))
+                    } else {
+                        (None, None)
                     }
+                }; // SHARED_USB_LIST 锁在此释放
+
+                // 持久化到在线表和离线表（锁已释放）
+                if let (Some(w), Some(b)) = (&db_white, &db_black) {
+                    if let Err(e) = local_store::peripheral_policy::save_all(w, b) {
+                        logging::log_error!("[peripheral_policy] task_fetcher 持久化在线表失败: {}", e);
+                    }
+                    if let Err(e) = local_store::peripheral_policy::save_all_local(w, b) {
+                        logging::log_error!("[peripheral_policy] task_fetcher 持久化本地表失败: {}", e);
+                    }
+                }
+
+                // 黑名单 + usb_protect 开启时，物理禁用设备（锁已释放）
+                if usb_protect && !new_black_eids.is_empty() {
+                    log_info!("[task_fetcher] usb_protect 开启，禁用 {} 个黑名单设备", new_black_eids.len());
+                    std::thread::spawn(move || {
+                        udisk::monitor::handle_blacklist_update(&new_black_eids);
+                    });
                 }
             }
         }
