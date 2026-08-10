@@ -26,8 +26,34 @@ members = [
      "crates/agent_manager",
     "crates/grpc_gateway",
     "crates/agent_local_svc",
-    # ebpf_backend 不作为 workspace 默认成员（通过 optional feature 按需编译）
-    # "crates/ebpf_backend",
+    "crates/ebpf_backend",
+    "crates/sqlite_db",
+    "crates/local_store",
+]
+
+# ebfp_backend 通过 main 的 optional feature 按需引入，不作为默认编译成员
+default-members = [
+    "crates/main",
+    "crates/kernel_module",
+    "crates/hostinfo",
+    "crates/common",
+    "crates/net_client",
+    "crates/online",
+    "crates/task",
+    "crates/netlink",
+    "crates/system_metrics",
+    "crates/logging",
+    "crates/pattern",
+    "crates/reporter",
+    "crates/zcopy_mgr",
+    "crates/process_mgr",
+    "crates/procinfo",
+    "crates/netblock",
+    "crates/snapman",
+    "crates/rules_jump_mgr",
+    "crates/agent_manager",
+    "crates/grpc_gateway",
+    "crates/agent_local_svc",
     "crates/sqlite_db",
     "crates/local_store",
 ]
