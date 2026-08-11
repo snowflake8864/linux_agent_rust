@@ -366,13 +366,22 @@ impl rusb::Hotplug<Context> for HotplugCallback {
                 DeviceListStatus::InBlacklist | DeviceListStatus::NotInAnyList => {
                     log::info!("上报 USB 设备拔出: name={}, eid={}, status={:?}", name, eid, status);
                     
+                    // 拔出编码：nType 区分名单（禁止/未知），level 区分防护模式（阻断/普通）
+                    let (n_type, n_level) = match (&status, usb_protect) {
+                        (DeviceListStatus::InBlacklist, true)  => (9007u16, 3u32),
+                        (DeviceListStatus::InBlacklist, false) => (9007u16, 2u32),
+                        (DeviceListStatus::NotInAnyList, true) => (9008u16, 3u32),
+                        (DeviceListStatus::NotInAnyList, false) => (9008u16, 2u32),
+                        _ => unreachable!(),
+                    };
+
                     let log = AuditLogInfo {
                         file_path: None,
                         rename_dir: None,
                         exception_process: None,
                         md5: None,
-                        n_type: if usb_protect { 9007 } else { 9008 },
-                        n_level: if usb_protect { 3 } else { 2 },
+                        n_type,
+                        n_level,
                         n_time: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
