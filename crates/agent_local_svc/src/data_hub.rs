@@ -26,8 +26,12 @@ fn ensure_callback_registered() {
 static CURRENT_TOKEN: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
 /// 由 online 模块在获取到 token 时调用，供 check_server_reachable 使用。
+/// 同时触发一次 newestJumpInfo 拉取：这是启动后有效 token 的第一个时机。
 pub fn update_token(token: String) {
     *CURRENT_TOKEN.lock().unwrap() = Some(token);
+    // token 就绪后异步拉取最新跳变信息（受 [JUMP] ENABLED 控制）
+    let hub = AgentDataHub::new();
+    tokio::spawn(async move { hub.fetch_newest_jump_info().await; });
 }
 
 /// 准入修复：根据当前模式设置 /proc/osec/tcp_force_ecn。
@@ -739,6 +743,13 @@ impl AgentDataHub {
 
         self.notify(PolicyChangeType::JumpStatusChanged);
         save_jump_status_to_db();
+
+        // 在线模式下，IP 跳变成功后异步更新服务器最新跳变信息并持久化
+        if info.status == 1 {
+            let hub = self.clone();
+            tokio::spawn(async move { hub.fetch_newest_jump_info().await; });
+        }
+
         Ok((info.source_ip, info.target_ip, info.gateway, info.status, info.reason))
     }
 
@@ -934,7 +945,145 @@ impl AgentDataHub {
 
         self.notify(PolicyChangeType::JumpStatusChanged);
         save_jump_status_to_db();
+
+        // 在线模式下，口令跳变成功后异步更新服务器最新跳变信息并持久化
+        if info.status == 1 {
+            let hub = self.clone();
+            tokio::spawn(async move { hub.fetch_newest_jump_info().await; });
+        }
+
         Ok((info.status, info.reason))
+    }
+
+    // ========================================================================
+    // Jump — 从服务器拉取最新跳变信息
+    // ========================================================================
+
+    /// 调用服务器 /v1/newestJumpInfo，将结果合并到全局 JUMP_STATUS 并持久化到 jump.db。
+    ///
+    /// 触发时机：
+    ///   1. 程序启动且处于在线模式（token 就绪后）
+    ///   2. execute_ip_jump 成功后
+    ///   3. execute_pw_jump 成功后
+    ///
+    /// 安全规则：
+    ///   - [JUMP] ENABLED=0 直接返回，不请求服务器
+    ///   - 离线模式直接返回
+    ///   - 请求失败/超时/非 000000 → 不更新内存缓存，不写数据库
+    pub async fn fetch_newest_jump_info(&self) {
+        let jump_enabled = config::net_info::NETINFO_CONFIG
+            .lock()
+            .map(|c| c.jump.enabled)
+            .unwrap_or(false);
+        if !jump_enabled {
+            log::debug!("[newestJumpInfo] [JUMP] ENABLED=0，跳过");
+            return;
+        }
+
+        if AGENT_MODE.load(Ordering::Relaxed) != AgentMode::Online as u8 {
+            log::debug!("[newestJumpInfo] 当前离线模式，跳过");
+            return;
+        }
+
+        let base_url = {
+            let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
+            format!("https://{}:{}", cfg.server_ip, cfg.server_port)
+        };
+        let token_ref = CURRENT_TOKEN.lock().unwrap().clone();
+        let token_str = token_ref.as_deref();
+
+        let net_client = match net_client::core::NetClient::new(Some(base_url.clone()), true) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("[newestJumpInfo] 创建 NetClient 失败: {}", e);
+                return;
+            }
+        };
+
+        let url = format!("{}/v1/newestJumpInfo", base_url);
+        match net_client.get_data_async(&url, tokio::time::Duration::from_secs(5), token_str).await {
+            Ok(resp) => {
+                match serde_json::from_str::<serde_json::Value>(&resp) {
+                    Ok(v) if v["code"].as_str() == Some("000000") => {
+                        let data = &v["data"];
+                        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+                        // 更新内存缓存
+                        let row = {
+                            let mut js = JUMP_STATUS.lock().unwrap();
+                            // IP 跳变信息
+                            if let Some(ip_jump) = data["ip_jump"].as_object() {
+                                if let Some(ip) = ip_jump.get("ip").and_then(|v| v.as_str()) {
+                                    js.current_ip = ip.to_string();
+                                }
+                                if let Some(scheme) = ip_jump.get("scheme").and_then(|v| v.as_u64()) {
+                                    js.ip_scheme = scheme as u32;
+                                }
+                                if let Some(s) = ip_jump.get("cycle_label").and_then(|v| v.as_str()) {
+                                    js.ip_cycle_label = s.to_string();
+                                }
+                                if let Some(s) = ip_jump.get("timing_label").and_then(|v| v.as_str()) {
+                                    js.ip_timing_label = s.to_string();
+                                }
+                                if let Some(s) = ip_jump.get("way_label").and_then(|v| v.as_str()) {
+                                    js.ip_way_label = s.to_string();
+                                }
+                            }
+                            // 口令跳变信息
+                            if let Some(pw_jump) = data["pw_jump"].as_object() {
+                                if let Some(pw) = pw_jump.get("pw").and_then(|v| v.as_str()) {
+                                    js.current_password = pw.to_string();
+                                }
+                                if let Some(scheme) = pw_jump.get("scheme").and_then(|v| v.as_u64()) {
+                                    js.pw_scheme = scheme as u32;
+                                }
+                                if let Some(s) = pw_jump.get("cycle_label").and_then(|v| v.as_str()) {
+                                    js.pw_cycle_label = s.to_string();
+                                }
+                                if let Some(s) = pw_jump.get("timing_label").and_then(|v| v.as_str()) {
+                                    js.pw_timing_label = s.to_string();
+                                }
+                            }
+                            // 构造持久化行
+                            local_store::jump_status::JumpStatusRow {
+                                current_ip:        js.current_ip.clone(),
+                                source_ip:         js.source_ip.clone(),
+                                target_ip:         js.target_ip.clone(),
+                                gateway:           js.gateway.clone(),
+                                mode:              js.mode,
+                                current_password:  js.current_password.clone(),
+                                last_ip_jump_time: js.last_ip_jump_time.clone(),
+                                last_pw_jump_time: js.last_pw_jump_time.clone(),
+                                last_pw_jump_user: js.last_pw_jump_user.clone(),
+                                ip_scheme:         js.ip_scheme,
+                                ip_cycle_label:    js.ip_cycle_label.clone(),
+                                ip_timing_label:   js.ip_timing_label.clone(),
+                                ip_way_label:      js.ip_way_label.clone(),
+                                pw_scheme:         js.pw_scheme,
+                                pw_cycle_label:    js.pw_cycle_label.clone(),
+                                pw_timing_label:   js.pw_timing_label.clone(),
+                                updated_at:        now,
+                            }
+                        };
+
+                        // 持久化（在锁外执行）
+                        if let Err(e) = local_store::jump_status::upsert(&row) {
+                            log::error!("[newestJumpInfo] 写入 jump.db 失败: {}", e);
+                        }
+                        log::info!("[newestJumpInfo] 同步并持久化成功");
+                    }
+                    Ok(v) => {
+                        log::error!("[newestJumpInfo] 服务器返回非成功 code: {}", v["code"]);
+                    }
+                    Err(e) => {
+                        log::error!("[newestJumpInfo] 响应解析失败: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("[newestJumpInfo] 请求失败: {}", e);
+            }
+        }
     }
 
     // ── 后端模式查询/设置 ──
