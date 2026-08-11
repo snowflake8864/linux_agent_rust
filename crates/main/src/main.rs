@@ -325,7 +325,7 @@ async fn main() -> std::io::Result<()> {
         } else {
             agent_local_svc::ADMISSION_EFFECTIVE.store(admission_mode, std::sync::atomic::Ordering::Relaxed);
         }
-        if admission_mode == 2 {
+        if admission_enabled && admission_mode == 2 {
             let hub = agent_local_svc::AgentDataHub::new();
             hub.start_auto_detect();
         }
