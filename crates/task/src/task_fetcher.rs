@@ -3307,6 +3307,7 @@ fn detect_runtime_arch() -> String {
                 "x86_64" | "amd64" => "x86_64".to_string(),
                 "aarch64" | "arm64"  => "aarch64".to_string(),
                 "loongarch64" => "loongarch64".to_string(),
+                "mips64" | "mips64el" => "mips64".to_string(),
                 other => {
                     log::warn!("[upgrade] uname -m 返回未知架构: {}，回退到编译目标 {}", other, std::env::consts::ARCH);
                     std::env::consts::ARCH.to_string()
