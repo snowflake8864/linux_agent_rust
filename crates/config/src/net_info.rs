@@ -113,7 +113,7 @@ impl Default for AdmissionConfig {
     fn default() -> Self {
         AdmissionConfig {
             enabled: false,       // 默认不启用
-            mode: 2,              // 默认自动检测
+            mode: 0,              // 默认关闭准入
             retry_interval: 60,   // 默认60秒重试
             max_retries: 3,       // 默认3次
         }
