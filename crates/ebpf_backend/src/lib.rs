@@ -391,7 +391,7 @@ impl EbpfBackend {
             file_path: Some(path.to_string()),
             md5: md5_hash,
             n_type,
-            n_level: if n_type >= 1100 { 2 } else { 1 },
+            n_level: if n_type >= 1100 { if self.proc_protect { 3 } else { 2 } } else { 2 },
             n_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             rename_dir: None,
@@ -411,7 +411,7 @@ impl EbpfBackend {
             file_path: Some(path.to_string()),
             md5: md5_hash,
             n_type,
-            n_level: if n_type >= 3100 { 2 } else { 1 },
+            n_level: if n_type >= 3100 { if self.file_protect { 3 } else { 2 } } else { 2 },
             n_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             rename_dir: None,
