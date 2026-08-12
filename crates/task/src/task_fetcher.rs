@@ -359,29 +359,30 @@ impl TaskFetcher {
         ).expect("创建 NetClient 失败");
 
 
-        let ifcfg = {
+        let (ifcfg, jump_enabled, jump_ip) = {
             let cfg = NETINFO_CONFIG.lock().unwrap();
-            cfg.ifcfg.clone()
+            (cfg.ifcfg.clone(), cfg.jump.enabled, cfg.jump.ip_jump)
         };
 
-        let ip_jump_manager = IpJumpManager::new(&ifcfg); 
-        let base_url_owned = base_url.to_string();
-        let token_for_cleanup = token.clone();
+        let ip_jump_manager = IpJumpManager::new(&ifcfg);
 
-        // Clone the Arc for the periodic cleanup task
-        let manager_clone = Arc::clone(&ip_jump_manager.clone());
-        tokio::spawn(async move {
-            manager_clone.start_periodic_cleanup(&base_url_owned, token_for_cleanup, Duration::from_secs(60)).await;
-        });
-/*
-        let base_url_for_jump = base_url.to_string();
-        let token_for_jump = token.clone();
+        // 仅在跳变总闸 && IP跳变开关开启时才启动 daemon 和清理任务
+        if jump_enabled && jump_ip {
+            let base_url_owned = base_url.to_string();
+            let token_for_cleanup = token.clone();
+            let manager_clone = Arc::clone(&ip_jump_manager);
+            tokio::spawn(async move {
+                manager_clone.start_periodic_cleanup(&base_url_owned, token_for_cleanup, Duration::from_secs(60)).await;
+            });
 
-        let ip_jump_manager_for_daemon = Arc::clone(&ip_jump_manager);
-        tokio::spawn(async move {
-            ip_jump_manager_for_daemon.start_ip_jump_daemon(base_url_for_jump, token_for_jump).await;
-        });
-*/
+            let base_url_for_jump = base_url.to_string();
+            let token_for_jump = token.clone();
+            let ip_jump_manager_for_daemon = Arc::clone(&ip_jump_manager);
+            tokio::spawn(async move {
+                ip_jump_manager_for_daemon.start_ip_jump_daemon(base_url_for_jump, token_for_jump).await;
+            });
+        }
+
         // 注册全局资源供 gRPC 路径使用
         GLOBAL_NL_SOCK.set(Mutex::new(nl_sock.clone())).ok();
         GLOBAL_PATTERN_MGR.set(pattern_mgr.clone()).ok();
