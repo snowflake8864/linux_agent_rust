@@ -11,7 +11,7 @@ use chrono::Utc;
 use logging::{log_info, log_error};
 use config::net_info::NETINFO_CONFIG;
 use grpc_gateway::agent_mode::set_online;
-use agent_local_svc::{set_offline_and_check_admission, update_token};
+use agent_local_svc::{set_offline_and_check_admission, update_token, clear_local_process_policy};
 #[derive(Deserialize)]
 #[allow(dead_code)]
 struct AuthResponse {
@@ -99,15 +99,18 @@ impl BaseOnline {
     }
 
 
-    pub async fn run(net_client: &mut NetClient) -> Result<String, String> {
+    /// verbose: 是否打印请求详情。仅在首次尝试或上线→离线切换时打印，失败重试不重复打印。
+    pub async fn run(net_client: &mut NetClient, verbose: bool) -> Result<String, String> {
         let base_online = BaseOnline::new();
         let json_str = serde_json::to_string(&base_online)
             .map_err(|e| format!("Failed to serialize to JSON: {}", e))?;
 
-        log_info!("Serialized JSON: {}", json_str);
+        if verbose {
+            log_info!("Serialized JSON: {}", json_str);
+        }
 
         let url = format!("{}/v1/auth", net_client.get_base_url().unwrap_or_default());
-        println!("==url:{}", url);
+        //println!("==url:{}", url);
         match net_client.post_data_async(&url, &json_str, Duration::from_secs(30), None).await {
             Ok(response) => {
                 log_info!("response: {:?}", response);
@@ -126,7 +129,12 @@ impl BaseOnline {
                 }
             }
 
-            Err(err) =>{log_info!("获取 token 失败 Error:{}",err);eprintln!("Error: {}", err)},
+            Err(err) => {
+                if verbose {
+                    log_info!("获取 token 失败 Error:{}", err);
+                    eprintln!("Error: {}", err);
+                }
+            }
         }
 
         Err("Failed to get token.".to_string()) // 如果没有 token，返回错误
@@ -145,6 +153,9 @@ impl StartOnline for BootManager {
             // EACCES (os error 13) 连续失败计数器，内核层不可恢复时退出进程
             let mut auth_fail_count: u32 = 0;
 
+            // 失败重试时避免重复刷屏：首次尝试打印请求详情，失败后关闭，上线成功后重新打开
+            let mut verbose = true;
+
             loop {
                 let base_url = self.get_base_url();
 
@@ -157,9 +168,10 @@ impl StartOnline for BootManager {
                 };
 
                 //let mut local_interval = interval(Duration::from_secs(30));
-                match BaseOnline::run(&mut net_client).await {
+                match BaseOnline::run(&mut net_client, verbose).await {
                     Ok(token) => {
                         auth_fail_count = 0; // 成功后重置
+                        verbose = true; // 上线成功，下次断开重连时重新打印详情
                         if let Err(err) = token_tx.send(token.clone()).await {
                             eprintln!("发送 token 失败: {}", err);
                             continue;
@@ -167,6 +179,7 @@ impl StartOnline for BootManager {
                         self.set_token(token.clone()).await;
                         update_token(token.clone()); // 同步到全局缓存，供 check_server_reachable 使用
                         set_online(); // 服务器连通，切换为在线模式
+                        clear_local_process_policy(); // 服务器接管，清空离线本地 gRPC 策略
                         log_info!("Token 已成功发送！");
                         log_info!("开始监听 host_is_offline 信号和系统资源...");
 
@@ -262,6 +275,10 @@ impl StartOnline for BootManager {
                         }
                     }
                     Err(err) => {
+                        if verbose {
+                            eprintln!("获取 token 时发生错误: {}", err);
+                        }
+                        verbose = false; // 失败后重试不再重复打印请求详情/错误
                         let err_str = err.to_string();
                         let is_eacces = err_str.contains("os error 13") || err_str.contains("Permission denied");
 
@@ -270,7 +287,6 @@ impl StartOnline for BootManager {
                             eprintln!("获取 token EACCES 错误 (连续 {}): {}", auth_fail_count, err);
                         } else {
                             auth_fail_count = 0;
-                            eprintln!("获取 token 时发生错误: {}", err);
                         }
                         set_offline_and_check_admission(); // 无法获取 token，服务器不可达+检查准入
 

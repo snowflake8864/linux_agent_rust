@@ -8,6 +8,8 @@ use crate::AuditLogInfo;
 use crate::build_alert_log_json;
 use logging::{log_info,log_error};
 use net_client::core::NetClient;
+use std::sync::atomic::Ordering;
+use grpc_gateway::agent_mode::{AgentMode, AGENT_MODE};
 
 
 pub trait StartBashLog {
@@ -60,6 +62,10 @@ impl StartBashLog for BootManager {
                     }
                     _ = interval.tick() => {
                         if !log_buffer.is_empty() {
+                            // 离线时不向服务器上报，保留 buffer，恢复在线后再补传
+                            if AGENT_MODE.load(Ordering::Relaxed) != AgentMode::Online as u8 {
+                                continue;
+                            }
                             let mut json_str = String::new();
                             match build_alert_log_json(&log_buffer, &mut json_str) {
                                 Ok(()) => {

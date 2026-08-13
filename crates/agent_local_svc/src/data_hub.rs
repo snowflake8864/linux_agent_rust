@@ -37,7 +37,7 @@ pub fn update_token(token: String) {
 /// 准入修复：根据当前模式设置 /proc/osec/tcp_force_ecn。
 /// 调用方不需要再重复写 proc——这里已经按模式处理。
 fn run_admission_repair() {
-    log_info!("[admission] >>> run_admission_repair() 被调用（调用栈回溯请查看上面的 >>> 箭头链）");
+    //log_info!("[admission] >>> run_admission_repair() 被调用（调用栈回溯请查看上面的 >>> 箭头链）");
     let admission_enabled = {
         let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
         cfg.admission.enabled
@@ -51,14 +51,14 @@ fn run_admission_repair() {
     let mode = ADMISSION_MODE.load(Ordering::Relaxed);
     let effective = ADMISSION_EFFECTIVE.load(Ordering::Relaxed);
     let detecting = ADMISSION_DETECTING.load(Ordering::Relaxed);
-    log_info!("[admission] >>> 准入修复: mode={}, effective={}, detecting={}", mode, effective, detecting);
+    //log_info!("[admission] >>> 准入修复: mode={}, effective={}, detecting={}", mode, effective, detecting);
 
     match mode {
         0 => {
-            log_info!("[admission] OFF 模式，固定关准入，跳过 repair（无需修复）");
+            //log_info!("[admission] OFF 模式，固定关准入，跳过 repair（无需修复）");
         }
         1 => {
-            log_info!("[admission] ON 模式，固定开准入，跳过 repair（无需修复）");
+            //log_info!("[admission] ON 模式，固定开准入，跳过 repair（无需修复）");
         }
         2 => {
             if !detecting {
@@ -77,22 +77,39 @@ fn run_admission_repair() {
 /// 断线时调用：累计失败次数，仅在首次切离线时执行准入修复。
 /// 已离线后不再重复触发——由 auto-detection 自身循环负责后续重试。
 pub fn set_offline_and_check_admission() {
-    log_info!("[admission] >>> set_offline_and_check_admission() 被调用");
+    //log_info!("[admission] >>> set_offline_and_check_admission() 被调用");
     ensure_callback_registered();
 
-    // OFF/ON 模式是固定设置，不需要 repair，直接返回
+    // 先累计失败并尝试切离线。OFF/ON 固定模式下也必须切，否则 AGENT_MODE 一直停留 Online，
+    // 导致 reporter 等模块无法感知离线状态。
+    let switched = set_offline();
+
+    // 首次切离线：加载离线本地表（gRPC 策略）并下发内核。
+    // 本地表非空时替换内存策略；为空则保留当前（服务器）策略。
+    if switched {
+        process_mgr::POLICY_MANAGER.lock().unwrap().load_local_policy_and_apply();
+        task::policy_persistence::restore_policies_from_db(true);
+    }
+
+    // OFF/ON 模式是固定设置，不需要准入 repair，直接返回
     let mode = ADMISSION_MODE.load(Ordering::Relaxed);
     if mode == 0 || mode == 1 {
-        log_info!("[admission] >>> set_offline_and_check_admission: OFF/ON 固定模式，跳过 repair");
+        //log_info!("[admission] >>> set_offline_and_check_admission: OFF/ON 固定模式，跳过 repair");
         return;
     }
 
-    if !set_offline() {
+    if !switched {
         log_info!("[admission] >>> set_offline_and_check_admission: 已经离线，跳过");
         return;
     }
     log_info!("[admission] >>> 切离线，触发准入修复");
     run_admission_repair();
+}
+
+/// 上线时清空离线本地进程策略表，使旧 gRPC 策略作废（服务器策略接管）。
+pub fn clear_local_process_policy() {
+    process_mgr::POLICY_MANAGER.lock().unwrap().clear_local_policy();
+    task::policy_persistence::clear_local_policies();
 }
 
 /// 检测服务器是否可达：向 /v1/getinfo 发送空请求，验证返回 code=="000000"。
@@ -157,7 +174,7 @@ pub fn trigger_connectivity_probe() {
             //log_info!("[admission] >>> 异步探测: 服务器可达 → set_online()，不触发 repair");
             set_online();
         } else {
-            log_info!("[admission] >>> 异步探测: 服务器不可达 → set_offline()");
+            //log_info!("[admission] >>> 异步探测: 服务器不可达 → set_offline()");
             let _ = set_offline();
             let admission_enabled = config::net_info::NETINFO_CONFIG
                 .lock()
@@ -405,6 +422,7 @@ impl AgentDataHub {
         protect_val: bool,
     ) -> Result<(), String> {
         let mut guard = config::net_info::NETINFO_CONFIG.lock().unwrap();
+        let old_cfg = guard.clone();
         match switch_key {
             "proc_switch" => guard.proc_switch = switch_val,
             "usb_switch" => guard.usb_switch = switch_val,
@@ -415,9 +433,13 @@ impl AgentDataHub {
             "usb_protect" => guard.usb_protect = protect_val,
             _ => {}
         }
+        let new_cfg = guard.clone();
         let ini_path = format!("{}/net_info.ini", guard.app_path);
         guard.to_ini(&ini_path)
             .map_err(|e| format!("写入 {} 失败: {}", ini_path, e))?;
+        // 同步开关变化到内核（eBPF 写 global_modes，driver 走 netlink/proc）
+        // 否则只改内存/ini 不生效，防护模式切换后内核仍是旧状态
+        task::apply_config_diff(&old_cfg, &new_cfg)?;
         self.notify(PolicyChangeType::ConfigChanged);
         Ok(())
     }
@@ -781,6 +803,7 @@ impl AgentDataHub {
             })
             .collect();
         // Push to kernel
+        task::policy_persistence::save_trust_dir(&dirs, true);
         pattern::process_pattern_rules_mgr::PROCESS_PATTERN_RULES_MGR
             .lock()
             .set_global_trust_dir(dirs);

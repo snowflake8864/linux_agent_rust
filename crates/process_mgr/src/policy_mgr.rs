@@ -207,6 +207,96 @@ impl ProcessPolicyManager {
         }
     }
 
+    /// 将内存中已加载（DB 恢复）的黑白名单全量下发到内核。
+    /// 离线启动时服务器不会下发进程策略，后端初始化完成后必须主动推给 eBPF/驱动，
+    /// 否则 gRPC 能读到内存里的策略，但内核 proc_rules 没有对应规则、不会触发拦截。
+    pub fn apply_loaded_policy_to_kernel(&mut self) {
+        // 只在 DB 开关开启时才下发（[SQLITE_DB] ENABLED + [DB_POLICY] PROCESS_POLICY）
+        if !local_store::sqlite_db_enabled() {
+            return;
+        }
+        let db_ok = config::net_info::NETINFO_CONFIG
+            .lock()
+            .map(|c| c.db_policy.process_policy)
+            .unwrap_or(false);
+        if !db_ok {
+            return;
+        }
+        let white: Vec<String> = self.white_set.iter().cloned().collect();
+        let black: Vec<String> = self.black_set.iter().cloned().collect();
+
+        if !white.is_empty() {
+            let data: String = white.iter().map(|h| format!("{}=0\n", h)).collect();
+            Self::add_md5_rules(&data);
+        }
+        if !black.is_empty() {
+            let data: String = black.iter().map(|h| format!("{}=1\n", h)).collect();
+            Self::add_md5_rules(&data);
+        }
+
+        // 同步 prev 集合，避免后续 set_policy_process 的 diff 把这些 hash 误判为“新增”重复下发
+        self.prev_white_set = self.white_set.clone();
+        self.prev_black_set = self.black_set.clone();
+
+        if !white.is_empty() || !black.is_empty() {
+            Self::notify_kernel_update();
+            log_info!("[process_policy] 启动下发 DB 策略到内核: 白名单 {} 条, 黑名单 {} 条",
+                white.len(), black.len());
+        }
+    }
+
+    /// 上线时清空离线本地表，使旧 gRPC 策略作废（服务器策略接管）。
+    pub fn clear_local_policy(&self) {
+        if !local_store::sqlite_db_enabled() {
+            return;
+        }
+        let db_ok = config::net_info::NETINFO_CONFIG
+            .lock()
+            .map(|c| c.db_policy.process_policy)
+            .unwrap_or(false);
+        if !db_ok {
+            return;
+        }
+        match local_store::process_policy::save_all_local(&[], &[]) {
+            Ok(()) => log_info!("[process_policy] 已清空离线本地表（上线，服务器策略接管）"),
+            Err(e) => log_error!("[process_policy] 清空离线本地表失败: {}", e),
+        }
+    }
+
+    /// 首次切离线时，从离线本地表加载 gRPC 策略并下发内核。
+    /// 本地表为空时保留当前（服务器）策略，避免误清空。
+    pub fn load_local_policy_and_apply(&mut self) {
+        if !local_store::sqlite_db_enabled() {
+            return;
+        }
+        let db_ok = config::net_info::NETINFO_CONFIG
+            .lock()
+            .map(|c| c.db_policy.process_policy)
+            .unwrap_or(false);
+        if !db_ok {
+            return;
+        }
+        let entries = match local_store::process_policy::load_all_local() {
+            Ok(e) => e,
+            Err(e) => {
+                log_error!("[process_policy] 加载离线本地表失败: {}", e);
+                return;
+            }
+        };
+        if entries.is_empty() {
+            log_info!("[process_policy] 离线本地表为空，保留当前服务器策略");
+            return;
+        }
+        let mut white = Vec::new();
+        let mut black = Vec::new();
+        for (hash, is_white) in entries {
+            if is_white { white.push(hash) } else { black.push(hash) }
+        }
+        self.set_policy_process(&white, true, None);
+        self.set_policy_process(&black, false, None);
+        log_info!("[process_policy] 离线加载本地策略并下发内核: 白 {} 条, 黑 {} 条", white.len(), black.len());
+    }
+
     pub fn get_white_list(&self) -> Vec<String> {
         self.white_set.iter().cloned().collect()
     }

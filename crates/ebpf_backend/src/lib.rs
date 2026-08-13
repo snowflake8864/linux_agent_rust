@@ -9,12 +9,33 @@ use std::sync::{Arc, Mutex, RwLock};
 pub mod loader;
 pub mod types;
 pub mod capability;
+pub mod dpi_parser;
 use loader::ModularLoader;
 use types::*;
 use common::backend::SecurityBackend;
 
-/// Size of the UnifiedEvent struct in eBPF = 90 bytes
-const UNIFIED_EVENT_SIZE: usize = 90;
+/// Maps (file_mode, run_mode, type_idx) → n_type for alert reporting.
+/// file_mode: 0=file, 1=directory
+/// run_mode:  0=monitor, 1=protect
+/// type_idx:  0=CREATE, 1=DELETE, 2=MODIFY, 3=OPEN, 4=RENAME
+static WARN_LOG_TYPE: [[[u16; 5]; 2]; 2] = [
+    [ // file_mode=0 (regular file)
+        [3001, 3002, 3003, 3004, 3005], // monitor
+        [3101, 3102, 3103, 3104, 3105], // protect
+    ],
+    [ // file_mode=1 (directory)
+        [2001, 2002, 2003, 2004, 2005], // monitor
+        [2101, 2102, 2103, 2104, 2105], // protect
+    ],
+];
+
+/// 自保专用目录保护列表（与 DPI dir_policies 独立）。
+/// (路径, 是否保护整个目录子树, 文件名前缀列表)
+const SELF_PROTECT_DIRS: &[(&str, bool, &[&str])] = &[
+    ("/opt/osec", true, &[]),
+    ("/var/lib/dpkg/info", false, &["osec."]),
+    ("/etc/systemd/system/multi-user.target.wants", false, &["osec.", "agent_manager."]),
+];
 
 /// eBPF 后端 — 按需加载 proc/file/net 模块，通过 BPF maps 下发规则
 pub struct EbpfBackend {
@@ -44,6 +65,18 @@ pub struct EbpfBackend {
     file_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
     /// path → (md5, mtime) 缓存（后台扫描填充 + 首次命中时补充）
     pub path_hash_cache: Arc<RwLock<std::collections::HashMap<String, (String, u64)>>>,
+    /// DPI patterns buffer — accumulated until `build` triggers matching
+    dpi_pat_buffer: Arc<Mutex<String>>,
+    /// DPI rules buffer — accumulated until `build` triggers matching
+    dpi_rule_buffer: Arc<Mutex<String>>,
+    /// DPI true process buffer
+    dpi_tp_buffer: Arc<Mutex<String>>,
+    /// Active dir_policies keys for clear operations
+    active_dir_keys: Arc<Mutex<Vec<DirKey>>>,
+    /// 进程信任白名单 patterns buffer — 累积到 build 时解析为 (dev,inode)
+    proc_pat_buffer: Arc<Mutex<String>>,
+    /// 已下发的进程信任白名单 proc_rules keys（用于 clear 时按 (dev,inode) 移除）
+    active_proc_whitelist: Arc<Mutex<Vec<ProcKey>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +84,34 @@ pub struct Md5Entry {
     pub inode: u64,
     pub dev: u64,
     pub path: String,
+}
+
+/// 解析进程模式行 `name=...,key=...,match_full_path=1`，返回 (name, key, match_full_path)。
+fn parse_process_pattern_line(line: &str) -> Option<(&str, &str, bool)> {
+    let mut name = None;
+    let mut key = None;
+    let mut full = false;
+    for kv in line.trim().split(',') {
+        let kv = kv.trim();
+        if let Some(v) = kv.strip_prefix("name=") {
+            name = Some(v);
+        } else if let Some(v) = kv.strip_prefix("key=") {
+            key = Some(v);
+        } else if kv == "match_full_path=1" {
+            full = true;
+        }
+    }
+    Some((name?, key?, full))
+}
+
+/// 把路径 stat 成 (dev, inode)，只接受普通文件（跟随符号链接）。
+fn stat_path_to_proc_key(path: &str) -> Option<ProcKey> {
+    use std::os::linux::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    Some(ProcKey { dev: meta.st_dev(), inode: meta.st_ino() })
 }
 
 impl EbpfBackend {
@@ -133,6 +194,12 @@ impl EbpfBackend {
             proc_ringbuf: Arc::new(Mutex::new(None)),
             file_ringbuf: Arc::new(Mutex::new(None)),
             path_hash_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            dpi_pat_buffer: Arc::new(Mutex::new(String::new())),
+            dpi_rule_buffer: Arc::new(Mutex::new(String::new())),
+            dpi_tp_buffer: Arc::new(Mutex::new(String::new())),
+            active_dir_keys: Arc::new(Mutex::new(Vec::new())),
+            proc_pat_buffer: Arc::new(Mutex::new(String::new())),
+            active_proc_whitelist: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -147,6 +214,8 @@ impl EbpfBackend {
             if let Some(bpf) = loader.file_bpf_mut() {
                 ModularLoader::enable_feature(bpf, 0, self.file_switch)?;
                 ModularLoader::set_global_mode(bpf, 0, self.file_protect)?;
+                // 写入 agent 自身 PID，防止自保规则阻断 agent 的文件操作（如写 net_info.ini）
+                ModularLoader::set_agent_pid(bpf, std::process::id())?;
                 if let Some(map) = bpf.take_map("event_ringbuf") {
                     match RingBuf::try_from(map) {
                         Ok(rb) => {
@@ -171,6 +240,8 @@ impl EbpfBackend {
             if let Some(bpf) = loader.proc_bpf_mut() {
                 ModularLoader::enable_feature(bpf, 1, self.proc_switch)?;
                 ModularLoader::set_global_mode(bpf, 1, self.proc_protect)?;
+                // 写入 agent 自身 PID，防止自保规则下 agent 被外部进程 kill
+                ModularLoader::set_agent_pid(bpf, std::process::id())?;
                 if let Some(map) = bpf.take_map("event_ringbuf") {
                     match RingBuf::try_from(map) {
                         Ok(rb) => {
@@ -276,13 +347,32 @@ impl EbpfBackend {
         }
     }
 
-    /// 解析 ringbuf 事件
+    /// 解析进程 ringbuf 事件
     fn parse_event(data: &[u8]) -> Option<(&UnifiedEvent, String, String)> {
         if data.len() < UNIFIED_EVENT_SIZE { return None; }
         let event: &UnifiedEvent = unsafe { &*(data.as_ptr() as *const UnifiedEvent) };
         let path = String::from_utf8_lossy(&event.path).trim_end_matches('\0').to_string();
         let comm = String::from_utf8_lossy(&event.comm).trim_end_matches('\0').to_string();
         Some((event, path, comm))
+    }
+
+    /// 解析文件 ringbuf 事件 (92 bytes, 含 op_type)
+    fn parse_file_event(data: &[u8]) -> Option<(&FileEvent, String, String)> {
+        if data.len() < FILE_EVENT_SIZE { return None; }
+        let event: &FileEvent = unsafe { &*(data.as_ptr() as *const FileEvent) };
+        let path = String::from_utf8_lossy(&event.path).trim_end_matches('\0').to_string();
+        let comm = String::from_utf8_lossy(&event.comm).trim_end_matches('\0').to_string();
+        Some((event, path, comm))
+    }
+
+    /// 按 op_type 位掩码推导 type_idx (匹配 G_WARN_LOG_TYPE 列)
+    /// OP_CREATE=0, OP_DELETE=1, OP_MODIFY=2, OP_OPEN=3, OP_RENAME=4
+    fn op_type_to_idx(op: u8) -> usize {
+        if op & OP_CREATE != 0 { 0 }
+        else if op & OP_DELETE != 0 { 1 }
+        else if op & OP_MODIFY != 0 { 2 }
+        else if op & OP_WRITE != 0 { 2 }  // OP_WRITE → modify
+        else { 3 }  // OP_READ → open (idx=3), and fallback
     }
 
     /// 启动 eBPF 进程事件 ring buffer 读取器
@@ -334,13 +424,26 @@ impl EbpfBackend {
             loop {
                 let items = Self::drain_ringbuf(&rb);
                 for data in &items {
-                    if let Some((event, path, comm)) = Self::parse_event(data) {
+                    if let Some((event, path, comm)) = Self::parse_file_event(data) {
+                        if event.event_type == EVENT_SELF_PROTECT {
+                            backend.report_self_protect_event(&path, &comm, event.pid, event.uid, event.op_type);
+                            continue;
+                        }
+                        let type_idx = Self::op_type_to_idx(event.op_type);
+                        let run_mode: usize = if event.blocked == 1 { 1 } else { 0 };
+                        let n_type = WARN_LOG_TYPE[0][run_mode][type_idx];
+                        let op_name = match type_idx {
+                            0 => "CREATE", 1 => "DELETE", 2 => "MODIFY",
+                            3 => "OPEN", 4 => "RENAME", _ => "?",
+                        };
                         if event.blocked == 1 {
-                            log::warn!("[EbpfBackend] 🚫 文件操作被拦截: path={}, comm={}, pid={}",
-                                path, comm, event.pid);
-                            backend.report_file_event(event, &path, &comm, 3101, "拦截");
+                            log::warn!("[EbpfBackend] 🚫 文件拦截: path={} comm={} pid={} op_type=0x{:02X}→{} n_type={}",
+                                path, comm, event.pid, event.op_type, op_name, n_type);
+                            backend.report_file_event(&path, &comm, n_type, "拦截", event.pid, event.op_type, op_name);
                         } else {
-                            backend.report_file_event(event, &path, &comm, 3001, "监控");
+                            log::info!("[EbpfBackend] 👀 文件监控: path={} comm={} pid={} op_type=0x{:02X}→{} n_type={}",
+                                path, comm, event.pid, event.op_type, op_name, n_type);
+                            backend.report_file_event(&path, &comm, n_type, "监控", event.pid, event.op_type, op_name);
                         }
                     }
                 }
@@ -404,8 +507,8 @@ impl EbpfBackend {
         reporter::send_to_http_upload(&log);    // HTTP 上报到服务器
     }
 
-    /// 上报文件告警（拦截: n_type=3101, 监控: n_type=3001）
-    fn report_file_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_type: u16, action: &str) {
+    /// 上报文件告警
+    fn report_file_event(&self, path: &str, comm: &str, n_type: u16, action: &str, pid: u32, op_type: u8, op_name: &str) {
         let md5_hash = self.get_md5_cached(path);
         let log = reporter::AuditLogInfo {
             file_path: Some(path.to_string()),
@@ -415,7 +518,8 @@ impl EbpfBackend {
             n_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             rename_dir: None,
-            notice_remark: Some(format!("eBPF文件{}: pid={}", action, event.pid)),
+            notice_remark: Some(format!("eBPF文件{}: pid={} op=0x{:02X}({}) n_type={}",
+                action, pid, op_type, op_name, n_type)),
             exception_process: Some(comm.to_string()),
             peripheral_name: None, peripheral_remark: None, peripheral_eid: None,
             p_param: Some(path.to_string()),
@@ -432,6 +536,205 @@ impl EbpfBackend {
         let mut proc_rules: AyaHashMap<_, ProcKey, ProcRuleVal> =
             AyaHashMap::try_from(bpf.map_mut("proc_rules").unwrap())?;
         proc_rules.insert(ProcKey { dev, inode }, ProcRuleVal { action, mode, reserved: [0; 6] }, 0)?;
+        Ok(())
+    }
+
+    // ── 进程信任白名单（PROCESS_PATTERNS）→ proc_rules (dev,inode) ──
+
+    /// 移除之前下发的信任进程白名单 proc_rules 条目。
+    fn clear_proc_whitelist_bpf(&self) {
+        let keys = std::mem::take(&mut *self.active_proc_whitelist.lock().unwrap());
+        if keys.is_empty() {
+            return;
+        }
+        let mut loader = match self.loader.lock() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let bpf = match loader.proc_bpf_mut() {
+            Some(b) => b,
+            None => return,
+        };
+        let map_data = match bpf.map_mut("proc_rules") {
+            Some(m) => m,
+            None => return,
+        };
+        let mut proc_rules = match AyaHashMap::<_, ProcKey, ProcRuleVal>::try_from(map_data) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        for key in &keys {
+            let _ = proc_rules.remove(key);
+        }
+        info!("[EbpfBackend] 已清除进程信任白名单 {} 条", keys.len());
+    }
+
+    /// 解析累积的进程模式文本，把每个信任进程解析成 (dev,inode) 写入 proc_rules 白名单。
+    /// action=ALLOW(0), mode=0(继承)；BPF 命中后按 (dev,inode) 做 O(1) hash 查找并放行，
+    /// 不做任何字符串比对。信任目录 trueDir_* 在此跳过（由 file DPI dir_policies 处理）。
+    fn commit_proc_whitelist_bpf(&self) {
+        let text = self.proc_pat_buffer.lock().unwrap().clone();
+        if text.trim().is_empty() {
+            return;
+        }
+
+        let search_dirs = self.trusted_process_search_dirs();
+        let mut keys: Vec<ProcKey> = Vec::new();
+        let mut seen = std::collections::HashSet::<(u64, u64)>::new();
+
+        for line in text.lines() {
+            let Some((name, key, full_path)) = parse_process_pattern_line(line) else { continue; };
+            // 只处理信任进程，跳过信任目录
+            if name.starts_with("trueDir_") {
+                continue;
+            }
+            if key.is_empty() {
+                continue;
+            }
+
+            if full_path {
+                // match_full_path=1：key 是完整路径，直接 stat
+                if let Some(dk) = stat_path_to_proc_key(key) {
+                    if seen.insert((dk.dev, dk.inode)) {
+                        keys.push(dk);
+                    }
+                }
+            } else {
+                // 子串/裸名：取 basename，在 $PATH + 系统目录中搜索
+                let basename = key.rsplit('/').next().unwrap_or(key);
+                if basename.is_empty() {
+                    continue;
+                }
+                for dir in &search_dirs {
+                    let cand = format!("{}/{}", dir, basename);
+                    if let Some(dk) = stat_path_to_proc_key(&cand) {
+                        if seen.insert((dk.dev, dk.inode)) {
+                            keys.push(dk);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut written = 0usize;
+        let mut tracked: Vec<ProcKey> = Vec::new();
+        for dk in &keys {
+            match self.add_proc_rule_by_inode(dk.dev, dk.inode, 0 /*allow*/, 0 /*inherit*/) {
+                Ok(_) => {
+                    written += 1;
+                    tracked.push(*dk);
+                }
+                Err(e) => warn!(
+                    "[EbpfBackend] 信任进程白名单写入失败 dev={} inode={}: {}",
+                    dk.dev, dk.inode, e
+                ),
+            }
+        }
+        *self.active_proc_whitelist.lock().unwrap() = tracked;
+        info!("[EbpfBackend] 🛡️ 信任进程白名单: 解析 {} 条, 写入 proc_rules {} 条", keys.len(), written);
+    }
+
+    /// 信任进程搜索目录：$PATH + 常见系统目录（去重）。
+    fn trusted_process_search_dirs(&self) -> Vec<String> {
+        let mut dirs: Vec<String> = Vec::new();
+        if let Ok(path) = std::env::var("PATH") {
+            for d in path.split(':') {
+                let d = d.trim();
+                if !d.is_empty() {
+                    dirs.push(d.to_string());
+                }
+            }
+        }
+        for d in [
+            "/sbin", "/usr/sbin", "/bin", "/usr/bin",
+            "/usr/local/sbin", "/usr/local/bin",
+            "/usr/lib/systemd", "/lib/systemd", "/usr/lib", "/lib",
+        ] {
+            let d = d.to_string();
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+        dirs
+    }
+
+    // ── DPI → dir_policies BPF map ──
+
+    /// Remove all entries from the dir_policies BPF map.
+    fn clear_dir_policies_bpf(&self) {
+        let mut keys = self.active_dir_keys.lock().unwrap();
+        if keys.is_empty() {
+            return;
+        }
+        let mut loader = match self.loader.lock() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let bpf = match loader.file_bpf_mut() {
+            Some(b) => b,
+            None => return,
+        };
+        let map_data = match bpf.map_mut("dir_policies") {
+            Some(m) => m,
+            None => return,
+        };
+        let mut dir_policies = match AyaHashMap::<_, DirKey, DirPolicy>::try_from(map_data) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        for key in keys.iter() {
+            let _ = dir_policies.remove(key);
+        }
+        keys.clear();
+    }
+
+    /// Write a single DirPolicy entry to the dir_policies BPF map.
+    fn write_dir_policy_bpf(&self, key: DirKey, policy: DirPolicy) {
+        let mut loader = match self.loader.lock() {
+            Ok(l) => l,
+            Err(e) => { warn!("[EbpfBackend] DPI lock error: {}", e); return; }
+        };
+        let bpf = match loader.file_bpf_mut() {
+            Some(b) => b,
+            None => { warn!("[EbpfBackend] DPI: file_bpf not loaded"); return; }
+        };
+        let map_data = match bpf.map_mut("dir_policies") {
+            Some(m) => m,
+            None => { warn!("[EbpfBackend] DPI: dir_policies map unavailable"); return; }
+        };
+        let mut dir_policies = match AyaHashMap::<_, DirKey, DirPolicy>::try_from(map_data) {
+            Ok(m) => m,
+            Err(e) => { warn!("[EbpfBackend] DPI: try_from failed: {}", e); return; }
+        };
+        match dir_policies.insert(key, policy, 0) {
+            Ok(_) => {
+                self.active_dir_keys.lock().unwrap().push(key);
+                info!("[EbpfBackend] DPI: wrote dir_policy dev={} inode={} ops_mask={} action={} rec={} ft={}",
+                    key.dev, key.inode, policy.ops_mask, policy.action, policy.recursive, policy.filter_type);
+            }
+            Err(e) => warn!("[EbpfBackend] DPI: insert dir_policy failed: {}", e),
+        }
+    }
+
+    /// Parse accumulated patterns+rules, match them, resolve directories,
+    /// and write DirPolicy entries to the BPF map.
+    fn commit_dpi_to_bpf(&self) -> Result<(), String> {
+        let pat_text = self.dpi_pat_buffer.lock().unwrap().clone();
+        let rule_text = self.dpi_rule_buffer.lock().unwrap().clone();
+        if pat_text.is_empty() && rule_text.is_empty() {
+            return Ok(());
+        }
+
+        let patterns = dpi_parser::parse_patterns(&pat_text);
+        let rules = dpi_parser::parse_rules(&rule_text);
+        info!("[EbpfBackend] DPI commit: {} patterns, {} rules parsed", patterns.len(), rules.len());
+
+        let entries = dpi_parser::match_patterns_to_rules(&patterns, &rules);
+        info!("[EbpfBackend] DPI commit: {} dir_policy entries resolved", entries.len());
+
+        for entry in &entries {
+            self.write_dir_policy_bpf(entry.key, entry.policy);
+        }
         Ok(())
     }
 
@@ -466,7 +769,7 @@ impl EbpfBackend {
         if pending.is_empty() { return; }
 
         let md5_map = self.md5_map.read().unwrap();
-        let mode = 2u8;
+        let mode = if self.proc_protect { 2u8 } else { 1u8 };
         let mut replayed = 0;
         let to_remove: Vec<String> = pending.iter()
             .filter_map(|(hash, action)| {
@@ -521,6 +824,61 @@ impl EbpfBackend {
         drop(map); // 释放写锁，让 replay_pending_rules 可以获取读锁
         self.replay_pending_rules();
         Ok(count)
+    }
+
+    /// 上报自保目录保护告警（/opt/osec 等自保目录被操作）。
+    /// 自保事件仅在自保开关开启且命中保护目录时产生，固定 n_level=3（保护）。
+    /// 复用现有 AuditLogInfo 上报链路（broadcast + HTTP /v1/alertupload）。
+    fn report_self_protect_event(&self, path: &str, comm: &str, pid: u32, uid: u32, op_type: u8) {
+        let type_idx = Self::op_type_to_idx(op_type);
+        let n_type = WARN_LOG_TYPE[1][1][type_idx]; // 目录保护 → 210x
+        let md5_hash = self.get_md5_cached(path);
+        let log = reporter::AuditLogInfo {
+            file_path: Some(path.to_string()),
+            md5: md5_hash,
+            n_type,
+            n_level: 3,
+            n_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+            rename_dir: None,
+            notice_remark: Some(format!("eBPF自保保护: pid={} uid={} op=0x{:02X}", pid, uid, op_type)),
+            exception_process: Some(comm.to_string()),
+            peripheral_name: None, peripheral_remark: None, peripheral_eid: None,
+            p_param: Some(path.to_string()),
+        };
+        log::warn!("[EbpfBackend] 🛡️ 自保目录命中: path={} comm={} pid={} op_type=0x{:02X} n_type={}",
+            path, comm, pid, op_type, n_type);
+        reporter::broadcast_audit_log(&log);
+        reporter::send_to_http_upload(&log);
+    }
+
+    /// 自保专用目录保护（与 DPI dir_policies 完全独立）。
+    fn write_self_protect_dirs(&self, enabled: bool) -> Result<(), String> {
+        let mut loader = self.loader.lock().map_err(|e| e.to_string())?;
+        let bpf = loader.file_bpf_mut()
+            .ok_or_else(|| "file_agent not loaded".to_string())?;
+        let map_data = bpf.map_mut("self_protect_dirs")
+            .ok_or_else(|| "self_protect_dirs map unavailable".to_string())?;
+        let mut map = AyaHashMap::<_, DirKey, SelfProtectRule>::try_from(map_data)
+            .map_err(|e| e.to_string())?;
+
+        for (path, whole_dir, prefixes) in SELF_PROTECT_DIRS {
+            let key = match dpi_parser::resolve_dir_to_key(path) {
+                Some(k) => k,
+                None => { warn!("[EbpfBackend] 自保目录不存在，跳过: {}", path); continue; }
+            };
+            if enabled {
+                let rule = if *whole_dir { SelfProtectRule::whole_dir() }
+                           else { SelfProtectRule::with_prefixes(prefixes) };
+                map.insert(key, rule, 0).map_err(|e| e.to_string())?;
+                info!("[EbpfBackend] 🛡️ 自保目录保护: {} dev={} inode={} whole_dir={}",
+                    path, key.dev, key.inode, whole_dir);
+            } else {
+                let _ = map.remove(&key);
+                info!("[EbpfBackend] 自保目录保护移除: {}", path);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -640,25 +998,59 @@ impl SecurityBackend for EbpfBackend {
     fn write_netblock_switch(&self, _value: &str) -> Result<(), String> { Ok(()) }
     fn write_defense_switch(&self, _rule_type: &str, _value: &str) -> Result<(), String> { Ok(()) }
 
-    // DPI (stub)
-    fn write_dpi_file_patterns(&self, _data: &str, _clear: bool, _build: bool) -> Result<(), String> {
-        warn!("[EbpfBackend] DPI file patterns not supported");
+    // DPI — parse pattern/rule text strings, resolve directories to (dev,inode),
+    // and write DirPolicy entries into the file_agent's dir_policies BPF map.
+    fn write_dpi_file_patterns(&self, data: &str, clear: bool, build: bool) -> Result<(), String> {
+        if clear {
+            self.dpi_pat_buffer.lock().unwrap().clear();
+            self.dpi_rule_buffer.lock().unwrap().clear();
+            self.clear_dir_policies_bpf();
+        }
+        if !data.is_empty() {
+            self.dpi_pat_buffer.lock().unwrap().push_str(data);
+        }
+        if build {
+            self.commit_dpi_to_bpf()?;
+        }
         Ok(())
     }
-    fn write_dpi_rules(&self, _data: &str, _clear: bool) -> Result<(), String> {
-        warn!("[EbpfBackend] DPI rules not supported");
+
+    fn write_dpi_rules(&self, data: &str, clear: bool) -> Result<(), String> {
+        if clear {
+            self.dpi_rule_buffer.lock().unwrap().clear();
+        }
+        if !data.is_empty() {
+            self.dpi_rule_buffer.lock().unwrap().push_str(data);
+        }
         Ok(())
     }
-    fn write_process_dpi_patterns(&self, _data: &str, _clear: bool, _build: bool) -> Result<(), String> {
-        warn!("[EbpfBackend] Process DPI patterns not supported");
+
+    fn write_process_dpi_patterns(&self, data: &str, clear: bool, build: bool) -> Result<(), String> {
+        if clear {
+            self.proc_pat_buffer.lock().unwrap().clear();
+            self.clear_proc_whitelist_bpf();
+        }
+        if !data.is_empty() {
+            self.proc_pat_buffer.lock().unwrap().push_str(data);
+        }
+        if build {
+            self.commit_proc_whitelist_bpf();
+        }
         Ok(())
     }
+
     fn write_process_dpi_rules(&self, _data: &str, _clear: bool) -> Result<(), String> {
-        warn!("[EbpfBackend] Process DPI rules not supported");
+        // 进程信任白名单在 eBPF 模式全部是 ACTION_ALLOW，rule 文本（type=0/1）无额外语义，忽略。
         Ok(())
     }
-    fn write_dpi_true_process(&self, _data: &str, _clear: bool) -> Result<(), String> {
-        warn!("[EbpfBackend] DPI true process not supported");
+
+    fn write_dpi_true_process(&self, data: &str, clear: bool) -> Result<(), String> {
+        if clear {
+            self.dpi_tp_buffer.lock().unwrap().clear();
+        }
+        if !data.is_empty() {
+            self.dpi_tp_buffer.lock().unwrap().push_str(data);
+        }
         Ok(())
     }
 
@@ -673,5 +1065,26 @@ impl SecurityBackend for EbpfBackend {
     fn emit_docker_event(&self, _kind: u8, _flag: u8, _pid: i32) -> Result<(), String> { Ok(()) }
     fn clear_docker_rt(&self) -> Result<(), String> { Ok(()) }
     fn write_business_ports(&self, _ports: &[u16]) -> Result<(), String> { Ok(()) }
-    fn write_self_protection(&self, _num: u32) -> Result<(), String> { Ok(()) }
+    /// 自保开关：防 kill（protected_pids）+ 自保目录保护（self_protect_dirs）。
+    /// 自保目录保护走专用 self_protect_dirs map，与 DPI dir_policies 完全独立，
+    /// 不依赖 file_switch，也不依赖 token/GLOBAL_PATTERN_MGR。
+    fn write_self_protection(&self, num: u32) -> Result<(), String> {
+        let enabled = num != 0;
+        let agent_pid = std::process::id();
+        {
+            let mut loader = self.loader.lock().unwrap();
+            if let Some(bpf) = loader.proc_bpf_mut() {
+                if enabled {
+                    ModularLoader::add_protected_pid(bpf, agent_pid)
+                        .map_err(|e| format!("protected_pids add failed: {}", e))?;
+                    info!("[EbpfBackend] 🛡️ 自保防 kill 已启用: agent PID {} 已加入保护列表", agent_pid);
+                } else {
+                    ModularLoader::remove_protected_pid(bpf, agent_pid)
+                        .map_err(|e| format!("protected_pids remove failed: {}", e))?;
+                    info!("[EbpfBackend] 自保防 kill 已禁用: agent PID {} 已移出保护列表", agent_pid);
+                }
+            }
+        }
+        self.write_self_protect_dirs(enabled)
+    }
 }

@@ -60,6 +60,64 @@ pub fn get_running_process_infos() -> Result<Vec<ProcessInfo>, ProcessInfoError>
     Ok(processes)
 }
 
+/// 系统可执行文件扫描目录（与 eBPF `scan_executables`、task `get_process_task` 保持一致）
+pub const EXECUTABLE_SCAN_DIRS: &[&str] = &[
+    "/bin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/local/bin",
+    "/usr/lib/systemd",
+];
+
+/// 扫描系统可执行文件目录，返回 (路径, MD5)，仅保留 ELF 文件。
+/// 注意：返回的是「去重前」的原始列表，去重逻辑由调用方按需处理（见 GetExecutableList 的 total/unique 语义）。
+pub fn scan_executable_files() -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    for dir in EXECUTABLE_SCAN_DIRS {
+        scan_dir_recursive(dir, &mut files);
+    }
+    files
+}
+
+fn scan_dir_recursive(dir: &str, out: &mut Vec<(String, String)>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let ft = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        // 只递归真实目录，不跟随目录软链，避免 /bin → /usr/bin 这类循环
+        if ft.is_dir() {
+            if let Some(s) = path.to_str() {
+                scan_dir_recursive(s, out);
+            }
+            continue;
+        }
+        // 真实文件，或软链指向的文件（/usr/bin 下有大量软链）
+        if !ft.is_file() && !(ft.is_symlink() && path.is_file()) {
+            continue;
+        }
+        let path_str = match path.to_str() {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        // 仅保留 ELF 可执行文件
+        if let Ok(mut f) = fs::File::open(&path) {
+            use std::io::Read;
+            let mut magic = [0u8; 4];
+            if f.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF" {
+                if let Ok(md5) = process_mgr::get_md5_global(&path_str) {
+                    out.push((path_str, md5));
+                }
+            }
+        }
+    }
+}
+
 fn build_process_info(pid: u32) -> Result<ProcessInfo, ProcessInfoError> {
     let pid_path = |file: &str| PathBuf::from("/proc").join(pid.to_string()).join(file);
 

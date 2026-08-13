@@ -5,7 +5,7 @@ use grpc_gateway::process_policy::{
     process_policy_service_server::ProcessPolicyService, ProcessPolicy, ProcessPolicyFilter,
 };
 use grpc_gateway::common::SimpleResponse;
-use crate::data_hub::AgentDataHub;
+use crate::data_hub::{require_offline, AgentDataHub};
 
 pub struct ProcessPolicyServiceImpl {
     pub data_hub: Arc<AgentDataHub>,
@@ -34,7 +34,8 @@ impl ProcessPolicyService for ProcessPolicyServiceImpl {
         &self,
         request: Request<ProcessPolicy>,
     ) -> Result<Response<SimpleResponse>, Status> {
-        // eBPF 模式下允许在线更新进程策略（便于测试验证），不再强制离线
+        // 在线时只允许服务器下发进程策略，离线时才允许本地 gRPC 修改
+        require_offline()?;
         let policy = request.into_inner();
         self.data_hub
             .update_process_policy(&policy.hash_list, policy.action)

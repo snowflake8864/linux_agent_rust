@@ -42,6 +42,34 @@ impl Default for DirPolicy {
     }
 }
 
+// --- 自保专用目录保护（独立于 dir_policies，匹配 file_agent.bpf.c self_protect_rule） ---
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SelfProtectRule {
+    pub whole_dir: u8,
+    pub prefix_count: u8,
+    pub prefixes: [[u8; 16]; 2],
+}
+
+unsafe impl aya::Pod for SelfProtectRule {}
+
+impl SelfProtectRule {
+    pub fn whole_dir() -> Self {
+        Self { whole_dir: 1, prefix_count: 0, prefixes: [[0; 16]; 2] }
+    }
+    pub fn with_prefixes(prefixes: &[&str]) -> Self {
+        let mut s = Self { whole_dir: 0, prefix_count: 0, prefixes: [[0; 16]; 2] };
+        for (i, p) in prefixes.iter().take(2).enumerate() {
+            let b = p.as_bytes();
+            for (j, &c) in b.iter().take(16).enumerate() {
+                s.prefixes[i][j] = c;
+            }
+            s.prefix_count += 1;
+        }
+        s
+    }
+}
+
 // --- 进程管控 ---
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -100,7 +128,7 @@ pub struct PktModValue {
 
 unsafe impl aya::Pod for PktModValue {}
 
-// --- 进程事件 ring buffer (匹配 eBPF C struct unified_event) ---
+// --- 进程事件 ring buffer (匹配 proc_agent.bpf.c unified_event) ---
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct UnifiedEvent {
@@ -114,6 +142,41 @@ pub struct UnifiedEvent {
 }
 
 unsafe impl aya::Pod for UnifiedEvent {}
+
+/// Size of proc UnifiedEvent in eBPF = 90 bytes
+pub const UNIFIED_EVENT_SIZE: usize = 90;
+
+// --- 文件事件 ring buffer (匹配 file_agent.bpf.c unified_event, 92字节) ---
+/// File event from eBPF file_agent ringbuf.
+/// Layout must match the C struct in file_agent.bpf.c exactly.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FileEvent {
+    pub event_type: u8,   // __u8 type;  EVENT_FILE(1)
+    pub op_type: u8,      // __u8 op_type; OP_READ|OP_WRITE|OP_CREATE|OP_DELETE
+    pub blocked: u8,      // __u8 blocked; 1=拦截, 0=监控
+    pub _pad: u8,         // alignment to 32bit
+    pub pid: u32,
+    pub uid: u32,
+    pub comm: [u8; 16],
+    pub path: [u8; 64],
+}
+
+unsafe impl aya::Pod for FileEvent {}
+
+/// Size of FileEvent in eBPF = 92 bytes (1+1+1+1 + 4+4 + 16 + 64)
+pub const FILE_EVENT_SIZE: usize = 92;
+
+// OP_* bitmask constants (file_agent.bpf.c)
+pub const OP_READ: u8   = 1;
+pub const OP_WRITE: u8  = 2;
+pub const OP_MODIFY: u8 = 4;
+pub const OP_CREATE: u8 = 8;
+pub const OP_DELETE: u8 = 16;
+
+// 文件事件 event_type（匹配 file_agent.bpf.c）
+pub const EVENT_FILE: u8 = 1;
+pub const EVENT_SELF_PROTECT: u8 = 4;
 
 impl Default for PktModValue {
     fn default() -> Self {

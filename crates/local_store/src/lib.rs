@@ -1,9 +1,12 @@
 pub mod alert_log;
+pub mod dir_policy;
+pub mod extort_policy;
 pub mod jump_status;
 pub mod known_executables;
 pub mod peripheral_policy;
 pub mod process_policy;
 pub mod quarantine;
+pub mod trust_dir;
 
 /// 便捷查询：SQLite 基础设施是否已开启
 pub fn sqlite_db_enabled() -> bool {
@@ -60,5 +63,26 @@ pub fn init_all() {
         if let Err(e) = quarantine::init_table() {
             logging::log_error!("[local_store] quarantine 建表失败: {}", e);
         }
+    }
+
+    // 服务器下发的目录/后缀/信任目录策略（离线重启恢复用）。
+    // 无独立 [DB_POLICY] 开关，随 [SQLITE_DB] ENABLED 一并启用。
+    if let Err(e) = dir_policy::init_table() {
+        logging::log_error!("[local_store] dir_policy 建表失败: {}", e);
+    }
+    if let Err(e) = dir_policy::init_local_table() {
+        logging::log_error!("[local_store] dir_policy_local 建表失败: {}", e);
+    }
+    if let Err(e) = extort_policy::init_table() {
+        logging::log_error!("[local_store] extort_policy 建表失败: {}", e);
+    }
+    if let Err(e) = extort_policy::init_local_table() {
+        logging::log_error!("[local_store] extort_policy_local 建表失败: {}", e);
+    }
+    if let Err(e) = trust_dir::init_table() {
+        logging::log_error!("[local_store] trust_dir 建表失败: {}", e);
+    }
+    if let Err(e) = trust_dir::init_local_table() {
+        logging::log_error!("[local_store] trust_dir_local 建表失败: {}", e);
     }
 }

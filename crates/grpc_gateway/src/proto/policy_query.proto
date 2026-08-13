@@ -1,0 +1,16 @@
+syntax = "proto3";
+package policy_query;
+
+import "common.proto";
+
+// 一次性查询所有当前生效的策略（与 /opt/osec/policies/ 目录下的 JSON 文件一致）
+// 便于运维通过 grpcurl 直接查看全部策略，无需逐个调用各策略服务。
+service PolicyQueryService {
+    rpc GetAllPolicies(common.Empty) returns (PolicyDump);
+}
+
+message PolicyDump {
+    // pretty JSON，包含所有策略（config / process / dir / extort / ip_block /
+    // ip_black / virtual_port / peripheral / outreach / trust_dir / backend）
+    string json = 1;
+}

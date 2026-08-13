@@ -54,6 +54,7 @@ const PROCESS_PATTERNS: &[ProcessPattern] = &[
     ProcessPattern { key: "bin/stty", typ: 1, param: ",pkt_len=-1" },
     ProcessPattern { key: "bin/lsmod", typ: 1, param: ",pkt_len=-1" },
     ProcessPattern { key: "bin/rmmod", typ: 1, param: ",pkt_len=-1" },
+    ProcessPattern { key: "bin/tc", typ: 1, param: ",pkt_len=-1" },
     ProcessPattern { key: "bin/unzip", typ: 1, param: ",pkt_len=-1" },
     ProcessPattern { key: "bin/reboot", typ: 1, param: ",pkt_len=-1" },
     ProcessPattern { key: "/usr/bin/systemctl", typ: 1, param: ",match_full_path=1" },
@@ -64,6 +65,8 @@ const PROCESS_PATTERNS: &[ProcessPattern] = &[
     ProcessPattern { key: "/systemd", typ: 1, param: ",pkt_len=-1" },
     ProcessPattern { key: "lsof", typ: 1, param: ",pkt_len=-1" },
     ProcessPattern { key: "awk", typ: 1, param: ",pkt_len=-1" },
+    ProcessPattern { key: "/bin/tc", typ: 1, param: ",pkt_len=-1" },
+    ProcessPattern { key: "/sbin/tc", typ: 1, param: ",pkt_len=-1" },
     ProcessPattern { key: "/opt/osec/MagicArmorAgent", typ: 0, param: ",match_full_path=1" },
 ];
 
@@ -124,6 +127,11 @@ impl ProcessPatternRulesMgr {
 
     // 清除文件模式
     pub fn clear_file_pattern(&self) -> std::io::Result<()> {
+        if let Some(w) = crate::get_dpi_writer() {
+            w.clear_process();
+            info!("已清除进程模式（DpiWriter）");
+            return Ok(());
+        }
         let mut file = File::create(FILE_PATTERNS_PROC_FILE)?;
         file.write_all(b"c\n")?;
         info!("已清除文件模式");
@@ -132,6 +140,10 @@ impl ProcessPatternRulesMgr {
 
     // 清除 DPI 规则
     pub fn clear_dpi_rules(&self) -> std::io::Result<()> {
+        // DpiWriter 模式下 clear_process() 已同时清空 pattern 与 rule，无需重复
+        if crate::get_dpi_writer().is_some() {
+            return Ok(());
+        }
         let mut file = File::create(DPI_RULE_PROC_FILE)?;
         file.write_all(b"c\n")?;
         info!("已清除 DPI 规则");
@@ -140,6 +152,11 @@ impl ProcessPatternRulesMgr {
 
     // 构建文件模式
     pub fn build_file_pattern(&self) {
+        if let Some(w) = crate::get_dpi_writer() {
+            w.build_process();
+            info!("已构建进程模式（DpiWriter）");
+            return;
+        }
         if let Err(e) = File::create(FILE_PATTERNS_PROC_FILE).and_then(|mut f| f.write_all(b"b\n")) {
             error!("构建文件模式失败: {}", e);
         } else {
@@ -221,7 +238,23 @@ impl ProcessPatternRulesMgr {
 
     // 加载模式和规则到内核
     fn load_pattern_rules(&self) {
-        // 写入常量进程模式
+        // backend 模式（driver/eBPF）：都走 DpiWriter。
+        // - driver：DriverBackend 照写 /proc/osec/process_dpi（与原先一致）。
+        // - eBPF：EbpfBackend 只把信任进程（true_process_/sys_true_process_）解析成
+        //   (dev,inode) 写入 proc_rules，跳过信任目录 trueDir_*（由 file DPI 处理）。
+        if let Some(w) = crate::get_dpi_writer() {
+            if !self.const_file_patterns.is_empty() {
+                w.write_process_pair(&self.const_file_patterns, &self.const_file_rules);
+            }
+            if !self.global_trust_dir_patterns.is_empty() {
+                w.write_process_pair(&self.global_trust_dir_patterns, &self.global_trust_dir_rules);
+            }
+            self.build_file_pattern();
+            info!("已通过 DpiWriter 加载进程模式和规则到内核");
+            return;
+        }
+
+        // 无 DpiWriter 注册时（正常启动流程都会注册），回退直接写 /proc/osec/process_dpi
         if !self.const_file_patterns.is_empty() {
             let _ = Self::write_to_proc_file(FILE_PATTERNS_PROC_FILE, &self.const_file_patterns);
             let _ = Self::write_to_proc_file(DPI_RULE_PROC_FILE, &self.const_file_rules);

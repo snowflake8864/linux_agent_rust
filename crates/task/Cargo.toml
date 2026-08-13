@@ -28,6 +28,7 @@ reporter = { path = "../reporter" }
 log = "0.4"
 pattern = { path = "../pattern" }
 process_mgr = { path =  "../process_mgr" }
+local_store = { path = "../local_store" }
 netlink = { path = "../netlink" }
 netblock = {path = "../netblock"}
 udisk = {path = "../udisk"}

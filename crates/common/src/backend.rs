@@ -1,5 +1,73 @@
 use std::sync::{Arc, OnceLock};
 
+/// DpiWriter adapter: bridges `pattern::DpiWriter` → `SecurityBackend`.
+/// Registered at startup so `PatternRulesMgr` can route through the active backend.
+struct BackendDpiWriter;
+
+impl pattern::DpiWriter for BackendDpiWriter {
+    fn clear_all(&self) {
+        if let Some(b) = super::backend::get_backend() {
+            let _ = b.write_dpi_file_patterns("", true, false);
+            let _ = b.write_dpi_rules("", true);
+            let _ = b.write_dpi_true_process("", true);
+        }
+    }
+
+    fn write_pair(&self, pat: &str, rule: &str) {
+        if let Some(b) = super::backend::get_backend() {
+            if !pat.is_empty() {
+                let _ = b.write_dpi_file_patterns(pat, false, false);
+            }
+            if !rule.is_empty() {
+                let _ = b.write_dpi_rules(rule, false);
+            }
+        }
+    }
+
+    fn write_true_process(&self, data: &str) {
+        if !data.is_empty() {
+            if let Some(b) = super::backend::get_backend() {
+                let _ = b.write_dpi_true_process(data, false);
+            }
+        }
+    }
+
+    fn build(&self) {
+        if let Some(b) = super::backend::get_backend() {
+            let _ = b.write_dpi_file_patterns("", false, true);
+        }
+    }
+
+    fn clear_process(&self) {
+        if let Some(b) = super::backend::get_backend() {
+            let _ = b.write_process_dpi_patterns("", true, false);
+            let _ = b.write_process_dpi_rules("", true);
+        }
+    }
+
+    fn write_process_pair(&self, pat: &str, rule: &str) {
+        if let Some(b) = super::backend::get_backend() {
+            if !pat.is_empty() {
+                let _ = b.write_process_dpi_patterns(pat, false, false);
+            }
+            if !rule.is_empty() {
+                let _ = b.write_process_dpi_rules(rule, false);
+            }
+        }
+    }
+
+    fn build_process(&self) {
+        if let Some(b) = super::backend::get_backend() {
+            let _ = b.write_process_dpi_patterns("", false, true);
+        }
+    }
+}
+
+/// Register the DPI writer adapter (call after `set_backend`).
+pub fn init_dpi_writer() {
+    pattern::set_dpi_writer(Arc::new(BackendDpiWriter));
+}
+
 /// 安全后端抽象 — 驱动模式写 /proc/osec ，eBPF 模式写 BPF maps
 pub trait SecurityBackend: Send + Sync {
     /// 后端是否已初始化可用

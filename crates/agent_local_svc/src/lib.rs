@@ -1,4 +1,6 @@
 pub mod data_hub;
+pub mod policy_file_writer;
+pub mod policy_query_impl;
 
 // Implemented handlers
 pub mod agent_status_impl;
@@ -20,7 +22,8 @@ pub mod stub_handlers;
 
 // Re-exports
 pub use data_hub::{AgentDataHub, AgentMode, AGENT_MODE, require_offline, set_online, set_offline,
-    set_offline_and_check_admission, check_server_reachable, trigger_connectivity_probe, update_token,
+    set_offline_and_check_admission, clear_local_process_policy, check_server_reachable,
+    trigger_connectivity_probe, update_token,
     ADMISSION_MODE, ADMISSION_EFFECTIVE, ADMISSION_DETECTING, ADMISSION_NETWORK_ANOMALY};
 pub use config_impl::ConfigServiceImpl;
 pub use process_policy_impl::ProcessPolicyServiceImpl;
@@ -29,6 +32,7 @@ pub use ip_policy_impl::IpPolicyServiceImpl;
 pub use data_query_impl::DataQueryServiceImpl;
 pub use outreach_detect_impl::OutreachDetectServiceImpl;
 pub use policy_watch_impl::PolicyWatchServiceImpl;
+pub use policy_query_impl::PolicyQueryServiceImpl;
 pub use protection_mode_impl::{ProcessDefenseServiceImpl, PeripheralDefenseServiceImpl};
 pub use admission_impl::AdmissionServiceImpl;
 pub use backend_impl::BackendServiceImpl;

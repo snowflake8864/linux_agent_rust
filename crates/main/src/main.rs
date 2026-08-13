@@ -6,7 +6,7 @@ use kernel_event::{StartKernelHandler, EventHandler,send_data_to_kernel};
 use kernel_module::{LoadKernelDriver, unload_driver, ensure_kernel_hold, DriverBackend};
 #[cfg(feature = "ebpf")]
 use ebpf_backend::{EbpfBackend, capability::EbpfCapability};
-use common::backend::{SecurityBackend, NoopBackend, set_backend};
+use common::backend::{SecurityBackend, NoopBackend, set_backend, init_dpi_writer};
 use common::manager::boot::BootManager;
 use reporter::{AuditLogInfo, StartBashLog};
 use tokio::sync::mpsc;
@@ -120,7 +120,7 @@ async fn main() -> std::io::Result<()> {
     }
 
     // 创建通信通道
-    let (file_audit_log_tx, file_audit_log_rx) = mpsc::channel::<AuditLogInfo>(512);
+    let (file_audit_log_tx, file_audit_log_rx) = mpsc::channel::<AuditLogInfo>(4096);
     reporter::set_audit_log_tx(file_audit_log_tx.clone());
     let (token_tx, token_rx) = mpsc::channel::<String>(8);
     let (host_is_offline_tx, host_is_offline_rx) = mpsc::channel::<bool>(8);
@@ -316,6 +316,20 @@ async fn main() -> std::io::Result<()> {
 
         // 设置全局后端
         set_backend(backend);
+
+        // 注册 DPI writer 适配器，使 PatternRulesMgr 的 DPI 下发走 SecurityBackend
+        init_dpi_writer();
+
+        // 启动时根据配置文件应用自保开关（离线/在线都生效，不依赖 token/服务器）。
+        // 自保走专用 self_protect_dirs + protected_pids，与 DPI dir_policies 完全独立。
+        // 仅 eBPF 模式；driver 模式自保仍走其原有 netlink/驱动逻辑，不受影响。
+        if backend_mode == "ebpf" {
+            let self_protect = cfg.self_protect_switch;
+            if let Err(e) = common::backend::with_backend(|b| b.write_self_protection(self_protect as u32)) {
+                log_warn!("[eBPF] 启动应用自保开关失败: {}", e);
+            }
+        }
+
         let _ = cfg.to_ini(&format!("{}/net_info.ini", cfg.app_path));
 
         // 初始化 ADMISSION 全局变量
@@ -331,6 +345,14 @@ async fn main() -> std::io::Result<()> {
         }
         drop(cfg);
     }
+
+    // 后端就绪后，把启动时从 DB 恢复的进程黑白名单主动下发到内核。
+    // 离线启动（拿不到 token）时服务器不会下发进程策略，若不在此补推，
+    // gRPC 能读到内存里的策略，但内核 proc_rules 为空、不会触发拦截。
+    // 注意：必须在 drop(cfg) 之后调用。apply_loaded_policy_to_kernel 内部会再次
+    // lock NETINFO_CONFIG（检查 [SQLITE_DB]/[DB_POLICY] 开关）；若在 cfg 仍被持有
+    // 的作用域内调用，会自死锁（std::sync::Mutex 不可重入），导致 gRPC 无法启动。
+    process_mgr::POLICY_MANAGER.lock().unwrap().apply_loaded_policy_to_kernel();
 
     // 检查是否为离线模式（配置指定，直接设置，不经过阈值）
     let is_offline = NETINFO_CONFIG.lock().unwrap().is_offline_mode;
