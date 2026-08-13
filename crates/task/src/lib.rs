@@ -1,4 +1,5 @@
 // crates/task/src/lib.rs
+pub mod policy_persistence;
 pub mod task_fetcher;
 pub mod virtual_port_rule;
 pub mod tamper_protect_rule;

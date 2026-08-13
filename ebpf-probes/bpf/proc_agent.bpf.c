@@ -72,6 +72,24 @@ struct {
     __type(value, struct pattern_rule);
 } proc_patterns SEC(".maps");
 
+// Agent PID: used by task_kill hook to allow the agent itself to send
+// signals (e.g. to its own children) while blocking external kill signals.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} agent_pids SEC(".maps");
+
+// Extensible protected PIDs: TGIDs that cannot be killed by external processes.
+// Populated by userspace when self_protect_switch is on.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, __u32);
+    __type(value, __u8);
+} protected_pids SEC(".maps");
+
 // ===== Constants =====
 #define EVENT_PROC 2
 #define EVENT_PROC_UNKNOWN 3  // 不明进程
@@ -147,7 +165,55 @@ static __always_inline __u8 resolve_mode(__u8 rule_mode, __u32 feature_idx) {
     return MODE_MONITOR;
 }
 
-// ===== LSM Hook =====
+// Returns 1 if current process TGID matches the agent PID stored in
+// agent_pids[0]. Used by task_kill to let the agent manage its own
+// children while blocking external kill attempts.
+static __always_inline int is_agent_process() {
+    __u32 key = 0;
+    __u32 *agent_pid = bpf_map_lookup_elem(&agent_pids, &key);
+    if (!agent_pid || *agent_pid == 0) {
+        return 0;
+    }
+    __u32 my_tgid = bpf_get_current_pid_tgid() >> 32;
+    return my_tgid == *agent_pid ? 1 : 0;
+}
+
+// Returns 1 if the given TGID is in the protected_pids set.
+// Self-protection is governed solely by the protected_pids map, populated by
+// userspace when self_protect_switch is on and cleared when it is turned off.
+// This makes the agent killable again once the server disables self-protect.
+static __always_inline int is_protected_pid(__u32 tgid) {
+    __u8 *entry = bpf_map_lookup_elem(&protected_pids, &tgid);
+    return entry != NULL ? 1 : 0;
+}
+
+// ===== LSM Hooks =====
+
+// Protect agent and designated processes from being killed by external processes.
+// Signals 9 (SIGKILL), 15 (SIGTERM), 19 (SIGSTOP) are blocked for protected PIDs
+// unless the sender is the agent process itself.
+SEC("lsm/task_kill")
+int BPF_PROG(enforce_task_kill, struct task_struct *p, struct kernel_siginfo *info, int sig, const struct cred *cred) {
+    // Only block destructive signals
+    if (sig != 9 && sig != 15 && sig != 19) {
+        return 0;
+    }
+
+    // Agent process can send any signal (needed to manage child processes)
+    if (is_agent_process()) {
+        return 0;
+    }
+
+    // Read target TGID
+    __u32 target_tgid = BPF_CORE_READ(p, tgid);
+
+    if (is_protected_pid(target_tgid)) {
+        bpf_printk("[PROC] task_kill BLOCKED: sig=%d target_tgid=%u", sig, target_tgid);
+        return -EPERM;
+    }
+
+    return 0;
+}
 
 SEC("lsm.s/bprm_check_security")
 int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {

@@ -61,6 +61,7 @@ impl DirPolicyService for DirPolicyServiceImpl {
             .collect();
 
         // Write to pattern_mgr (→ /proc/osec/)
+        task::policy_persistence::save_dir_policy(&protect_dirs, true);
         self.pattern_mgr.lock().unwrap().set_protect_dir(protect_dirs);
 
         // Update cache for subsequent GetDirPolicy calls
@@ -105,6 +106,7 @@ impl ExtortPolicyService for ExtortPolicyServiceImpl {
             .collect();
 
         // Write to pattern_mgr (→ /proc/osec/)
+        task::policy_persistence::save_extort_policy(&extort_rules, true);
         self.pattern_mgr.lock().unwrap().set_exiport_dir(extort_rules);
 
         // Update cache

@@ -4,7 +4,7 @@ use std::path::Path;
 use logging::{log_info,log_error};
 use std::fs::OpenOptions;
 use std::io::{Write, Error, ErrorKind};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::GlobalTrustDir;
 
@@ -28,14 +28,14 @@ enum PatternType {
 
 
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct POLICY_EXIPOR_PROTECT {
     pub file_type: String,
     pub typ: u8,
     pub map_comm: HashMap<String, String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct POLICY_PROTECT_DIR {
     pub id: u32,
     pub dir: String,
@@ -264,6 +264,11 @@ impl PatternRulesMgr {
 
     // 清除文件模式
     pub fn clear_file_pattern(&self) -> std::io::Result<()> {
+        if let Some(w) = crate::get_dpi_writer() {
+            w.clear_all();
+            return Ok(());
+        }
+        // Fallback: direct /proc write (no backend registered)
         let mut file = File::create("/proc/osec/dpi/file_patterns")?;
         file.write_all(b"c\n")?;
         Ok(())
@@ -271,6 +276,10 @@ impl PatternRulesMgr {
 
     // 清除 DPI 规则
     pub fn clear_dpi_rules(&self) -> std::io::Result<()> {
+        // clear_all() already handles rules clear in the DPI writer path
+        if crate::get_dpi_writer().is_some() {
+            return Ok(());
+        }
         let mut file = File::create("/proc/osec/dpi/rules")?;
         file.write_all(b"c\n")?;
         Ok(())
@@ -278,6 +287,10 @@ impl PatternRulesMgr {
 
     // 清除进程白名单
     pub fn clear_true_process(&self) {
+        if let Some(w) = crate::get_dpi_writer() {
+            w.clear_all();
+            return;
+        }
         if let Err(e) = File::create("/proc/osec/dpi/true_process_rt").and_then(|mut f| f.write_all(b"c\n")) {
             log_error!("Failed to clear true process: {}", e);
         }
@@ -285,30 +298,60 @@ impl PatternRulesMgr {
 
     // 构建文件模式
     pub fn build_file_pattern(&self) {
+        if let Some(w) = crate::get_dpi_writer() {
+            w.build();
+            return;
+        }
         if let Err(e) = File::create("/proc/osec/dpi/file_patterns").and_then(|mut f| f.write_all(b"b\n")) {
             log_error!("Build file pattern failed: {}", e);
         }
     }
 
-    pub fn add_file_pattern(&mut self, enable: bool) {
-        if !enable {
+    /// 通过 DpiWriter 或直接 /proc/osec 下发一对 pattern + rule。
+    fn write_dpi_pair(pat: &str, rule: &str) {
+        if let Some(w) = crate::get_dpi_writer() {
+            w.write_pair(pat, rule);
             return;
         }
+        // Fallback:直接写 /proc/osec（driver 模式或尚无 backend 时）
+        if !pat.is_empty() {
+            let _ = Self::write_to_proc_file("/proc/osec/dpi/file_patterns", pat);
+        }
+        if !rule.is_empty() {
+            let _ = Self::write_to_proc_file("/proc/osec/dpi/rules", rule);
+        }
+    }
+
+    /// 通过 DpiWriter 或直接 /proc/osec 下发 true_process 数据。
+    fn write_dpi_tp(data: &str) {
+        if data.is_empty() { return; }
+        if let Some(w) = crate::get_dpi_writer() {
+            w.write_true_process(data);
+            return;
+        }
+        let _ = Self::write_to_proc_file("/proc/osec/dpi/true_process_rt", data);
+    }
+
+    pub fn add_file_pattern(&mut self, enable: bool) {
         self.const_file_patterns.clear();
         self.const_file_rules.clear();
 
-        self.const_file_patterns.push_str("name=self_1,key=/var/lib/dpkg/info/osec.\n");
-        self.const_file_rules.push_str("target=self,pattern=self_1,type=3\n");
+        if enable {
+            self.const_file_patterns.push_str("name=self_1,key=/var/lib/dpkg/info/osec.\n");
+            self.const_file_rules.push_str("target=self,pattern=self_1,type=3\n");
 
-        self.const_file_patterns.push_str("name=self_2,key=/opt/osec,pkt_len=-1,case_offset=1\n");
-        self.const_file_rules.push_str("target=self,pattern=self_2,type=3\n");
+            self.const_file_patterns.push_str("name=self_2,key=/opt/osec,pkt_len=-1,case_offset=1\n");
+            self.const_file_rules.push_str("target=self,pattern=self_2,type=3\n");
 
-        self.const_file_patterns.push_str("name=self_3,key=/opt/osec/,case_offset=1\n");
-        self.const_file_rules.push_str("target=self,pattern=self_3,type=3\n");
-        self.const_file_patterns.push_str("name=self_4,key=/etc/systemd/system/multi-user.target.wants/osec.\n");
-        self.const_file_rules.push_str("target=self,pattern=self_4,type=3\n");
-        self.const_file_patterns.push_str("name=self_5,key=/etc/systemd/system/multi-user.target.wants/agent_manager.\n");
-        self.const_file_rules.push_str("target=self,pattern=self_5,type=3\n");
+            self.const_file_patterns.push_str("name=self_3,key=/opt/osec/,case_offset=1\n");
+            self.const_file_rules.push_str("target=self,pattern=self_3,type=3\n");
+            self.const_file_patterns.push_str("name=self_4,key=/etc/systemd/system/multi-user.target.wants/osec.\n");
+            self.const_file_rules.push_str("target=self,pattern=self_4,type=3\n");
+            self.const_file_patterns.push_str("name=self_5,key=/etc/systemd/system/multi-user.target.wants/agent_manager.\n");
+            self.const_file_rules.push_str("target=self,pattern=self_5,type=3\n");
+        }
+        // enable 时写入自保目录保护规则；disable 时清空 const 规则并重建，
+        // 让 eBPF dir_policies / driver /proc/osec/dpi 中的自保目录保护被移除。
         self.set_pattern_rules();
     }
 
@@ -558,48 +601,28 @@ impl PatternRulesMgr {
         self.set_pattern_rules();
     }
 
-    // 加载规则到内核
+    // 加载规则到内核（通过 SecurityBackend 或直接 /proc/osec fallback）
     pub fn load_pattern_rules(&self) {
-        if !self.const_file_patterns.is_empty() {
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/file_patterns", &self.const_file_patterns);
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/rules", &self.const_file_rules);
-        }
-        if !self.global_trust_dir_patterns.is_empty() {
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/file_patterns", &self.global_trust_dir_patterns);
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/rules", &self.global_trust_dir_rules);
-        }
-        if !self.exiport_dir_patterns.is_empty() {
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/file_patterns", &self.exiport_dir_patterns);
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/rules", &self.exiport_dir_rules);
-        }
-        if !self.protect_dir_patterns.is_empty() {
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/file_patterns", &self.protect_dir_patterns);
-        }
-        if !self.protect_dir_rules.is_empty() {
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/rules", &self.protect_dir_rules);
-        }
-        if !self.protect_dir_white_patterns.is_empty() {
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/file_patterns", &self.protect_dir_white_patterns);
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/rules", &self.protect_dir_white_rules);
-        }
+        Self::write_dpi_pair(&self.const_file_patterns, &self.const_file_rules);
+        Self::write_dpi_pair(&self.global_trust_dir_patterns, &self.global_trust_dir_rules);
+        Self::write_dpi_pair(&self.exiport_dir_patterns, &self.exiport_dir_rules);
+        Self::write_dpi_pair(&self.protect_dir_patterns, &self.protect_dir_rules);
+        Self::write_dpi_pair(&self.protect_dir_white_patterns, &self.protect_dir_white_rules);
         if !self.protect_dir_include_exe_patterns.is_empty() {
             log_info!("===protect_dir_include_exe_patterns:{}", self.protect_dir_include_exe_patterns);
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/file_patterns", &self.protect_dir_include_exe_patterns);
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/rules", &self.protect_dir_include_exe_rules);
         }
-        if !self.protect_dir_exclude_exe_patterns.is_empty() {
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/file_patterns", &self.protect_dir_exclude_exe_patterns);
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/rules", &self.protect_dir_exclude_exe_rules);
-        }
+        Self::write_dpi_pair(&self.protect_dir_include_exe_patterns, &self.protect_dir_include_exe_rules);
+        Self::write_dpi_pair(&self.protect_dir_exclude_exe_patterns, &self.protect_dir_exclude_exe_rules);
+
         if !self.protect_true_process.is_empty() {
             log_info!("00=====================================================true process [{:?}]", self.protect_true_process);
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/true_process_rt", &self.protect_true_process);
         }
-        if !self.exiport_true_process.is_empty() {
+        Self::write_dpi_tp(&self.protect_true_process);
 
+        if !self.exiport_true_process.is_empty() {
             log_info!("=====================================================true process [{:?}]", self.exiport_true_process);
-            let _ = Self::write_to_proc_file("/proc/osec/dpi/true_process_rt", &self.exiport_true_process);
         }
+        Self::write_dpi_tp(&self.exiport_true_process);
 
         self.build_file_pattern();
     }

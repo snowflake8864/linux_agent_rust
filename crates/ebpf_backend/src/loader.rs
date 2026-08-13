@@ -129,6 +129,18 @@ impl ModularLoader {
             warn!("[EbpfBackend] ⚠ 未找到程序: enforce_bprm_check_security");
         }
 
+        // task_kill hook: prevent protected processes (agent + designated PIDs)
+        // from being killed by external processes
+        if let Some(prog) = bpf.program_mut("enforce_task_kill") {
+            info!("[EbpfBackend] 🔌 加载 LSM: task_kill (防杀保护)...");
+            let lsm: &mut Lsm = prog.try_into()?;
+            lsm.load("task_kill", &btf)?;
+            lsm.attach()?;
+            info!("[EbpfBackend] ✅ LSM attached: task_kill ← 保护进程不被 kill");
+        } else {
+            warn!("[EbpfBackend] ⚠ 未找到程序: enforce_task_kill");
+        }
+
         Ok(())
     }
 
@@ -152,20 +164,28 @@ impl ModularLoader {
                 }
             }
 
-            // TC egress (packet modification)
+            // TC egress (回程流量识别/改写)。挂在网桥（如 br0）等接口上可能因
+            // clsact qdisc 无法建立而失败（内核返回 ENOENT）——与 cgroup connect4
+            // 一样降级为警告，不阻断 XDP/进程/文件功能。
             if let Some(prog) = bpf.program_mut("tc_packet_filter") {
                 info!("[EbpfBackend] 🔌 加载 TC egress: tc_packet_filter on {}...", interface);
-                // 先清理旧 clsact（移除残留的 tc filter），再重建
-                let _ = std::process::Command::new("tc")
-                    .args(["qdisc", "del", "dev", interface, "clsact"])
-                    .output();
-                let _ = std::process::Command::new("tc")
-                    .args(["qdisc", "add", "dev", interface, "clsact"])
-                    .output();
-                let tc: &mut SchedClassifier = prog.try_into()?;
-                tc.load()?;
-                tc.attach(interface, TcAttachType::Egress)?;
-                info!("[EbpfBackend] ✅ TC Egress attached: tc_packet_filter -> {}", interface);
+                let tc_result = (|| -> anyhow::Result<()> {
+                    // 先清理旧 clsact（移除残留的 tc filter），再重建
+                    let _ = std::process::Command::new("tc")
+                        .args(["qdisc", "del", "dev", interface, "clsact"])
+                        .output();
+                    let _ = std::process::Command::new("tc")
+                        .args(["qdisc", "add", "dev", interface, "clsact"])
+                        .output();
+                    let tc: &mut SchedClassifier = prog.try_into()?;
+                    tc.load()?;
+                    tc.attach(interface, TcAttachType::Egress)?;
+                    Ok(())
+                })();
+                match tc_result {
+                    Ok(()) => info!("[EbpfBackend] ✅ TC Egress attached: tc_packet_filter -> {}", interface),
+                    Err(e) => warn!("[EbpfBackend] ⚠ TC Egress 挂载失败（非致命，XDP 仍生效）: {}", e),
+                }
             } else {
                 warn!("[EbpfBackend] ⚠ 未找到程序: tc_packet_filter");
             }
@@ -228,6 +248,18 @@ impl ModularLoader {
         Ok(())
     }
 
+    /// 写入 agent PID 到 agent_pids map，让自保规则放行 agent 自身的文件操作
+    pub fn set_agent_pid(bpf: &mut Bpf, pid: u32) -> anyhow::Result<()> {
+        let map = match bpf.map_mut("agent_pids") {
+            Some(m) => m,
+            None => { info!("[EbpfBackend] agent_pids map 不存在，跳过"); return Ok(()); }
+        };
+        let mut arr: Array<_, u32> = Array::try_from(map)?;
+        arr.set(0, pid, 0)?;
+        info!("[EbpfBackend] ✅ agent_pids[0] = {} (agent PID 已写入，自保规则将放行本进程)", pid);
+        Ok(())
+    }
+
     /// 启用/禁用 eBPF 模块的 feature_switches
     /// feature_idx: 0=FILE, 1=PROC, 2=NET
     pub fn enable_feature(bpf: &mut Bpf, feature_idx: u32, enabled: bool) -> anyhow::Result<()> {
@@ -242,6 +274,34 @@ impl ModularLoader {
         let val: u8 = if enabled { 1 } else { 0 };
         arr.set(feature_idx, val, 0)?;
         info!("[EbpfBackend] ✅ feature_switches[{}] = {}", feature_idx, val);
+        Ok(())
+    }
+
+    /// 添加受保护 PID（防 kill），用于扩展自保规则。
+    /// pid: TGID 值
+    pub fn add_protected_pid(bpf: &mut Bpf, pid: u32) -> anyhow::Result<()> {
+        use aya::maps::HashMap;
+        let map = match bpf.map_mut("protected_pids") {
+            Some(m) => m,
+            None => { info!("[EbpfBackend] protected_pids map 不存在，跳过"); return Ok(()); }
+        };
+        let mut hash: HashMap<_, u32, u8> = HashMap::try_from(map)?;
+        let val: u8 = 1;
+        hash.insert(pid, val, 0)?;
+        info!("[EbpfBackend] ✅ protected_pids[{}] 已添加（防 kill）", pid);
+        Ok(())
+    }
+
+    /// 移除受保护 PID
+    pub fn remove_protected_pid(bpf: &mut Bpf, pid: u32) -> anyhow::Result<()> {
+        use aya::maps::HashMap;
+        let map = match bpf.map_mut("protected_pids") {
+            Some(m) => m,
+            None => { info!("[EbpfBackend] protected_pids map 不存在，跳过"); return Ok(()); }
+        };
+        let mut hash: HashMap<_, u32, u8> = HashMap::try_from(map)?;
+        hash.remove(&pid)?;
+        info!("[EbpfBackend] ✅ protected_pids[{}] 已移除", pid);
         Ok(())
     }
 

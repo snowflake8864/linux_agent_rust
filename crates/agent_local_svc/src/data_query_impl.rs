@@ -166,40 +166,58 @@ impl DataQueryService for DataQueryServiceImpl {
 
     async fn get_executable_list(
         &self,
-        _request: Request<ProcessFilter>,
+        request: Request<ProcessFilter>,
     ) -> Result<Response<ExecutableList>, Status> {
-        let processes = self
-            .data_hub
-            .get_process_list()
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let filter_status = request.into_inner().filter_status;
 
-        let white_hashes: std::collections::HashSet<String> =
+        // 扫描系统可执行文件目录（/bin /usr/bin /usr/sbin /usr/local/bin /usr/lib/systemd），
+        // 仅保留 ELF 文件。total = 去重前文件数，unique = 按 MD5 去重后数量。
+        let files = procinfo::scan_executable_files();
+        let total = files.len() as i32;
+
+        // 按 MD5 去重（/bin 常软链到 /usr/bin，会产生同 MD5 的重复路径）
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut deduped: Vec<(String, String)> = Vec::new();
+        for (path, md5) in files {
+            if seen.insert(md5.clone()) {
+                deduped.push((path, md5));
+            }
+        }
+        let unique = deduped.len() as i32;
+
+        let white_hashes: HashSet<String> =
             self.data_hub.get_process_policy(true).into_iter().collect();
-        let black_hashes: std::collections::HashSet<String> =
+        let black_hashes: HashSet<String> =
             self.data_hub.get_process_policy(false).into_iter().collect();
 
-        let mut executables: Vec<ExecutableInfo> = processes
+        let mut executables: Vec<ExecutableInfo> = deduped
             .into_iter()
-            .map(|p| {
-                let policy_status = if black_hashes.contains(&p.hash) {
+            .map(|(path, hash)| {
+                let policy_status = if black_hashes.contains(&hash) {
                     PolicyStatus::PolicyBlacklist
-                } else if white_hashes.contains(&p.hash) {
+                } else if white_hashes.contains(&hash) {
                     PolicyStatus::PolicyWhitelist
                 } else {
                     PolicyStatus::PolicyNone
                 };
                 ExecutableInfo {
-                    path: p.exe_path,
-                    hash: p.hash,
+                    path,
+                    hash,
                     policy_status: policy_status as i32,
                 }
             })
             .collect();
 
-        // Deduplicate by path (keep first occurrence)
-        let mut seen = std::collections::HashSet::new();
-        executables.retain(|e| seen.insert(e.path.clone()));
+        // filter_status: 0=全部(默认), 1=白名单, 2=黑名单, 3=未知(未在名单中)
+        if filter_status != 0 {
+            let target: i32 = if filter_status == 3 {
+                PolicyStatus::PolicyNone as i32
+            } else {
+                filter_status
+            };
+            executables.retain(|e| e.policy_status == target);
+        }
 
-        Ok(Response::new(ExecutableList { executables, total: 0, unique: 0 }))
+        Ok(Response::new(ExecutableList { executables, total, unique }))
     }
 }

@@ -154,6 +154,20 @@ fn ip_str_to_u32(ip: &str) -> Result<u32, String> {
     let parsed = ip.parse::<Ipv4Addr>().map_err(|e| e.to_string())?;
     Ok(u32::from_be_bytes(parsed.octets()))
 }
+
+/// eBPF 模式下应用防 kill 自保开关（写 proc_agent 的 protected_pids map）。
+/// driver 模式的自保防 kill 走 netlink 0x103，不经过此函数；这里仅对 eBPF
+/// 后端生效，避免影响 driver 模式现有行为。
+fn apply_self_protect_antikill(enable: bool) -> Result<(), String> {
+    let is_ebpf = common::backend::get_backend()
+        .map(|b| b.name() == "ebpf")
+        .unwrap_or(false);
+    if is_ebpf {
+        common::backend::with_backend(|b| b.write_self_protection(enable as u32))?;
+    }
+    Ok(())
+}
+
 /// 独立的配置差异应用函数：将 old→new 的开关变化下发到内核/BPF。
 /// driver 模式：通过 netlink + /proc/osec 下发
 /// eBPF  模式：通过 SecurityBackend trait（BPF maps）+ sync_switches 下发
@@ -170,6 +184,8 @@ pub fn apply_config_diff(old: &NetInfoConfig, new: &NetInfoConfig) -> Result<(),
                 let mut pattern_mgr = mgr.lock().map_err(|e| e.to_string())?;
                 pattern_mgr.add_file_pattern(new.self_protect_switch);
             }
+            // eBPF 模式：防 kill（protected_pids）；driver 模式走 netlink 0x103
+            apply_self_protect_antikill(new.self_protect_switch)?;
             if let Some(sock_guard) = GLOBAL_NL_SOCK.get() {
                 let sock = sock_guard.lock().unwrap();
                 if let Some(ref s) = *sock {
@@ -387,6 +403,15 @@ impl TaskFetcher {
         GLOBAL_NL_SOCK.set(Mutex::new(nl_sock.clone())).ok();
         GLOBAL_PATTERN_MGR.set(pattern_mgr.clone()).ok();
 
+        // 启动时从 DB 恢复服务器下发策略（防篡改目录/勒索后缀/信任目录）。
+        // 离线模式读 *_local 表，在线模式读在线基线表，表为空时保持现状。
+        // 必须在 GLOBAL_PATTERN_MGR 注册之后执行（main.rs 已 set_backend + init_dpi_writer）。
+        let restore_local = config::net_info::NETINFO_CONFIG
+            .lock()
+            .map(|c| c.is_offline_mode)
+            .unwrap_or(false);
+        crate::policy_persistence::restore_policies_from_db(restore_local);
+
         TaskFetcher {
             base_url: base_url.to_string(),
             token,
@@ -535,6 +560,7 @@ impl TaskFetcher {
         if !cfg.mod_ver.is_empty() {
             let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
             pattern_mgr.add_file_pattern(cfg.self_protect_switch);
+            apply_self_protect_antikill(cfg.self_protect_switch)?;
             self.write_net_rule(NetRule::SelfProtect(cfg.self_protect_switch as u32))?;
         }
     }
@@ -709,6 +735,7 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
         if driver_ready {
             let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
             pattern_mgr.add_file_pattern(new.self_protect_switch);
+            apply_self_protect_antikill(new.self_protect_switch)?;
             self.nl_sock.as_ref()
                 .ok_or("Netlink socket not initialized".to_string())?
                 .send_uint32(0x103, new.self_protect_switch as u32)
@@ -1301,7 +1328,8 @@ async fn task_down_dir_policy(&self, task_type: u64) -> Result<(), String> {
             if parsed["code"] == "000000" {
                 //                    log_info!("{}", parsed["data"]);
                 let rules = pattern_rules_mgr::PatternRulesMgr::parse_policy_from_json(&parsed["data"])?;
-                //if (rules.len() > 0) 
+                crate::policy_persistence::save_dir_policy(&rules, false);
+                //if (rules.len() > 0)
                 {
                     let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
                     pattern_mgr.set_protect_dir(rules);
@@ -1811,6 +1839,7 @@ async fn task_down_extort(&self, task_type: u64) -> Result<(), String> {
 
             if parsed["code"] == "000000" {
                 let rules = pattern_rules_mgr::PatternRulesMgr::parse_exipor_policy_from_json(&parsed["data"])?;
+                crate::policy_persistence::save_extort_policy(&rules, false);
                 let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
                 pattern_mgr.set_exiport_dir(rules);
 
@@ -2235,6 +2264,7 @@ async fn task_global_dir(&self,task_type: u64) -> Result<(), String> {
                     *TRUST_DIR_CACHE.lock().unwrap() = proto_dirs;
                     notify_policy_change(PolicyChangeType::TrustDirChanged);
                 }
+                crate::policy_persistence::save_trust_dir(&trust_dirs, false);
                 let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
                 pattern_mgr.set_global_trust_dir(trust_dirs);
             } else {
