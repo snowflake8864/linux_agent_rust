@@ -77,6 +77,7 @@ impl NetClient {
             .post(url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
+            .header("Accept-Encoding", "gzip")
             .timeout(timeout)
             .body(json_data.to_string());
 
@@ -270,6 +271,7 @@ impl NetClient {
         token: Option<&str>,
     ) -> Result<Vec<u8>, String> {
         let mut request = self.client.get(url)
+            .header("Accept-Encoding", "identity")
             .timeout(timeout);
 
         // 如果有 token，加入 Header

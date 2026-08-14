@@ -65,9 +65,9 @@ const PROCESS_PATTERNS: &[ProcessPattern] = &[
     ProcessPattern { key: "/systemd", typ: 1, param: ",pkt_len=-1" },
     ProcessPattern { key: "lsof", typ: 1, param: ",pkt_len=-1" },
     ProcessPattern { key: "awk", typ: 1, param: ",pkt_len=-1" },
-    ProcessPattern { key: "/bin/tc", typ: 1, param: ",pkt_len=-1" },
-    ProcessPattern { key: "/sbin/tc", typ: 1, param: ",pkt_len=-1" },
+    ProcessPattern { key: "bin/tc", typ: 1, param: ",pkt_len=-1" },
     ProcessPattern { key: "/opt/osec/MagicArmorAgent", typ: 0, param: ",match_full_path=1" },
+    ProcessPattern { key: "/opt/terminal_agent/terminal_agent_qt5", typ: 0, param: ",match_full_path=1" },
 ];
 
 // 主管理器结构体

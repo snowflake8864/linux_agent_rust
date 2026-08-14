@@ -1,6 +1,7 @@
 use aya::maps::HashMap as AyaHashMap;
 use aya::maps::RingBuf;
 use log::{info, warn};
+use logging::log_info;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -490,11 +491,13 @@ impl EbpfBackend {
     /// 上报进程告警（拦截: n_type=1101, 监控: n_type=1001）
     fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_type: u16, action: &str) {
         let md5_hash = self.get_md5_cached(path);
+        // level 由事件自身的 blocked 状态决定（n_type>=1100 即被拦截），
+        // 不依赖 self.proc_protect：该字段仅在构造时赋值，运行时切保护模式不会同步更新，会导致误报 level。
         let log = reporter::AuditLogInfo {
             file_path: Some(path.to_string()),
-            md5: md5_hash,
+            md5: md5_hash.clone(),
             n_type,
-            n_level: if n_type >= 1100 { if self.proc_protect { 3 } else { 2 } } else { 2 },
+            n_level: if n_type >= 1100 { 3 } else { 2 },
             n_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             rename_dir: None,
@@ -505,6 +508,26 @@ impl EbpfBackend {
         };
         reporter::broadcast_audit_log(&log);   // gRPC 推送
         reporter::send_to_http_upload(&log);    // HTTP 上报到服务器
+
+        // 不明进程（监控 1001 / 保护 1101）额外上报 /v1/autouploadprocess，与 driver 模式对齐
+        if matches!(n_type, 1001 | 1101) {
+            reporter::send_to_autoupload_process(&reporter::AuditProcess {
+                n_time: 0,
+                str_name: String::new(),
+                str_vendor: String::new(),
+                str_package: String::new(),
+                n_process_id: event.pid,
+                n_parent_id: 0,
+                n_priority: 0,
+                n_thread_count: 0,
+                n_working_set_size: 0,
+                str_start_time: String::new(),
+                str_executable_path: path.to_string(),
+                str_user: reporter::get_user_name(event.uid),
+                hash: md5_hash.unwrap_or_default(),
+                map_depends: vec![],
+            });
+        }
     }
 
     /// 上报文件告警
@@ -514,7 +537,7 @@ impl EbpfBackend {
             file_path: Some(path.to_string()),
             md5: md5_hash,
             n_type,
-            n_level: if n_type >= 3100 { if self.file_protect { 3 } else { 2 } } else { 2 },
+            n_level: if action == "拦截" { 3 } else { 2 },
             n_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             rename_dir: None,
@@ -575,10 +598,13 @@ impl EbpfBackend {
     fn commit_proc_whitelist_bpf(&self) {
         let text = self.proc_pat_buffer.lock().unwrap().clone();
         if text.trim().is_empty() {
+            log_info!("[EbpfBackend] 信任进程白名单: proc_pat_buffer 为空，跳过下发");
             return;
         }
 
         let search_dirs = self.trusted_process_search_dirs();
+        log_info!("[EbpfBackend] 信任进程白名单: 开始解析 {} 行, search_dirs={:?}",
+            text.lines().count(), search_dirs);
         let mut keys: Vec<ProcKey> = Vec::new();
         let mut seen = std::collections::HashSet::<(u64, u64)>::new();
 
@@ -594,10 +620,15 @@ impl EbpfBackend {
 
             if full_path {
                 // match_full_path=1：key 是完整路径，直接 stat
-                if let Some(dk) = stat_path_to_proc_key(key) {
-                    if seen.insert((dk.dev, dk.inode)) {
-                        keys.push(dk);
+                match stat_path_to_proc_key(key) {
+                    Some(dk) => {
+                        if seen.insert((dk.dev, dk.inode)) {
+                            log_info!("[EbpfBackend] 信任进程白名单 ✅ {} (full) -> dev={} inode={}",
+                                key, dk.dev, dk.inode);
+                            keys.push(dk);
+                        }
                     }
+                    None => log_info!("[EbpfBackend] 信任进程白名单 ⚠️ {} (full) 未解析到 dev/inode（文件不存在或非普通文件）", key),
                 }
             } else {
                 // 子串/裸名：取 basename，在 $PATH + 系统目录中搜索
@@ -605,13 +636,20 @@ impl EbpfBackend {
                 if basename.is_empty() {
                     continue;
                 }
+                let mut hit = false;
                 for dir in &search_dirs {
                     let cand = format!("{}/{}", dir, basename);
                     if let Some(dk) = stat_path_to_proc_key(&cand) {
                         if seen.insert((dk.dev, dk.inode)) {
+                            log_info!("[EbpfBackend] 信任进程白名单 ✅ {} (basename={}) -> {} dev={} inode={}",
+                                key, basename, cand, dk.dev, dk.inode);
                             keys.push(dk);
                         }
+                        hit = true;
                     }
+                }
+                if !hit {
+                    log_info!("[EbpfBackend] 信任进程白名单 ⚠️ {} (basename={}) 在 search_dirs 中未找到", key, basename);
                 }
             }
         }
@@ -631,7 +669,7 @@ impl EbpfBackend {
             }
         }
         *self.active_proc_whitelist.lock().unwrap() = tracked;
-        info!("[EbpfBackend] 🛡️ 信任进程白名单: 解析 {} 条, 写入 proc_rules {} 条", keys.len(), written);
+        log_info!("[EbpfBackend] 🛡️ 信任进程白名单: 解析 {} 条, 写入 proc_rules {} 条", keys.len(), written);
     }
 
     /// 信任进程搜索目录：$PATH + 常见系统目录（去重）。
@@ -922,7 +960,7 @@ impl SecurityBackend for EbpfBackend {
                 // md5_map 尚未包含此 hash，暂存到 pending_rules，等扫描填充后补写
                 self.pending_rules.lock().unwrap().insert(hash.to_string(), action);
                 pending += 1;
-                log::warn!("[EbpfBackend] hash {} 不在 md5_map 中，暂存为待下发规则 (action={})", hash, action);
+                //log::warn!("[EbpfBackend] hash {} 不在 md5_map 中，暂存为待下发规则 (action={})", hash, action);
             }
         }
 
@@ -931,7 +969,7 @@ impl SecurityBackend for EbpfBackend {
         if is_white { cache.0 = self.extract_hashes(data); }
         else { cache.1 = self.extract_hashes(data); }
 
-        log::info!("[EbpfBackend] add_md5_rules: 已下发 {} 条, 待扫描 {} 条", applied, pending);
+        //log::info!("[EbpfBackend] add_md5_rules: 已下发 {} 条, 待扫描 {} 条", applied, pending);
         Ok(())
     }
 
@@ -1026,6 +1064,8 @@ impl SecurityBackend for EbpfBackend {
     }
 
     fn write_process_dpi_patterns(&self, data: &str, clear: bool, build: bool) -> Result<(), String> {
+        log_info!("[EbpfBackend] write_process_dpi_patterns: clear={} build={} data_len={}",
+            clear, build, data.len());
         if clear {
             self.proc_pat_buffer.lock().unwrap().clear();
             self.clear_proc_whitelist_bpf();

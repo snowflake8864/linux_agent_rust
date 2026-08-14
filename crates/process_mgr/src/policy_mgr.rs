@@ -25,9 +25,9 @@ impl ProcessPolicyManager {
     }
 
     fn add_md5_rules(data: &str) {
-        log_info!("[process_policy] >>> add_md5_rules raw='{}'", data.trim_end());
+        //log_info!("[process_policy] >>> add_md5_rules raw='{}'", data.trim_end());
         match common::backend::with_backend(|b| b.add_md5_rules(data)) {
-            Ok(()) => log_info!("[process_policy] ✅ add_md5_rules: 已写入内核"),
+            Ok(()) => {/*log_info!("[process_policy] ✅ add_md5_rules: 已写入内核")*/},
             Err(e) => log_error!("[process_policy] ❌ add_md5_rules 失败: {}", e),
         }
     }

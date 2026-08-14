@@ -133,7 +133,7 @@ pub async fn check_server_reachable() -> bool {
 
     let url = format!("{}/v1/getinfo", base_url);
 
-    match net_client.post_data_async(&url, "", tokio::time::Duration::from_secs(10), token_str).await {
+    match net_client.post_data_async_with_retry(&url, "", tokio::time::Duration::from_secs(30), token_str, 3).await {
         Ok(resp) => {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp) {
                 let reachable = parsed["code"].as_str() == Some("000000");

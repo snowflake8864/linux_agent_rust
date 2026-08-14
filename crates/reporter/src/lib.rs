@@ -11,7 +11,7 @@ pub mod self_protect;
 pub mod netlink_msg;
 pub mod net_service_log;
 pub mod log_worker;
-pub use log_worker::StartBashLog;
+pub use log_worker::{StartBashLog, StartAutoProcess};
 
 /// 全局 mpsc 发送端：用于将告警推送到 log_worker → HTTP /v1/alertupload
 pub static AUDIT_LOG_TX: OnceLock<Mutex<Option<mpsc::Sender<AuditLogInfo>>>> = OnceLock::new();
@@ -19,6 +19,29 @@ pub static AUDIT_LOG_TX: OnceLock<Mutex<Option<mpsc::Sender<AuditLogInfo>>>> = O
 /// 由 main.rs 初始化：注册 mpsc sender 以供 eBPF 等后端上报告警
 pub fn set_audit_log_tx(tx: mpsc::Sender<AuditLogInfo>) {
     let _ = AUDIT_LOG_TX.set(Mutex::new(Some(tx)));
+}
+
+/// 全局 mpsc 发送端：用于将不明进程推送到 auto_process_worker → HTTP /v1/autouploadprocess
+pub static AUTO_PROCESS_TX: OnceLock<Mutex<Option<mpsc::Sender<AuditProcess>>>> = OnceLock::new();
+
+/// 由 main.rs 初始化：注册 autouploadprocess 上报 sender
+pub fn set_auto_process_tx(tx: mpsc::Sender<AuditProcess>) {
+    let _ = AUTO_PROCESS_TX.set(Mutex::new(Some(tx)));
+}
+
+/// eBPF 等后端调用：将不明进程信息送入 autouploadprocess 上报队列
+pub fn send_to_autoupload_process(proc: &AuditProcess) {
+    if let Some(mutex) = AUTO_PROCESS_TX.get() {
+        if let Ok(guard) = mutex.lock() {
+            if let Some(ref tx) = *guard {
+                if let Err(e) = tx.try_send(proc.clone()) {
+                    if matches!(e, mpsc::error::TrySendError::Closed(_)) {
+                        log_error!("[上报] ❌ autouploadprocess 通道已关闭");
+                    }
+                }
+            }
+        }
+    }
 }
 pub mod build_json;
 pub use build_json::{build_alert_log_json,build_auto_process_list_json,build_batch_process_edr_json, build_open_port_json, build_dns_log_json, build_self_protect_alert_log_json};
@@ -224,7 +247,7 @@ pub struct EdrProcessLog {
     pub log_type: i32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AuditProcess {
     pub n_time: i64,
     pub str_name: String,

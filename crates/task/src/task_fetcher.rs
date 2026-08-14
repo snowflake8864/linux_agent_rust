@@ -1488,8 +1488,10 @@ pub async fn task_down_white(&self, task_type: u64) -> Result<(), String> {
 
     let token = self.get_token();
     let token_str = token.as_ref().map(|s| s.as_str()); // 转换为 Option<&str>
-    match self.net_client.post_data_async(&url, "", Duration::from_secs(30), token_str).await {
+    log_info!("==============url:{},token{:?}", url, token_str);                                                        
+    match self.net_client.post_data_async(&url, "", Duration::from_secs(120), token_str).await {
         Ok(response) => {
+            //log_info!("[task_down_white] 服务器原始响应: {}", response);
             let parsed: Value = match serde_json::from_str(&response) {
                 Ok(parsed) => parsed,
                 Err(e) => {
@@ -1507,12 +1509,16 @@ pub async fn task_down_white(&self, task_type: u64) -> Result<(), String> {
                     .collect::<Vec<String>>();
 
                 if hash_list.is_empty() {
+                    log_error!("[task_down_white] proclist 为空或字段不是 hash，原始响应: {}", response);
                     return Err("No hashes found in the response".to_string());
                 }
 
                 let mut mgr = POLICY_MANAGER.lock().unwrap();
                 mgr.set_policy_process(&hash_list, true, Some(false));
-                //println!("hash_list:{:?}",hash_list);
+                log_info!("[task_down_white] 白名单 {} 条已写入内存", hash_list.len());
+            } else {
+                log_error!("[task_down_white] 响应 code != 000000: code={}", parsed["code"]);
+                return Err("Invalid response code.".to_string());
             }
         }
         Err(err) => {
