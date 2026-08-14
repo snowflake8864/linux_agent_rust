@@ -8,7 +8,7 @@ use kernel_module::{LoadKernelDriver, unload_driver, ensure_kernel_hold, DriverB
 use ebpf_backend::{EbpfBackend, capability::EbpfCapability};
 use common::backend::{SecurityBackend, NoopBackend, set_backend, init_dpi_writer};
 use common::manager::boot::BootManager;
-use reporter::{AuditLogInfo, StartBashLog};
+use reporter::{AuditLogInfo, AuditProcess, StartBashLog, StartAutoProcess};
 use tokio::sync::mpsc;
 use logging::{log_info, CustomLogger, log_error, log_warn};
 use netlink::netlink::NlSockInfo;
@@ -122,6 +122,8 @@ async fn main() -> std::io::Result<()> {
     // 创建通信通道
     let (file_audit_log_tx, file_audit_log_rx) = mpsc::channel::<AuditLogInfo>(4096);
     reporter::set_audit_log_tx(file_audit_log_tx.clone());
+    let (auto_process_tx, auto_process_rx) = mpsc::channel::<AuditProcess>(4096);
+    reporter::set_auto_process_tx(auto_process_tx.clone());
     let (token_tx, token_rx) = mpsc::channel::<String>(8);
     let (host_is_offline_tx, host_is_offline_rx) = mpsc::channel::<bool>(8);
 
@@ -172,6 +174,13 @@ async fn main() -> std::io::Result<()> {
                     log_error!("EbpfBackend 创建失败: {}", e);
                     std::process::exit(1);
                 }));
+
+                // 在 attach LSM + 开启保护模式之前，先把信任进程白名单下发到 proc_rules。
+                // 否则保护模式一开、白名单还没写入，agent 自身调用的 /usr/sbin/tc 等信任进程会被拦截。
+                // 此时 BPF maps 已由 EbpfBackend::new() 创建（proc_rules 已存在），可安全写入。
+                set_backend(ebpf.clone());
+                init_dpi_writer();
+                pattern::process_pattern_rules_mgr::PROCESS_PATTERN_RULES_MGR.lock().init();
 
                 if let Err(e) = ebpf.init() {
                     log_error!("[eBPF] ❌ EbpfBackend 初始化失败: {}", e);
@@ -268,6 +277,10 @@ async fn main() -> std::io::Result<()> {
                             ) {
                                 Ok(raw_ebpf) => {
                                     let ebpf = Arc::new(raw_ebpf);
+                                    // 保护模式生效前先下发信任进程白名单（同主 eBPF 分支）
+                                    set_backend(ebpf.clone());
+                                    init_dpi_writer();
+                                    pattern::process_pattern_rules_mgr::PROCESS_PATTERN_RULES_MGR.lock().init();
                                     if let Err(e) = ebpf.init() {
                                         log_error!("EbpfBackend fallback init 失败: {}", e);
                                         log_warn!("eBPF 初始化失败，以空后端模式继续运行");
@@ -407,6 +420,18 @@ async fn main() -> std::io::Result<()> {
                 .await
                 .map_err(|e| {
                     logging::log_error!("start_log_services 失败: {}", e);
+                    std::io::Error::new(std::io::ErrorKind::Other, e)
+                })
+        }
+    });
+
+    let auto_process_handle = tokio::spawn({
+        let mut init = init.clone();
+        async move {
+            init.start_auto_process_services(auto_process_rx)
+                .await
+                .map_err(|e| {
+                    logging::log_error!("start_auto_process_services 失败: {}", e);
                     std::io::Error::new(std::io::ErrorKind::Other, e)
                 })
         }

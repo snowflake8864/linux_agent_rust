@@ -130,7 +130,7 @@ where
 {
     match BACKEND.get() {
         Some(b) => {
-            log::info!("[with_backend] backend={} calling...", b.name());
+            //log::info!("[with_backend] backend={} calling...", b.name());
             f(b.as_ref())
         }
         None => {

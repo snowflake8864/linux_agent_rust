@@ -4,8 +4,8 @@ use common::
 use std::future::Future;
 use tokio::time::{interval, Duration};
 use tokio::sync::mpsc;
-use crate::AuditLogInfo;
-use crate::build_alert_log_json;
+use crate::{AuditLogInfo, AuditProcess};
+use crate::{build_alert_log_json, build_auto_process_list_json};
 use logging::{log_info,log_error};
 use net_client::core::NetClient;
 use std::sync::atomic::Ordering;
@@ -124,6 +124,90 @@ impl StartBashLog for BootManager {
             }
 
             Ok("后台告警任务正常退出".to_string())
+        })
+    }
+}
+
+/// 不明进程 autouploadprocess 上报任务（eBPF 模式使用，driver 模式由 process_audit 直接上报）。
+/// 与 start_log_services 对称：批量缓冲，定时 + 关闭时 flush，POST /v1/autouploadprocess。
+pub trait StartAutoProcess {
+    fn start_auto_process_services(
+        &mut self,
+        auto_process_rx: mpsc::Receiver<AuditProcess>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
+}
+
+impl StartAutoProcess for BootManager {
+    fn start_auto_process_services(
+        &mut self,
+        mut auto_process_rx: mpsc::Receiver<AuditProcess>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        Box::pin(async move {
+            let mut buffer: Vec<AuditProcess> = Vec::new();
+            let mut interval = interval(Duration::from_secs(5));
+            let base_url = self.get_base_url();
+            let net_client = match NetClient::new(Some(base_url), true) {
+                Ok(client) => client,
+                Err(err) => {
+                    eprintln!("创建 NetClient 失败: {}", err);
+                    return Err("创建 NetClient 失败".to_string());
+                }
+            };
+            let url = format!("{}/v1/autouploadprocess", net_client.get_base_url().unwrap_or_default());
+
+            loop {
+                tokio::select! {
+                    result = auto_process_rx.recv() => {
+                        match result {
+                            Some(proc) => buffer.push(proc),
+                            None => {
+                                log_error!("auto_process_rx 通道已关闭，退出任务。");
+                                break;
+                            }
+                        }
+                    }
+                    _ = interval.tick() => {
+                        if buffer.is_empty() {
+                            continue;
+                        }
+                        // 离线时不向服务器上报，保留 buffer，恢复在线后再补传
+                        if AGENT_MODE.load(Ordering::Relaxed) != AgentMode::Online as u8 {
+                            continue;
+                        }
+                        let mut json_str = String::new();
+                        match build_auto_process_list_json(&buffer, &mut json_str) {
+                            Ok(()) => {
+                                match net_client.post_data_async(
+                                    &url,
+                                    &json_str,
+                                    Duration::from_secs(10),
+                                    self.get_token().await.as_deref(),
+                                ).await {
+                                    Ok(_) => {},
+                                    Err(err) => log_error!("[autouploadprocess] ❌ 上报失败: {}", err),
+                                }
+                                buffer.clear();
+                            }
+                            Err(e) => log_error!("[autouploadprocess] 构建 JSON 失败: {}", e),
+                        }
+                    }
+                }
+            }
+
+            // 处理剩余缓冲
+            if !buffer.is_empty() {
+                let mut json_str = String::new();
+                if let Ok(()) = build_auto_process_list_json(&buffer, &mut json_str) {
+                    let _ = net_client.post_data_async(
+                        &url,
+                        &json_str,
+                        Duration::from_secs(10),
+                        self.get_token().await.as_deref(),
+                    ).await;
+                }
+            }
+
+            Ok("autouploadprocess 上报任务正常退出".to_string())
         })
     }
 }
