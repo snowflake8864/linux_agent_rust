@@ -198,6 +198,11 @@ async fn main() -> std::io::Result<()> {
                     if let Err(e) = ebpf_scan.scan_executables(&scan_dirs, true) {
                         log_error!("[EbpfBackend] 扫描可执行文件失败: {}", e);
                     }
+                    // 扫描完成后，从 DB 重建非扫描目录(/opt 等)可执行文件的 md5_map，
+                    // 避免重启后这些白名单进程再次被拦截一次。
+                    if let Err(e) = ebpf_scan.load_md5_inode_cache() {
+                        log_error!("[EbpfBackend] 从 DB 加载 md5_inode_cache 失败: {}", e);
+                    }
                 });
                 log_info!("eBPF md5_map 后台扫描已启动");
 

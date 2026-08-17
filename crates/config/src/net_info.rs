@@ -142,6 +142,7 @@ pub struct DbPolicyConfig {
     pub alert_log: bool,            // ALERT_LOG — 告警日志持久化
     pub process_policy: bool,       // PROCESS_POLICY — 进程黑白名单双表
     pub known_executables: bool,    // KNOWN_EXECUTABLES — 非标准目录可执行文件记录
+    pub md5_inode_cache: bool,      // MD5_INODE_CACHE — eBPF 非扫描目录 md5→path 映射缓存（重启免二次拦截）
     pub jump_status: bool,          // JUMP_STATUS — IP跳变状态
     pub peripheral_policy: bool,    // PERIPHERAL_POLICY — USB外设黑白名单双表
     pub quarantine: bool,           // QUARANTINE — 病毒隔离/还原元数据（替代.meta文件）
@@ -154,6 +155,7 @@ impl Default for DbPolicyConfig {
             alert_log: false,
             process_policy: false,
             known_executables: false,
+            md5_inode_cache: false,
             jump_status: false,
             peripheral_policy: false,
             quarantine: false,
@@ -632,6 +634,9 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("DB_POLICY", "KNOWN_EXECUTABLES") {
             config.db_policy.known_executables = matches!(value.trim(), "1");
         }
+        if let Some(value) = ini.get("DB_POLICY", "MD5_INODE_CACHE") {
+            config.db_policy.md5_inode_cache = matches!(value.trim(), "1");
+        }
         if let Some(value) = ini.get("DB_POLICY", "JUMP_STATUS") {
             config.db_policy.jump_status = matches!(value.trim(), "1");
         }
@@ -813,6 +818,7 @@ impl NetInfoConfig {
         writeln!(file, "ALERT_LOG={}", self.db_policy.alert_log as u8)?;
         writeln!(file, "PROCESS_POLICY={}", self.db_policy.process_policy as u8)?;
         writeln!(file, "KNOWN_EXECUTABLES={}", self.db_policy.known_executables as u8)?;
+        writeln!(file, "MD5_INODE_CACHE={}", self.db_policy.md5_inode_cache as u8)?;
         writeln!(file, "JUMP_STATUS={}", self.db_policy.jump_status as u8)?;
         writeln!(file, "PERIPHERAL_POLICY={}", self.db_policy.peripheral_policy as u8)?;
         writeln!(file, "QUARANTINE={}", self.db_policy.quarantine as u8)?;
