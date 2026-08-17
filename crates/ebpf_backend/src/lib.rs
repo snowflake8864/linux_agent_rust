@@ -491,6 +491,16 @@ impl EbpfBackend {
     /// 上报进程告警（拦截: n_type=1101, 监控: n_type=1001）
     fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_type: u16, action: &str) {
         let md5_hash = self.get_md5_cached(path);
+        // 不明进程命中时，若其 MD5 已在待下发白/黑名单(pending_rules)中，即时补写 proc_rules，
+        // 让下一次 exec 能按名单放行/拦截（否则 /opt 等未扫描路径的白名单永远不生效）。
+        // 只处理绝对路径：相对路径(如 ./script/x.sh)会相对 agent 自身 CWD 解析，读到错误文件、
+        // 写出错误 inode，所以跳过（相对路径继续走"不明→拦截→上报"，由服务器/名单侧处理）。
+        let mut in_server_list = false;
+        if matches!(n_type, 1001 | 1101) && path.starts_with('/') {
+            if let Some(h) = md5_hash.as_deref() {
+                in_server_list = self.try_resolve_pending_rule(path, h);
+            }
+        }
         // level 由事件自身的 blocked 状态决定（n_type>=1100 即被拦截），
         // 不依赖 self.proc_protect：该字段仅在构造时赋值，运行时切保护模式不会同步更新，会导致误报 level。
         let log = reporter::AuditLogInfo {
@@ -509,8 +519,9 @@ impl EbpfBackend {
         reporter::broadcast_audit_log(&log);   // gRPC 推送
         reporter::send_to_http_upload(&log);    // HTTP 上报到服务器
 
-        // 不明进程（监控 1001 / 保护 1101）额外上报 /v1/autouploadprocess，与 driver 模式对齐
-        if matches!(n_type, 1001 | 1101) {
+        // 只有真正不在服务器黑白名单里的"不明进程"才上报 /v1/autouploadprocess，
+        // 让服务器有机会把它加白/黑；已在名单里的（上面已即时补写 proc_rules）不再重复上报。
+        if matches!(n_type, 1001 | 1101) && !in_server_list {
             reporter::send_to_autoupload_process(&reporter::AuditProcess {
                 n_time: 0,
                 str_name: String::new(),
@@ -776,16 +787,6 @@ impl EbpfBackend {
         Ok(())
     }
 
-    /// 从 data 行中提取 hash 列表
-    fn extract_hashes(&self, data: &str) -> Vec<String> {
-        data.lines()
-            .filter_map(|line| {
-                if line.starts_with("del ") { None }
-                else { line.find('=').map(|i| line[..i].to_string()) }
-            })
-            .collect()
-    }
-
     /// 按 hash 删除 proc_rule（从 proc_rules map 中移除所有匹配 inode）
     fn remove_proc_rule_by_hash(&self, hash: &str) -> anyhow::Result<()> {
         let md5_map = self.md5_map.read().unwrap();
@@ -799,6 +800,37 @@ impl EbpfBackend {
             }
         }
         Ok(())
+    }
+
+    /// 不明进程首次命中时，若其 MD5 已在待下发规则(pending_rules)中，立即解析 (dev,inode) 补写 proc_rules。
+    /// 解决扫描目录(/bin /usr/bin /usr/sbin /usr/local/bin /usr/lib/systemd)未覆盖第三方路径
+    /// （如 /opt/vigilixav/sbin/vigilixd）时，白名单 hash 永远无法解析成 inode 的问题。
+    /// 返回是否在服务器黑白名单(pending_rules)中：true=已在名单（不重复上报），false=真正的不明进程。
+    fn try_resolve_pending_rule(&self, path: &str, hash: &str) -> bool {
+        let action = match self.pending_rules.lock().unwrap().get(hash) {
+            Some(a) => *a,
+            None => return false, // 不在待下发名单：真正的不明进程
+        };
+        use std::os::unix::fs::MetadataExt;
+        let (dev, inode) = match std::fs::metadata(path) {
+            Ok(md) => (md.dev(), md.ino()),
+            Err(_) => return true, // 在名单但解析失败（服务器已决定，不重复上报）
+        };
+        let mode = if self.proc_protect { 2u8 } else { 1u8 };
+        if let Err(e) = self.add_proc_rule_by_inode(dev, inode, action, mode) {
+            log::warn!("[EbpfBackend] 补写 proc_rules 失败: {}", e);
+            return true;
+        }
+        self.md5_map.write().unwrap()
+            .entry(hash.to_string()).or_insert_with(Vec::new)
+            .push(Md5Entry { inode, dev, path: path.to_string() });
+        // 持久化 hash→path 到 DB：重启后 md5_map 只从标准目录重建，/opt 等非扫描路径
+        // 若不落库，重启会再次拦截一次、再走一遍即时补写。
+        local_store::md5_inode_cache::persist_if_enabled(hash, path);
+        self.pending_rules.lock().unwrap().remove(hash);
+        self.applied_rules.lock().unwrap().insert(hash.to_string(), action);
+        log::info!("[EbpfBackend] ✅ 不明进程命中白/黑名单，即时补写 proc_rules: path={} action={}", path, action);
+        true
     }
 
     /// 将 pending_rules 中已有 md5_map 的条目重新下发
@@ -861,6 +893,52 @@ impl EbpfBackend {
         info!("[EbpfBackend] Scanned {} executables, {} unique MD5s", count, map.len());
         drop(map); // 释放写锁，让 replay_pending_rules 可以获取读锁
         self.replay_pending_rules();
+        Ok(count)
+    }
+
+    /// 启动时从 DB 加载历史「非扫描目录」可执行文件，重建 md5_map。
+    /// 对每条 hash→path 重新 stat 得到当前 (dev,inode)，并重新校验文件 MD5 仍等于 hash，
+    /// 避免文件被升级替换后沿用旧 hash 误放行。加载完调用 replay_pending_rules 补写待下发规则。
+    pub fn load_md5_inode_cache(&self) -> anyhow::Result<usize> {
+        let entries = local_store::md5_inode_cache::load_if_enabled();
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let mut map = self.md5_map.write().unwrap();
+        let mut path_cache = self.path_hash_cache.write().unwrap();
+        let mut count = 0usize;
+        for (hash, path) in entries {
+            if !path.starts_with('/') {
+                continue; // 相对路径无法可靠重建，跳过
+            }
+            let Ok(data) = std::fs::read(&path) else { continue; };
+            if data.len() < 4 || &data[..4] != b"\x7fELF" {
+                continue; // 非 ELF，跳过
+            }
+            let actual = hex::encode(md5::compute(&data).0);
+            if actual != hash {
+                continue; // 文件内容已变化，跳过避免误放行
+            }
+            use std::os::unix::fs::MetadataExt;
+            let Ok(md) = std::fs::metadata(&path) else { continue; };
+            let mtime = md.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d: std::time::Duration| d.as_secs())
+                .unwrap_or(0);
+            path_cache.insert(path.clone(), (hash.clone(), mtime));
+            map.entry(hash.clone()).or_insert_with(Vec::new)
+                .push(Md5Entry { inode: md.ino(), dev: md.dev(), path });
+            count += 1;
+        }
+        drop(map); // 释放写锁，让 replay_pending_rules 可以获取读锁
+        drop(path_cache);
+
+        if count > 0 {
+            info!("[EbpfBackend] 从 DB 加载 {} 条非扫描目录可执行文件到 md5_map", count);
+            self.replay_pending_rules();
+        }
         Ok(count)
     }
 
@@ -928,27 +1006,37 @@ impl SecurityBackend for EbpfBackend {
 
     // 进程
     fn add_md5_rules(&self, data: &str) -> Result<(), String> {
-        // data 格式: "{hash}=0\n" (白) / "{hash}=1\n" (黑) / "del 0 {hash}\n"
+        // data 格式: "{hash}=0\n" (白) / "{hash}=1\n" (黑) / "del 0 {hash}\n" (删白) / "del 1 {hash}\n" (删黑)
         // eBPF 模式下，path 字段实际存的是 MD5 hash，需要查 md5_map 转换为 inode 后写入 BPF map
-        let is_white = data.contains("=0");
-        let action = if is_white { 0u8 } else { 1u8 };
+        // 注意：批处理可能混合「新增 + 删除 + 黑↔白互转」，必须逐行解析 action，不能按整批判断黑白。
         // mode: 1=监控(MONITOR) 2=保护(PROTECT)，由 PROC_PROTECT/FILE_PROTECT 控制
         let mode = if self.proc_protect { 2u8 } else { 1u8 };
         let md5_map = self.md5_map.read().unwrap();
         let mut applied = 0;
         let mut pending = 0;
 
-        for line in data.lines() {
-            let hash = if let Some(stripped) = line.strip_prefix("del ") {
-                // eBPF 模式删除: 从 pending_rules 移除
-                let h = if let Some(idx) = stripped.find(' ') { &stripped[idx+1..] } else { stripped };
+        for raw in data.lines() {
+            let line = raw.trim();
+            if line.is_empty() { continue; }
+
+            // 删除: "del 0 {hash}" / "del 1 {hash}"
+            if let Some(stripped) = line.strip_prefix("del ") {
+                let mut parts = stripped.split_whitespace();
+                let which = parts.next(); // "0"=白, "1"=黑
+                let Some(h) = parts.next() else { continue; };
                 let _ = self.remove_proc_rule_by_hash(h);
                 self.pending_rules.lock().unwrap().remove(h);
                 self.applied_rules.lock().unwrap().remove(h);
+                let mut cache = self.process_cache.lock().unwrap();
+                if which == Some("0") { cache.0.retain(|x| x != h); }
+                else { cache.1.retain(|x| x != h); }
                 continue;
-            } else if let Some(idx) = line.find('=') {
-                &line[..idx]
-            } else { continue; };
+            }
+
+            // 新增/覆盖: "{hash}=0" (白) / "{hash}=1" (黑)
+            let Some(idx) = line.find('=') else { continue; };
+            let hash = &line[..idx];
+            let action = if line[idx + 1..].starts_with('0') { 0u8 } else { 1u8 };
 
             if let Some(entries) = md5_map.get(hash) {
                 for e in entries {
@@ -960,14 +1048,15 @@ impl SecurityBackend for EbpfBackend {
                 // md5_map 尚未包含此 hash，暂存到 pending_rules，等扫描填充后补写
                 self.pending_rules.lock().unwrap().insert(hash.to_string(), action);
                 pending += 1;
-                //log::warn!("[EbpfBackend] hash {} 不在 md5_map 中，暂存为待下发规则 (action={})", hash, action);
+            }
+
+            // 同步 process_cache（追加，不整体覆盖）
+            if action == 0 {
+                self.process_cache.lock().unwrap().0.push(hash.to_string());
+            } else {
+                self.process_cache.lock().unwrap().1.push(hash.to_string());
             }
         }
-
-        // 同步 process_cache
-        let mut cache = self.process_cache.lock().unwrap();
-        if is_white { cache.0 = self.extract_hashes(data); }
-        else { cache.1 = self.extract_hashes(data); }
 
         //log::info!("[EbpfBackend] add_md5_rules: 已下发 {} 条, 待扫描 {} 条", applied, pending);
         Ok(())

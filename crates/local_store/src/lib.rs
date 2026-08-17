@@ -3,6 +3,7 @@ pub mod dir_policy;
 pub mod extort_policy;
 pub mod jump_status;
 pub mod known_executables;
+pub mod md5_inode_cache;
 pub mod peripheral_policy;
 pub mod process_policy;
 pub mod quarantine;
@@ -39,6 +40,11 @@ pub fn init_all() {
         }
         if let Err(e) = process_policy::init_local_table() {
             logging::log_error!("[local_store] process_policy_local 建表失败: {}", e);
+        }
+    }
+    if db.md5_inode_cache {
+        if let Err(e) = md5_inode_cache::init_table() {
+            logging::log_error!("[local_store] md5_inode_cache 建表失败: {}", e);
         }
     }
     if db.known_executables {

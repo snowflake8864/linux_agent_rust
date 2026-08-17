@@ -196,6 +196,11 @@ KNOWN_EXECUTABLES               非标准目录可执行文件记录到 known_ex
                                 0=不记录 1=UIO 事件发现的 exe 写入 DB
                                 开启后: process_audit 发现非标准路径 exe 时 upsert
 
+MD5_INODE_CACHE                 eBPF 非扫描目录 md5→path 映射缓存到 md5_inode_cache.db
+                                0=不持久化 1=不明进程命中白/黑名单即时补写后落库
+                                开启后: 重启时重建 /opt 等非扫描目录白名单进程的
+                                        md5_map，避免再次拦截一次（仅 eBPF 后端）
+
 JUMP_STATUS                     IP/口令跳变状态持久化到 jump.db
                                 0=不持久化 1=重启后自动恢复上次跳变状态
                                 还需 [JUMP] ENABLED=1
@@ -350,6 +355,7 @@ NTP_SYNC                        NTP 时间同步: 0=不同步 1=同步
 │       ├── ALERT_LOG           → 告警写入/查询
 │       ├── PROCESS_POLICY      → 进程黑白名单双表
 │       ├── KNOWN_EXECUTABLES   → UIO 可执行文件记录
+│       ├── MD5_INODE_CACHE     → eBPF 非扫描目录 md5→path 缓存（重启免二次拦截）
 │       ├── JUMP_STATUS         → 跳变状态恢复（还要 [JUMP] ENABLED）
 │       ├── PERIPHERAL_POLICY   → USB 黑白名单双表
 │       ├── QUARANTINE          → 病毒隔离元数据（替代 .meta）
@@ -428,6 +434,7 @@ IP 跳变执行                        [JUMP] ENABLED && IP_JUMP
 进程策略 DB 读/写                  SQLITE_DB && PROCESS_POLICY
 外设策略 DB 读/写                  SQLITE_DB && PERIPHERAL_POLICY
 可执行文件 DB 记录                 SQLITE_DB && KNOWN_EXECUTABLES
+eBPF md5→path 缓存                 SQLITE_DB && MD5_INODE_CACHE && eBPF 后端
 病毒隔离元数据 DB                  SQLITE_DB && QUARANTINE
 病毒扫描（VigilixAV引擎）          [VIGILIXAV] ENABLED
 准入控制                           [ADMISSION] ENABLED && ADMISSION_SWITCH
@@ -529,6 +536,7 @@ ENABLED=0
 ALERT_LOG=0
 PROCESS_POLICY=0
 KNOWN_EXECUTABLES=0
+MD5_INODE_CACHE=0
 JUMP_STATUS=0
 PERIPHERAL_POLICY=0
 QUARANTINE=0

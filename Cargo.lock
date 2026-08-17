@@ -674,6 +674,7 @@ dependencies = [
  "common",
  "hex",
  "libc",
+ "local_store",
  "log 0.4.29",
  "logging",
  "md5",

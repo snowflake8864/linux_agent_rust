@@ -54,36 +54,46 @@ impl ProcessPolicyManager {
             self.white_set.clear();
             self.white_set.extend(process_list.iter().cloned());
 
-            // 👇 清理原来的黑名单中的路径
+            // 收集本次 diff 规则（与 prev 集合对比，只下发增量），最后一次性写入内核
+            let mut batch: Vec<String> = Vec::new();
+            let mut n_add = 0usize;  // 新增白名单
+            let mut n_del = 0usize;  // 删除白名单
+            let mut n_move = 0usize; // 黑→白 互转
+
+            // 👇 清理原来的黑名单中的路径（黑→白）
             for path in &self.white_set {
                 if self.prev_black_set.contains(path) {
-                    let rule = format!("del 1 {}\n", path);
-                    Self::add_md5_rules(&rule);
+                    batch.push(format!("del 1 {}\n", path));
                     self.prev_black_set.remove(path); // 同时更新 prev_black_set
+                    n_move += 1;
                     is_changed = true;
                 }
             }
 
+            // 新增白名单
             for path in &self.white_set {
                 if !self.prev_white_set.contains(path) {
-                    let rule = format!("{}=0\n", path);
-                    Self::add_md5_rules(&rule);
+                    batch.push(format!("{}=0\n", path));
+                    n_add += 1;
                     is_changed = true;
                 }
             }
 
+            // 删除已不在白名单的路径
             for path in &self.prev_white_set {
                 if !self.white_set.contains(path) {
-                    let rule = format!("del 0 {}\n", path);
-                    Self::add_md5_rules(&rule);
+                    batch.push(format!("del 0 {}\n", path));
+                    n_del += 1;
                     is_changed = true;
                 }
             }
 
             if is_changed {
                 self.prev_white_set = self.white_set.clone();
+                Self::add_md5_rules(&batch.concat());
                 Self::notify_kernel_update();
-                log_info!("[process_policy] 白名单已下发内核 ({} 条)", self.white_set.len());
+                log_info!("[process_policy] 白名单已下发内核: 新增 {} 条, 删除 {} 条, 黑→白 {} 条",
+                    n_add, n_del, n_move);
             }
         } else {
             log_info!("[process_policy] 应用黑名单: {} 条hash", process_list.len());
@@ -97,36 +107,46 @@ impl ProcessPolicyManager {
                 }
             }
 
-            //  清理原来的白名单中的路径
+            // 收集本次 diff 规则，最后一次性写入内核
+            let mut batch: Vec<String> = Vec::new();
+            let mut n_add = 0usize;  // 新增黑名单
+            let mut n_del = 0usize;  // 删除黑名单
+            let mut n_move = 0usize; // 白→黑 互转
+
+            //  清理原来的白名单中的路径（白→黑）
             for path in &self.black_set {
                 if self.prev_white_set.contains(path) {
-                    let rule = format!("del 0 {}\n", path);
-                    Self::add_md5_rules(&rule);
+                    batch.push(format!("del 0 {}\n", path));
                     self.prev_white_set.remove(path); // 同时更新 prev_white_set
+                    n_move += 1;
                     is_changed = true;
                 }
             }
 
+            // 新增黑名单
             for path in &self.black_set {
                 if !self.prev_black_set.contains(path) {
-                    let rule = format!("{}=1\n", path);
-                    Self::add_md5_rules(&rule);
+                    batch.push(format!("{}=1\n", path));
+                    n_add += 1;
                     is_changed = true;
                 }
             }
 
+            // 删除已不在黑名单的路径
             for path in &self.prev_black_set {
                 if !self.black_set.contains(path) {
-                    let rule = format!("del 1 {}\n", path);
-                    Self::add_md5_rules(&rule);
+                    batch.push(format!("del 1 {}\n", path));
+                    n_del += 1;
                     is_changed = true;
                 }
             }
 
             if is_changed {
                 self.prev_black_set = self.black_set.clone();
+                Self::add_md5_rules(&batch.concat());
                 Self::notify_kernel_update();
-                log_info!("[process_policy] 黑名单已下发内核 ({} 条)", self.black_set.len());
+                log_info!("[process_policy] 黑名单已下发内核: 新增 {} 条, 删除 {} 条, 白→黑 {} 条",
+                    n_add, n_del, n_move);
             }
         }
 
