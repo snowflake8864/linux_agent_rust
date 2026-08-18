@@ -63,10 +63,12 @@ impl SecurityBackend for DriverBackend {
 
     // ── 进程管控 ──
 
+   
     fn add_md5_rules(&self, data: &str) -> Result<(), String> {
-        proc_write("/proc/osec/md5_rt", data)
+        data.split_inclusive('\n')
+        .filter(|line| !line.trim().is_empty())
+        .try_for_each(|line| proc_write("/proc/osec/md5_rt", line))
     }
-
     fn notify_process_update(&self) -> Result<(), String> {
         proc_write("/proc/osec/process_rt", "update\n")
     }
