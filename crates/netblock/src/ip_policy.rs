@@ -18,64 +18,55 @@ pub struct IpPolicy {
 // Define global maps for IP policies and expiry tasks
 lazy_static::lazy_static! {
     pub static ref IP_POLICIES: Arc<RwLock<HashMap<String, IpPolicy>>> = Arc::new(RwLock::new(HashMap::new()));
+    pub static ref NETBLOCK_POLICIES: Arc<RwLock<HashMap<String, IpPolicy>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref IP_EXPIRY_TASKS: Arc<RwLock<HashMap<String, JoinHandle<()>>>> = Arc::new(RwLock::new(HashMap::new()));
 }
 
-// Update global map and write to kernel
-pub async fn update_and_write_policies(policies: Vec<IpPolicy>) -> Result<(), String> {
+pub async fn update_and_write_policies(
+    policies: Vec<IpPolicy>,
+    source: &str,
+) -> Result<(), String> {
     let mut global_policies = IP_POLICIES.write().await;
+    let mut netblock_policies = NETBLOCK_POLICIES.write().await;
     let mut expiry_tasks = IP_EXPIRY_TASKS.write().await;
 
-    // Update global map and manage expiry tasks
-    for policy in policies {
-        let ip = policy.ip.clone();
-        let has_task = expiry_tasks.contains_key(&ip);
-
-        // If duration == 0 and task exists, cancel it
-        if policy.duration == 0 && has_task {
-            if let Some(task) = expiry_tasks.remove(&ip) {
-                task.abort();
-                log_info!("IP {} duration set to 0, cancelled expiry task", ip);
+    match source {
+        "policies" => {
+            // 来自policies，清空并重设全局IP策略
+            for (_, task) in expiry_tasks.drain() { task.abort(); }
+            global_policies.clear();
+            for policy in policies {
+                let ip = policy.ip.clone();
+                if policy.duration > 0 {
+                    let ip_clone = ip.clone();
+                    let p_map = Arc::clone(&IP_POLICIES);
+                    let t_map = Arc::clone(&IP_EXPIRY_TASKS);
+                    let task = tokio::spawn(async move {
+                        sleep(Duration::from_secs(policy.duration)).await;
+                        p_map.write().await.remove(&ip_clone);
+                        t_map.write().await.remove(&ip_clone);
+                    });
+                    expiry_tasks.insert(ip.clone(), task);
+                }
+                global_policies.insert(ip, policy);
             }
         }
-        // If duration > 0 and no task, create new task
-        else if policy.duration > 0 && !has_task {
-            let ip_for_task = ip.clone(); // Clone ip for task
-            let policies_map = Arc::clone(&IP_POLICIES);
-            let tasks_map = Arc::clone(&IP_EXPIRY_TASKS);
-            let task = tokio::spawn(async move {
-                // Wait for duration seconds
-                sleep(Duration::from_secs(policy.duration)).await;
-                // Remove expired IP
-                let mut policies = policies_map.write().await;
-                policies.remove(&ip_for_task);
-                log_info!("IP {} expired and removed, current policies: {:?}", ip_for_task, *policies);
-                // Remove task handle
-                let mut tasks = tasks_map.write().await;
-                tasks.remove(&ip_for_task);
-                // Write updated policies
-                if let Err(e) = write_policies_to_proc(&mut policies).await {
-                    eprintln!("Failed to re-write policies in expiry task for IP {}: {}", ip_for_task, e);
-                }
-            });
-            // Store task handle
-            expiry_tasks.insert(ip.clone(), task);
-            log_info!("Created expiry task for IP {}, duration: {}", ip, policy.duration);
+        "netblocks" => {
+            // 来自netblocks，清空并重设网段策略
+            netblock_policies.clear();
+            for policy in policies {
+                netblock_policies.insert(policy.ip.clone(), policy);
+            }
         }
-        // If duration > 0 and task exists, keep existing task, update policy
-        else if policy.duration > 0 && has_task {
-            log_info!("IP {} has existing expiry task, skipped creating new task, updated duration: {}", ip, policy.duration);
-        }
-
-        // Update IP_POLICIES
-        global_policies.insert(ip, policy);
+        _ => return Err(format!("unknown source: {}", source)),
     }
 
-    // Log merged policies
-    log_info!("Global IP policies: {:?}", *global_policies);
+    // 合并写入
+    let mut merged: HashMap<String, IpPolicy> = HashMap::new();
+    merged.extend(global_policies.iter().map(|(k, v)| (k.clone(), v.clone())));
+    merged.extend(netblock_policies.iter().map(|(k, v)| (k.clone(), v.clone())));
 
-    // Write policies to kernel while holding write lock
-    write_policies_to_proc(&mut global_policies).await
+    write_policies_to_proc(&mut merged).await
 }
 
 // Write policies to /proc files

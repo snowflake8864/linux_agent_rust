@@ -11,9 +11,9 @@ pub struct DriverBackend;
 fn proc_write(path: &str, data: &str) -> Result<(), String> {
     let trimmed = data.trim_end_matches('\n');
     let exists = std::path::Path::new(path).exists();
-    log::info!("[DriverBackend] >>> path={} exists={} flags=O_WRONLY data='{}' len={}",
-        path, exists, trimmed, data.len());
-
+    /*log::info!("[DriverBackend] >>> path={} exists={} flags=O_WRONLY data='{}' len={}",
+        path, exists, trimmed, data.len());*/
+    
     // open
     let mut file = match std::fs::OpenOptions::new().write(true).open(path) {
         Ok(f) => f,
@@ -24,7 +24,7 @@ fn proc_write(path: &str, data: &str) -> Result<(), String> {
         }
     };
     let fd = file.as_raw_fd();
-    log::info!("[DriverBackend] fd={} open_ok", fd);
+    //log::info!("[DriverBackend] fd={} open_ok", fd);
 
     // write（write_all 保证大批量多行规则不被内核 proc 缓冲截断）
     match file.write_all(data.as_bytes()) {
@@ -38,7 +38,7 @@ fn proc_write(path: &str, data: &str) -> Result<(), String> {
 
     // close
     drop(file);
-    log::info!("[DriverBackend] fd={} close_ok", fd);
+    //log::info!("[DriverBackend] fd={} close_ok", fd);
     Ok(())
 }
 

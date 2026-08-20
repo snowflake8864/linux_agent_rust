@@ -11,6 +11,16 @@ use logging::{log_error, log_info};
 use reporter::{SyslogSshLog, build_json::build_ssh_login_json};
 use net_client::core::NetClient;
 
+/// glibc 的 `struct utmp` 布局按架构不同（由 `__WORDSIZE_TIME64_COMPAT32` 决定）：
+/// - x86_64 / mips64：为与 32 位进程共享 utmp 文件，ut_session/ut_tv 用 32 位 → 384 字节
+/// - aarch64 / loongarch64：无 32 位兼容，用原生 64 位 long/timeval → 400 字节
+/// 必须与写入 btmp/wtmp 的系统 glibc 一致，否则 read_exact 步长错位、只能解析出第一条。
+#[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
+type UtmpWord = i32; // 384 字节布局
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
+type UtmpWord = i64; // 400 字节布局
+
 /// utmp结构体定义 (与C语言兼容)
 #[repr(C)]
 #[derive(Debug, Clone)]
@@ -22,7 +32,7 @@ struct Utmp {
     ut_user: [u8; 32],
     ut_host: [u8; 256],
     ut_exit: UtmpExit,
-    ut_session: i32,
+    ut_session: UtmpWord,
     ut_tv: UtmpTimeval,
     ut_addr_v6: [i32; 4],
     unused: [u8; 20],
@@ -38,11 +48,19 @@ struct UtmpExit {
 #[repr(C)]
 #[derive(Debug, Clone)]
 struct UtmpTimeval {
-    tv_sec: i32,
-    tv_usec: i32,
+    tv_sec: UtmpWord,
+    tv_usec: UtmpWord,
 }
 
 const UTMP_SIZE: usize = std::mem::size_of::<Utmp>();
+
+// 编译期校验结构体大小与目标架构的 glibc 一致，防止字段类型改错导致 read_exact 步长错位。
+#[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
+const _: () = assert!(UTMP_SIZE == 384, "x86_64/mips64 的 glibc struct utmp 应为 384 字节");
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
+const _: () = assert!(UTMP_SIZE == 400, "aarch64/loongarch64 的 glibc struct utmp 应为 400 字节");
+
 const LOGIN_PROCESS: i16 = 6; // 登录会话（btmp失败登录多用此类型）
 const USER_PROCESS: i16 = 7;  // 登录
 const DEAD_PROCESS: i16 = 8;  // 登出

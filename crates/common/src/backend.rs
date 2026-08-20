@@ -68,6 +68,18 @@ pub fn init_dpi_writer() {
     pattern::set_dpi_writer(Arc::new(BackendDpiWriter));
 }
 
+/// 进程规则查询结果（gRPC 诊断接口用：进程是否在 proc_rules 白/黑名单表中）
+#[derive(Debug, Clone, Default)]
+pub struct ProcRuleQueryResult {
+    pub found: bool,
+    pub action: i32, // 0=白名单(allow), 1=黑名单(deny), -1=未命中
+    pub mode: i32,   // 0=inherit, 1=monitor, 2=protect
+    pub dev: u64,
+    pub inode: u64,
+    pub resolved_path: String,
+    pub message: String,
+}
+
 /// 安全后端抽象 — 驱动模式写 /proc/osec ，eBPF 模式写 BPF maps
 pub trait SecurityBackend: Send + Sync {
     /// 后端是否已初始化可用
@@ -82,6 +94,11 @@ pub trait SecurityBackend: Send + Sync {
     fn get_process_blacklist(&self) -> Vec<String>;
     /// 查询 hash 对应的文件路径（从 md5_map 中获取，eBPF 模式有效）
     fn lookup_hash_paths(&self, _hash: &str) -> Vec<String> { Vec::new() }
+    /// 查询指定进程（路径或 dev/inode）是否在 proc_rules 白/黑名单表中。
+    /// eBPF 模式：解析 path → (dev,inode) 后查 BPF map；驱动/noop 模式：默认返回 Err。
+    fn query_process_rule(&self, _path: &str, _dev: u64, _inode: u64) -> Result<ProcRuleQueryResult, String> {
+        Err("当前后端不支持进程规则查询".into())
+    }
 
     // ── 网络 / 准入 ──
     fn write_tcp_force_ecn(&self, enable: bool) -> Result<(), String>;

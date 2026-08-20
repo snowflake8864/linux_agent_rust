@@ -6,6 +6,7 @@ use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod loader;
 pub mod types;
@@ -46,7 +47,9 @@ pub struct EbpfBackend {
     net_loaded: bool,
     /// 功能开关 (对应 *_SWITCH 配置)
     file_switch: bool,
-    proc_switch: bool,
+    proc_switch: AtomicBool,
+    /// 进程黑白名单策略是否已加载（决定何时允许开启进程检测）
+    proc_detection_enabled: AtomicBool,
     /// 防护模式 (对应 *_PROTECT 配置): false=监控, true=保护
     file_protect: bool,
     proc_protect: bool,
@@ -184,7 +187,8 @@ impl EbpfBackend {
         Ok(Self {
             loader: Arc::new(Mutex::new(loader)),
             file_loaded, proc_loaded, net_loaded,
-            file_switch, proc_switch,
+            file_switch, proc_switch: AtomicBool::new(proc_switch),
+            proc_detection_enabled: AtomicBool::new(false),
             file_protect, proc_protect,
             interface: interface.to_string(),
             engine: engine.to_string(),
@@ -237,9 +241,11 @@ impl EbpfBackend {
         if self.proc_loaded {
             info!("[EbpfBackend] --- 挂载 proc agent ---");
             loader.attach_proc_programs()?;
-            // 启用 proc feature switch (index 1)
+            // 挂载后先关闭 proc feature switch (index 1)：此刻 proc_rules 表为空，
+            // 若直接使能，任何未命中信任白名单的 exec 都会被误判为“不明进程”。
+            // 等黑白名单策略真正写入 proc_rules 后再由 enable_proc_detection() 开启。
             if let Some(bpf) = loader.proc_bpf_mut() {
-                ModularLoader::enable_feature(bpf, 1, self.proc_switch)?;
+                ModularLoader::enable_feature(bpf, 1, false)?;
                 ModularLoader::set_global_mode(bpf, 1, self.proc_protect)?;
                 // 写入 agent 自身 PID，防止自保规则下 agent 被外部进程 kill
                 ModularLoader::set_agent_pid(bpf, std::process::id())?;
@@ -276,6 +282,22 @@ impl EbpfBackend {
         Ok(())
     }
 
+    /// 黑白名单策略首次真正写入 proc_rules 后才启用进程检测（feature_switches[1]）。
+    /// 幂等，只开启一次。init() 阶段检测被关闭，避免启动空表导致误报；
+    /// 在线(服务器 push → add_md5_rules 直写)与离线(扫描后 replay_pending_rules 补写)两条路径
+    /// 首次写规则时都会走到这里。
+    fn enable_proc_detection(&self) {
+        if self.proc_detection_enabled.swap(true, Ordering::SeqCst) {
+            return; // 已开启
+        }
+        let mut loader = self.loader.lock().unwrap();
+        if let Some(bpf) = loader.proc_bpf_mut() {
+            let _ = ModularLoader::enable_feature(bpf, 1, self.proc_switch.load(Ordering::SeqCst));
+            info!("[EbpfBackend] ✅ 进程策略已加载，启用进程检测 (proc_switch={})",
+                self.proc_switch.load(Ordering::SeqCst));
+        }
+    }
+
     pub fn is_file_loaded(&self) -> bool { self.file_loaded }
     pub fn is_proc_loaded(&self) -> bool { self.proc_loaded }
     pub fn is_net_loaded(&self) -> bool { self.net_loaded }
@@ -283,6 +305,8 @@ impl EbpfBackend {
     /// 运行时更新 feature_switches + global_modes + 刷新已有 proc_rules
     pub fn sync_runtime_switches(&self, file_switch: bool, proc_switch: bool,
                                   file_protect: bool, proc_protect: bool) {
+        // 记录运行时进程开关，供 enable_proc_detection 按最新值开启检测
+        self.proc_switch.store(proc_switch, Ordering::SeqCst);
         {
             let mut loader = self.loader.lock().unwrap();
             if self.file_loaded {
@@ -293,7 +317,9 @@ impl EbpfBackend {
             }
             if self.proc_loaded {
                 if let Some(bpf) = loader.proc_bpf_mut() {
-                    let _ = ModularLoader::enable_feature(bpf, 1, proc_switch);
+                    // 进程检测需在黑白名单策略加载后才允许开启，避免启动空表误报。
+                    let effective = proc_switch && self.proc_detection_enabled.load(Ordering::SeqCst);
+                    let _ = ModularLoader::enable_feature(bpf, 1, effective);
                     let _ = ModularLoader::set_global_mode(bpf, 1, proc_protect);
                 }
             }
@@ -392,9 +418,9 @@ impl EbpfBackend {
                         let is_unknown = event.event_type == 3; // EVENT_PROC_UNKNOWN
                         if event.blocked == 1 {
                             let n_type = if is_black { 1102 } else { 1101 };
-                            log::warn!("[EbpfBackend] 🚫 {}命中(保护): path={}, comm={}, pid={}, uid={}",
+                            /*log::warn!("[EbpfBackend] 🚫 {}命中(保护): path={}, comm={}, pid={}, uid={}",
                                 if is_black { "黑名单" } else { "不明进程" },
-                                path, comm, event.pid, event.uid);
+                                path, comm, event.pid, event.uid);*/
                             backend.report_process_event(event, &path, &comm, n_type, "拦截");
                         } else if is_black {
                             // 黑名单+监控：打印本地日志 + 上报
@@ -652,8 +678,8 @@ impl EbpfBackend {
                     let cand = format!("{}/{}", dir, basename);
                     if let Some(dk) = stat_path_to_proc_key(&cand) {
                         if seen.insert((dk.dev, dk.inode)) {
-                            log_info!("[EbpfBackend] 信任进程白名单 ✅ {} (basename={}) -> {} dev={} inode={}",
-                                key, basename, cand, dk.dev, dk.inode);
+                            /*log_info!("[EbpfBackend] 信任进程白名单 ✅ {} (basename={}) -> {} dev={} inode={}",
+                                key, basename, cand, dk.dev, dk.inode);*/
                             keys.push(dk);
                         }
                         hit = true;
@@ -856,6 +882,10 @@ impl EbpfBackend {
         if replayed > 0 {
             info!("[EbpfBackend] replay_pending_rules: 补写 {} 条 (剩余 {} 条)", replayed, pending.len());
         }
+        // 扫描完成后补写待下发规则：能走到这里说明启动时确有 pending 待处理。
+        // 无论本次解析了多少条，都视为「策略已加载」，开启进程检测；
+        // 未解析到的（如 /opt 等非扫描目录）由首次命中时 try_resolve_pending_rule 即时补写。
+        self.enable_proc_detection();
     }
 
     pub fn scan_executables(&self, dirs: &[String], recursive: bool) -> anyhow::Result<usize> {
@@ -1059,16 +1089,76 @@ impl SecurityBackend for EbpfBackend {
         }
 
         //log::info!("[EbpfBackend] add_md5_rules: 已下发 {} 条, 待扫描 {} 条", applied, pending);
+        // 有规则真正写入 proc_rules（在线 push 且 md5_map 已就绪）→ 首次加载完成，开启进程检测
+        if applied > 0 {
+            self.enable_proc_detection();
+        }
         Ok(())
     }
 
-    fn notify_process_update(&self) -> Result<(), String> { Ok(()) }
+    fn notify_process_update(&self) -> Result<(), String> {
+        // 进程策略「加载/应用」完成信号：此刻若没有任何待补写规则（pending_rules 空），
+        // 说明要么是空策略、要么规则已直接写入 proc_rules（在线且 md5_map 就绪），
+        // 可立即开启进程检测。非空离线策略此时 pending 非空，等扫描后 replay_pending_rules 再开。
+        let pending_empty = self.pending_rules.lock().unwrap().is_empty();
+        if pending_empty {
+            self.enable_proc_detection();
+        }
+        Ok(())
+    }
 
     fn get_process_whitelist(&self) -> Vec<String> {
         self.process_cache.lock().unwrap().0.clone()
     }
     fn get_process_blacklist(&self) -> Vec<String> {
         self.process_cache.lock().unwrap().1.clone()
+    }
+
+    fn query_process_rule(&self, path: &str, dev: u64, inode: u64) -> Result<common::backend::ProcRuleQueryResult, String> {
+        let mut result = common::backend::ProcRuleQueryResult { action: -1, ..Default::default() };
+
+        // 1. 确定 (dev, inode)：显式 dev/inode 优先，否则从 path 解析（相对路径先 canonicalize）
+        let key = if dev != 0 || inode != 0 {
+            ProcKey { dev, inode }
+        } else {
+            let resolved = std::fs::canonicalize(path)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| path.to_string());
+            result.resolved_path = resolved.clone();
+            match stat_path_to_proc_key(&resolved) {
+                Some(k) => k,
+                None => {
+                    result.message = format!("无法 stat 路径（不存在或非普通文件）: {}", resolved);
+                    return Ok(result);
+                }
+            }
+        };
+        if result.resolved_path.is_empty() {
+            result.resolved_path = path.to_string();
+        }
+        result.dev = key.dev;
+        result.inode = key.inode;
+
+        // 2. 查 proc_rules map（key=(dev,inode)，value.action: 0=allow/白, 1=deny/黑）
+        let mut loader = self.loader.lock().map_err(|e| e.to_string())?;
+        let bpf = loader.proc_bpf_mut().ok_or_else(|| "Proc agent not loaded".to_string())?;
+        let map_data = bpf.map_mut("proc_rules").ok_or_else(|| "proc_rules map not found".to_string())?;
+        let proc_rules = AyaHashMap::<_, ProcKey, ProcRuleVal>::try_from(map_data)
+            .map_err(|e| e.to_string())?;
+        match proc_rules.get(&key, 0) {
+            Ok(val) => {
+                result.found = true;
+                result.action = val.action as i32;
+                result.mode = val.mode as i32;
+                let kind = if val.action == 0 { "白名单(allow)" } else { "黑名单(deny)" };
+                result.message = format!("命中 {} dev={} inode={} mode={}", kind, key.dev, key.inode, val.mode);
+            }
+            Err(aya::maps::MapError::KeyNotFound) => {
+                result.message = format!("未命中 proc_rules dev={} inode={}", key.dev, key.inode);
+            }
+            Err(e) => return Err(format!("查询 proc_rules 失败: {}", e)),
+        }
+        Ok(result)
     }
 
     fn lookup_hash_paths(&self, hash: &str) -> Vec<String> {

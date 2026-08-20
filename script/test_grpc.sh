@@ -3,8 +3,8 @@
 # gRPC 接口测试脚本 — 可手动选择要测试的接口
 # 用法:
 #   ./test_grpc.sh              # 交互式菜单选择
-#   ./test_grpc.sh <编号>        # 直接测试指定接口 (1-31, s1)
-#   ./test_grpc.sh all           # 测试全部只读接口 (1-31)
+#   ./test_grpc.sh <编号>        # 直接测试指定接口 (1-33, s1)
+#   ./test_grpc.sh all           # 测试全部只读接口 (1-33)
 #   ./test_grpc.sh write         # 测试写接口（需离线模式）
 #   ./test_grpc.sh stream        # 测试流式接口 (17, 18, s1)
 #   ./test_grpc.sh full          # 测试全部接口（读写+流）
@@ -130,6 +130,16 @@ show_test_help() {
                echo "    返回包含 config/process/dir/extort/ip_block/ip_black/"
                echo "          virtual_port/peripheral/outreach/trust_dir/backend 的完整 JSON"
                echo "    用法: $0 31" ;;
+        32)    echo -e "${CYAN}[32] ProcRuleQuery${NC} — 查询进程是否在 eBPF 白/黑名单表(proc_rules)"
+               echo "    参数: {\"path\": \"/bin/bash\"}  按路径查（相对路径会 canonicalize）"
+               echo "           {\"dev\": 2050, \"inode\": 12345}  直接按 dev/inode 查"
+               echo "    返回: found, action(0=白/1=黑/-1=未命中), mode, dev, inode, resolved_path, message"
+               echo "    用法: $0 32  |  手动: $0 32 '{\"path\":\"/opt/osec/MagicArmor_0\"}'" ;;
+        33)    echo -e "${CYAN}[33] PortKnock${NC} — 单包敲门(SPA)中继：转发到服务器 /v1/portknock"
+               echo "    参数: {\"user_id\": \"zhangsan\", \"signed_random\": \"xxxx\"}"
+               echo "    返回: success(code==000000), http_status, response(服务器透传 body)"
+               echo "    ⚠️  需要 [GRPC] PORT_KNOCK=1 才注册该服务"
+               echo "    用法: $0 33  |  手动: $0 33 '{\"user_id\":\"zhangsan\",\"signed_random\":\"xxxx\"}'" ;;
         s1)    echo -e "${CYAN}[s1] VirusScan流${NC} — 病毒扫描双向流 (StreamControl)"
                echo "    双向流式接口，客户端发送扫描指令，服务端返回扫描结果"
                echo "    用法: $0 s1" ;;
@@ -202,7 +212,7 @@ show_test_help() {
               echo -e "    ${GREEN}执行模式:${NC} w17 {\"backup_id\":\"root_snap_6_20260626_155713\"} → 实际删除指定快照" ;;
 
         *)     echo -e "${RED}未知测试编号: $tid${NC}"
-                echo "有效范围: 1-31, s1, w1-w17"
+                echo "有效范围: 1-33, s1, w1-w17"
                echo "输入 ? 查看完整菜单，输入 <编号> ? 查看单项说明" ;;
     esac
     echo ""
@@ -325,7 +335,7 @@ print_result() {
     echo -e "=============================================="
 }
 
-# ── 只读接口测试 (1-31) ─────────────────────────────────────────────────
+# ── 只读接口测试 (1-33) ─────────────────────────────────────────────────
 
 test_01() { grpc_call "Agent状态(含is_online/protection_days)" \
     agent_status.proto agent_status.AgentStatusService GetAgentStatus; }
@@ -519,6 +529,18 @@ test_31() { grpc_call "全部策略(一次查所有,与/opt/osec/policies/一致
     policy_query.proto policy_query.PolicyQueryService GetAllPolicies \
     '{}'; }
 
+# 32: 进程规则查询（诊断用）— 查进程是否命中 eBPF proc_rules 白/黑名单表
+# 默认查 /bin/bash；菜单里用 `32 {"path":"..."}` 或 `32 {"dev":..,"inode":..}` 自定义
+test_32() { grpc_call "进程规则查询(默认 /bin/bash)" \
+    proc_diag.proto proc_diag.ProcDiagService QueryProcessRule \
+    '{"path": "/bin/bash"}'; }
+
+# 33: 单包敲门（SPA）中继 — 转发第三方敲门请求到服务器 /v1/portknock
+# 默认用测试参数；菜单里用 `33 {"user_id":"...","signed_random":"..."}` 自定义
+test_33() { grpc_call "单包敲门(默认测试参数)" \
+    port_knock.proto port_knock.PortKnockService PortKnock \
+    '{"user_id": "test_user", "signed_random": "test_signature"}'; }
+
 # ── 流式接口测试 ────────────────────────────────────────────────────────
 
 # 病毒扫描双向流 — 发 StartScanRequest 并等待响应，测连通性
@@ -678,6 +700,8 @@ show_menu() {
     echo -e "${CYAN}║${NC}  27) 告警处置(已处理) 28) 告警处置(已忽略)                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  29) ProcessDefenseMode(读)  30) PeripheralDefenseMode(读)${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  31) PolicyQuery(全部策略JSON)                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  32) ProcRuleQuery(进程白/黑名单表查询)                      ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  33) PortKnock(单包敲门SPA中继)                              ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  s1) VirusScan流(StreamControl)                              ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${RED}写接口（仅离线可用，在线应返回 PERMISSION_DENIED）${NC}       ${CYAN}║${NC}"
@@ -693,7 +717,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}  ${GREEN}wN {json} 离线时实际执行写操作${NC}                                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  例: w17 {\"backup_id\":\"snap_name\"}  → 实际删除快照           ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}all${NC}    测试全部只读接口 (1-31)                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${GREEN}all${NC}    测试全部只读接口 (1-33)                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${RED}write${NC}  测试全部写接口（验证在线拒绝）                    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}stream${NC} 测试全部流式接口 (17, 18, s1)                   ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}full${NC}   测试全部接口（读写+流）                          ${CYAN}║${NC}"
@@ -704,7 +728,7 @@ show_menu() {
 }
 
 run_all_readonly() {
-    for i in $(seq -w 1 31); do
+    for i in $(seq -w 1 33); do
         fn="test_$(printf '%02d' $((10#$i)))"
         type "$fn" &>/dev/null && "$fn"
     done
@@ -792,6 +816,20 @@ case "${1:-menu}" in
                 continue
             fi
 
+            # ── 预检查: 32 {json} → 自定义进程规则查询 ──
+            if [[ "$choice" =~ ^(32)[[:space:]]+(\{.*\})$ ]]; then
+                json="${BASH_REMATCH[2]}"
+                grpc_call "进程规则查询(自定义)" proc_diag.proto proc_diag.ProcDiagService QueryProcessRule "$json"
+                continue
+            fi
+
+            # ── 预检查: 33 {json} → 自定义单包敲门 ──
+            if [[ "$choice" =~ ^(33)[[:space:]]+(\{.*\})$ ]]; then
+                json="${BASH_REMATCH[2]}"
+                grpc_call "单包敲门(自定义)" port_knock.proto port_knock.PortKnockService PortKnock "$json"
+                continue
+            fi
+
             # ── 预检查: <编号> ? 格式 → 查看详细说明 ──
             if [[ "$choice" =~ ^(.+)\ ([\?]|help|h)$ ]]; then
                 tid="${BASH_REMATCH[1]}"
@@ -828,7 +866,7 @@ case "${1:-menu}" in
                 21) test_21 ;; 22) test_22 ;; 23) test_23 ;; 24) test_24 ;;
                 25) test_25 ;; 26) test_26 ;;
                 27) test_27 ;; 28) test_28 ;; 28b) test_28b ;;
-                29) test_29 ;; 30) test_30 ;; 31) test_31 ;;
+                29) test_29 ;; 30) test_30 ;; 31) test_31 ;; 32) test_32 ;; 33) test_33 ;;
                 s1) test_s1 ;;
                 03b) test_03b ;; 14b) test_14b ;; 14c) test_14c ;; 14d) test_14d ;;
                 04b) test_04b ;;
@@ -840,7 +878,7 @@ case "${1:-menu}" in
                 w9)  test_w9  ;; w10) test_w10 ;; w11) test_w11 ;; w12) test_w12 ;;
                 w13) test_w13 ;; w14) test_w14 ;; w15) test_w15 ;; w16) test_w16 ;; w17) test_w17 ;;
                 all)
-                    echo -e "\n${GREEN}── 测试全部只读接口 (1-31) ──${NC}"
+                    echo -e "\n${GREEN}── 测试全部只读接口 (1-33) ──${NC}"
                     run_all_readonly
                     print_result
                     ;;
@@ -899,6 +937,8 @@ case "${1:-menu}" in
                     echo "  27) 告警处置(已处理)  28) 告警处置(已忽略)"
                     echo "  29) ProcessDefenseMode(读)  30) PeripheralDefenseMode(读)"
                     echo "  31) PolicyQuery(全部策略JSON)"
+                    echo "  32) ProcRuleQuery(进程白/黑名单表查询)"
+                    echo "  33) PortKnock(单包敲门SPA中继)"
                     echo "  s1) VirusScan流"
                     echo ""
                     echo -e "${CYAN}── 扩展测试（filter_status / is_white 过滤）──${NC}"
@@ -919,7 +959,7 @@ case "${1:-menu}" in
                     echo "  w15) PeripheralDefenseMode  w16) TriggerLocalUpdate  w17) DeleteBackup"
                     echo ""
                     echo -e "${CYAN}── 快捷命令 ──${NC}"
-                    echo "  all    测试全部只读 (1-31)"
+                    echo "  all    测试全部只读 (1-33)"
                     echo "  write  测试全部写 (w1-w17, 需离线模式)"
                     echo "  stream 测试全部流式 (17, 18, s1)"
                     echo "  full   测试全部 (读写+流)"
@@ -1000,7 +1040,7 @@ case "${1:-menu}" in
         echo "  menu            同无参数"
         echo ""
         echo "  交互菜单内可用命令:"
-        echo "    1-31, s1       测试指定只读/流式接口"
+        echo "    1-33, s1       测试指定只读/流式接口"
         echo "    03b,14b/14c/14d,23b  filter_status 过滤测试"
         echo "    w1-w17          测试指定写接口"
         echo "    all/write/stream/full  批量测试"
@@ -1016,7 +1056,7 @@ case "${1:-menu}" in
         echo "  $0 23b           直接测试 ExecutableList(仅黑名单)"
         echo "  $0 s1            直接测试 VirusScan 双向流"
         echo "  $0 w8            直接测试 CreateBackup"
-        echo "  $0 all           测试全部只读接口 (1-31)"
+        echo "  $0 all           测试全部只读接口 (1-33)"
         echo "  $0 write         测试全部写接口 (w1-w17)"
         echo "  $0 stream        测试流式接口 (17, 18, s1)"
         echo "  $0 full          测试全部接口（读写+流）"
@@ -1039,16 +1079,28 @@ case "${1:-menu}" in
         ;;
 
     s1) test_s1; print_result ;;
+    32) if [ -n "$2" ]; then
+            grpc_call "进程规则查询(自定义)" proc_diag.proto proc_diag.ProcDiagService QueryProcessRule "$2"
+        else
+            test_32
+        fi
+        print_result ;;
+    33) if [ -n "$2" ]; then
+            grpc_call "单包敲门(自定义)" port_knock.proto port_knock.PortKnockService PortKnock "$2"
+        else
+            test_33
+        fi
+        print_result ;;
 
     *)
         arg="$1"
         if [[ "$arg" =~ ^w[1-9]$|^w1[0-6]$ ]]; then
             "test_$arg"
-        elif [[ "$arg" =~ ^[0-9]+$ ]] && [ "$arg" -ge 1 ] && [ "$arg" -le 28 ]; then
+        elif [[ "$arg" =~ ^[0-9]+$ ]] && [ "$arg" -ge 1 ] && [ "$arg" -le 33 ]; then
             "test_$(printf '%02d' "$arg")"
         else
             echo "无效参数: $1"
-            echo "用法: $0 [?|help|all|write|stream|full|listen|<1-31>|s1|w1-w17|menu]"
+            echo "用法: $0 [?|help|all|write|stream|full|listen|<1-33>|s1|w1-w17|menu]"
             echo "试试: $0 ?  查看完整帮助"
             exit 1
         fi

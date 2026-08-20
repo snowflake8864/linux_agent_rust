@@ -8,6 +8,8 @@ pub mod alert_impl;
 pub mod config_impl;
 pub mod task_local_impl;
 pub mod process_policy_impl;
+pub mod proc_diag_impl;
+pub mod port_knock_impl;
 pub mod peripheral_policy_impl;
 pub mod ip_policy_impl;
 pub mod data_query_impl;
@@ -27,6 +29,8 @@ pub use data_hub::{AgentDataHub, AgentMode, AGENT_MODE, require_offline, set_onl
     ADMISSION_MODE, ADMISSION_EFFECTIVE, ADMISSION_DETECTING, ADMISSION_NETWORK_ANOMALY};
 pub use config_impl::ConfigServiceImpl;
 pub use process_policy_impl::ProcessPolicyServiceImpl;
+pub use proc_diag_impl::ProcDiagServiceImpl;
+pub use port_knock_impl::PortKnockServiceImpl;
 pub use peripheral_policy_impl::PeripheralPolicyServiceImpl;
 pub use ip_policy_impl::IpPolicyServiceImpl;
 pub use data_query_impl::DataQueryServiceImpl;

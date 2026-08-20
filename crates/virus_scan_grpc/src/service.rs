@@ -42,7 +42,8 @@ use agent_local_svc::{
     IpPolicyServiceImpl, DataQueryServiceImpl, OutreachDetectServiceImpl,
     AgentStatusServiceImpl, AlertServiceImpl, LocalTaskServiceImpl,
     PolicyWatchServiceImpl, ProcessDefenseServiceImpl, PeripheralDefenseServiceImpl,
-    AdmissionServiceImpl, BackendServiceImpl, PolicyQueryServiceImpl,
+    AdmissionServiceImpl, BackendServiceImpl, PolicyQueryServiceImpl, ProcDiagServiceImpl,
+    PortKnockServiceImpl,
 };
 use agent_local_svc::stub_handlers::{
     DirPolicyServiceImpl, ExtortPolicyServiceImpl, JumpServiceImpl,
@@ -196,7 +197,9 @@ impl StartVirusScanGrpcService for BootManager {
                 .add_service(grpc_gateway::policy_watch::policy_watch_service_server::PolicyWatchServiceServer::new(
                     PolicyWatchServiceImpl { data_hub: data_hub.clone() }))
                 .add_service(grpc_gateway::policy_query::policy_query_service_server::PolicyQueryServiceServer::new(
-                    PolicyQueryServiceImpl { data_hub: data_hub.clone() }));
+                    PolicyQueryServiceImpl { data_hub: data_hub.clone() }))
+                .add_service(grpc_gateway::proc_diag::proc_diag_service_server::ProcDiagServiceServer::new(
+                    ProcDiagServiceImpl));
 
             // [GRPC] VIRUS_SCAN && [VIGILIXAV] ENABLED
             if grpc_svc.virus_scan && vigilixav_enabled {
@@ -261,6 +264,16 @@ impl StartVirusScanGrpcService for BootManager {
             builder = builder.add_service(
                 grpc_gateway::outreach_detect::outreach_detect_service_server::OutreachDetectServiceServer::new(
                     OutreachDetectServiceImpl { data_hub: data_hub.clone() }));
+
+            // [GRPC] PORT_KNOCK — 单包敲门中继
+            if grpc_svc.port_knock {
+                builder = builder.add_service(
+                    grpc_gateway::port_knock::port_knock_service_server::PortKnockServiceServer::new(
+                        PortKnockServiceImpl { data_hub: data_hub.clone() }));
+                log_info!("[gRPC] PortKnockService 已注册");
+            } else {
+                log_info!("[gRPC] PortKnockService 跳过（GRPC.PORT_KNOCK=0）");
+            }
 
             // Stub services（始终注册）
             builder = builder

@@ -21,6 +21,9 @@ use docker::StartDockerMonitor;
 use virus_scan_grpc::StartVirusScanGrpcService;
 use std::fs;
 use std::path::Path;
+use std::net::IpAddr;
+use std::time::Duration;
+
 
 const PID_FILE: &str = "/var/run/osec_backend.pid";
 
@@ -86,19 +89,28 @@ async fn main() -> std::io::Result<()> {
     // 初始化 SQLite 数据库（受 [SQLITE_DB] 和 [DB_POLICY] 开关控制）
     local_store::init_all();
 
+    // 启动早期同步探测服务器连通性：拿到 token 才算真正在线。
+    // 在线则跳过 DB 进程策略加载（交给服务器重推），离线才加载本地表并下发。
+    let online = match online::probe_online(Duration::from_secs(5)).await {
+        Some(_) => { log_info!("[startup] 在线探测成功（拿到 token），跳过 DB 进程策略加载"); true }
+        None => { log_info!("[startup] 在线探测失败（拿不到 token），按离线处理"); false }
+    };
+
     // 从 DB 恢复策略到内存（仅 SQLite 开关开启时生效）
-    // 在线模式 → 从在线基线表加载；离线模式 → 从离线本地表加载
     {
         let cfg = NETINFO_CONFIG.lock().unwrap();
         let db_enabled = cfg.sqlite_db.enabled;
-        let is_offline = cfg.is_offline_mode;
         let load_process = cfg.db_policy.process_policy;
         let load_peripheral = cfg.db_policy.peripheral_policy;
         let usb_protect = cfg.usb_protect;
         drop(cfg);
+        log_info!("[startup] cfg: sqlite_db.enabled={} db_policy.process_policy={} db_policy.peripheral_policy={} usb_protect={} online={}",
+            db_enabled, load_process, load_peripheral, usb_protect, online);
         if db_enabled {
-            if load_process {
-                process_mgr::POLICY_MANAGER.lock().unwrap().load_policy_from_db_if_enabled(is_offline);
+            if load_process && !online {
+                // 启动即离线：合并加载在线基线表(上次服务器策略) + 离线本地表(gRPC 策略)，
+                // 延用上次在线时服务器下发的策略，不丢；在线交给服务器重推，避免与 scan 的 md5_map 锁互锁
+                process_mgr::POLICY_MANAGER.lock().unwrap().load_policy_from_db_merged();
             }
             if load_peripheral {
                 // 合并加载在线表 + 本地表，避免在线启动时丢失用户本地策略修改
@@ -126,6 +138,10 @@ async fn main() -> std::io::Result<()> {
     reporter::set_auto_process_tx(auto_process_tx.clone());
     let (token_tx, token_rx) = mpsc::channel::<String>(8);
     let (host_is_offline_tx, host_is_offline_rx) = mpsc::channel::<bool>(8);
+
+    // 捕获 eBPF 后端引用，供策略下发完成后再启动后台 MD5 扫描（避免与下发互锁）
+    #[cfg(feature = "ebpf")]
+    let mut ebpf_scan: Option<Arc<ebpf_backend::EbpfBackend>> = None;
 
     // ── 后端选择 ──
     {
@@ -188,23 +204,9 @@ async fn main() -> std::io::Result<()> {
                 }
                 log_info!("[eBPF] ✅ EbpfBackend 初始化完成，所有 BPF 程序已加载到内核");
 
-                // 扫描系统可执行文件目录，填充 md5_map（hash→inode 映射）
-                // 这是 eBPF 进程黑白名单生效的前提：下发 MD5 规则后需通过 md5_map 查找 inode 写入 BPF map
-                let scan_dirs: Vec<String> = [
-                    "/bin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/lib/systemd",
-                ].iter().map(|s| s.to_string()).collect();
-                let ebpf_scan = ebpf.clone();
-                tokio::task::spawn_blocking(move || {
-                    if let Err(e) = ebpf_scan.scan_executables(&scan_dirs, true) {
-                        log_error!("[EbpfBackend] 扫描可执行文件失败: {}", e);
-                    }
-                    // 扫描完成后，从 DB 重建非扫描目录(/opt 等)可执行文件的 md5_map，
-                    // 避免重启后这些白名单进程再次被拦截一次。
-                    if let Err(e) = ebpf_scan.load_md5_inode_cache() {
-                        log_error!("[EbpfBackend] 从 DB 加载 md5_inode_cache 失败: {}", e);
-                    }
-                });
-                log_info!("eBPF md5_map 后台扫描已启动");
+                // 扫描系统可执行文件目录（hash→inode 映射）留到策略下发之后再启动，
+                // 避免与 apply_loaded_policy_to_kernel 争抢 md5_map 锁导致主线程阻塞。
+                ebpf_scan = Some(ebpf.clone());
 
                 // 启动 eBPF 进程/文件事件 ring buffer reader（拦截/监控告警上报）
                 ebpf.start_proc_event_reader();
@@ -292,13 +294,8 @@ async fn main() -> std::io::Result<()> {
                                         cfg.mod_ver = "noop".to_string();
                                         Arc::new(NoopBackend)
                                     } else {
-                                        // 后台扫描 + ringbuf reader
-                                        let ebpf_fb = ebpf.clone();
-                                        tokio::task::spawn_blocking(move || {
-                                            let dirs: Vec<String> = ["/bin","/usr/bin","/usr/sbin","/usr/local/bin","/usr/lib/systemd"]
-                                                .iter().map(|s| s.to_string()).collect();
-                                            let _ = ebpf_fb.scan_executables(&dirs, true);
-                                        });
+                                        // 后台扫描同样后移（与主 eBPF 分支一致）
+                                        ebpf_scan = Some(ebpf.clone());
                                         ebpf.start_proc_event_reader();
                                         ebpf.start_file_event_reader();
 
@@ -364,23 +361,42 @@ async fn main() -> std::io::Result<()> {
         drop(cfg);
     }
 
-    // 后端就绪后，把启动时从 DB 恢复的进程黑白名单主动下发到内核。
-    // 离线启动（拿不到 token）时服务器不会下发进程策略，若不在此补推，
-    // gRPC 能读到内存里的策略，但内核 proc_rules 为空、不会触发拦截。
+    // 后端就绪后，仅在离线时把启动恢复的进程黑白名单下发到内核。
+    // 在线时服务器会通过 task_fetcher 重推策略，这里跳过，避免与后台 MD5 扫描抢 md5_map 锁。
     // 注意：必须在 drop(cfg) 之后调用。apply_loaded_policy_to_kernel 内部会再次
     // lock NETINFO_CONFIG（检查 [SQLITE_DB]/[DB_POLICY] 开关）；若在 cfg 仍被持有
     // 的作用域内调用，会自死锁（std::sync::Mutex 不可重入），导致 gRPC 无法启动。
-    process_mgr::POLICY_MANAGER.lock().unwrap().apply_loaded_policy_to_kernel();
+    if !online {
+        process_mgr::POLICY_MANAGER.lock().unwrap().apply_loaded_policy_to_kernel();
+    }
 
-    // 检查是否为离线模式（配置指定，直接设置，不经过阈值）
-    let is_offline = NETINFO_CONFIG.lock().unwrap().is_offline_mode;
-    if is_offline {
+    // 策略下发完成后再启动 eBPF 后台 MD5 扫描，避免与下发争抢 md5_map 锁阻塞主线程。
+    #[cfg(feature = "ebpf")]
+    if let Some(ebpf) = ebpf_scan {
+        let scan_dirs: Vec<String> = [
+            "/bin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/lib/systemd",
+        ].iter().map(|s| s.to_string()).collect();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = ebpf.scan_executables(&scan_dirs, true) {
+                log_error!("[EbpfBackend] 扫描可执行文件失败: {}", e);
+            }
+            // 扫描完成后，从 DB 重建非扫描目录(/opt 等)可执行文件的 md5_map，
+            // 避免重启后这些白名单进程再次被拦截一次。
+            if let Err(e) = ebpf.load_md5_inode_cache() {
+                log_error!("[EbpfBackend] 从 DB 加载 md5_inode_cache 失败: {}", e);
+            }
+        });
+        log_info!("eBPF md5_map 后台扫描已启动");
+    }
+
+    // 初始 AGENT_MODE 以启动探测结果为准（token 才是真正上线的依据）
+    if online {
+        AGENT_MODE.store(AgentMode::Online as u8, std::sync::atomic::Ordering::Relaxed);
+    } else {
         AGENT_MODE.store(AgentMode::Offline as u8, std::sync::atomic::Ordering::Relaxed);
         ADMISSION_NETWORK_ANOMALY.store(true, std::sync::atomic::Ordering::Relaxed);
-    } else {
-        AGENT_MODE.store(AgentMode::Online as u8, std::sync::atomic::Ordering::Relaxed);
     }
-    log_info!("当前模式: {}", if is_offline { "离线" } else { "在线" });
+    log_info!("当前模式: {}", if online { "在线" } else { "离线" });
 
     // 创建 Netlink 套接字（在离线模式下仍尝试创建，供内核事件使用）
     let nl_sock = NlSockInfo::create_socket()
@@ -390,15 +406,29 @@ async fn main() -> std::io::Result<()> {
         })
         .ok();
 
+
     if let Some(ref sock) = nl_sock {
         match send_data_to_kernel(sock) {
             Ok(msg) => log_info!("向内核发送数据成功: {}", msg),
             Err(e) => log_error!("向内核发送数据失败: {}", e),
         }
+        let cfg = NETINFO_CONFIG.lock().unwrap();
+
+        if let Ok(ip) = cfg.server_ip.parse::<IpAddr>() {
+            let bytes = match ip {
+                IpAddr::V4(v4) => v4.octets().to_vec(),
+                IpAddr::V6(v6) => v6.octets().to_vec(),
+            };
+            // 这里调用 send_message
+            sock.send_message(0x703, &bytes)?; // 或者用 match 处理错误
+        } else {
+            log_error!("Invalid IP address: {}", cfg.server_ip);
+        }
+
+        drop(cfg);
     } else {
         log_error!("Netlink socket 未创建，跳过 send_data_to_kernel");
     }
-
 /*
     // 初始化信号处理
     let sigint = unix_signal(SignalKind::interrupt())?;

@@ -111,15 +111,18 @@ impl BaseOnline {
 
         let url = format!("{}/v1/auth", net_client.get_base_url().unwrap_or_default());
         //println!("==url:{}", url);
-        match net_client.post_data_async(&url, &json_str, Duration::from_secs(30), None).await {
-            Ok(response) => {
-                log_info!("response: {:?}", response);
+        match net_client
+            .post_data_async_with_status(&url, &json_str, Duration::from_secs(30), None)
+            .await
+        {
+            Ok((status, body)) => {
+                log_info!("auth request returned status={} body={}", status, body);
                 // 尝试将响应解析为 AuthResponse 结构
-                match serde_json::from_str::<AuthResponse>(&response) {
+                match serde_json::from_str::<AuthResponse>(&body) {
                     Ok(auth_response) => {
                         // 成功解析 token
                         log_info!("Token: {}", auth_response.data.token);
-                        return Ok(auth_response.data.token);  // 返回 token
+                        return Ok(auth_response.data.token); // 返回 token
                     }
                     Err(e) => {
                         eprintln!("Failed to parse response: {}", e);
@@ -140,6 +143,18 @@ impl BaseOnline {
         Err("Failed to get token.".to_string()) // 如果没有 token，返回错误
     }
 
+}
+
+/// 启动早期同步探测服务器连通性：短超时发一次 /v1/auth，拿到 token 才算真正在线。
+/// 返回 Some(token) 表示在线；网络错误/超时/解析失败返回 None（离线）。
+/// 唯一依据是 token，不依赖配置里的 OFFLINE_MODE。
+pub async fn probe_online(timeout: std::time::Duration) -> Option<String> {
+    let base_url = NETINFO_CONFIG.lock().ok()?.server_ip_port.clone();
+    let mut net_client = NetClient::new(Some(base_url), true).ok()?;
+    match tokio::time::timeout(timeout, BaseOnline::run(&mut net_client, false)).await {
+        Ok(Ok(token)) => Some(token),
+        _ => None,
+    }
 }
 
 pub trait StartOnline {

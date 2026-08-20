@@ -1,0 +1,18 @@
+syntax = "proto3";
+package port_knock;
+
+// 并把服务器的响应内容原样返回。
+service PortKnockService {
+    rpc PortKnock(PortKnockRequest) returns (PortKnockResponse);
+}
+
+message PortKnockRequest {
+    string user_id = 1;       // 用户标识
+    string signed_random = 2; // 签名后的随机数
+}
+
+message PortKnockResponse {
+    bool success = 1;         // 是否成功（服务器业务 code=="000000"；非 JSON 时退回按 HTTP 2xx 判断）
+    int32 http_status = 2;    // 服务器返回的 HTTP 状态码（网络错误时为 0）
+    string response = 3;      // 服务器响应内容（透传 body，形如 {"code":"000000","msg":...,"data":...}）
+}

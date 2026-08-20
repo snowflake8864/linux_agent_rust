@@ -10,6 +10,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "src/proto/config.proto",
                 "src/proto/task_local.proto",
                 "src/proto/process_policy.proto",
+                "src/proto/proc_diag.proto",
+                "src/proto/port_knock.proto",
                 "src/proto/peripheral_policy.proto",
                 "src/proto/dir_policy.proto",
                 "src/proto/extort_policy.proto",

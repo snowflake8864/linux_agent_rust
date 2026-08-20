@@ -274,6 +274,44 @@ impl AgentDataHub {
         }
     }
 
+    /// 单包敲门（SPA）中继：把第三方敲门请求（user_id + 签名随机数）转发到服务器
+    /// POST /v1/portknock，并把服务器响应原样透传回来。
+    /// 返回 (success, http_status, response_body)；网络错误时 success=false, http_status=0。
+    pub async fn port_knock(&self, user_id: &str, signed_random: &str) -> (bool, i32, String) {
+        let base_url = {
+            let cfg = config::net_info::NETINFO_CONFIG.lock().unwrap();
+            format!("https://{}:{}", cfg.server_ip, cfg.server_port)
+        };
+
+        let net_client = match net_client::core::NetClient::new(Some(base_url.clone()), true) {
+            Ok(c) => c,
+            Err(e) => {
+                log_info!("[port_knock] 创建 NetClient 失败: {}", e);
+                return (false, 0, format!("创建 NetClient 失败: {}", e));
+            }
+        };
+
+        let token = CURRENT_TOKEN.lock().unwrap().clone();
+        let url = format!("{}/v1/portknock", base_url);
+        let body = serde_json::json!({ "user_id": user_id, "signed_random": signed_random }).to_string();
+
+        match net_client
+            .post_data_async_with_status(&url, &body, tokio::time::Duration::from_secs(30), token.as_deref())
+            .await
+        {
+            Ok((status, resp)) => {
+                // 服务器返回 { code: "000000", msg, data }，code=="000000" 表示业务成功
+                // （参考 task_fetcher.rs 中 post_data_async 的响应处理）
+                let success = match serde_json::from_str::<serde_json::Value>(&resp) {
+                    Ok(parsed) => parsed["code"].as_str() == Some("000000"),
+                    Err(_) => status >= 200 && status < 300, // 非 JSON 响应退回按 HTTP 状态判断
+                };
+                (success, status as i32, resp)
+            }
+            Err(e) => (false, 0, e),
+        }
+    }
+
     /// Get peripheral (USB) whitelist or blacklist.
     pub fn get_peripheral_policy(
         &self,
@@ -690,7 +728,7 @@ impl AgentDataHub {
         &self,
         items: &[netblock::ip_policy::IpPolicy],
     ) -> Result<(), String> {
-        netblock::ip_policy::update_and_write_policies(items.to_vec()).await?;
+        netblock::ip_policy::update_and_write_policies(items.to_vec(), "netblocks").await?;
         self.notify(PolicyChangeType::IpBlockPolicyChanged);
         Ok(())
     }
