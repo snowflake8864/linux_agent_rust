@@ -103,6 +103,41 @@ impl NetClient {
         }
     }
 
+    /// POST 并透传 HTTP 状态码与响应体：(u16 status, String body)。
+    /// 无论 2xx/4xx/5xx 都返回状态码+body，仅网络层错误才返回 Err。
+    /// 用于单包敲门等需要把服务器响应原样透传的场景。
+    pub async fn post_data_async_with_status(
+        &self,
+        url: &str,
+        json_data: &str,
+        timeout: Duration,
+        token: Option<&str>,
+    ) -> Result<(u16, String), String> {
+        let mut request = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("Accept-Encoding", "gzip")
+            .timeout(timeout)
+            .body(json_data.to_string());
+
+        if let Some(token_str) = token {
+            request = request.header("Authorization", format!("{}", token_str));
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send POST request: {}", e))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read response text: {}", e))?;
+        Ok((status, body))
+    }
+
 
     /// 带指数退避重试的 POST 请求
     /// - 网络错误 / 5xx 服务端错误：最多重试 max_retries 次

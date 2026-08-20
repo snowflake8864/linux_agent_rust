@@ -1626,10 +1626,11 @@ pub async fn task_down_virtual_port(&self, task_type: u64) -> Result<(), String>
                 r#type: r.r#type.clone(),
             })
             .collect();
+        log_info!("=======proto_rules{:?}",proto_rules);
         *VIRTUAL_PORT_CACHE.lock().unwrap() = proto_rules;
         notify_policy_change(PolicyChangeType::VirtualPortChanged);
     }
-
+    log_info!("================valid_rules:{:?}",valid_rules);
     if total == 0 {
         log_error!("No valid rules to write to /proc/osec/net_rules");
         return Ok(());
@@ -1754,7 +1755,7 @@ async fn task_down_netblock_policy(&self, task_type: u64) -> Result<(), String> 
         }
     }
 
-    update_and_write_policies(policies).await
+    update_and_write_policies(policies, "netblocks").await
 }
 
 async fn task_down_black_ip_policy(&self, task_type: u64) -> Result<(), String> {
@@ -1812,9 +1813,9 @@ async fn task_down_black_ip_policy(&self, task_type: u64) -> Result<(), String> 
             }
         }
     }
-
+   log_info!("black ip policies:{:?}", policies);
     // 更新全局 Map 并下发到内核
-    update_and_write_policies(policies).await
+    update_and_write_policies(policies, "policies").await
 }
 async fn task_down_extort(&self, task_type: u64) -> Result<(), String> {
 

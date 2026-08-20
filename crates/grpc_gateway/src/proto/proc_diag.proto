@@ -1,0 +1,25 @@
+syntax = "proto3";
+package proc_diag;
+
+// 进程规则诊断服务（独立于 ProcessPolicyService，避免影响已对第三方开放的接口）。
+// 用于查询某个进程（路径或 dev/inode）是否命中 eBPF proc_rules 白/黑名单表。
+service ProcDiagService {
+    rpc QueryProcessRule(ProcessRuleQuery) returns (ProcessRuleResult);
+}
+
+// 查询指定进程：优先用显式 dev/inode，否则从 path 解析（相对路径先 canonicalize）
+message ProcessRuleQuery {
+    string path = 1;   // 进程路径（相对或绝对），如 ./script/test_grpc.sh
+    uint64 dev = 2;    // 可选：显式 dev（dev+inode 任一非 0 时优先于 path）
+    uint64 inode = 3;  // 可选：显式 inode
+}
+
+message ProcessRuleResult {
+    bool found = 1;           // 是否命中 proc_rules 表
+    int32 action = 2;         // 0=白名单(allow), 1=黑名单(deny), -1=未命中
+    int32 mode = 3;           // 0=inherit, 1=monitor, 2=protect
+    uint64 dev = 4;           // 解析后的 dev
+    uint64 inode = 5;         // 解析后的 inode
+    string resolved_path = 6; // canonicalize 后的全路径
+    string message = 7;       // 说明文字
+}

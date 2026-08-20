@@ -10,6 +10,8 @@ pub mod alert { tonic::include_proto!("alert"); }
 pub mod config { tonic::include_proto!("config"); }
 pub mod task_local { tonic::include_proto!("task_local"); }
 pub mod process_policy { tonic::include_proto!("process_policy"); }
+pub mod proc_diag { tonic::include_proto!("proc_diag"); }
+pub mod port_knock { tonic::include_proto!("port_knock"); }
 pub mod peripheral_policy { tonic::include_proto!("peripheral_policy"); }
 pub mod dir_policy { tonic::include_proto!("dir_policy"); }
 pub mod extort_policy { tonic::include_proto!("extort_policy"); }

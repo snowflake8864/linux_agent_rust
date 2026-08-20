@@ -227,6 +227,65 @@ impl ProcessPolicyManager {
         }
     }
 
+    /// 启动即离线：合并加载在线基线表(process_policy，上次服务器策略) + 离线本地表(process_policy_local，gRPC 策略)。
+    /// 先加载在线基线，再叠加本地表（同 hash 本地覆盖在线），保证：
+    ///   - 上次在线时服务器下发的策略不丢失（本次离线延用）；
+    ///   - 本地 gRPC 策略仍然生效。
+    pub fn load_policy_from_db_merged(&mut self) {
+        if !local_store::sqlite_db_enabled() {
+            return;
+        }
+        let db_ok = config::net_info::NETINFO_CONFIG
+            .lock()
+            .map(|c| c.db_policy.process_policy)
+            .unwrap_or(false);
+        if !db_ok {
+            return;
+        }
+
+        self.white_set.clear();
+        self.black_set.clear();
+
+        // 1. 在线基线表（上次服务器策略）
+        let mut online_white = 0usize;
+        let mut online_black = 0usize;
+        match local_store::process_policy::load_all() {
+            Ok(entries) => {
+                for (hash, is_white) in entries {
+                    if is_white {
+                        self.white_set.insert(hash);
+                        online_white += 1;
+                    } else {
+                        self.black_set.insert(hash);
+                        online_black += 1;
+                    }
+                }
+            }
+            Err(e) => logging::log_error!("[process_policy] 加载在线基线表失败: {}", e),
+        }
+
+        // 2. 离线本地表（gRPC 策略），同 hash 覆盖在线
+        match local_store::process_policy::load_all_local() {
+            Ok(entries) => {
+                for (hash, is_white) in entries {
+                    self.white_set.remove(&hash);
+                    self.black_set.remove(&hash);
+                    if is_white {
+                        self.white_set.insert(hash);
+                    } else {
+                        self.black_set.insert(hash);
+                    }
+                }
+            }
+            Err(e) => logging::log_error!("[process_policy] 加载离线本地表失败: {}", e),
+        }
+
+        log::info!(
+            "[process_policy] 合并加载完成: 在线基线(白{} 黑{}) + 本地覆盖 => 最终 白{} 黑{}",
+            online_white, online_black, self.white_set.len(), self.black_set.len()
+        );
+    }
+
     /// 将内存中已加载（DB 恢复）的黑白名单全量下发到内核。
     /// 离线启动时服务器不会下发进程策略，后端初始化完成后必须主动推给 eBPF/驱动，
     /// 否则 gRPC 能读到内存里的策略，但内核 proc_rules 没有对应规则、不会触发拦截。
@@ -258,8 +317,10 @@ impl ProcessPolicyManager {
         self.prev_white_set = self.white_set.clone();
         self.prev_black_set = self.black_set.clone();
 
+        // 无论策略是否为空都通知内核：空策略表示「加载完成」，eBPF 侧据此开启进程检测，
+        // 否则无黑白名单时检测会一直关闭。
+        Self::notify_kernel_update();
         if !white.is_empty() || !black.is_empty() {
-            Self::notify_kernel_update();
             log_info!("[process_policy] 启动下发 DB 策略到内核: 白名单 {} 条, 黑名单 {} 条",
                 white.len(), black.len());
         }

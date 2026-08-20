@@ -192,6 +192,7 @@ pub struct GrpcServices {
     pub backup: bool,        // BACKUP — 备份还原服务
     pub task: bool,          // TASK — 本地任务服务
     pub agent_status: bool,  // AGENT_STATUS — 状态上报服务
+    pub port_knock: bool,    // PORT_KNOCK — 单包敲门中继服务（默认关）
 }
 
 impl Default for GrpcServices {
@@ -206,6 +207,7 @@ impl Default for GrpcServices {
             backup:       true,
             task:         true,
             agent_status: true,
+            port_knock:   false,
         }
     }
 }
@@ -558,6 +560,9 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("GRPC", "AGENT_STATUS") {
             config.grpc_svc.agent_status = matches!(value.trim(), "1");
         }
+        if let Some(value) = ini.get("GRPC", "PORT_KNOCK") {
+            config.grpc_svc.port_knock = matches!(value.trim(), "1");
+        }
 
         // [VIGILIXAV] — VigilixAV 病毒扫描配置
         if let Some(value) = ini.get("VIGILIXAV", "ENABLED") {
@@ -776,6 +781,7 @@ impl NetInfoConfig {
         writeln!(file, "BACKUP={}", self.grpc_svc.backup as u8)?;
         writeln!(file, "TASK={}", self.grpc_svc.task as u8)?;
         writeln!(file, "AGENT_STATUS={}", self.grpc_svc.agent_status as u8)?;
+        writeln!(file, "PORT_KNOCK={}", self.grpc_svc.port_knock as u8)?;
         writeln!(file, "[VIGILIXAV]")?;
         writeln!(file, "ENABLED={}", self.vigilixav_enabled as u8)?;
         writeln!(file, "HOST={}", self.vigilixav_host)?;
