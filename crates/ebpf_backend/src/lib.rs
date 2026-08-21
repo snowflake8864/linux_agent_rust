@@ -547,7 +547,7 @@ impl EbpfBackend {
 
         // 只有真正不在服务器黑白名单里的"不明进程"才上报 /v1/autouploadprocess，
         // 让服务器有机会把它加白/黑；已在名单里的（上面已即时补写 proc_rules）不再重复上报。
-        if matches!(n_type, 1001 | 1101) && !in_server_list {
+        if matches!(n_type, 1001 | 1101) /*&& !in_server_list*/ {
             reporter::send_to_autoupload_process(&reporter::AuditProcess {
                 n_time: 0,
                 str_name: String::new(),

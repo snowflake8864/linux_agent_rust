@@ -183,7 +183,7 @@ impl StartAutoProcess for BootManager {
                                     Duration::from_secs(10),
                                     self.get_token().await.as_deref(),
                                 ).await {
-                                    Ok(_) => {},
+                                    Ok(_) => {/*log_info!("[autouploadprocess]: {}", json_str);*/},
                                     Err(err) => log_error!("[autouploadprocess] ❌ 上报失败: {}", err),
                                 }
                                 buffer.clear();
