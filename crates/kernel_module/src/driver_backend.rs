@@ -25,10 +25,9 @@ fn proc_write(path: &str, data: &str) -> Result<(), String> {
     };
     let fd = file.as_raw_fd();
     //log::info!("[DriverBackend] fd={} open_ok", fd);
-
     // write（write_all 保证大批量多行规则不被内核 proc 缓冲截断）
     match file.write_all(data.as_bytes()) {
-        Ok(()) => log::info!("[DriverBackend] fd={} write_ok {}bytes", fd, data.len()),
+        Ok(()) => {/*log::info!("[DriverBackend] fd={} write_ok {}bytes", fd, data.len());*/},
         Err(e) => {
             log::error!("[DriverBackend] ❌ fd={} write_err errno={} {}",
                 fd, e.raw_os_error().unwrap_or(-1), e);
