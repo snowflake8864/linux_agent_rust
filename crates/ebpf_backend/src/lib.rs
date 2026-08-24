@@ -67,6 +67,8 @@ pub struct EbpfBackend {
     proc_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
     /// eBPF ring buffer 读取器（从 file_agent 的 event_ringbuf 读取文件拦截/监控事件）
     file_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
+    /// eBPF ring buffer 读取器（从 net_agent 的 pkt_events 读取虚开端口命中事件）
+    net_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
     /// path → (md5, mtime) 缓存（后台扫描填充 + 首次命中时补充）
     pub path_hash_cache: Arc<RwLock<std::collections::HashMap<String, (String, u64)>>>,
     /// DPI patterns buffer — accumulated until `build` triggers matching
@@ -81,6 +83,10 @@ pub struct EbpfBackend {
     proc_pat_buffer: Arc<Mutex<String>>,
     /// 已下发的进程信任白名单 proc_rules keys（用于 clear 时按 (dev,inode) 移除）
     active_proc_whitelist: Arc<Mutex<Vec<ProcKey>>>,
+    /// 虚拟开端口（VIR_OPEN_PORT）策略状态：镜像驱动的"攒齐一批→整体生效"语义
+    vir_port_state: Arc<Mutex<VirPortState>>,
+    /// NET_AGENT 挂载时修改的 sysctl 原始值（退出时还原）
+    net_sysctl_state: Mutex<Option<NetSysctlState>>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +94,167 @@ pub struct Md5Entry {
     pub inode: u64,
     pub dev: u64,
     pub path: String,
+}
+
+// ── 虚拟开端口（端口虚开/重定向）──
+/// 单条 VIR_OPEN_PORT 规则（对应驱动 network_dos.c 的 NetworkKernelRulesInfo）
+#[derive(Debug, Clone, Default)]
+struct VirPortRule {
+    /// IPPROTO 编号：6=TCP, 17=UDP（VIR_OPEN_PORT 文本 1=tcp 2=udp，解析时换算）
+    protocol: u8,
+    /// 虚开的本机 IP（规则的 source_ip 字段，网络字节序；0=任意，走 find_net_rule wildcard 命中）
+    dst_ip: u32,
+    start_port: u16,
+    end_port: u16,
+    /// 重定向目标 IP（规则的 dest_ip 字段，网络字节序，非 0）
+    dest_ip: u32,
+    /// true=dest_port_type==1，保持原端口转发；false=用 redirect_port
+    keep_port: bool,
+    /// 重定向端口（主机字节序）
+    redirect_port: u16,
+    /// 告警等级（策略 addr_type & 0x1f，对应驱动 osec_report->type / 上报 weight）
+    addr_type: u8,
+}
+
+/// VIR_OPEN_PORT 攒批状态。
+/// 镜像驱动语义：index==0 重置缓冲；index+1==total 时整批生效；
+/// vir_open_port_switch 为总闸（对应驱动 NET_DOS_ENABLE），关闭时条目从 map 清除。
+#[derive(Debug, Default)]
+struct VirPortState {
+    /// 对应 vir_open_port_switch 总闸（驱动 NET_DOS_ENABLE）。
+    /// None=未收到过开关行，视为开启 —— eBPF 模式下 apply_config_diff 因无驱动
+    /// 不下发该行，若默认关闭会导致规则永远不生效。
+    enabled: Option<bool>,
+    expect_total: usize,
+    pending: Vec<VirPortRule>,
+    /// 最近一次完整下发且已生效的规则集（总闸重开时据此恢复写入）
+    latest: Vec<VirPortRule>,
+    /// 已写入 pkt_mod_rules 的 key，用于增量清理（不影响 ECN/阻断等共用此 map 的其他功能）
+    applied_keys: Vec<PktModKey>,
+}
+
+/// 网络转发 sysctl 原始值（退出时还原，对齐老框架 setup_sysctl/restore_sysctl）
+#[derive(Debug)]
+struct NetSysctlState {
+    accept_local_all: Option<String>,
+    accept_local_iface: Option<String>,
+    ip_forward: Option<String>,
+    interface: String,
+}
+
+/// XDP 端口重定向依赖的内核转发设置：
+/// - SNAT 后转发包的源 IP 是本机地址，内核默认按 martian 丢弃，需 accept_local=1
+/// - 重定向转发本身需要 ip_forward=1
+/// 仅在 NET_AGENT 启用挂载时设置；进程退出时由 shutdown() 还原原值。
+fn apply_net_sysctls(interface: &str) -> NetSysctlState {
+    let iface_path = format!("/proc/sys/net/ipv4/conf/{}/accept_local", interface);
+    let items: [(&str, &str); 3] = [
+        ("/proc/sys/net/ipv4/conf/all/accept_local", "1"),
+        (&iface_path, "1"),
+        ("/proc/sys/net/ipv4/ip_forward", "1"),
+    ];
+    let state = NetSysctlState {
+        accept_local_all: std::fs::read_to_string(items[0].0).ok().map(|s| s.trim().to_string()),
+        accept_local_iface: std::fs::read_to_string(items[1].0).ok().map(|s| s.trim().to_string()),
+        ip_forward: std::fs::read_to_string(items[2].0).ok().map(|s| s.trim().to_string()),
+        interface: interface.to_string(),
+    };
+
+    info!("[EbpfBackend] 应用网络转发 sysctl (iface={})...", interface);
+    for (path, val) in items {
+        match std::fs::write(path, val) {
+            Ok(()) => info!("[EbpfBackend] ✅ sysctl {} = {}", path, val),
+            Err(e) => warn!("[EbpfBackend] ⚠ 写 {}={} 失败: {}", path, val, e),
+        }
+    }
+    state
+}
+
+fn restore_net_sysctls(state: &NetSysctlState) {
+    let pairs = [
+        (format!("/proc/sys/net/ipv4/conf/{}/accept_local", state.interface), &state.accept_local_iface),
+        ("/proc/sys/net/ipv4/conf/all/accept_local".to_string(), &state.accept_local_all),
+        ("/proc/sys/net/ipv4/ip_forward".to_string(), &state.ip_forward),
+    ];
+    info!("[EbpfBackend] 还原网络转发 sysctl...");
+    for (path, orig) in pairs {
+        if let Some(v) = orig {
+            match std::fs::write(&path, v) {
+                Ok(()) => info!("[EbpfBackend] ✅ 还原 {} = {}", path, v),
+                Err(e) => warn!("[EbpfBackend] ⚠ 还原 {}={} 失败: {}", path, v, e),
+            }
+        } else {
+            info!("[EbpfBackend] {} 无原始值（原本不可读），跳过还原", path);
+        }
+    }
+}
+
+/// 解析 VIR_OPEN_PORT 行里的 IP 字段为网络字节序 u32。
+/// 空串 / `""` 占位 / 0.0.0.0 / 255.255.255.255 → 0
+/// （对齐驱动 `eip != 4294967295 && eip != 0 才转发` 的判断，避免全网重定向）。
+fn parse_vir_ip(s: &str) -> u32 {
+    let s = s.trim().trim_matches('"');
+    match s.parse::<Ipv4Addr>() {
+        Ok(a) if !a.is_unspecified() && !a.is_broadcast() => u32::from(a).to_be(),
+        _ => 0,
+    }
+}
+
+/// 解析一行 VIR_OPEN_PORT 规则，返回 (index, total, Option<rule>)。
+/// 协议非 tcp/udp、IPv6、无有效 dest_ip 或既不保端口也无 redirectPort 的规则
+/// （纯告警模式，eBPF 无对应语义）返回 None，但仍推进 index/total 计数。
+fn parse_vir_open_port_line(line: &str) -> Option<(usize, usize, Option<VirPortRule>)> {
+    let rest = line.trim().strip_prefix("VIR_OPEN_PORT ")?;
+    let mut index: Option<usize> = None;
+    let mut total: Option<usize> = None;
+    let mut id = 0u32;
+    let mut rule = VirPortRule::default();
+    let mut proto_num = 0u8;
+    let mut is_ipv4 = true;
+
+    // 按 key=value 词法解析，兼容字段间的多余空格（下发端格式串里有双空格）
+    for tok in rest.split_whitespace() {
+        let Some((k, v)) = tok.split_once('=') else { continue };
+        match k {
+            "index" => index = v.parse::<usize>().ok(),
+            "total" => total = v.parse::<usize>().ok(),
+            "id" => id = v.parse::<u32>().unwrap_or(0),
+            "protocol" => proto_num = v.parse::<u8>().unwrap_or(0),
+            "is_ipv4" => is_ipv4 = v.parse::<u8>().unwrap_or(1) == 1,
+            "source_ip" => rule.dst_ip = parse_vir_ip(v),
+            "start_port" => rule.start_port = v.parse::<u16>().unwrap_or(0),
+            "end_port" => rule.end_port = v.parse::<u16>().unwrap_or(0),
+            "dest_ip" => rule.dest_ip = parse_vir_ip(v),
+            // dest_port_type==1 → 保持原端口转发（与驱动 forward_dport 逻辑一致）
+            "dest_port_type" => rule.keep_port = (v.parse::<u32>().unwrap_or(0) & 1) == 1,
+            "redirectPort" => rule.redirect_port = v.parse::<u16>().unwrap_or(0),
+            // 告警等级，上报 weight 用（对齐驱动 osec_report->type）
+            "addr_type" => rule.addr_type = (v.parse::<u32>().unwrap_or(0) & 0x1f) as u8,
+            _ => {} // type 字符串在 eBPF 侧无对应语义，忽略
+        }
+    }
+
+    let (i, t) = (index?, total?);
+
+    let mut r = Some(rule);
+    if !is_ipv4 || proto_num == 0 {
+        warn!("[EbpfBackend] VIR_OPEN_PORT id={} {} 规则，XDP 仅支持 IPv4 tcp/udp，跳过",
+            id, if is_ipv4 { "协议未知" } else { "为 IPv6" });
+        r = None;
+    } else {
+        let mut rule = r.take().unwrap();
+        if rule.keep_port {
+            // 保持原端口转发：不修改目的端口
+            rule.redirect_port = 0;
+        }
+        // 纯告警规则（无有效 dest_ip 或无重定向端口）不再丢弃：
+        // 以"零改写"条目写入 pkt_mod_rules，命中后仍产生事件用于上报告警，
+        // 对齐驱动行为（端口区间命中即上报 openport 审计，无论是否转发）。
+        // 协议换算：文本 1=tcp 2=udp → IPPROTO 6/17
+        rule.protocol = match proto_num { 1 => 6, _ => 17 };
+        r = Some(rule);
+    }
+    Some((i, t, r))
 }
 
 /// 解析进程模式行 `name=...,key=...,match_full_path=1`，返回 (name, key, match_full_path)。
@@ -198,6 +365,7 @@ impl EbpfBackend {
             applied_rules: Arc::new(Mutex::new(std::collections::HashMap::new())),
             proc_ringbuf: Arc::new(Mutex::new(None)),
             file_ringbuf: Arc::new(Mutex::new(None)),
+            net_ringbuf: Arc::new(Mutex::new(None)),
             path_hash_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             dpi_pat_buffer: Arc::new(Mutex::new(String::new())),
             dpi_rule_buffer: Arc::new(Mutex::new(String::new())),
@@ -205,7 +373,80 @@ impl EbpfBackend {
             active_dir_keys: Arc::new(Mutex::new(Vec::new())),
             proc_pat_buffer: Arc::new(Mutex::new(String::new())),
             active_proc_whitelist: Arc::new(Mutex::new(Vec::new())),
+            vir_port_state: Arc::new(Mutex::new(VirPortState::default())),
+            net_sysctl_state: Mutex::new(None),
         })
+    }
+
+    /// 将缓存的 VIR_OPEN_PORT 规则集刷入 net_agent 的 pkt_mod_rules map。
+    /// 镜像驱动语义：总闸（vir_open_port_switch）关闭时只清不写；
+    /// 每次刷新前先清掉自己上次写入的条目，不影响 ECN/动态阻断等同 map 其他功能。
+    fn apply_vir_port_rules(&self) -> Result<(), String> {
+        let mut st = self.vir_port_state.lock().unwrap();
+        let mut loader = self.loader.lock().unwrap();
+        let bpf = loader.net_bpf_mut()
+            .ok_or_else(|| "net agent 未加载".to_string())?;
+        let map_ref = bpf.map_mut("pkt_mod_rules")
+            .ok_or_else(|| "pkt_mod_rules map 不存在".to_string())?;
+        let mut pkt_mod_rules: AyaHashMap<_, PktModKey, PktModValue> =
+            AyaHashMap::try_from(map_ref).map_err(|e| e.to_string())?;
+
+        // 清理上次下发的条目（只清自己写的 key）
+        for k in st.applied_keys.drain(..) {
+            let _ = pkt_mod_rules.remove(&k);
+        }
+
+        if !st.enabled.unwrap_or(true) {
+            info!("[EbpfBackend] vir_open_port_switch=0，虚拟端口条目保持清空");
+            return Ok(());
+        }
+
+        // pkt_mod_rules max_entries=256，给 ECN/阻断等其他功能预留空间
+        const MAX_ENTRIES: usize = 200;
+        const MAX_PORTS_PER_RULE: u32 = 64;
+        let mut inserted = 0usize;
+        let latest = st.latest.clone();
+        for r in &latest {
+            if inserted >= MAX_ENTRIES {
+                warn!("[EbpfBackend] 虚拟端口条目数达到上限 {}，剩余规则截断", MAX_ENTRIES);
+                break;
+            }
+            let start = r.start_port as u32;
+            let end = r.end_port as u32;
+            let (ps, pe) = if end < start || start == 0 { continue; }
+                else if end - start + 1 > MAX_PORTS_PER_RULE {
+                    warn!("[EbpfBackend] 端口区间 {}-{} 过大，截断为 {} 个端口",
+                        r.start_port, r.end_port, MAX_PORTS_PER_RULE);
+                    (start, start + MAX_PORTS_PER_RULE - 1)
+                } else { (start, end) };
+
+            for p in ps..=pe {
+                if inserted >= MAX_ENTRIES { break; }
+                let key = PktModKey {
+                    protocol: r.protocol,
+                    direction: 1, // ingress
+                    padding: [0; 2],
+                    dst_ip: r.dst_ip,
+                    src_port: 0, // 任意源端口
+                    dst_port: (p as u16).to_be(),
+                };
+                let val = PktModValue {
+                    port_mod_enable: (!r.keep_port && r.redirect_port != 0) as u8,
+                    new_dst_port: if r.keep_port || r.redirect_port == 0 { 0 } else { r.redirect_port.to_be() },
+                    // 无有效 dest_ip 的纯告警规则不改写地址
+                    ip_mod_enable: (r.dest_ip != 0) as u8,
+                    new_dst_ip: r.dest_ip,
+                    ..Default::default()
+                };
+                pkt_mod_rules.insert(key, val, 0)
+                    .map_err(|e| format!("pkt_mod_rules insert: {}", e))?;
+                st.applied_keys.push(key);
+                inserted += 1;
+            }
+        }
+        info!("[EbpfBackend] ✅ 虚拟开端口下发完成: {} 条规则 → {} 个 pkt_mod_rules 条目",
+            st.latest.len(), inserted);
+        Ok(())
     }
 
     pub fn init(&self) -> anyhow::Result<()> {
@@ -268,10 +509,24 @@ impl EbpfBackend {
 
         if self.net_loaded {
             info!("[EbpfBackend] --- 挂载 net agent ---");
+            // 端口重定向依赖：accept_local（SNAT 后本机源地址不被判 martian）+ ip_forward
+            *self.net_sysctl_state.lock().unwrap() = Some(apply_net_sysctls(&self.interface));
             loader.attach_net_programs(&self.interface, &self.engine)?;
             // 启用 net feature switch (index 2) — net_agent 可能没有 feature_switches map，容错
             if let Some(bpf) = loader.net_bpf_mut() {
                 ModularLoader::enable_feature(bpf, 2, true)?;
+                // 创建 pkt_events ringbuf reader（虚开端口命中事件 → 告警上报）
+                if let Some(map) = bpf.take_map("pkt_events") {
+                    match RingBuf::try_from(map) {
+                        Ok(rb) => {
+                            *self.net_ringbuf.lock().unwrap() = Some(rb);
+                            info!("[EbpfBackend] ✅ Net event ringbuf reader 创建成功");
+                        }
+                        Err(e) => warn!("[EbpfBackend] ❌ 创建 net ringbuf reader 失败: {}", e),
+                    }
+                } else {
+                    warn!("[EbpfBackend] ⚠ net_agent 无 pkt_events map，虚开端口不上报告警");
+                }
             }
             info!("[EbpfBackend] ✅ Net agent 挂载完成 ({}@{})", self.interface, self.engine);
         } else {
@@ -473,6 +728,84 @@ impl EbpfBackend {
                             backend.report_file_event(&path, &comm, n_type, "监控", event.pid, event.op_type, op_name);
                         }
                     }
+                }
+                if items.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        });
+    }
+
+    /// 启动 eBPF 网络事件 ring buffer 读取器
+    /// net_agent XDP 命中虚开端口/重定向规则时通过 pkt_events 发送事件，
+    /// 这里转换为 OpenPortLog 上报（对齐驱动 openport 审计 → /v1/upOpenPort）。
+    pub fn start_net_event_reader(self: &Arc<Self>) {
+        if !self.net_loaded { return; }
+        let rb = self.net_ringbuf.clone();
+        let backend = self.clone();
+        std::thread::spawn(move || {
+            info!("[EbpfBackend] 网络事件 ringbuf reader 已启动");
+            // 同 (攻击IP, 虚开端口) 30 秒去重：抑制 SYN 重传造成的告警风暴
+            let mut last_seen: std::collections::HashMap<(u32, u16), std::time::Instant> =
+                std::collections::HashMap::new();
+            loop {
+                let items = Self::drain_ringbuf(&rb);
+                for data in &items {
+                    if data.len() < PKT_EVENT_SIZE { continue; }
+                    let ev: PktEvent = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const PktEvent) };
+                    // 只关心 XDP ingress 命中 pkt_mod 规则的事件（0x40），阻断(0x80)走别的告警
+                    if ev.event_type != 3 || ev.tcp_flags_set != 0x40 { continue; }
+
+                    let attack_ip = u32::from_be(ev.src_ip);
+                    let dest_ip = u32::from_be(ev.dst_ip);
+                    let dport = u16::from_be(ev.dst_port);
+
+                    // 去重窗口
+                    let key = (attack_ip, dport);
+                    let now = std::time::Instant::now();
+                    if let Some(t) = last_seen.get(&key) {
+                        if now.duration_since(*t) < std::time::Duration::from_secs(30) {
+                            continue;
+                        }
+                    }
+                    last_seen.insert(key, now);
+                    last_seen.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(120));
+
+                    // 用本地规则缓存补全 redirect_ip / redirect_port / weight(addr_type)
+                    let (weight, redirect_ip, redirect_port) = {
+                        let st = backend.vir_port_state.lock().unwrap();
+                        match st.latest.iter().find(|r| {
+                            r.protocol == ev.protocol
+                                && dport >= r.start_port && dport <= r.end_port
+                                && (r.dst_ip == 0 || r.dst_ip == ev.dst_ip)
+                        }) {
+                            Some(r) => (
+                                r.addr_type as i32,
+                                if r.dest_ip != 0 {
+                                    Ipv4Addr::from(u32::from_be(r.dest_ip)).to_string()
+                                } else {
+                                    String::new()
+                                },
+                                if !r.keep_port && r.redirect_port != 0 { r.redirect_port as i32 } else { 0 },
+                            ),
+                            None => (0, String::new(), 0),
+                        }
+                    };
+
+                    let log = reporter::OpenPortLog {
+                        weight,
+                        time: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i32,
+                        attack_ip: Ipv4Addr::from(attack_ip).to_string(),
+                        destination_ip: Ipv4Addr::from(dest_ip).to_string(),
+                        open_port: dport as i32,
+                        redirect_ip,
+                        redirect_port,
+                    };
+                    info!("[EbpfBackend] 🚨 虚开端口命中: {}:{} -> {}:{} redirect={}:{} weight={}",
+                        log.attack_ip, u16::from_be(ev.src_port), log.destination_ip,
+                        log.open_port, log.redirect_ip, log.redirect_port, log.weight);
+                    reporter::fake_port_audit::push_open_port_log(log);
                 }
                 if items.is_empty() {
                     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1207,9 +1540,56 @@ impl SecurityBackend for EbpfBackend {
         Ok(())
     }
 
-    fn write_net_rules(&self, _rules: &str) -> Result<(), String> {
-        warn!("[EbpfBackend] net_rules not yet supported via eBPF");
-        Ok(())
+    /// 网络规则文本下发。
+    /// 支持 VIR_OPEN_PORT 行（端口虚开/重定向）与 vir_open_port_switch 总闸，
+    /// 语义对齐驱动 net_rules_cmd_parse()；其余行暂不支持，忽略并告警。
+    fn write_net_rules(&self, rules: &str) -> Result<(), String> {
+        let mut result = Ok(());
+        for line in rules.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with("VIR_OPEN_PORT ") {
+                match parse_vir_open_port_line(line) {
+                    Some((index, total, rule)) => {
+                        // 攒批：index==0 重置缓冲（对应驱动 INIT_LIST_HEAD）
+                        let flush = {
+                            let mut st = self.vir_port_state.lock().unwrap();
+                            if index == 0 {
+                                st.pending.clear();
+                            }
+                            st.expect_total = total;
+                            if let Some(r) = rule {
+                                st.pending.push(r);
+                            }
+                            total > 0 && index + 1 == total
+                        };
+                        // index+1==total：整批生效（对应驱动 splice 到 gListTcpPolicy）
+                        if flush {
+                            let mut st = self.vir_port_state.lock().unwrap();
+                            st.latest = std::mem::take(&mut st.pending);
+                        }
+                        if let Err(e) = self.apply_vir_port_rules() {
+                            result = Err(e);
+                        }
+                    }
+                    None => warn!("[EbpfBackend] VIR_OPEN_PORT 行解析失败: {}", line),
+                }
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("vir_open_port_switch ") {
+                let on = v.trim() != "0";
+                self.vir_port_state.lock().unwrap().enabled = Some(on);
+                info!("[EbpfBackend] vir_open_port_switch={}", on as u8);
+                if let Err(e) = self.apply_vir_port_rules() {
+                    result = Err(e);
+                }
+                continue;
+            }
+            warn!("[EbpfBackend] write_net_rules 忽略不支持的规则行: {}", line);
+        }
+        result
     }
 
     fn write_netblock_switch(&self, _value: &str) -> Result<(), String> { Ok(()) }
@@ -1305,5 +1685,13 @@ impl SecurityBackend for EbpfBackend {
             }
         }
         self.write_self_protect_dirs(enabled)
+    }
+
+    /// 退出清理：还原 NET_AGENT 挂载时修改的 sysctl（accept_local / ip_forward）
+    fn shutdown(&self) {
+        let st = self.net_sysctl_state.lock().unwrap();
+        if let Some(ref s) = *st {
+            restore_net_sysctls(s);
+        }
     }
 }

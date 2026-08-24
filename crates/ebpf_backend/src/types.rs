@@ -146,6 +146,27 @@ unsafe impl aya::Pod for UnifiedEvent {}
 /// Size of proc UnifiedEvent in eBPF = 90 bytes
 pub const UNIFIED_EVENT_SIZE: usize = 90;
 
+// --- 网络事件 ring buffer (匹配 net_agent.bpf.c pkt_event, 16字节) ---
+/// XDP/TC 网络事件：tcp_flags_set=0x40 表示命中 pkt_mod 规则（虚开端口/重定向），
+/// 0x80 表示命中阻断规则。IP 为网络字节序，端口为网络字节序（线上原始值）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PktEvent {
+    pub event_type: u8,      // EVENT_NET = 3
+    pub protocol: u8,        // IPPROTO: 6=TCP, 17=UDP
+    pub tcp_flags_set: u8,   // 动作标记
+    pub _pad: u8,
+    pub src_ip: u32,         // 攻击源 IP（网络字节序）
+    pub dst_ip: u32,         // 原始目的 IP = 本机虚开地址（网络字节序，改写前）
+    pub src_port: u16,       // 源端口（网络字节序）
+    pub dst_port: u16,       // 虚开端口（网络字节序，改写前）
+}
+
+unsafe impl aya::Pod for PktEvent {}
+
+/// Size of net PktEvent in eBPF = 16 bytes
+pub const PKT_EVENT_SIZE: usize = 16;
+
 // --- 文件事件 ring buffer (匹配 file_agent.bpf.c unified_event, 92字节) ---
 /// File event from eBPF file_agent ringbuf.
 /// Layout must match the C struct in file_agent.bpf.c exactly.

@@ -127,6 +127,11 @@ pub trait SecurityBackend: Send + Sync {
     fn clear_docker_rt(&self) -> Result<(), String>;
     fn write_business_ports(&self, ports: &[u16]) -> Result<(), String>;
     fn write_self_protection(&self, num: u32) -> Result<(), String>;
+
+    // ── 退出清理 ──
+    /// 进程退出前的后端清理（如 eBPF 模式还原 sysctl），默认无操作。
+    /// driver/noop 后端无需清理。
+    fn shutdown(&self) {}
 }
 
 /// 全局后端单例

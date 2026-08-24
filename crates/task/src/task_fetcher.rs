@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use tokio::io::AsyncWriteExt; // 
 use std::sync::{Arc, Mutex};
-use tokio::fs::OpenOptions;
 use logging::{log_info,log_error,log_warn};
 use common::manager::boot::BootManager;
 use crate::virtual_port_rule::VirtualPortRule;
@@ -1608,7 +1607,7 @@ pub async fn task_down_virtual_port(&self, task_type: u64) -> Result<(), String>
         .collect();
 
     let total = valid_rules.len();
-
+    log_info!("virtual port ==============================================");
     // Update gRPC cache BEFORE proc write (cache works even without kernel module)
     {
         let proto_rules: Vec<grpc_gateway::virtual_port::VirtualPortRule> = valid_rules
@@ -1636,13 +1635,10 @@ pub async fn task_down_virtual_port(&self, task_type: u64) -> Result<(), String>
         return Ok(());
     }
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .open("/proc/osec/net_rules")
-        .await
-        .map_err(|e| format!("Failed to open /proc/osec/net_rules: {}", e))?;
-
+    // 通过 SecurityBackend 抽象下发：
+    // driver 后端 → 原样写 /proc/osec/net_rules（内容与直写完全一致）；
+    // eBPF  后端 → 解析 VIR_OPEN_PORT 行写入 pkt_mod_rules map
+    let mut batch = String::new();
     for (index, rule) in valid_rules.iter().enumerate() {
         // protocol 转数字: tcp=1, udp=2, 其他=0
         let protocol_num = match rule.protocol.to_lowercase().as_str() {
@@ -1682,17 +1678,12 @@ pub async fn task_down_virtual_port(&self, task_type: u64) -> Result<(), String>
             );
 
         log_info!("{}", rule_str);
+        batch.push_str(&rule_str);
+    }
 
-        file.write_all(rule_str.as_bytes())
-            .await
-            .map_err(|e| format!("Failed to write rule: {}", e))?;
-        }
+    common::backend::with_backend(|b| b.write_net_rules(&batch))?;
 
-    file.flush()
-        .await
-        .map_err(|e| format!("Failed to flush /proc/osec/net_rules: {}", e))?;
-
-    log_info!("Successfully wrote {} rules to /proc/osec/net_rules", total);
+    log_info!("Successfully wrote {} rules via backend", total);
 
     Ok(())
 }

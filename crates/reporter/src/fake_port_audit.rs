@@ -1,15 +1,74 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::collections::VecDeque;
+use std::sync::{Arc, OnceLock, Mutex as StdMutex};
 use crate::netlink_msg::NetlinkNetlog;
-use logging::{log_error, log_info};
+use logging::{log_error, log_info, log_warn};
 use std::mem;
 use std::ptr;
-use std::sync::Arc;
 use zcopy_mgr::{OsecOpenportReport, ZcopyMgr, IpAddrUnion};
 use crate::{OpenPortLog, build_open_port_json};
 use net_client::core::NetClient;
 use tokio::time::Duration;
 use common::manager::boot::BootManager;
+
+/// 全局虚开端口告警队列：eBPF 后端等直接 push，worker 批量 POST /v1/upOpenPort
+/// （对齐驱动模式 netlink/zcopy → FakePortAuditHandler 的上报路径）
+pub static OPEN_PORT_QUEUE: OnceLock<StdMutex<VecDeque<OpenPortLog>>> = OnceLock::new();
+
+/// eBPF 等后端的同步接口：推入虚开端口命中告警（队列上限 500 条防洪）
+pub fn push_open_port_log(log: OpenPortLog) {
+    let q = OPEN_PORT_QUEUE.get_or_init(|| StdMutex::new(VecDeque::new()));
+    if let Ok(mut g) = q.lock() {
+        if g.len() >= 500 {
+            g.pop_front();
+            log_warn!("[openport] 告警队列满，丢弃最旧条目");
+        }
+        g.push_back(log);
+    }
+}
+
+/// 批量取走积压的虚开端口告警（worker 用）
+fn drain_open_port_logs() -> Vec<OpenPortLog> {
+    let q = OPEN_PORT_QUEUE.get_or_init(|| StdMutex::new(VecDeque::new()));
+    match q.lock() {
+        Ok(mut g) => g.drain(..).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 虚开端口告警上报 worker：每 2 秒批量取队列并 POST /v1/upOpenPort。
+/// main.rs 在启动时 spawn；eBPF 后端只管 push_open_port_log，无需感知网络配置。
+pub async fn run_open_port_audit_worker(boot_manager: Arc<BootManager>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    loop {
+        interval.tick().await;
+        let logs = drain_open_port_logs();
+        if logs.is_empty() { continue; }
+
+        let base_url = boot_manager.get_base_url();
+        let client = match NetClient::new(Some(base_url.clone()), true) {
+            Ok(c) => c,
+            Err(err) => {
+                log_error!("[openport] 创建 NetClient 失败: {}", err);
+                continue;
+            }
+        };
+        let url = format!("{}/v1/upOpenPort", base_url);
+        let mut json_str = String::new();
+        match build_open_port_json(&logs, &mut json_str) {
+            Ok(()) => {
+                let token = boot_manager.get_token().await;
+                match client.post_data_async(&url, &json_str, Duration::from_secs(10), token.as_deref()).await {
+                    Ok(_) => {}, //log_info!("[openport] 上报 {} 条成功", logs.len()),
+                    Err(err) => log_error!("[openport] 上报 {} 条失败: {}", logs.len(), err),
+                }
+            }
+            Err(e) => log_error!("[openport] 构建 JSON 失败: {}", e),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct FakePortAuditHandler {
     zcopy_mgr: Arc<ZcopyMgr>,
