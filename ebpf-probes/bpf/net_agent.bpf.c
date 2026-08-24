@@ -102,6 +102,52 @@ struct {
     __type(value, struct pkt_mod_value);
 } pkt_mod_rules SEC(".maps");
 
+// 虚开端口区间规则表（对齐驱动 virtual_open_port_list 链表语义：
+// 一条规则一个 [start,end] 区间，命中靠线性比较，无需按端口展开）
+#define VIR_PORT_MAX 16
+struct vir_port_rule {
+    __u8  protocol;        // IPPROTO 6/17
+    __u8  keep_port;       // 1=保持原端口转发
+    __u16 start_port;      // 主机字节序
+    __u16 end_port;        // 主机字节序
+    __u16 redirect_port;   // 主机字节序，0=不改端口
+    __u32 dst_ip;          // 虚开本机地址(网络序)，0=任意；对应策略 source_ip
+    __u32 new_dst_ip;      // 重定向目标(网络序)，0=纯告警不改写
+    __u8  addr_type;       // 告警等级
+    __u8  pad[3];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, VIR_PORT_MAX);
+    __type(key, __u32);
+    __type(value, struct vir_port_rule);
+} vir_port_rules SEC(".maps");
+
+// 生效规则条数（0=未配置虚开端口，热路径一次查找即短路返回）
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} vir_port_meta SEC(".maps");
+
+// 源地址阻断表（对齐驱动 block_saddr_rt：PRE_ROUTING 前只看源IP，协议无关）
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);   // 网络字节序源IP
+    __type(value, __u8);  // 1=阻断
+} saddr_block_rules SEC(".maps");
+
+// 阻断条数（0=未配置阻断策略，热路径短路跳过查询）
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} saddr_block_meta SEC(".maps");
+
 // Reverse mapping for return traffic
 struct reverse_key {
     __u32 target_ip;
@@ -217,6 +263,38 @@ static __always_inline struct pkt_mod_value *find_net_rule(__u8 protocol, __u8 d
     return NULL;
 }
 
+// Helper: 虚开端口区间匹配（对齐驱动链表线性比较）
+// 命中则把规则折算成等价的 pkt_mod_value 填入 out，走与精确规则相同的改写路径
+static __always_inline int find_vir_port_rule(__u8 protocol, __u32 dst_ip,
+                                              __u16 dst_port_be, struct pkt_mod_value *out)
+{
+    // 性能门控：未配置虚开端口时只花一次数组查找（ARRAY 是最廉价的 map 类型）
+    __u32 mk = 0;
+    __u32 *cnt = bpf_map_lookup_elem(&vir_port_meta, &mk);
+    if (!cnt || *cnt == 0) return 0;
+    __u32 n = *cnt;
+    if (n > VIR_PORT_MAX) n = VIR_PORT_MAX;
+
+    __u16 dport_h = bpf_ntohs(dst_port_be);
+    for (__u32 i = 0; i < VIR_PORT_MAX; i++) {
+        if (i >= n) return 0;
+        __u32 k = i;
+        struct vir_port_rule *r = bpf_map_lookup_elem(&vir_port_rules, &k);
+        if (!r || r->protocol == 0) continue;
+        if (r->protocol != protocol) continue;
+        if (r->dst_ip != 0 && r->dst_ip != dst_ip) continue;
+        if (dport_h < r->start_port || dport_h > r->end_port) continue;
+
+        __builtin_memset(out, 0, sizeof(*out));
+        out->ip_mod_enable   = (r->new_dst_ip != 0);
+        out->new_dst_ip      = r->new_dst_ip;
+        out->port_mod_enable = (!r->keep_port && r->redirect_port != 0);
+        out->new_dst_port    = bpf_htons(r->redirect_port);
+        return 1;
+    }
+    return 0;
+}
+
 // XDP program for ingress packet processing
 SEC("xdp")
 int xdp_packet_filter(struct xdp_md *ctx) {
@@ -238,6 +316,23 @@ int xdp_packet_filter(struct xdp_md *ctx) {
     __u8 protocol = ip->protocol;
     __u32 src_ip = ip->saddr;
     __u32 dst_ip = ip->daddr;
+
+    // 0. 源地址阻断（对齐驱动 PRE_ROUTING block_saddr，协议无关）
+    //    计数门控：未配置阻断策略时只花一次 ARRAY 读，不做 HASH 查询
+    {
+        __u32 mk = 0;
+        __u32 *scnt = bpf_map_lookup_elem(&saddr_block_meta, &mk);
+        if (scnt && *scnt > 0) {
+            __u8 *sb = bpf_map_lookup_elem(&saddr_block_rules, &src_ip);
+            if (sb && *sb) {
+                __u32 k12 = 12;
+                __u64 *c12 = bpf_map_lookup_elem(&debug_stats, &k12);
+                if (c12) (*c12)++;
+                send_network_event(protocol, src_ip, dst_ip, 0, 0, 0x80);
+                return XDP_DROP;
+            }
+        }
+    }
 
     // Debug: count IP packets
     __u32 k1 = 1;
@@ -301,8 +396,14 @@ int xdp_packet_filter(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
-    // 2. Try find mod rule (Ingress = 1)
+    // 2. Try find mod rule (Ingress = 1)，miss 时回退虚开端口区间表
+    struct pkt_mod_value vr_val;
     struct pkt_mod_value *rule = find_net_rule(protocol, 1, dst_ip, src_port, dst_port);
+    if (!rule) {
+        if (find_vir_port_rule(protocol, dst_ip, dst_port, &vr_val)) {
+            rule = &vr_val;
+        }
+    }
     if (!rule) {
         // Debug: count no rule found
         __u32 k4 = 4;

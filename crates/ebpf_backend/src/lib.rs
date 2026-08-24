@@ -1,4 +1,5 @@
 use aya::maps::HashMap as AyaHashMap;
+use aya::maps::Array as AyaArray;
 use aya::maps::RingBuf;
 use log::{info, warn};
 use logging::log_info;
@@ -87,6 +88,12 @@ pub struct EbpfBackend {
     vir_port_state: Arc<Mutex<VirPortState>>,
     /// NET_AGENT 挂载时修改的 sysctl 原始值（退出时还原）
     net_sysctl_state: Mutex<Option<NetSysctlState>>,
+    /// 源地址阻断（对齐驱动 block_saddr）：已写入 saddr_block_rules 的 key
+    saddr_block_keys: Mutex<Vec<u32>>,
+    /// 最近一次下发的阻断 IP 全量列表（开关重开时据此恢复）
+    saddr_latest: Mutex<Vec<String>>,
+    /// 动态阻断总开关（对应驱动 net_block_enable / write_netblock_switch）
+    netblock_enabled: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -118,19 +125,17 @@ struct VirPortRule {
 
 /// VIR_OPEN_PORT 攒批状态。
 /// 镜像驱动语义：index==0 重置缓冲；index+1==total 时整批生效；
-/// vir_open_port_switch 为总闸（对应驱动 NET_DOS_ENABLE），关闭时条目从 map 清除。
+/// vir_open_port_switch 为总闸（对应驱动 NET_DOS_ENABLE），关闭时规则表清空。
 #[derive(Debug, Default)]
 struct VirPortState {
     /// 对应 vir_open_port_switch 总闸（驱动 NET_DOS_ENABLE）。
-    /// None=未收到过开关行，视为开启 —— eBPF 模式下 apply_config_diff 因无驱动
-    /// 不下发该行，若默认关闭会导致规则永远不生效。
+    /// None=未收到过开关行，视为开启 —— eBPF 模式下若总闸行从未到达，
+    /// 默认关闭会导致规则永远不生效。
     enabled: Option<bool>,
     expect_total: usize,
     pending: Vec<VirPortRule>,
     /// 最近一次完整下发且已生效的规则集（总闸重开时据此恢复写入）
     latest: Vec<VirPortRule>,
-    /// 已写入 pkt_mod_rules 的 key，用于增量清理（不影响 ECN/阻断等共用此 map 的其他功能）
-    applied_keys: Vec<PktModKey>,
 }
 
 /// 网络转发 sysctl 原始值（退出时还原，对齐老框架 setup_sysctl/restore_sysctl）
@@ -375,77 +380,126 @@ impl EbpfBackend {
             active_proc_whitelist: Arc::new(Mutex::new(Vec::new())),
             vir_port_state: Arc::new(Mutex::new(VirPortState::default())),
             net_sysctl_state: Mutex::new(None),
+            saddr_block_keys: Mutex::new(Vec::new()),
+            saddr_latest: Mutex::new(Vec::new()),
+            netblock_enabled: AtomicBool::new(false),
         })
     }
 
-    /// 将缓存的 VIR_OPEN_PORT 规则集刷入 net_agent 的 pkt_mod_rules map。
-    /// 镜像驱动语义：总闸（vir_open_port_switch）关闭时只清不写；
-    /// 每次刷新前先清掉自己上次写入的条目，不影响 ECN/动态阻断等同 map 其他功能。
+    /// 将缓存的 VIR_OPEN_PORT 规则集刷入 net_agent 的 vir_port_rules 区间表。
+    /// 一条规则占一个槽位（区间不展开），总开关关闭时清空全表。
+    /// 镜像驱动语义：每次刷新为全量替换。
     fn apply_vir_port_rules(&self) -> Result<(), String> {
-        let mut st = self.vir_port_state.lock().unwrap();
+        const VIR_PORT_MAX: u32 = 16;
+        let st = self.vir_port_state.lock().unwrap();
         let mut loader = self.loader.lock().unwrap();
         let bpf = loader.net_bpf_mut()
             .ok_or_else(|| "net agent 未加载".to_string())?;
-        let map_ref = bpf.map_mut("pkt_mod_rules")
-            .ok_or_else(|| "pkt_mod_rules map 不存在".to_string())?;
-        let mut pkt_mod_rules: AyaHashMap<_, PktModKey, PktModValue> =
-            AyaHashMap::try_from(map_ref).map_err(|e| e.to_string())?;
+        let map_ref = bpf.map_mut("vir_port_rules")
+            .ok_or_else(|| "vir_port_rules map 不存在".to_string())?;
+        // ARRAY 类型 map，必须用 Array 接口（HashMap::try_from 会报 invalid map type 2）
+        let mut tbl: AyaArray<_, VirPortBpfRule> =
+            AyaArray::try_from(map_ref).map_err(|e| e.to_string())?;
 
-        // 清理上次下发的条目（只清自己写的 key）
-        for k in st.applied_keys.drain(..) {
-            let _ = pkt_mod_rules.remove(&k);
+        // 全量替换：先清空所有槽位（protocol=0 即空槽，XDP 侧跳过）
+        let empty = VirPortBpfRule {
+            protocol: 0, keep_port: 0, start_port: 0, end_port: 0,
+            redirect_port: 0, dst_ip: 0, new_dst_ip: 0, addr_type: 0, pad: [0; 3],
+        };
+        for i in 0..VIR_PORT_MAX {
+            let _ = tbl.set(i, &empty, 0);
         }
 
         if !st.enabled.unwrap_or(true) {
-            info!("[EbpfBackend] vir_open_port_switch=0，虚拟端口条目保持清空");
+            info!("[EbpfBackend] vir_open_port_switch=0，虚拟端口规则保持清空");
             return Ok(());
         }
 
-        // pkt_mod_rules max_entries=256，给 ECN/阻断等其他功能预留空间
-        const MAX_ENTRIES: usize = 200;
-        const MAX_PORTS_PER_RULE: u32 = 64;
-        let mut inserted = 0usize;
-        let latest = st.latest.clone();
-        for r in &latest {
-            if inserted >= MAX_ENTRIES {
-                warn!("[EbpfBackend] 虚拟端口条目数达到上限 {}，剩余规则截断", MAX_ENTRIES);
-                break;
-            }
-            let start = r.start_port as u32;
-            let end = r.end_port as u32;
-            let (ps, pe) = if end < start || start == 0 { continue; }
-                else if end - start + 1 > MAX_PORTS_PER_RULE {
-                    warn!("[EbpfBackend] 端口区间 {}-{} 过大，截断为 {} 个端口",
-                        r.start_port, r.end_port, MAX_PORTS_PER_RULE);
-                    (start, start + MAX_PORTS_PER_RULE - 1)
-                } else { (start, end) };
+        let latest = &st.latest;
+        if latest.len() > VIR_PORT_MAX as usize {
+            warn!("[EbpfBackend] 虚开端口规则 {} 条超过表容量 {}，截断",
+                latest.len(), VIR_PORT_MAX);
+        }
+        for (i, r) in latest.iter().take(VIR_PORT_MAX as usize).enumerate() {
+            // 纯告警规则（无 dest_ip 且不保端口无 redirect）：new_dst_ip=0/redirect=0
+            // 即为零改写条目，命中仍发事件用于告警
+            let v = VirPortBpfRule {
+                protocol: r.protocol,
+                keep_port: r.keep_port as u8,
+                start_port: r.start_port,
+                end_port: r.end_port,
+                redirect_port: r.redirect_port,
+                dst_ip: r.dst_ip,
+                new_dst_ip: r.dest_ip,
+                addr_type: r.addr_type,
+                pad: [0; 3],
+            };
+            tbl.set(i as u32, &v, 0)
+                .map_err(|e| format!("vir_port_rules insert[{}]: {}", i, e))?;
+        }
+        // 计数放最后写：XDP 侧以此做热路径短路，未配置时一次查找即返回
+        let meta_ref = bpf.map_mut("vir_port_meta")
+            .ok_or_else(|| "vir_port_meta map 不存在".to_string())?;
+        let mut meta: AyaArray<_, u32> =
+            AyaArray::try_from(meta_ref).map_err(|e| e.to_string())?;
+        let count = if st.enabled.unwrap_or(true) {
+            (latest.len() as u32).min(VIR_PORT_MAX)
+        } else {
+            0
+        };
+        meta.set(0u32, &count, 0)
+            .map_err(|e| format!("vir_port_meta update: {}", e))?;
+        info!("[EbpfBackend] ✅ 虚拟开端口下发完成: {} 条区间规则", count);
+        Ok(())
+    }
 
-            for p in ps..=pe {
-                if inserted >= MAX_ENTRIES { break; }
-                let key = PktModKey {
-                    protocol: r.protocol,
-                    direction: 1, // ingress
-                    padding: [0; 2],
-                    dst_ip: r.dst_ip,
-                    src_port: 0, // 任意源端口
-                    dst_port: (p as u16).to_be(),
-                };
-                let val = PktModValue {
-                    port_mod_enable: (!r.keep_port && r.redirect_port != 0) as u8,
-                    new_dst_port: if r.keep_port || r.redirect_port == 0 { 0 } else { r.redirect_port.to_be() },
-                    // 无有效 dest_ip 的纯告警规则不改写地址
-                    ip_mod_enable: (r.dest_ip != 0) as u8,
-                    new_dst_ip: r.dest_ip,
-                    ..Default::default()
-                };
-                pkt_mod_rules.insert(key, val, 0)
-                    .map_err(|e| format!("pkt_mod_rules insert: {}", e))?;
-                st.applied_keys.push(key);
-                inserted += 1;
+    /// 将 saddr_latest 刷入 net_agent 的 saddr_block_rules map。
+    /// 先清上次写入的 key 再写本次全量；总开关关闭时只清不写（对齐驱动 net_block_enable）。
+    fn apply_saddr_blocks(&self) -> Result<(), String> {
+        let enabled = self.netblock_enabled.load(Ordering::SeqCst);
+        let list = self.saddr_latest.lock().unwrap().clone();
+        let mut tracked = self.saddr_block_keys.lock().unwrap();
+
+        let mut loader = self.loader.lock().unwrap();
+        let bpf = loader.net_bpf_mut()
+            .ok_or_else(|| "net agent 未加载".to_string())?;
+        let map_ref = bpf.map_mut("saddr_block_rules")
+            .ok_or_else(|| "saddr_block_rules map 不存在".to_string())?;
+        let mut m: AyaHashMap<_, u32, u8> =
+            AyaHashMap::try_from(map_ref).map_err(|e| e.to_string())?;
+
+        // 清上次写入的条目
+        for k in tracked.drain(..) {
+            let _ = m.remove(&k);
+        }
+
+        if !enabled {
+            info!("[EbpfBackend] 动态阻断开关=0，源地址阻断表保持清空");
+            return Ok(());
+        }
+
+        let mut n = 0usize;
+        for ip in &list {
+            match ip.parse::<Ipv4Addr>() {
+                Ok(addr) => {
+                    // 网络字节序，与 XDP 里 ip->saddr 原始字节一致
+                    let key = u32::from(addr).to_be();
+                    m.insert(&key, &1u8, 0)
+                        .map_err(|e| format!("saddr_block_rules insert {}: {}", ip, e))?;
+                    tracked.push(key);
+                    n += 1;
+                }
+                Err(_) => warn!("[EbpfBackend] 阻断 IP 非法，跳过: {}", ip),
             }
         }
-        info!("[EbpfBackend] ✅ 虚拟开端口下发完成: {} 条规则 → {} 个 pkt_mod_rules 条目",
-            st.latest.len(), inserted);
+        // 计数放最后写：XDP 侧以此做热路径短路，未配置阻断时一次 ARRAY 读即返回
+        let meta_ref = bpf.map_mut("saddr_block_meta")
+            .ok_or_else(|| "saddr_block_meta map 不存在".to_string())?;
+        let mut meta: AyaArray<_, u32> =
+            AyaArray::try_from(meta_ref).map_err(|e| e.to_string())?;
+        meta.set(0u32, &(n as u32), 0)
+            .map_err(|e| format!("saddr_block_meta update: {}", e))?;
+        info!("[EbpfBackend] ✅ 源地址阻断下发完成: {} 条 (开关={})", n, enabled as u8);
         Ok(())
     }
 
@@ -1520,19 +1574,9 @@ impl SecurityBackend for EbpfBackend {
     }
 
     fn write_ipv4_block_policies(&self, ips: &[String]) -> Result<(), String> {
-        let mut loader = self.loader.lock().unwrap();
-        let bpf = loader.net_bpf_mut().ok_or_else(|| "Net agent not loaded".to_string())?;
-        let mut pkt_mod_rules: AyaHashMap<_, PktModKey, PktModValue> =
-            AyaHashMap::try_from(bpf.map_mut("pkt_mod_rules").unwrap()).map_err(|e| format!("{}", e))?;
-
-        for ip in ips {
-            if let Ok(addr) = ip.parse::<Ipv4Addr>() {
-                let key = PktModKey { protocol: 6, direction: 1, padding: [0;2],
-                    dst_ip: u32::from(addr).to_be(), src_port: 0, dst_port: 0 };
-                let _ = pkt_mod_rules.insert(key, PktModValue::default(), 0);
-            }
-        }
-        Ok(())
+        // 全量替换语义（对齐驱动 'c' 清空+重写）：本次列表即全部阻断项
+        *self.saddr_latest.lock().unwrap() = ips.to_vec();
+        self.apply_saddr_blocks()
     }
 
     fn write_ipv6_block_policies(&self, _ips: &[String]) -> Result<(), String> {
@@ -1592,7 +1636,13 @@ impl SecurityBackend for EbpfBackend {
         result
     }
 
-    fn write_netblock_switch(&self, _value: &str) -> Result<(), String> { Ok(()) }
+    /// 动态阻断总开关（对应驱动 net_block_enable）：0=清空阻断表，1=按最近列表恢复
+    fn write_netblock_switch(&self, value: &str) -> Result<(), String> {
+        let on = value.trim() != "0";
+        self.netblock_enabled.store(on, Ordering::SeqCst);
+        info!("[EbpfBackend] write_netblock_switch={}", on as u8);
+        self.apply_saddr_blocks()
+    }
     fn write_defense_switch(&self, _rule_type: &str, _value: &str) -> Result<(), String> { Ok(()) }
 
     // DPI — parse pattern/rule text strings, resolve directories to (dev,inode),

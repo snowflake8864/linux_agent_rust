@@ -167,6 +167,24 @@ unsafe impl aya::Pod for PktEvent {}
 /// Size of net PktEvent in eBPF = 16 bytes
 pub const PKT_EVENT_SIZE: usize = 16;
 
+// --- 虚开端口区间规则表 (匹配 net_agent.bpf.c vir_port_rule, 20字节) ---
+/// 一条规则一个 [start_port,end_port] 区间，XDP 线性比较命中（对齐驱动链表）
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct VirPortBpfRule {
+    pub protocol: u8,        // IPPROTO: 6=TCP, 17=UDP；0=空槽位
+    pub keep_port: u8,       // 1=保持原端口转发
+    pub start_port: u16,     // 主机字节序
+    pub end_port: u16,       // 主机字节序
+    pub redirect_port: u16,  // 主机字节序，0=不改端口
+    pub dst_ip: u32,         // 虚开本机地址（网络序），0=任意
+    pub new_dst_ip: u32,     // 重定向目标（网络序），0=纯告警不改写
+    pub addr_type: u8,       // 告警等级
+    pub pad: [u8; 3],
+}
+
+unsafe impl aya::Pod for VirPortBpfRule {}
+
 // --- 文件事件 ring buffer (匹配 file_agent.bpf.c unified_event, 92字节) ---
 /// File event from eBPF file_agent ringbuf.
 /// Layout must match the C struct in file_agent.bpf.c exactly.
