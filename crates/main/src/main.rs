@@ -211,6 +211,15 @@ async fn main() -> std::io::Result<()> {
                 // 启动 eBPF 进程/文件事件 ring buffer reader（拦截/监控告警上报）
                 ebpf.start_proc_event_reader();
                 ebpf.start_file_event_reader();
+                // 启动网络事件 ring buffer reader（虚开端口/重定向命中 → 告警队列）
+                ebpf.start_net_event_reader();
+                // 虚开端口告警上报 worker：批量 POST /v1/upOpenPort（对齐驱动模式路径）
+                {
+                    let bm = Arc::new(init.clone());
+                    tokio::spawn(async move {
+                        reporter::fake_port_audit::run_open_port_audit_worker(bm).await;
+                    });
+                }
 
                 // 准入控制：ECN-Echo
                 if admission_enabled && admission_mode == 1 {
@@ -610,6 +619,11 @@ async fn main() -> std::io::Result<()> {
 
     shutdown_signal().await;
     log_info!("程序退出，执行清理...");
+
+    // 后端清理：eBPF 模式还原 NET_AGENT 设置的 sysctl（accept_local / ip_forward）
+    if let Some(b) = common::backend::get_backend() {
+        b.shutdown();
+    }
 
     // 卸载驱动
     if let Err(e) = unload_driver() {

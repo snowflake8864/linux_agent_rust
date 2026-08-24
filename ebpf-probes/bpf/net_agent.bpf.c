@@ -259,7 +259,19 @@ int xdp_packet_filter(struct xdp_md *ctx) {
         if ((void *)(tcp + 1) > data_end) return XDP_PASS;
         src_port = tcp->source;
         dst_port = tcp->dest;
-        
+
+        /* Debug: 打印所有入向 TCP SYN（连接发起包），用于确认包是否进入 XDP。
+         * generic XDP 在 tcpdump 挂点之前执行，抓包看不到原始进向包，只能靠这里。 */
+        {
+            __u8 flags_byte = *((__u8 *)tcp + 13);
+            if ((flags_byte & 0x12) == 0x02) { /* SYN 且无 ACK */
+                bpf_printk("[NET XDP] SYN-IN src %pI4:%u",
+                           &src_ip, bpf_ntohs(src_port));
+                bpf_printk("[NET XDP] SYN-IN dst %pI4:%u",
+                           &dst_ip, bpf_ntohs(dst_port));
+            }
+        }
+
         // Debug: count TCP SYN to dst_port 30002 (12917)
         if (dst_port == 12917) {
             __u32 k11 = 11;
@@ -366,6 +378,16 @@ int xdp_packet_filter(struct xdp_md *ctx) {
     __u32 new_src_ip = src_ip;
     if (rule->ip_mod_enable && rule->new_dst_ip != 0) {
         new_src_ip = dst_ip; // SNAT to local IP
+    }
+
+    /* Debug: 命中虚开/重定向策略后的改写明细 */
+    if (rule->ip_mod_enable || rule->port_mod_enable) {
+        bpf_printk("[NET XDP]   DNAT-> %pI4:%u", &target_ip, bpf_ntohs(target_port));
+        bpf_printk("[NET XDP]   SNAT-> %pI4:%u", &new_src_ip, bpf_ntohs(src_port));
+        if (rule->ip_mod_enable && rule->new_dst_ip != 0) {
+            bpf_printk("[NET XDP]   REVERSE-REC target=%pI4:%u",
+                       &rule->new_dst_ip, bpf_ntohs(rule->new_dst_port));
+        }
     }
 
     // Store reverse mapping

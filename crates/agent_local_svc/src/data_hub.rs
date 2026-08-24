@@ -883,15 +883,11 @@ impl AgentDataHub {
             return Ok(());
         }
 
+        // 通过 SecurityBackend 抽象下发：
+        // driver 后端 → 原样写 /proc/osec/net_rules（内容与直写完全一致）；
+        // eBPF  后端 → 解析 VIR_OPEN_PORT 行写入 pkt_mod_rules map
         let total = valid_rules.len();
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open("/proc/osec/net_rules")
-            .await
-            .map_err(|e| format!("Failed to open /proc/osec/net_rules: {}", e))?;
-
-        use tokio::io::AsyncWriteExt;
+        let mut batch = String::new();
         for (index, rule) in valid_rules.iter().enumerate() {
             let protocol_num = match rule.protocol.to_lowercase().as_str() {
                 "tcp" => 1,
@@ -910,11 +906,9 @@ impl AgentDataHub {
                 if rule.dest_port_type == 0 { rule.dest_port.parse::<u16>().unwrap_or(0) } else { 0 },
                 addr_type,
             );
-            file.write_all(rule_str.as_bytes()).await
-                .map_err(|e| format!("Failed to write rule: {}", e))?;
+            batch.push_str(&rule_str);
         }
-        file.flush().await.map_err(|e| format!("Flush failed: {}", e))?;
-        drop(file);
+        common::backend::with_backend(|b| b.write_net_rules(&batch))?;
 
         self.notify(PolicyChangeType::VirtualPortChanged);
         Ok(())
