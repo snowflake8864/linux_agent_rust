@@ -377,13 +377,80 @@ async fn run_scripts_and_cleanup(script_paths: Vec<PathBuf>, cleanup_dir: &str) 
     }
 }
 
+/// 简易通配符匹配：支持 '*'（任意长度，含 0）和 '?'（任意单字符）
+fn wildcard_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut star_ni = 0usize;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            star_ni = ni;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ni += 1;
+            ni = star_ni;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// 解析 upgrade.conf 中的一行为实际存在的脚本路径列表：
+/// - 含通配符（* 或 ?）：在 dir 下匹配所有同名模式的普通文件（按文件名排序）
+/// - 普通文件名：精确匹配
+fn resolve_upgrade_conf_line(dir: &str, line: &str) -> Vec<PathBuf> {
+    if line.contains('*') || line.contains('?') {
+        let mut matched: Vec<PathBuf> = fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.is_file()
+                            && p.file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|n| wildcard_match(line, n))
+                                .unwrap_or(false)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        matched.sort();
+        if matched.is_empty() {
+            log_error!("[agent_manager] upgrade.conf 通配符未匹配到任何脚本: {} (目录: {})", line, dir);
+        }
+        matched
+    } else {
+        let p = PathBuf::from(dir).join(line);
+        if p.exists() {
+            vec![p]
+        } else {
+            log_error!("[agent_manager] upgrade.conf 列出的脚本不存在: {:?}", p);
+            Vec::new()
+        }
+    }
+}
+
 /// 查找升级脚本列表，按执行顺序返回。
 ///
-/// 优先使用 upgrade.conf（升级包内的配置文件），格式为每行一个脚本名：
+/// 优先使用 upgrade.conf（升级包内的配置文件），格式为每行一个脚本名，
+/// 支持通配符 '*' 和 '?'，同一行可展开为多个脚本（按文件名排序），例如：
 ///   ```
-///   # 按行顺序执行
+///   # 按行顺序执行；含通配符的行按文件名排序后依次执行
+///   ccw-installer-*.sh
+///   osec-installer-*.sh
 ///   driver-installer-1.0.sh
-///   osec-installer-1.1.26T.sh
 ///   ```
 /// 如果没有 upgrade.conf，退回已有逻辑：
 ///   - 文件名含 "installer-" 的 .sh 才参与执行（install.sh 等不含 "installer-" 的被跳过）
@@ -401,20 +468,14 @@ fn find_upgrade_scripts(dir: &str) -> Vec<PathBuf> {
                 return Vec::new();
             }
         };
-        let scripts: Vec<PathBuf> = content
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(|name| PathBuf::from(dir).join(name))
-            .filter(|p| {
-                if p.exists() {
-                    true
-                } else {
-                    log_error!("[agent_manager] upgrade.conf 列出的脚本不存在: {:?}", p);
-                    false
+        let mut scripts: Vec<PathBuf> = Vec::new();
+        for line in content.lines().map(|l| l.trim()).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            for p in resolve_upgrade_conf_line(dir, line) {
+                if !scripts.contains(&p) {
+                    scripts.push(p);
                 }
-            })
-            .collect();
+            }
+        }
 
         if scripts.is_empty() {
             log_error!("[agent_manager] upgrade.conf 中未找到可执行脚本");

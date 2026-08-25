@@ -330,6 +330,68 @@ fn zip_single_file(src_path: &str, zip_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 简易通配符匹配：支持 '*'（任意长度，含 0）和 '?'（任意单字符）
+fn wildcard_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut star_ni = 0usize;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            star_ni = ni;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ni += 1;
+            ni = star_ni;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// 解析 upgrade.conf 中的一行为实际存在的脚本路径列表：
+/// - 含通配符（* 或 ?）：在 dir 下匹配所有同名模式的普通文件（按文件名排序）
+/// - 普通文件名：精确匹配
+/// 与 agent_manager::find_upgrade_scripts 的解析规则保持一致
+fn resolve_upgrade_conf_line(dir: &str, line: &str) -> Vec<PathBuf> {
+    if line.contains('*') || line.contains('?') {
+        let mut matched: Vec<PathBuf> = fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.is_file()
+                            && p.file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|n| wildcard_match(line, n))
+                                .unwrap_or(false)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        matched.sort();
+        matched
+    } else {
+        let p = PathBuf::from(dir).join(line);
+        if p.exists() {
+            vec![p]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 impl TaskFetcher {
     pub fn new(base_url: &str, token: Option<String>, pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>, nl_sock: Option<NlSockInfo>) -> Self 
     {
@@ -1110,26 +1172,22 @@ pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
     log_info!("✅ 更新包已解压到: {}", temp_dir);
 
     // 前置校验：确认升级包里有可执行脚本
-    // 优先检查 upgrade.conf，没有则退回找含 "installer-" 的 .sh
+    // 优先检查 upgrade.conf（每行一个脚本名，支持 '*' / '?' 通配符），没有则退回找含 "installer-" 的 .sh
     let conf_path = format!("{}/upgrade.conf", temp_dir);
-    let script_path_ref: PathBuf;
-    let _script_owned: PathBuf; // 持有所有权
 
-    if Path::new(&conf_path).exists() {
-        // 有 upgrade.conf：只需确认配置文件可读、至少有一行有效脚本名
+    let resolved_scripts: Vec<PathBuf> = if Path::new(&conf_path).exists() {
         log_info!("升级包包含 upgrade.conf，将按配置文件执行");
         let content = fs::read_to_string(&conf_path)
             .map_err(|e| format!("读取 upgrade.conf 失败: {}", e))?;
-        let first_script = content
-            .lines()
-            .map(|l| l.trim())
-            .find(|l| !l.is_empty() && !l.starts_with('#'))
-            .ok_or_else(|| "升级包里的 upgrade.conf 没有列出任何脚本".to_string())?;
-        _script_owned = PathBuf::from(temp_dir).join(first_script);
-        if !_script_owned.exists() {
-            return Err(format!("upgrade.conf 中第一个脚本不存在: {:?}", _script_owned));
+        let mut matched: Vec<PathBuf> = Vec::new();
+        for line in content.lines().map(|l| l.trim()).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            for p in resolve_upgrade_conf_line(temp_dir, line) {
+                if !matched.contains(&p) {
+                    matched.push(p);
+                }
+            }
         }
-        script_path_ref = _script_owned.clone();
+        matched
     } else {
         // 无 upgrade.conf：退回找含 "installer-" 的 .sh
         let mut found: Option<PathBuf> = None;
@@ -1143,23 +1201,32 @@ pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
                 }
             }
         }
-        _script_owned = found.ok_or_else(|| {
-            let mut files = vec![];
-            if let Ok(entries) = fs::read_dir(temp_dir) {
-                for entry in entries.flatten() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        files.push(name.to_string());
-                    } else {
-                        files.push("<非UTF8文件名>".to_string());
+        match found {
+            Some(p) => vec![p],
+            None => {
+                let mut files = vec![];
+                if let Ok(entries) = fs::read_dir(temp_dir) {
+                    for entry in entries.flatten() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            files.push(name.to_string());
+                        } else {
+                            files.push("<非UTF8文件名>".to_string());
+                        }
                     }
                 }
+                return Err(format!(
+                    "升级包里既无 upgrade.conf 也无含 'installer-' 的脚本，目录文件: {:?}",
+                    files
+                ));
             }
-            format!("升级包里既无 upgrade.conf 也无含 'installer-' 的脚本，目录文件: {:?}", files)
-        })?;
-        script_path_ref = _script_owned.clone();
+        }
+    };
+
+    if resolved_scripts.is_empty() {
+        return Err("upgrade.conf 中没有任何一行匹配到升级脚本（支持通配符 * 和 ?）".to_string());
     }
 
-    log_info!("✅ 找到升级脚本: {:?}", script_path_ref);
+    log_info!("✅ 找到升级脚本: {:?}", resolved_scripts);
 
 
     let binary_name = "MagicArmorAgent";
