@@ -1737,8 +1737,14 @@ impl SecurityBackend for EbpfBackend {
         self.write_self_protect_dirs(enabled)
     }
 
-    /// 退出清理：还原 NET_AGENT 挂载时修改的 sysctl（accept_local / ip_forward）
+    /// 退出清理：显式卸载 XDP/TC 网络管控 eBPF（TC filter 内核态持有 prog 引用，
+    /// 不显式卸载会残留并持续拦截流量），再还原 NET_AGENT 挂载时修改的 sysctl
+    /// （accept_local / ip_forward）
     fn shutdown(&self) {
+        {
+            let mut loader = self.loader.lock().unwrap();
+            loader.detach_net_programs();
+        }
         let st = self.net_sysctl_state.lock().unwrap();
         if let Some(ref s) = *st {
             restore_net_sysctls(s);

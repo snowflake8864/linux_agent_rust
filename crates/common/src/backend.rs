@@ -129,7 +129,7 @@ pub trait SecurityBackend: Send + Sync {
     fn write_self_protection(&self, num: u32) -> Result<(), String>;
 
     // ── 退出清理 ──
-    /// 进程退出前的后端清理（如 eBPF 模式还原 sysctl），默认无操作。
+    /// 进程退出前的后端清理（eBPF 模式：卸载 XDP/TC 网络管控程序 + 还原 sysctl），默认无操作。
     /// driver/noop 后端无需清理。
     fn shutdown(&self) {}
 }
