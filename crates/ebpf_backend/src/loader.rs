@@ -1,5 +1,7 @@
 use aya::maps::Array;
-use aya::programs::{SchedClassifier, TcAttachType, Xdp, XdpFlags};
+use aya::programs::{
+    tc::SchedClassifierLinkId, xdp::XdpLinkId, SchedClassifier, TcAttachType, Xdp, XdpFlags,
+};
 use aya::{Bpf, BpfLoader};
 use log::{info, warn};
 
@@ -8,6 +10,11 @@ pub struct ModularLoader {
     pub file_bpf: Option<Bpf>,
     pub proc_bpf: Option<Bpf>,
     pub net_bpf: Option<Bpf>,
+    /// 已挂载的 XDP (程序名, link_id) — 退出时精确 detach
+    xdp_attached: Option<(String, XdpLinkId)>,
+    /// 已挂载的 TC egress (程序名, link_id) — 退出时精确 detach。
+    /// TC cls_bpf filter 在内核侧持有 prog 引用，进程退出不会自动卸载，必须显式处理
+    tc_attached: Option<(String, SchedClassifierLinkId)>,
 }
 
 impl ModularLoader {
@@ -16,6 +23,8 @@ impl ModularLoader {
             file_bpf: None,
             proc_bpf: None,
             net_bpf: None,
+            xdp_attached: None,
+            tc_attached: None,
         }
     }
 
@@ -152,13 +161,25 @@ impl ModularLoader {
             .ok_or_else(|| anyhow::anyhow!("Net agent not loaded"))?;
 
         if engine == "xdp" {
+            // 先清理上次异常退出（SIGKILL/崩溃）可能残留的挂载：
+            // - TC cls_bpf filter 内核侧持有 prog 引用，进程死亡不会自动卸载；
+            // - kernel < 5.9 时 XDP netlink 挂载同样残留（>= 5.9 走 bpf_link 由内核自动回收）。
+            // 本 agent 是该接口 XDP/clsact 的唯一属主，直接清掉旧挂载，避免 EEXIST / 双份拦截。
+            let _ = std::process::Command::new("ip")
+                .args(["link", "set", "dev", interface, "xdp", "off"])
+                .output();
+            let _ = std::process::Command::new("tc")
+                .args(["qdisc", "del", "dev", interface, "clsact"])
+                .output();
+
             // XDP (ingress)
             for name in &["xdp_pkt_mod", "xdp_packet_filter"] {
                 if let Some(prog) = bpf.program_mut(name) {
                     info!("[EbpfBackend] 🔌 加载 XDP: {} on {}...", name, interface);
                     let xdp: &mut Xdp = prog.try_into()?;
                     xdp.load()?;
-                    xdp.attach(interface, XdpFlags::default())?;
+                    let link_id = xdp.attach(interface, XdpFlags::default())?;
+                    self.xdp_attached = Some((name.to_string(), link_id));
                     info!("[EbpfBackend] ✅ XDP attached: {} -> {}", name, interface);
                     break;
                 }
@@ -169,21 +190,19 @@ impl ModularLoader {
             // 一样降级为警告，不阻断 XDP/进程/文件功能。
             if let Some(prog) = bpf.program_mut("tc_packet_filter") {
                 info!("[EbpfBackend] 🔌 加载 TC egress: tc_packet_filter on {}...", interface);
-                let tc_result = (|| -> anyhow::Result<()> {
-                    // 先清理旧 clsact（移除残留的 tc filter），再重建
-                    let _ = std::process::Command::new("tc")
-                        .args(["qdisc", "del", "dev", interface, "clsact"])
-                        .output();
+                let tc_result = (|| -> anyhow::Result<SchedClassifierLinkId> {
                     let _ = std::process::Command::new("tc")
                         .args(["qdisc", "add", "dev", interface, "clsact"])
                         .output();
                     let tc: &mut SchedClassifier = prog.try_into()?;
                     tc.load()?;
-                    tc.attach(interface, TcAttachType::Egress)?;
-                    Ok(())
+                    Ok(tc.attach(interface, TcAttachType::Egress)?)
                 })();
                 match tc_result {
-                    Ok(()) => info!("[EbpfBackend] ✅ TC Egress attached: tc_packet_filter -> {}", interface),
+                    Ok(link_id) => {
+                        self.tc_attached = Some(("tc_packet_filter".to_string(), link_id));
+                        info!("[EbpfBackend] ✅ TC Egress attached: tc_packet_filter -> {}", interface);
+                    }
                     Err(e) => warn!("[EbpfBackend] ⚠ TC Egress 挂载失败（非致命，XDP 仍生效）: {}", e),
                 }
             } else {
@@ -224,6 +243,49 @@ impl ModularLoader {
 
     pub fn file_bpf_mut(&mut self) -> Option<&mut Bpf> {
         self.file_bpf.as_mut()
+    }
+
+    /// 退出时卸载网络管控 eBPF（XDP/TC）。
+    ///
+    /// 为什么必须显式卸载：
+    /// - TC (cls_bpf)：netlink filter 挂载，内核侧 filter 持有 prog 引用，
+    ///   进程退出（包括 Ctrl+C 后的 process::exit）不会自动卸载，流量拦截会持续生效；
+    /// - XDP：kernel >= 5.9 走 bpf_link 会随进程退出由内核自动回收，这里做确定性兜底。
+    ///
+    /// LSM/kprobe/cgroup connect4 为 bpf_link 挂载，内核随进程退出自动回收，无需处理。
+    pub fn detach_net_programs(&mut self) {
+        if let Some((name, link_id)) = self.tc_attached.take() {
+            if let Some(bpf) = self.net_bpf.as_mut() {
+                if let Some(prog) = bpf.program_mut(&name) {
+                    let tc_res: Result<&mut SchedClassifier, _> = prog.try_into();
+                    match tc_res {
+                        Ok(tc) => match tc.detach(link_id) {
+                            Ok(()) => info!("[EbpfBackend] ✅ TC egress 已卸载: {}", name),
+                            Err(e) => warn!("[EbpfBackend] ⚠ TC egress 卸载失败: {}: {}", name, e),
+                        },
+                        Err(e) => warn!("[EbpfBackend] ⚠ TC 程序类型转换失败 {}: {}", name, e),
+                    }
+                } else {
+                    warn!("[EbpfBackend] ⚠ 未找到 TC 程序: {}", name);
+                }
+            }
+        }
+        if let Some((name, link_id)) = self.xdp_attached.take() {
+            if let Some(bpf) = self.net_bpf.as_mut() {
+                if let Some(prog) = bpf.program_mut(&name) {
+                    let xdp_res: Result<&mut Xdp, _> = prog.try_into();
+                    match xdp_res {
+                        Ok(xdp) => match xdp.detach(link_id) {
+                            Ok(()) => info!("[EbpfBackend] ✅ XDP 已卸载: {}", name),
+                            Err(e) => warn!("[EbpfBackend] ⚠ XDP 卸载失败: {}: {}", name, e),
+                        },
+                        Err(e) => warn!("[EbpfBackend] ⚠ XDP 程序类型转换失败 {}: {}", name, e),
+                    }
+                } else {
+                    warn!("[EbpfBackend] ⚠ 未找到 XDP 程序: {}", name);
+                }
+            }
+        }
     }
 
     pub fn proc_bpf_mut(&mut self) -> Option<&mut Bpf> {
