@@ -120,14 +120,12 @@ struct {
 // ===== Process Control Maps =====
 
 struct proc_key {
-    __u64 dev;
+    __u32 dev;
     __u64 inode;
-};
+} __attribute__((packed));
 
 struct proc_rule {
-    __u8 action;
-    __u8 mode;
-    __u8 reserved[6];
+    __u8 action_mode;  // bit0=action(0=allow,1=deny), bit1-2=mode(0=inherit,1=monitor,2=protect)
 };
 
 struct {

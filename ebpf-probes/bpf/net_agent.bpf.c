@@ -360,10 +360,8 @@ int xdp_packet_filter(struct xdp_md *ctx) {
         {
             __u8 flags_byte = *((__u8 *)tcp + 13);
             if ((flags_byte & 0x12) == 0x02) { /* SYN 且无 ACK */
-                bpf_printk("[NET XDP] SYN-IN src %pI4:%u",
-                           &src_ip, bpf_ntohs(src_port));
-                bpf_printk("[NET XDP] SYN-IN dst %pI4:%u",
-                           &dst_ip, bpf_ntohs(dst_port));
+                // [removed bpf_printk]
+                // [removed bpf_printk]
             }
         }
 
@@ -388,10 +386,8 @@ int xdp_packet_filter(struct xdp_md *ctx) {
         __u32 k3 = 3;
         __u64 *c3 = bpf_map_lookup_elem(&debug_stats, &k3);
         if (c3) (*c3)++;
-        bpf_printk("[NET XDP] BLOCKED: %pI4 -> %pI4",
-                   &src_ip, &dst_ip);
-        bpf_printk("[NET XDP]   sport=%u dport=%u proto=%u",
-                   bpf_ntohs(src_port), bpf_ntohs(dst_port), protocol);
+        // [removed bpf_printk]
+        // [removed bpf_printk]
         send_network_event(protocol, src_ip, dst_ip, src_port, dst_port, 0x80);
         return XDP_DROP;
     }
@@ -419,11 +415,9 @@ int xdp_packet_filter(struct xdp_md *ctx) {
 
         struct reverse_value *r_val = bpf_map_lookup_elem(&reverse_rules, &r_key);
         if (r_val) {
-            bpf_printk("[NET XDP] REV NAT: %pI4 -> %pI4", &src_ip, &dst_ip);
-            bpf_printk("[NET XDP]   sport=%u dport=%u",
-                       bpf_ntohs(src_port), bpf_ntohs(dst_port));
-            bpf_printk("[NET XDP]   => local %pI4:%u client %pI4",
-                       &r_val->local_ip, bpf_ntohs(r_val->local_port), &r_val->client_ip);
+            // [removed bpf_printk]
+            // [removed bpf_printk]
+            // [removed bpf_printk]
             // Reverse mapping found - translate and pass
             if (protocol == 6) {
                 struct tcphdr *tcp = l4_hdr;
@@ -458,11 +452,9 @@ int xdp_packet_filter(struct xdp_md *ctx) {
     __u64 *c5 = bpf_map_lookup_elem(&debug_stats, &k5);
     if (c5) (*c5)++;
 
-    bpf_printk("[NET XDP] MOD RULE: %pI4 -> %pI4", &src_ip, &dst_ip);
-    bpf_printk("[NET XDP]   sport=%u dport=%u proto=%u",
-               bpf_ntohs(src_port), bpf_ntohs(dst_port), protocol);
-    bpf_printk("[NET XDP]   flags_en=%u port_mod=%u",
-               rule->tcp_flags_enable, rule->port_mod_enable);
+    // [removed bpf_printk]
+    // [removed bpf_printk]
+    // [removed bpf_printk]
 
     // 3. Mod rule hit: Forward + SNAT
     __u32 target_ip = dst_ip;
@@ -483,11 +475,10 @@ int xdp_packet_filter(struct xdp_md *ctx) {
 
     /* Debug: 命中虚开/重定向策略后的改写明细 */
     if (rule->ip_mod_enable || rule->port_mod_enable) {
-        bpf_printk("[NET XDP]   DNAT-> %pI4:%u", &target_ip, bpf_ntohs(target_port));
-        bpf_printk("[NET XDP]   SNAT-> %pI4:%u", &new_src_ip, bpf_ntohs(src_port));
+        // [removed bpf_printk]
+        // [removed bpf_printk]
         if (rule->ip_mod_enable && rule->new_dst_ip != 0) {
-            bpf_printk("[NET XDP]   REVERSE-REC target=%pI4:%u",
-                       &rule->new_dst_ip, bpf_ntohs(rule->new_dst_port));
+            // [removed bpf_printk]
         }
     }
 
@@ -536,10 +527,9 @@ int xdp_packet_filter(struct xdp_md *ctx) {
 
             // Update flags and checksum if changed
             if (old_flags != new_flags) {
-                bpf_printk("[NET XDP] TCP MOD: %pI4 -> %pI4", &src_ip, &dst_ip);
-                bpf_printk("[NET XDP]   sport=%u dport=%u old=0x%x",
-                           bpf_ntohs(src_port), bpf_ntohs(dst_port), old_flags);
-                bpf_printk("[NET XDP]   new=0x%x", new_flags);
+                // [removed bpf_printk]
+                // [removed bpf_printk]
+                // [removed bpf_printk]
                 csum_replace2(&tcp->check, old_flags, new_flags);
                 *flags_byte = new_flags;
             }
@@ -644,11 +634,9 @@ int tc_packet_filter(struct __sk_buff *skb) {
 
     struct reverse_value *r_val = bpf_map_lookup_elem(&reverse_rules, &r_key);
     if (r_val) {
-        bpf_printk("[NET TC] REV NAT: %pI4 -> %pI4", &src_ip, &dst_ip);
-        bpf_printk("[NET TC]   sport=%u dport=%u",
-                   bpf_ntohs(src_port), bpf_ntohs(dst_port));
-        bpf_printk("[NET TC]   => local %pI4:%u client %pI4",
-                   &r_val->local_ip, bpf_ntohs(r_val->local_port), &r_val->client_ip);
+        // [removed bpf_printk]
+        // [removed bpf_printk]
+        // [removed bpf_printk]
         // Translate source: target -> local
         // Translate destination: agent -> client
         if (protocol == 6) {
@@ -690,11 +678,9 @@ int tc_packet_filter(struct __sk_buff *skb) {
     }
 
     if (rule && protocol == 6) {
-        bpf_printk("[NET TC] EGRESS: %pI4 -> %pI4", &src_ip, &dst_ip);
-        bpf_printk("[NET TC]   sport=%u dport=%u proto=%u",
-                   bpf_ntohs(src_port), bpf_ntohs(dst_port), protocol);
-        bpf_printk("[NET TC]   flags_en=%u port_mod=%u",
-                   rule->tcp_flags_enable, rule->port_mod_enable);
+        // [removed bpf_printk]
+        // [removed bpf_printk]
+        // [removed bpf_printk]
         struct tcphdr *tcp = l4;
         if ((void *)(tcp + 1) > data_end) return TC_ACT_OK;
 
@@ -721,10 +707,9 @@ int tc_packet_filter(struct __sk_buff *skb) {
             
             // Update flags and checksum if changed
             if (old_flags != new_flags) {
-                bpf_printk("[NET TC] TCP MOD: %pI4 -> %pI4", &src_ip, &dst_ip);
-                bpf_printk("[NET TC]   sport=%u dport=%u old=0x%x",
-                           bpf_ntohs(src_port), bpf_ntohs(dst_port), old_flags);
-                bpf_printk("[NET TC]   new=0x%x", new_flags);
+                // [removed bpf_printk]
+                // [removed bpf_printk]
+                // [removed bpf_printk]
                 csum_replace2(&tcp->check, old_flags, new_flags);
                 *flags_byte = new_flags;
             }
@@ -767,10 +752,8 @@ int enforce_connect4(struct bpf_sock_addr *ctx) {
     }
 
     if (rule) {
-        bpf_printk("[NET CGROUP] CONNECT REDIRECT: dst=%pI4:%u proto=%u",
-                   &dst_ip, bpf_ntohs(dst_port), protocol);
-        bpf_printk("[NET CGROUP]   port_mod=%u ip_mod=%u",
-                   rule->port_mod_enable, rule->ip_mod_enable);
+        // [removed bpf_printk]
+        // [removed bpf_printk]
         if (rule->port_mod_enable && rule->new_dst_port) {
             ctx->user_port = rule->new_dst_port;
         }

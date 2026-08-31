@@ -71,10 +71,10 @@ impl SelfProtectRule {
 }
 
 // --- 进程管控 ---
-#[repr(C)]
+#[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct ProcKey {
-    pub dev: u64,
+    pub dev: u32,
     pub inode: u64,
 }
 
@@ -83,9 +83,15 @@ unsafe impl aya::Pod for ProcKey {}
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ProcRuleVal {
-    pub action: u8, // 0=allow, 1=deny
-    pub mode: u8,   // 0=inherit, 1=monitor, 2=protect
-    pub reserved: [u8; 6],
+    pub action_mode: u8,  // bit0=action(0=allow,1=deny), bit1-2=mode(0=inherit,1=monitor,2=protect)
+}
+
+impl ProcRuleVal {
+    pub fn new(action: u8, mode: u8) -> Self {
+        Self { action_mode: (action & 0x01) | ((mode & 0x03) << 1) }
+    }
+    pub fn action(&self) -> u8 { self.action_mode & 0x01 }
+    pub fn mode(&self) -> u8 { (self.action_mode >> 1) & 0x03 }
 }
 
 unsafe impl aya::Pod for ProcRuleVal {}
@@ -129,22 +135,38 @@ pub struct PktModValue {
 unsafe impl aya::Pod for PktModValue {}
 
 // --- 进程事件 ring buffer (匹配 proc_agent.bpf.c unified_event) ---
+/// repr(C) 自动在 event_type 后填充 7 字节对齐到 8，与 C union 布局一致。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct UnifiedEvent {
-    pub event_type: u8,           // __u8 type; 2=EVENT_PROC
-    pub pid: u32,                 // __u32 pid
-    pub uid: u32,                 // __u32 uid
-    pub blocked: u8,              // __u8 blocked; 1=被拦截, 0=仅监控
-    pub comm: [u8; 16],           // char comm[16]
-    pub path: [u8; 64],           // char path[64]
-    pub _padding: [u8; 2],        // pad to 90 bytes (1+4+4+1+16+64=90)
+    pub event_type: u8,
+    pub dev: u64,
+    pub inode: u64,
+    pub pid: u32,
+    pub uid: u32,
+    pub blocked: u8,
+    pub comm: [u8; 16],
+    pub path: [u8; 64],
+    pub cwd: [u8; 64],
 }
 
 unsafe impl aya::Pod for UnifiedEvent {}
 
-/// Size of proc UnifiedEvent in eBPF = 90 bytes
-pub const UNIFIED_EVENT_SIZE: usize = 90;
+/// Size of proc UnifiedEvent in eBPF = 184 bytes
+pub const UNIFIED_EVENT_SIZE: usize = 184;
+
+const _: () = assert!(std::mem::size_of::<UnifiedEvent>() == UNIFIED_EVENT_SIZE);
+
+// --- (dev, inode) → md5 表的 value ---
+/// 以文件身份为主键的 MD5 记录：inode 全局唯一，宿主机/容器进程统一按此查表。
+/// 命中即直接返回 md5（不做 stat/mtime 比对）；mtime 为入表时文件 mtime（预留/调试用），
+/// path 为入表时记录的路径（宿主为宿主机真实路径，容器为容器内路径），用于告警展示。
+#[derive(Debug, Clone)]
+pub struct InodeMd5Rec {
+    pub md5: String,
+    pub mtime: u64,
+    pub path: String,
+}
 
 // --- 网络事件 ring buffer (匹配 net_agent.bpf.c pkt_event, 16字节) ---
 /// XDP/TC 网络事件：tcp_flags_set=0x40 表示命中 pkt_mod 规则（虚开端口/重定向），

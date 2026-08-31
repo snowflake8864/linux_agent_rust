@@ -25,6 +25,11 @@ fn ensure_callback_registered() {
 /// 全局 token 缓存，token 获取时由 online 模块更新，check_server_reachable 读取。
 static CURRENT_TOKEN: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
+/// 获取当前缓存的 token，供 gRPC TokenService 使用。
+pub fn get_cached_token() -> Option<String> {
+    CURRENT_TOKEN.lock().unwrap().clone()
+}
+
 /// 由 online 模块在获取到 token 时调用，供 check_server_reachable 使用。
 /// 同时触发一次 newestJumpInfo 拉取：这是启动后有效 token 的第一个时机。
 pub fn update_token(token: String) {

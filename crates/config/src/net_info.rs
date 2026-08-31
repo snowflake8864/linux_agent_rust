@@ -97,6 +97,8 @@ pub struct NetInfoConfig {
     pub ebpf_file_agent: bool,
     pub ebpf_proc_agent: bool,
     pub ebpf_net_agent: bool,
+    // eBPF proc_rules map 最大条目数（默认 131072）
+    pub ebpf_proc_rules_max_entries: u32,
 }
 
 /// 准入功能配置，对应 ini 中的 [ADMISSION] 段
@@ -614,6 +616,7 @@ impl NetInfoConfig {
             .unwrap_or_else(|| "driver".to_string());
 
         // [EBPF] — 控制 eBPF 模式下加载哪些模块（.bpf.o）
+        config.ebpf_proc_rules_max_entries = 131072; // 默认 128K
         if let Some(value) = ini.get("EBPF", "FILE_AGENT") {
             config.ebpf_file_agent = matches!(value.trim(), "1");
         }
@@ -622,6 +625,14 @@ impl NetInfoConfig {
         }
         if let Some(value) = ini.get("EBPF", "NET_AGENT") {
             config.ebpf_net_agent = matches!(value.trim(), "1");
+        }
+        // [EBPF] proc_rules map 条目数上限，默认 131072（128K）
+        if let Some(value) = ini.get("EBPF", "PROC_RULES_MAX_ENTRIES") {
+            if let Ok(n) = value.trim().parse::<u32>() {
+                if n >= 1024 {
+                    config.ebpf_proc_rules_max_entries = n;
+                }
+            }
         }
 
         // [SQLITE_DB] — SQLite 基础设施开关，默认关闭
@@ -814,6 +825,7 @@ impl NetInfoConfig {
         writeln!(file, "FILE_AGENT={}", self.ebpf_file_agent as u8)?;
         writeln!(file, "PROC_AGENT={}", self.ebpf_proc_agent as u8)?;
         writeln!(file, "NET_AGENT={}", self.ebpf_net_agent as u8)?;
+        writeln!(file, "PROC_RULES_MAX_ENTRIES={}", self.ebpf_proc_rules_max_entries)?;
 
         // [SQLITE_DB] 段 — SQLite 基础设施开关
         writeln!(file, "[SQLITE_DB]")?;
