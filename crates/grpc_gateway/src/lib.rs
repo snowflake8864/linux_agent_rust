@@ -27,6 +27,7 @@ pub mod protection_mode { tonic::include_proto!("protection_mode"); }
 pub mod admission { tonic::include_proto!("admission"); }
 pub mod backend { tonic::include_proto!("backend"); }
 pub mod policy_query { tonic::include_proto!("policy_query"); }
+pub mod token { tonic::include_proto!("token"); }
 
 pub mod notify;
 
