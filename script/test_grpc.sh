@@ -3,8 +3,8 @@
 # gRPC 接口测试脚本 — 可手动选择要测试的接口
 # 用法:
 #   ./test_grpc.sh              # 交互式菜单选择
-#   ./test_grpc.sh <编号>        # 直接测试指定接口 (1-33, s1)
-#   ./test_grpc.sh all           # 测试全部只读接口 (1-33)
+#   ./test_grpc.sh <编号>        # 直接测试指定接口 (1-34, s1)
+#   ./test_grpc.sh all           # 测试全部只读接口 (1-34)
 #   ./test_grpc.sh write         # 测试写接口（需离线模式）
 #   ./test_grpc.sh stream        # 测试流式接口 (17, 18, s1)
 #   ./test_grpc.sh full          # 测试全部接口（读写+流）
@@ -140,6 +140,10 @@ show_test_help() {
                echo "    返回: success(code==000000), http_status, response(服务器透传 body)"
                echo "    ⚠️  需要 [GRPC] PORT_KNOCK=1 才注册该服务"
                echo "    用法: $0 33  |  手动: $0 33 '{\"user_id\":\"zhangsan\",\"signed_random\":\"xxxx\"}'" ;;
+        34)    echo -e "${CYAN}[34] GetToken${NC} — 获取当前缓存的认证 Token"
+               echo "    返回: token(字符串), is_valid(true=有效/false=未获取到)"
+               echo "    无参数，始终可用（在线/离线均可调用）"
+               echo "    用法: $0 34" ;;
         s1)    echo -e "${CYAN}[s1] VirusScan流${NC} — 病毒扫描双向流 (StreamControl)"
                echo "    双向流式接口，客户端发送扫描指令，服务端返回扫描结果"
                echo "    用法: $0 s1" ;;
@@ -541,6 +545,10 @@ test_33() { grpc_call "单包敲门(默认测试参数)" \
     port_knock.proto port_knock.PortKnockService PortKnock \
     '{"user_id": "test_user", "signed_random": "test_signature"}'; }
 
+# 34: 获取认证 Token — 从内存缓存读取，始终可用
+test_34() { grpc_call "获取认证Token(缓存)" \
+    token.proto token.TokenService GetToken; }
+
 # ── 流式接口测试 ────────────────────────────────────────────────────────
 
 # 病毒扫描双向流 — 发 StartScanRequest 并等待响应，测连通性
@@ -702,6 +710,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}  31) PolicyQuery(全部策略JSON)                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  32) ProcRuleQuery(进程白/黑名单表查询)                      ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  33) PortKnock(单包敲门SPA中继)                              ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  34) GetToken(获取认证Token)                                 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  s1) VirusScan流(StreamControl)                              ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${RED}写接口（仅离线可用，在线应返回 PERMISSION_DENIED）${NC}       ${CYAN}║${NC}"
@@ -728,7 +737,7 @@ show_menu() {
 }
 
 run_all_readonly() {
-    for i in $(seq -w 1 33); do
+    for i in $(seq -w 1 34); do
         fn="test_$(printf '%02d' $((10#$i)))"
         type "$fn" &>/dev/null && "$fn"
     done
@@ -866,7 +875,7 @@ case "${1:-menu}" in
                 21) test_21 ;; 22) test_22 ;; 23) test_23 ;; 24) test_24 ;;
                 25) test_25 ;; 26) test_26 ;;
                 27) test_27 ;; 28) test_28 ;; 28b) test_28b ;;
-                29) test_29 ;; 30) test_30 ;; 31) test_31 ;; 32) test_32 ;; 33) test_33 ;;
+                29) test_29 ;; 30) test_30 ;; 31) test_31 ;; 32) test_32 ;; 33) test_33 ;; 34) test_34 ;;
                 s1) test_s1 ;;
                 03b) test_03b ;; 14b) test_14b ;; 14c) test_14c ;; 14d) test_14d ;;
                 04b) test_04b ;;
@@ -939,6 +948,7 @@ case "${1:-menu}" in
                     echo "  31) PolicyQuery(全部策略JSON)"
                     echo "  32) ProcRuleQuery(进程白/黑名单表查询)"
                     echo "  33) PortKnock(单包敲门SPA中继)"
+                    echo "  34) GetToken(获取认证Token)"
                     echo "  s1) VirusScan流"
                     echo ""
                     echo -e "${CYAN}── 扩展测试（filter_status / is_white 过滤）──${NC}"
