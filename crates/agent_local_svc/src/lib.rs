@@ -18,6 +18,7 @@ pub mod policy_watch_impl;
 pub mod protection_mode_impl;
 pub mod admission_impl;
 pub mod backend_impl;
+pub mod token_impl;
 
 // Stub handlers (need deeper integration)
 pub mod stub_handlers;
@@ -25,7 +26,7 @@ pub mod stub_handlers;
 // Re-exports
 pub use data_hub::{AgentDataHub, AgentMode, AGENT_MODE, require_offline, set_online, set_offline,
     set_offline_and_check_admission, clear_local_process_policy, check_server_reachable,
-    trigger_connectivity_probe, update_token,
+    trigger_connectivity_probe, update_token, get_cached_token,
     ADMISSION_MODE, ADMISSION_EFFECTIVE, ADMISSION_DETECTING, ADMISSION_NETWORK_ANOMALY};
 pub use config_impl::ConfigServiceImpl;
 pub use process_policy_impl::ProcessPolicyServiceImpl;
@@ -43,6 +44,7 @@ pub use backend_impl::BackendServiceImpl;
 pub use agent_status_impl::AgentStatusServiceImpl;
 pub use alert_impl::AlertServiceImpl;
 pub use task_local_impl::LocalTaskServiceImpl;
+pub use token_impl::TokenServiceImpl;
 pub use stub_handlers::{
     DirPolicyServiceImpl, ExtortPolicyServiceImpl, JumpServiceImpl,
     BackupServiceImpl, TrustDirServiceImpl, VirtualPortServiceImpl,

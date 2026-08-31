@@ -39,9 +39,14 @@ impl ModularLoader {
         Ok(())
     }
 
-    pub fn load_proc_agent(&mut self, path: &str) -> anyhow::Result<()> {
+    pub fn load_proc_agent(&mut self, path: &str, proc_rules_max_entries: u32) -> anyhow::Result<()> {
         info!("[EbpfBackend] 📦 解析 ELF: proc_agent.bpf.o");
-        let bpf = BpfLoader::new().load_file(path)?;
+        let mut loader = BpfLoader::new();
+        if proc_rules_max_entries > 0 {
+            loader.set_max_entries("proc_rules", proc_rules_max_entries);
+            info!("[EbpfBackend]   proc_rules max_entries = {}", proc_rules_max_entries);
+        }
+        let bpf = loader.load_file(path)?;
         for (name, _prog) in bpf.programs() {
             info!("[EbpfBackend]   发现程序: {}", name);
         }

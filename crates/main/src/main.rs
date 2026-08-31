@@ -186,6 +186,7 @@ async fn main() -> std::io::Result<()> {
                     proc_enabled, cfg.proc_switch, cfg.proc_protect,
                     net_enabled,
                     &cfg.ifcfg, "xdp",
+                    cfg.ebpf_proc_rules_max_entries,
                 ).unwrap_or_else(|e| {
                     log_error!("EbpfBackend 创建失败: {}", e);
                     std::process::exit(1);
@@ -202,6 +203,9 @@ async fn main() -> std::io::Result<()> {
                     log_error!("[eBPF] ❌ EbpfBackend 初始化失败: {}", e);
                     std::process::exit(1);
                 }
+                // init() 内会关闭 feature_switches[1] 避免空表误报，
+                // 此时信任白名单已写入 proc_rules，可以安全开启进程检测。
+                ebpf.enable_proc_detection();
                 log_info!("[eBPF] ✅ EbpfBackend 初始化完成，所有 BPF 程序已加载到内核");
 
                 // 扫描系统可执行文件目录（hash→inode 映射）留到策略下发之后再启动，
@@ -290,6 +294,7 @@ async fn main() -> std::io::Result<()> {
                                 proc_enabled, cfg.proc_switch, cfg.proc_protect,
                                 net_enabled,
                                 &cfg.ifcfg, "xdp",
+                                cfg.ebpf_proc_rules_max_entries,
                             ) {
                                 Ok(raw_ebpf) => {
                                     let ebpf = Arc::new(raw_ebpf);
@@ -393,6 +398,16 @@ async fn main() -> std::io::Result<()> {
             // 避免重启后这些白名单进程再次被拦截一次。
             if let Err(e) = ebpf.load_md5_inode_cache() {
                 log_error!("[EbpfBackend] 从 DB 加载 md5_inode_cache 失败: {}", e);
+            }
+            // 扫描容器 overlay rootfs 中的可执行文件（Docker/Podman/containerd），
+            // 路径存储为容器内逻辑路径（如 /bin/ls），不含 overlay 前缀。
+            if let Err(e) = ebpf.scan_container_overlays() {
+                log_error!("[EbpfBackend] 扫描容器 overlay 失败: {}", e);
+            }
+            // 枚举运行中进程（含容器/其它 mount ns 进程），预填 inode_md5_map：
+            // 容器里已运行的二进制后续 exec 时能直接命中缓存，不依赖 /proc/<pid>/root 的瞬时时序。
+            if let Err(e) = ebpf.scan_running_processes() {
+                log_error!("[EbpfBackend] 枚举运行进程预填 inode_md5_map 失败: {}", e);
             }
         });
         log_info!("eBPF md5_map 后台扫描已启动");

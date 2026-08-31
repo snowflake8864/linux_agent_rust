@@ -102,7 +102,7 @@ impl ProcessAuditHandler {
             let mut json_str = String::new();
             match build_auto_process_list_json(&processvec, &mut json_str) {
                 Ok(()) => {
-                    //log_info!("生成 JSON: {}", json_str);
+                    log_info!("生成 JSON: {}", json_str);
                     match net_client.post_data_async(
                         &url,
                         &json_str,

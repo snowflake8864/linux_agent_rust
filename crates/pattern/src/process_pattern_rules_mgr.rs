@@ -71,6 +71,13 @@ const PROCESS_PATTERNS: &[ProcessPattern] = &[
     ProcessPattern { key: "/opt/EndpointSecurityApp/scripts/SecurityScan_linux.sh", typ: 0, param: ",match_full_path=1" },
     ProcessPattern { key: "/opt/EndpointSecurityApp/EndpointSecurityApp", typ: 0, param: ",match_full_path=1" },
     ProcessPattern { key: "/opt/terminal_agent/terminal_agent_qt5", typ: 0, param: ",match_full_path=1" },
+    ProcessPattern { key: "/usr/bin/docker", typ: 0, param: ",match_full_path=1" },
+    ProcessPattern { key: "/bin/docker", typ: 0, param: ",match_full_path=1" },
+    ProcessPattern { key: "/usr/lib/cni/bridge", typ: 0, param: ",match_full_path=1" },
+    ProcessPattern { key: "/usr/lib/cni/portmap", typ: 0, param: ",match_full_path=1" },
+    ProcessPattern { key: "/usr/lib/cni/firewall", typ: 0, param: ",match_full_path=1" },
+    ProcessPattern { key: "/usr/lib/cni/tuning", typ: 0, param: ",match_full_path=1" },
+    ProcessPattern { key: "/usr/bin/podman", typ: 0, param: ",match_full_path=1" },
 ];
 
 // 主管理器结构体

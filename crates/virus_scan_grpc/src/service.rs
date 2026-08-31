@@ -43,7 +43,7 @@ use agent_local_svc::{
     AgentStatusServiceImpl, AlertServiceImpl, LocalTaskServiceImpl,
     PolicyWatchServiceImpl, ProcessDefenseServiceImpl, PeripheralDefenseServiceImpl,
     AdmissionServiceImpl, BackendServiceImpl, PolicyQueryServiceImpl, ProcDiagServiceImpl,
-    PortKnockServiceImpl,
+    PortKnockServiceImpl, TokenServiceImpl,
 };
 use agent_local_svc::stub_handlers::{
     DirPolicyServiceImpl, ExtortPolicyServiceImpl, JumpServiceImpl,
@@ -199,7 +199,9 @@ impl StartVirusScanGrpcService for BootManager {
                 .add_service(grpc_gateway::policy_query::policy_query_service_server::PolicyQueryServiceServer::new(
                     PolicyQueryServiceImpl { data_hub: data_hub.clone() }))
                 .add_service(grpc_gateway::proc_diag::proc_diag_service_server::ProcDiagServiceServer::new(
-                    ProcDiagServiceImpl));
+                    ProcDiagServiceImpl))
+                .add_service(grpc_gateway::token::token_service_server::TokenServiceServer::new(
+                    TokenServiceImpl));
 
             // [GRPC] VIRUS_SCAN && [VIGILIXAV] ENABLED
             if grpc_svc.virus_scan && vigilixav_enabled {

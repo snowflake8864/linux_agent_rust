@@ -38,14 +38,12 @@ struct {
 } path_scratch SEC(".maps");
 
 struct proc_key {
-    __u64 dev;
+    __u32 dev;
     __u64 inode;
-};
+} __attribute__((packed));
 
 struct proc_rule {
-    __u8 action;
-    __u8 mode;
-    __u8 reserved[6];
+    __u8 action_mode;  // bit0=action(0=allow,1=deny), bit1-2=mode(0=inherit,1=monitor,2=protect)
 };
 
 struct {
@@ -106,36 +104,42 @@ struct {
 #endif
 
 // ===== Helper Structures =====
+// 内存布局必须与 Rust 侧 types.rs 的 UnifiedEvent 完全一致：
+// repr(C): event_type 后填充 7 字节对齐到 8，总大小 = 184 字节。
 struct unified_event {
     __u8 type;
-    union {
-        struct {
-            __u32 pid;
-            __u32 uid;
-            __u8 blocked;
-            char comm[16];
-            char path[64];
-        } monitor;
-        char msg[89];
-    };
+    __u64 dev;
+    __u64 inode;
+    __u32 pid;
+    __u32 uid;
+    __u8 blocked;
+    char comm[16];
+    char path[64];
+    char cwd[64];
 };
 
 // ===== Helper Functions =====
 
-static __always_inline void send_monitor_event(__u8 type, const char *path, __u8 blocked) {
+static __always_inline void send_monitor_event(__u8 type, const char *path, __u8 blocked,
+                                               __u64 dev, __u64 inode, const char *cwd) {
     struct unified_event *e = bpf_ringbuf_reserve(&event_ringbuf, sizeof(*e), 0);
     if (!e) return;
 
     e->type = type;
-    e->monitor.pid = bpf_get_current_pid_tgid() >> 32;
-    e->monitor.uid = bpf_get_current_uid_gid();
-    e->monitor.blocked = blocked;
+    e->dev = dev;
+    e->inode = inode;
+    e->pid = bpf_get_current_pid_tgid() >> 32;
+    e->uid = bpf_get_current_uid_gid();
+    e->blocked = blocked;
 
     if (path) {
-        __builtin_memcpy(e->monitor.path, path, sizeof(e->monitor.path));
+        bpf_probe_read_kernel_str(e->path, sizeof(e->path), path);
+    }
+    if (cwd) {
+        bpf_probe_read_kernel_str(e->cwd, sizeof(e->cwd), cwd);
     }
 
-    bpf_get_current_comm(e->monitor.comm, sizeof(e->monitor.comm));
+    bpf_get_current_comm(e->comm, sizeof(e->comm));
     bpf_ringbuf_submit(e, 0);
 }
 
@@ -242,6 +246,9 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
     key.dev = kernel_dev_to_user(kdev);
     key.inode = BPF_CORE_READ(inode, i_ino);
 
+    __u64 udev = key.dev;
+    __u64 uinode = key.inode;
+
     // Try inode-based rule first
     struct proc_rule *rule = bpf_map_lookup_elem(&proc_rules, &key);
 
@@ -254,10 +261,10 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
             __u8 effective_mode = resolve_mode(prule->mode, FEATURE_PROC);
             if (effective_mode == MODE_PROTECT && prule->action == ACTION_DENY) {
                 bpf_printk("[PROC] BLOCKED (pattern): %s", buf);
-                send_monitor_event(EVENT_PROC, buf, 1);
+                send_monitor_event(EVENT_PROC, buf, 1, udev, uinode, NULL);
                 return -EPERM;
             }
-            send_monitor_event(EVENT_PROC, buf, 0);
+            send_monitor_event(EVENT_PROC, buf, 0, udev, uinode, NULL);
             return 0;
         }
     }
@@ -278,30 +285,32 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
                 __u8 effective_mode = resolve_mode(prule->mode, FEATURE_PROC);
                 if (effective_mode == MODE_PROTECT && prule->action == ACTION_DENY) {
                     bpf_printk("[PROC] BLOCKED (basename): %s", buf);
-                    send_monitor_event(EVENT_PROC, buf, 1);
+                    send_monitor_event(EVENT_PROC, buf, 1, udev, uinode, NULL);
                     return -EPERM;
                 }
-                send_monitor_event(EVENT_PROC, buf, 0);
+                send_monitor_event(EVENT_PROC, buf, 0, udev, uinode, NULL);
                 return 0;
             }
         }
     }
 
     if (rule) {
-        // 命中规则：区分白/黑名单
-        if (rule->action == ACTION_ALLOW) {
-            // 白名单 → 放行，不产生事件
+        // 命中规则：从 action_mode 解包
+        __u8 rule_action = rule->action_mode & 0x01;
+        __u8 rule_mode   = (rule->action_mode >> 1) & 0x03;
+
+        if (rule_action == ACTION_ALLOW) {
             return 0;
         }
         // blacklist (ACTION_DENY)
-        __u8 effective_mode = resolve_mode(rule->mode, FEATURE_PROC);
+        __u8 effective_mode = resolve_mode(rule_mode, FEATURE_PROC);
         if (effective_mode == MODE_PROTECT) {
-            bpf_printk("[PROC] BLOCKED(black): %s", buf);
-            send_monitor_event(EVENT_PROC, buf, 1);
+            bpf_printk("[PROC] BLOCKED(black): dev=%llu ino=%llu %s", udev, uinode, buf);
+            send_monitor_event(EVENT_PROC, buf, 1, udev, uinode, NULL);
             return -EPERM;
         }
-        bpf_printk("[PROC] MONITOR(black): %s", buf);
-        send_monitor_event(EVENT_PROC, buf, 0);
+        bpf_printk("[PROC] MONITOR(black): dev=%llu ino=%llu %s", udev, uinode, buf);
+        send_monitor_event(EVENT_PROC, buf, 0, udev, uinode, NULL);
         return 0;
     }
 
@@ -309,12 +318,12 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
     {
         __u8 effective_mode = resolve_mode(0, FEATURE_PROC);
         if (effective_mode == MODE_PROTECT) {
-            bpf_printk("[PROC] BLOCKED(unknown): %s", buf);
-            send_monitor_event(EVENT_PROC_UNKNOWN, buf, 1);
+            bpf_printk("[PROC] BLOCKED(unknown): dev=%llu ino=%llu %s", udev, uinode, buf);
+            send_monitor_event(EVENT_PROC_UNKNOWN, buf, 1, udev, uinode, NULL);
             return -EPERM;
         }
-        // monitor: silent, only ringbuf
-        send_monitor_event(EVENT_PROC_UNKNOWN, buf, 0);
+        bpf_printk("[PROC] MONITOR(unknown): dev=%llu ino=%llu %s", udev, uinode, buf);
+        send_monitor_event(EVENT_PROC_UNKNOWN, buf, 0, udev, uinode, NULL);
     }
 
     return 0;

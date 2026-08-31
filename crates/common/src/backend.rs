@@ -94,6 +94,16 @@ pub trait SecurityBackend: Send + Sync {
     fn get_process_blacklist(&self) -> Vec<String>;
     /// 查询 hash 对应的文件路径（从 md5_map 中获取，eBPF 模式有效）
     fn lookup_hash_paths(&self, _hash: &str) -> Vec<String> { Vec::new() }
+    /// 获取额外可执行文件扫描目录：eBPF 模式返回容器 overlay rootfs 路径，
+    /// task_global_proc 据此扫描容器内可执行文件并上报服务器。
+    /// 返回值: Vec<overlay_root>，task_global_proc 自行拼接 bin/sbin/usr/bin 等子目录扫描。
+    fn get_executable_overlay_roots(&self) -> Vec<String> { Vec::new() }
+    /// 触发容器 overlay 补扫并回写 md5_map：task_global_proc 扫描完容器目录后调用，
+    /// 确保后续容器进程 exec 能直接命中 BPF 缓存。驱动/空后端空操作。
+    fn trigger_overlay_rescan(&self) {}
+    /// 获取已知可执行文件列表（path, md5）：eBPF 模式从扫描缓存读取，
+    /// 含标准目录 + 容器 overlay + 运行中进程；驱动/空后端返回空 Vec。
+    fn get_known_executables(&self) -> Vec<(String, String)> { Vec::new() }
     /// 查询指定进程（路径或 dev/inode）是否在 proc_rules 白/黑名单表中。
     /// eBPF 模式：解析 path → (dev,inode) 后查 BPF map；驱动/noop 模式：默认返回 Err。
     fn query_process_rule(&self, _path: &str, _dev: u64, _inode: u64) -> Result<ProcRuleQueryResult, String> {
