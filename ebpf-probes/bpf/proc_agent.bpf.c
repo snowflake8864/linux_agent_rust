@@ -208,7 +208,7 @@ int BPF_PROG(enforce_task_kill, struct task_struct *p, struct kernel_siginfo *in
     __u32 target_tgid = BPF_CORE_READ(p, tgid);
 
     if (is_protected_pid(target_tgid)) {
-        bpf_printk("[PROC] task_kill BLOCKED: sig=%d target_tgid=%u", sig, target_tgid);
+        //bpf_printk("[PROC] task_kill BLOCKED: sig=%d target_tgid=%u", sig, target_tgid);
         return -EPERM;
     }
 
@@ -268,7 +268,7 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
         if (prule) {
             __u8 effective_mode = resolve_mode(prule->mode, FEATURE_PROC);
             if (effective_mode == MODE_PROTECT && prule->action == ACTION_DENY) {
-                bpf_printk("[PROC] BLOCKED (pattern): %s", buf);
+                //bpf_printk("[PROC] BLOCKED (pattern): %s", buf);
                 send_monitor_event(EVENT_PROC, buf, 1, udev, uinode);
                 return -EPERM;
             }
@@ -292,7 +292,7 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
             if (prule) {
                 __u8 effective_mode = resolve_mode(prule->mode, FEATURE_PROC);
                 if (effective_mode == MODE_PROTECT && prule->action == ACTION_DENY) {
-                    bpf_printk("[PROC] BLOCKED (basename): %s", buf);
+                    //bpf_printk("[PROC] BLOCKED (basename): %s", buf);
                     send_monitor_event(EVENT_PROC, buf, 1, udev, uinode);
                     return -EPERM;
                 }
@@ -313,11 +313,11 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
         // blacklist (ACTION_DENY)
         __u8 effective_mode = resolve_mode(rule_mode, FEATURE_PROC);
         if (effective_mode == MODE_PROTECT) {
-            bpf_printk("[PROC] BLOCKED(black): dev=%llu ino=%llu %s", udev, uinode, buf);
+            //bpf_printk("[PROC] BLOCKED(black): dev=%llu ino=%llu %s", udev, uinode, buf);
             send_monitor_event(EVENT_PROC, buf, 1, udev, uinode);
             return -EPERM;
         }
-        bpf_printk("[PROC] MONITOR(black): dev=%llu ino=%llu %s", udev, uinode, buf);
+        //bpf_printk("[PROC] MONITOR(black): dev=%llu ino=%llu %s", udev, uinode, buf);
         send_monitor_event(EVENT_PROC, buf, 0, udev, uinode);
         return 0;
     }
@@ -326,11 +326,11 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
     {
         __u8 effective_mode = resolve_mode(0, FEATURE_PROC);
         if (effective_mode == MODE_PROTECT) {
-            bpf_printk("[PROC] BLOCKED(unknown): dev=%llu ino=%llu %s", udev, uinode, buf);
+            //bpf_printk("[PROC] BLOCKED(unknown): dev=%llu ino=%llu %s", udev, uinode, buf);
             send_monitor_event(EVENT_PROC_UNKNOWN, buf, 1, udev, uinode);
             return -EPERM;
         }
-        bpf_printk("[PROC] MONITOR(unknown): dev=%llu ino=%llu %s", udev, uinode, buf);
+        //bpf_printk("[PROC] MONITOR(unknown): dev=%llu ino=%llu %s", udev, uinode, buf);
         send_monitor_event(EVENT_PROC_UNKNOWN, buf, 0, udev, uinode);
     }
 
