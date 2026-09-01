@@ -692,13 +692,12 @@ impl EbpfBackend {
     }
 
     /// 解析进程 ringbuf 事件
-    fn parse_event(data: &[u8]) -> Option<(&UnifiedEvent, String, String, String)> {
+    fn parse_event(data: &[u8]) -> Option<(&UnifiedEvent, String, String)> {
         if data.len() < UNIFIED_EVENT_SIZE { return None; }
         let event: &UnifiedEvent = unsafe { &*(data.as_ptr() as *const UnifiedEvent) };
         let path = String::from_utf8_lossy(&event.path).trim_end_matches('\0').to_string();
         let comm = String::from_utf8_lossy(&event.comm).trim_end_matches('\0').to_string();
-        let cwd = String::from_utf8_lossy(&event.cwd).trim_end_matches('\0').to_string();
-        Some((event, path, comm, cwd))
+        Some((event, path, comm))
     }
 
     /// 解析文件 ringbuf 事件 (92 bytes, 含 op_type)
@@ -740,17 +739,17 @@ impl EbpfBackend {
                 for data in &items {
                     log::info!("[EbpfBackend] 📨 事件原始数据: len={} first_bytes={:02x?}", data.len(), &data[..std::cmp::min(data.len(), 16)]);
                     match Self::parse_event(data) {
-                        Some((event, path, comm, cwd)) => {
+                        Some((event, path, comm)) => {
                             let is_black = event.event_type == 2; // EVENT_PROC
-                            log::info!("[EbpfBackend] 📨 事件解析: type={} blocked={} pid={} uid={} dev={} inode={} path={} comm={} cwd={}",
-                                event.event_type, event.blocked, event.pid, event.uid, event.dev, event.inode, path, comm, cwd);
+                            log::info!("[EbpfBackend] 📨 事件解析: type={} blocked={} pid={} uid={} dev={} inode={} path={} comm={}",
+                                event.event_type, event.blocked, event.pid, event.uid, event.dev, event.inode, path, comm);
                             let n_type = if event.blocked == 1 {
                                 if is_black { 1102 } else { 1101 }
                             } else if is_black { 1002 } else { 1001 };
                             let action_str = if event.blocked == 1 { "拦截" } else { "监控" };
                             log::info!("[EbpfBackend] 📨 开始上报: n_type={} action={} pid={}", n_type, action_str, event.pid);
                             if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                backend.report_process_event(event, &path, &comm, &cwd, n_type, action_str);
+                                backend.report_process_event(event, &path, &comm, n_type, action_str);
                             })) {
                                 total_errors += 1;
                                 log::error!("[EbpfBackend] ❌ report_process_event panic! pid={} err={:?} (total_errors={})",
@@ -765,11 +764,13 @@ impl EbpfBackend {
                         }
                     }
                 }
+                /*
                 tick += 1;
                 if tick % 600 == 0 {  // ~5分钟 (500ms * 600)
                     log::info!("[EbpfBackend] 💓 proc ringbuf reader alive: tick={} total_events={} total_errors={}",
                         tick, total_events, total_errors);
                 }
+                */
                 if items.is_empty() {
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
@@ -929,28 +930,52 @@ impl EbpfBackend {
         Some(hash)
     }
 
-    /// 上报进程告警（拦截: n_type=1101, 监控: n_type=1001）
-    fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, cwd: &str, n_type: u16, action: &str) {
-        log::info!("[EbpfBackend] 📋 report_process_event BEGIN: n_type={} pid={} uid={} dev={} inode={} path={} comm={} cwd={}",
-            n_type, event.pid, event.uid, event.dev, event.inode, path, comm, cwd);
+/// 上报进程告警（拦截: n_type=1101, 监控: n_type=1001）
+fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_type: u16, action: &str) {
+//            log::info!("[EbpfBackend] 📋 report_process_event BEGIN: n_type={} pid={} uid={} dev={} inode={} path={} comm={}", n_type, event.pid, event.uid, event.dev, event.inode, path, comm);
         let key = (event.dev, event.inode);
-        let (md5_hash, real_path) = self.resolve_proc_md5(event.pid, key, path, cwd);
+        // 根据 UID 筛选候选 PID 列表（仅遍历 /proc 一次，符合性能要求）
+        let uid = event.uid;
+        let mut candidate_pids = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                let pid_str = entry.file_name().to_string_lossy().to_string();
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    let status_path = format!("/proc/{}/status", pid);
+                    if let Ok(content) = std::fs::read_to_string(&status_path) {
+                        if let Some(uid_line) = content.lines().find(|line| line.starts_with("Uid:")) {
+                            let parts: Vec<&str> = uid_line.split_whitespace().collect();
+                            if let Some(uid_str) = parts.get(1) {
+                                if let Ok(process_uid) = uid_str.parse::<u32>() {
+                                    if process_uid == uid {
+                                        candidate_pids.push(pid);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let (md5_hash, real_path) = self.resolve_proc_md5(event.pid, key, path, uid, &candidate_pids);
         log::info!("[EbpfBackend] 📋 resolve_proc_md5 done: md5={} real_path={}",
             md5_hash.as_deref().unwrap_or("(none)"), real_path);
         let is_container = real_path != path;
+        /*
         if is_container {
             info!("[EbpfBackend] 🔍 跨 mount ns 进程(疑似容器): pid={} uid={} comm={} ns_path={} real_path={} dev={} inode={} md5={}",
                 event.pid, event.uid, comm, path, real_path,
                 event.dev, event.inode,
                 md5_hash.as_deref().unwrap_or("(none)"));
         }
+        */
         // 容器进程且 md5 未命中 → 按需补扫容器 overlay（防止启动后新容器的可执行文件漏扫）
         let mut md5_hash = md5_hash;
         let mut real_path = real_path;
         if is_container && md5_hash.is_none() {
             self.maybe_rescan_container_overlays();
             // 补扫后重新解析 md5（新扫描的数据已入 md5_map/inode_md5_map）
-            let (h, p) = self.resolve_proc_md5(event.pid, key, path, cwd);
+            let (h, p) = self.resolve_proc_md5(event.pid, key, path, uid, &candidate_pids);
             md5_hash = h;
             real_path = p;
             if md5_hash.is_some() {
@@ -964,9 +989,9 @@ impl EbpfBackend {
         let mut resolved_action: Option<u8> = None;
         if matches!(n_type, 1001 | 1101) {
             if let Some(h) = md5_hash.as_deref() {
-                log::info!("[EbpfBackend] 📋 尝试解析待定规则: n_type={} hash={}", n_type, h);
+                //log::info!("[EbpfBackend] 📋 尝试解析待定规则: n_type={} hash={}", n_type, h);
                 resolved_action = self.try_resolve_pending_rule(key, h, &real_path);
-                log::info!("[EbpfBackend] 📋 resolved_action={:?} (None=真未知,0=白名单,1=黑名单)", resolved_action);
+                //log::info!("[EbpfBackend] 📋 resolved_action={:?} (None=真未知,0=白名单,1=黑名单)", resolved_action);
             } else {
 
                 log::info!("[EbpfBackend] 📋 无 md5，跳过 try_resolve_pending_rule");
@@ -1056,98 +1081,38 @@ impl EbpfBackend {
 
     /// 按文件身份 (dev, inode) 解析进程可执行文件的 MD5 与展示路径。
     /// 返回 (md5, 展示路径)；md5 可能为 None（文件已删除/进程秒退且表未命中）。
-    fn resolve_proc_md5(&self, pid: u32, key: (u64, u64), hint_path: &str, bpf_cwd: &str)
+    fn resolve_proc_md5(&self, pid: u32, key: (u64, u64), hint_path: &str, uid: u32, candidate_pids: &[u32])
         -> (Option<String>, String)
     {
-        // 1. 先查 inode_md5_map 缓存
-        if let Some(rec) = self.inode_md5_map.read()
-            .unwrap_or_else(|e| { log::error!("[EbpfBackend] ❌ inode_md5_map read poisoned, recovering"); e.into_inner() })
-            .get(&key) {
-            return (Some(rec.md5.clone()), rec.path.clone());
-        }
+// 核心修改：直接遍历候选 PID 列表（由 UID 筛选），不再遍历 /proc 全量
+log::info!("[EbpfBackend] 🔍 resolve_proc_md5: uid={} candidate_pids_count={}", uid, candidate_pids.len());
 
-        // 相对路径（./ls、ls 等）→ 用 BPF 沿 d_parent 链拼出的 cwd 绝对路径。
-        let owned_abs_path;
-        let abs_path = if !hint_path.starts_with('/') && pid > 0 {
-            if !bpf_cwd.is_empty() && bpf_cwd.starts_with('/') {
-                owned_abs_path = format!("{}/{}", bpf_cwd.trim_end_matches('/'), hint_path);
-                log::info!("[EbpfBackend] 🔍 相对路径解析(BPF cwd): cwd={} + {} → {}", bpf_cwd, hint_path, owned_abs_path);
-                owned_abs_path.as_str()
-            } else {
-                log::info!("[EbpfBackend] 🔍 BPF cwd 无效: '{}' (非绝对路径或空), pid={} path={}", bpf_cwd, pid, hint_path);
-                hint_path
-            }
-        } else {
-            hint_path
-        };
-
-        // 2. 未命中 → 尝试确定是宿主机还是容器
-        //    绝对路径直接 stat 宿主机；相对路径无意义，跳过。
-        //    统一用 /proc/<pid>/exe 尝试宿主机身份匹配。
-        log::info!("[EbpfBackend] 🔍 resolve step2: abs_path={} pid={}", abs_path, pid);
-        if abs_path.starts_with('/') {
-            if let Some((md5, rp)) = self.lookup_or_compute_md5(key, abs_path) {
-                log::info!("[EbpfBackend] 🔍 step2 命中宿主机: md5={}", &md5[..8]);
-                return (Some(md5), rp);
-            }
-        }
-        // 3. /proc/<pid>/exe 尝试宿主机（相对路径也适用）
-        if pid > 0 {
-            let exe_path = format!("/proc/{}/exe", pid);
-            log::info!("[EbpfBackend] 🔍 step3: 读取 {}", exe_path);
-            if let Ok(meta) = std::fs::metadata(&exe_path) {
-                use std::os::unix::fs::MetadataExt;
-                let exe_key = (meta.dev(), meta.ino());
-                log::info!("[EbpfBackend] 🔍 step3: exe_key=({},{}) key=({},{})",
-                    exe_key.0, exe_key.1, key.0, key.1);
-                if exe_key == key {
-                    if let Ok(target) = std::fs::read_link(&exe_path) {
-                        log::info!("[EbpfBackend] 🔍 step3: exe匹配, target={}", target.display());
-                        if let Some((md5, rp)) = self.lookup_or_compute_md5(key, &target.to_string_lossy()) {
-                            log::info!("[EbpfBackend] 🔍 step3 命中宿主机exe: md5={}", &md5[..8]);
-                            return (Some(md5), rp);
-                        }
-                    }
-                } else {
-                    log::info!("[EbpfBackend] 🔍 step3: exe不匹配，可能是容器进程");
-                }
-            } else {
-                log::info!("[EbpfBackend] 🔍 step3: 读取{}失败", exe_path);
-            }
-        }
-        // 4. 容器/其它 mount ns：相对路径 ./grep 尝试常见前缀，绝对路径直接拼
-        if pid > 0 {
-            let root = format!("/proc/{}/root", pid);
-            if hint_path.starts_with('/') {
-                // 绝对路径：直接 /proc/<pid>/root/<path>
-                log::info!("[EbpfBackend] 🔍 step4: 绝对路径尝试 {}/{}", root, hint_path);
-                if let Some((hash, rp)) = self.read_container_md5(key, hint_path, &root) {
-                    log::info!("[EbpfBackend] 🔍 step4 命中容器(绝对路径): md5={}", &hash[..8]);
-                    return (Some(hash), rp);
-                }
-            } else {
-                // 相对路径：猜常见 bin 目录
-                let name = hint_path.trim_start_matches("./");
-                let candidates = ["/bin", "/usr/bin", "/usr/local/bin", "/sbin", "/usr/sbin", "/usr/local/sbin"];
-                for prefix in &candidates {
-                    let full = format!("{}/{}", prefix, name);
-                    log::info!("[EbpfBackend] 🔍 step4: 相对路径尝试 {}/{}", root, full);
-                    if let Some((hash, rp)) = self.read_container_md5(key, &full, &root) {
-                        log::info!("[EbpfBackend] 🔍 step4 命中容器({}): md5={}", full, &hash[..8]);
-                        return (Some(hash), rp);
-                    }
-                }
-            }
-            log::info!("[EbpfBackend] 🔍 step4: 容器路径全部未命中");
-        }
-        // 5. 兜底：遍历存活进程
-        log::info!("[EbpfBackend] 🔍 step5: 遍历存活进程");
-        if let Some((hash, rp)) = self.resolve_md5_via_surviving_proc(key, hint_path, pid) {
-            log::info!("[EbpfBackend] 🔍 step5 命中存活进程: md5={}", &hash[..8]);
+// 直接遍历候选 PID 列表
+for pid in candidate_pids {
+    let root = format!("/proc/{}/root", pid);
+    
+    if hint_path.starts_with('/') {
+        if let Some((hash, rp)) = self.read_container_md5(key, hint_path, &root) {
+            log::info!("[EbpfBackend] 🔍 仅遍历UID下PID命中: pid={} md5={}", pid, &hash[..8]);
             return (Some(hash), rp);
         }
-        // 5. 全部失败：无 md5；展示路径退回原始提示值
-        (None, hint_path.to_string())
+    } else {
+        // 相对路径逻辑
+        let name = hint_path.trim_start_matches("./");
+        let candidates = ["/bin", "/usr/bin", "/usr/local/bin", "/sbin", "/usr/small", "/usr/local/sbin"];
+        for prefix in &candidates {
+            let full = format!("{}/{}", prefix, name);
+            if let Some((hash, rp)) = self.read_container_md5(key, &full, &root) {
+                log::info!("[EbpfBackend] 🔍 仅遍历UID下PID命中: pid={} md5={}", pid, &hash[..8]);
+                return (Some(hash), rp);
+            }
+        }
+    }
+}
+
+// 如果候选 PID 列表遍历完毕仍未命中，返回失败
+log::info!("[EbpfBackend] 🔍 未在候选 PID 列表中找到匹配");
+(None, hint_path.to_string())
     }
 
     /// 从某个进程 root（/proc/<pid>/root，宿主机或任一容器）下读取 hint_path 指向的文件，

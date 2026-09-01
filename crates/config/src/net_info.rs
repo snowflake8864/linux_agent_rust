@@ -865,7 +865,7 @@ impl NetInfoConfig {
             self.dev_uid = agent_uid::ensure_and_get_mgs_guid(&("/etc/.vedasystem"))
                 .unwrap_or_else(|_| "unknown".to_string());
         }
-        // 同步 uid 到 app.conf（供 EndpointSecurityApp GUI 读取）
+        // 同步 uid 到 /etc/.greatwall_app.conf（供 EndpointSecurityApp GUI 读取）
         self.sync_uid_to_app_conf();
         log_info!("=====dev_id:{}", self.dev_uid);
         // MAC 地址必须始终从系统获取，不能信任 ini 缓存值
@@ -901,10 +901,10 @@ impl NetInfoConfig {
         Ok(())
     }
 
-    /// 将 uid 同步到 /opt/EndpointSecurityApp/app.conf
+    /// 将 uid 同步到 /etc/.greatwall_app.conf
     /// 供 EndpointSecurityApp GUI 读取，格式: uid=<dev_uid>
     fn sync_uid_to_app_conf(&self) {
-        let app_conf = "/opt/EndpointSecurityApp/app.conf";
+        let app_conf = "/etc/.greatwall_app.conf";
         let uid_line = format!("uid={}", self.dev_uid);
         match std::fs::read_to_string(app_conf) {
             Ok(content) => {
@@ -930,15 +930,15 @@ impl NetInfoConfig {
                 if let Err(e) = std::fs::write(app_conf, &new_content) {
                     log_error!("写入 app.conf uid 失败: {}", e);
                 } else {
-                    log_info!("已同步 uid={} 到 app.conf", self.dev_uid);
+                    log_info!("已同步 uid={} 到 /etc/.greatwall_app.conf", self.dev_uid);
                 }
             }
             Err(_) => {
                 // 文件不存在，创建
                 if let Err(e) = std::fs::write(app_conf, format!("{}\n", uid_line)) {
-                    log_error!("创建 app.conf 失败: {}", e);
+                    log_error!("创建 .greatwall_app.conf 失败: {}", e);
                 } else {
-                    log_info!("已创建 app.conf uid={}", self.dev_uid);
+                    log_info!("已创建 .greatwall_app.conf uid={}", self.dev_uid);
                 }
             }
         }

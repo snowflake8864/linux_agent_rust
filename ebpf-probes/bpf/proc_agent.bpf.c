@@ -114,14 +114,13 @@ struct unified_event {
     __u32 uid;
     __u8 blocked;
     char comm[16];
-    char path[64];
-    char cwd[64];
+    char path[128];
 };
 
 // ===== Helper Functions =====
 
 static __always_inline void send_monitor_event(__u8 type, const char *path, __u8 blocked,
-                                               __u64 dev, __u64 inode, const char *cwd) {
+                                               __u64 dev, __u64 inode) {
     struct unified_event *e = bpf_ringbuf_reserve(&event_ringbuf, sizeof(*e), 0);
     if (!e) return;
 
@@ -134,9 +133,6 @@ static __always_inline void send_monitor_event(__u8 type, const char *path, __u8
 
     if (path) {
         bpf_probe_read_kernel_str(e->path, sizeof(e->path), path);
-    }
-    if (cwd) {
-        bpf_probe_read_kernel_str(e->cwd, sizeof(e->cwd), cwd);
     }
 
     bpf_get_current_comm(e->comm, sizeof(e->comm));
@@ -234,9 +230,21 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
 
     if (bpf_probe_read_kernel_str(buf, 256, bprm->filename) < 0) return 0;
 
-    // Get the file's inode for proc_rules lookup
-    struct file *file = BPF_CORE_READ(bprm, file);
+    // Get the exec file. 注意：这里必须用直接字段访问 bprm->file，而不是
+    // BPF_CORE_READ(bprm, file) —— 后者得到的是标量(scalar)，无法作为
+    // bpf_d_path 的 ARG_PTR_TO_BTF_ID 入参，会触发 verifier 报错。
+    struct file *file = bprm->file;
     if (!file) return 0;
+
+    // ★ 只有相对路径（./、../、sub/...）才补偿：bprm->filename 是用户传的原始串，
+    //   绝对路径时它已是全路径；相对路径用已解析的 dentry 反推全路径。
+    //   bpf_d_path 一次 helper 调用走完 d_parent 链，不产生 BPF 侧循环，
+    //   因此不会像手写多级遍历那样触发 verifier back-edge/复杂度错误。
+    //   失败时(buf 超长等) helper 不写 buf，仍保留原始相对路径，退化为
+    //   原有的 inode 规则匹配，不会因此绕过进程管控。
+    if (buf[0] != '/') {
+        bpf_d_path(&file->f_path, buf, 256);
+    }
 
     struct inode *inode = BPF_CORE_READ(file, f_inode);
     if (!inode) return 0;
@@ -261,10 +269,10 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
             __u8 effective_mode = resolve_mode(prule->mode, FEATURE_PROC);
             if (effective_mode == MODE_PROTECT && prule->action == ACTION_DENY) {
                 bpf_printk("[PROC] BLOCKED (pattern): %s", buf);
-                send_monitor_event(EVENT_PROC, buf, 1, udev, uinode, NULL);
+                send_monitor_event(EVENT_PROC, buf, 1, udev, uinode);
                 return -EPERM;
             }
-            send_monitor_event(EVENT_PROC, buf, 0, udev, uinode, NULL);
+            send_monitor_event(EVENT_PROC, buf, 0, udev, uinode);
             return 0;
         }
     }
@@ -285,10 +293,10 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
                 __u8 effective_mode = resolve_mode(prule->mode, FEATURE_PROC);
                 if (effective_mode == MODE_PROTECT && prule->action == ACTION_DENY) {
                     bpf_printk("[PROC] BLOCKED (basename): %s", buf);
-                    send_monitor_event(EVENT_PROC, buf, 1, udev, uinode, NULL);
+                    send_monitor_event(EVENT_PROC, buf, 1, udev, uinode);
                     return -EPERM;
                 }
-                send_monitor_event(EVENT_PROC, buf, 0, udev, uinode, NULL);
+                send_monitor_event(EVENT_PROC, buf, 0, udev, uinode);
                 return 0;
             }
         }
@@ -306,11 +314,11 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
         __u8 effective_mode = resolve_mode(rule_mode, FEATURE_PROC);
         if (effective_mode == MODE_PROTECT) {
             bpf_printk("[PROC] BLOCKED(black): dev=%llu ino=%llu %s", udev, uinode, buf);
-            send_monitor_event(EVENT_PROC, buf, 1, udev, uinode, NULL);
+            send_monitor_event(EVENT_PROC, buf, 1, udev, uinode);
             return -EPERM;
         }
         bpf_printk("[PROC] MONITOR(black): dev=%llu ino=%llu %s", udev, uinode, buf);
-        send_monitor_event(EVENT_PROC, buf, 0, udev, uinode, NULL);
+        send_monitor_event(EVENT_PROC, buf, 0, udev, uinode);
         return 0;
     }
 
@@ -319,11 +327,11 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
         __u8 effective_mode = resolve_mode(0, FEATURE_PROC);
         if (effective_mode == MODE_PROTECT) {
             bpf_printk("[PROC] BLOCKED(unknown): dev=%llu ino=%llu %s", udev, uinode, buf);
-            send_monitor_event(EVENT_PROC_UNKNOWN, buf, 1, udev, uinode, NULL);
+            send_monitor_event(EVENT_PROC_UNKNOWN, buf, 1, udev, uinode);
             return -EPERM;
         }
         bpf_printk("[PROC] MONITOR(unknown): dev=%llu ino=%llu %s", udev, uinode, buf);
-        send_monitor_event(EVENT_PROC_UNKNOWN, buf, 0, udev, uinode, NULL);
+        send_monitor_event(EVENT_PROC_UNKNOWN, buf, 0, udev, uinode);
     }
 
     return 0;

@@ -146,8 +146,7 @@ pub struct UnifiedEvent {
     pub uid: u32,
     pub blocked: u8,
     pub comm: [u8; 16],
-    pub path: [u8; 64],
-    pub cwd: [u8; 64],
+    pub path: [u8; 128],
 }
 
 unsafe impl aya::Pod for UnifiedEvent {}
@@ -220,7 +219,7 @@ pub struct FileEvent {
     pub pid: u32,
     pub uid: u32,
     pub comm: [u8; 16],
-    pub path: [u8; 64],
+    pub path: [u8; 128],
 }
 
 unsafe impl aya::Pod for FileEvent {}
