@@ -79,3 +79,32 @@ message SecurityScanEvent {
         ScanFailed failed = 4;
     }
 }
+
+// ============================================================================
+// 简化版：直接返回检测结果（无流式，仅最终汇总）
+// 适用于只需快速获取安全评分与报告路径的场景
+// ============================================================================
+service SecurityScanServiceSimple {
+    // CheckSecurity: 快速检测并返回汇总结果，不推送中间进度事件
+    rpc CheckSecurity(CheckSecurityRequest) returns (CheckSecurityResponse);
+}
+
+// ============================================================================
+// 简化检测请求
+// ============================================================================
+message CheckSecurityRequest {
+    string output_dir = 1;  // HTML 报告输出目录（留空默认 /tmp）
+}
+
+// ============================================================================
+// 简化检测响应
+// ============================================================================
+message CheckSecurityResponse {
+    bool success = 1;           // 脚本是否正常结束
+    string message = 2;         // 结果描述
+    int32 safe_count = 3;       // 安全项数量
+    int32 warning_count = 4;    // 警告项数量
+    int32 critical_count = 5;   // 危险项数量
+    int32 score = 6;            // 安全评分（0~100）
+    string report_file = 7;     // HTML 报告完整路径
+}
