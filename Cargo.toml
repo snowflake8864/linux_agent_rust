@@ -29,6 +29,7 @@ members = [
     "crates/ebpf_backend",
     "crates/sqlite_db",
     "crates/local_store",
+    "crates/security_scan_grpc",
 ]
 
 # ebfp_backend 通过 main 的 optional feature 按需引入，不作为默认编译成员
@@ -56,6 +57,7 @@ default-members = [
     "crates/agent_local_svc",
     "crates/sqlite_db",
     "crates/local_store",
+    "crates/security_scan_grpc",
 ]
 
 [profile.dev]

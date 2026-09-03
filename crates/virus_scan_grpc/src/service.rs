@@ -222,6 +222,16 @@ impl StartVirusScanGrpcService for BootManager {
                 log_info!("[gRPC] VulnScanService 跳过（VULN_SCAN=0）");
             }
 
+            // [GRPC] SECURITY_SCAN
+            if grpc_svc.security_scan {
+                builder = builder.add_service(
+                    grpc_gateway::security_scan::security_scan_service_server::SecurityScanServiceServer::new(
+                        security_scan_grpc::SecurityScanGrpcService::new()));
+                log_info!("[gRPC] SecurityScanService 已注册");
+            } else {
+                log_info!("[gRPC] SecurityScanService 跳过（SECURITY_SCAN=0）");
+            }
+
             // [GRPC] AGENT_STATUS
             if grpc_svc.agent_status {
                 builder = builder.add_service(

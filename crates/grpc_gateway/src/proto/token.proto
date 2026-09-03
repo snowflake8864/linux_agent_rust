@@ -1,0 +1,13 @@
+syntax = "proto3";
+package token;
+
+import "common.proto";
+
+service TokenService {
+    rpc GetToken(common.Empty) returns (TokenResponse);
+}
+
+message TokenResponse {
+    string token = 1;
+    bool is_valid = 2;
+}
