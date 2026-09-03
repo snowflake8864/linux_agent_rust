@@ -11,7 +11,7 @@
 #   ./test_grpc.sh listen [秒]   # 监听告警流
 # ============================================================================
 
-GRPC_ADDR="${GRPC_ADDR:-192.168.135.114:50051}"
+GRPC_ADDR="${GRPC_ADDR:-192.168.3.4:50051}"
 PROTO_DIR="$(dirname "$0")/../crates/grpc_gateway/src/proto"
 PROTO_DIR="$(cd "$PROTO_DIR" 2>/dev/null && pwd || echo "$PROTO_DIR")"
 
