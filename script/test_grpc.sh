@@ -580,6 +580,32 @@ test_35() {
     fi
 }
 
+# 36: 系统安全检测（简化版）— 一键获取安全评分与报告路径
+test_36() {
+    local desc="系统安全检测(CheckSecurity/简化版)"
+    echo -ne "${CYAN}[TEST]${NC} $desc ... "
+    local output
+    output=$(timeout 120 grpcurl -plaintext -emit-defaults \
+        -import-path "$PROTO_DIR" \
+        -proto common.proto -proto security_scan.proto \
+        -d '{"output_dir":"/tmp"}' \
+        -connect-timeout 3 \
+        "$GRPC_ADDR" security_scan.SecurityScanServiceSimple/CheckSecurity 2>&1)
+    if echo "$output" | grep -q '"success": true'; then
+        echo -e "${GREEN}PASS${NC} (检测成功)"
+        echo "$output" | sed 's/^/  /'
+        ((pass++))
+    elif echo "$output" | grep -q '"success": false'; then
+        echo -e "${RED}FAIL${NC} (检测失败)"
+        echo "$output" | sed 's/^/  /'
+        ((fail++))
+    else
+        echo -e "${RED}FAIL${NC} (未收到有效响应)"
+        echo "$output" | sed 's/^/  /'
+        ((fail++))
+    fi
+}
+
 # ── 流式接口测试 ────────────────────────────────────────────────────────
 
 # 病毒扫描双向流 — 发 StartScanRequest 并等待响应，测连通性
@@ -743,6 +769,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}  33) PortKnock(单包敲门SPA中继)                              ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  34) GetToken(获取认证Token)                                 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  35) SecurityScan(流)                                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  36) CheckSecurity(简化版)                                     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  s1) VirusScan流(StreamControl)                              ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${RED}写接口（仅离线可用，在线应返回 PERMISSION_DENIED）${NC}       ${CYAN}║${NC}"
@@ -794,7 +821,7 @@ run_all_write() {
 }
 
 run_all_stream() {
-    test_17; test_18; test_s1; test_35
+    test_17; test_18; test_s1; test_35; test_36
 }
 
 # ── main ───────────────────────────────────────────────────────────────
@@ -907,7 +934,7 @@ case "${1:-menu}" in
                 21) test_21 ;; 22) test_22 ;; 23) test_23 ;; 24) test_24 ;;
                 25) test_25 ;; 26) test_26 ;;
                 27) test_27 ;; 28) test_28 ;; 28b) test_28b ;;
-                29) test_29 ;; 30) test_30 ;; 31) test_31 ;; 32) test_32 ;; 33) test_33 ;; 34) test_34 ;; 35) test_35 ;;
+                29) test_29 ;; 30) test_30 ;; 31) test_31 ;; 32) test_32 ;; 33) test_33 ;; 34) test_34 ;; 35) test_35 ;; 36) test_36 ;;
                 s1) test_s1 ;;
                 03b) test_03b ;; 14b) test_14b ;; 14c) test_14c ;; 14d) test_14d ;;
                 04b) test_04b ;;
@@ -1123,6 +1150,7 @@ case "${1:-menu}" in
 
     s1) test_s1; print_result ;;
     35) test_35; print_result ;;
+    36) test_36; print_result ;;
     32) if [ -n "$2" ]; then
             grpc_call "进程规则查询(自定义)" proc_diag.proto proc_diag.ProcDiagService QueryProcessRule "$2"
         else
