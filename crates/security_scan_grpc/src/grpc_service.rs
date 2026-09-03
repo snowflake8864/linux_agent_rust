@@ -10,7 +10,7 @@ use futures::Stream;
 use grpc_gateway::security_scan::security_scan_service_server::SecurityScanService;
 use grpc_gateway::security_scan::security_scan_event::Event;
 use grpc_gateway::security_scan::{
-    RunSecurityScanRequest, ScanCompleted, ScanFailed, ScanProgress, ScanStarted,
+    CheckSecurityResponse, RunSecurityScanRequest, ScanCompleted, ScanFailed, ScanProgress, ScanStarted,
     SecurityCheckItem, SecurityScanEvent,
 };
 use logging::{log_error, log_info, log_warn};
@@ -163,8 +163,94 @@ async fn run_script(
         let l = l.trim();
         if !l.is_empty() {
             log_warn!("[SecurityScan] 脚本 stderr: {}", l);
+}
+}
+
+/// ============================================================================
+// 简化版：直接返回检测结果（unary RPC，仅最终汇总）
+// ============================================================================
+
+// 异步执行脚本并解析固定输出格式
+// 这是一个独立函数，不实现 tonic trait - 可被网关层或其他代码调用
+async fn run_check_security_inner(output_dir: &str) -> Result<CheckSecurityResponse, String> {
+    let mut child = Command::new("bash")
+        .arg(SCRIPT_PATH)
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("启动检测脚本失败: {}", e))?;
+
+    let stdout = child.stdout.take().ok_or("无法获取脚本 stdout")?;
+    let stderr = child.stderr.take().ok_or("无法获取脚本 stderr")?;
+
+    let mut report_file = String::new();
+    let mut safe_count = 0i32;
+    let mut warning_count = 0i32;
+    let mut critical_count = 0i32;
+    let mut score = 0i32;
+
+    let mut lines = BufReader::new(stdout).lines();
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|e| format!("读取脚本输出失败: {}", e))?
+    {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("HTML:") {
+            report_file = rest.trim().to_string();
+            continue;
+        }
+        if line == "SCAN_COMPLETE" {
+            continue;
+        }
+
+        // 解析 "安全: 5"、"警告: 2"、"危险: 2"
+        if let Some((label, value)) = line.split_once(':') {
+            let level = label.trim();
+            let value: i32 = value.trim().parse().unwrap_or(0);
+            match level {
+                "安全" => safe_count = value,
+                "警告" => warning_count = value,
+                "危险" => critical_count = value,
+                _ => {}
+            }
+        }
+
+        // 解析 "安全评分: 55%"
+        if line.starts_with("安全评分:") {
+            let score_str: String = line.split_once(':').unwrap().1.trim().replace("%", "");
+            score = score_str.parse().unwrap_or(0);
         }
     }
+
+    // 等待子进程结束
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("等待脚本结束失败: {}", e))?;
+
+    let success = status.success();
+    let message = if success {
+        "检测完成".to_string()
+    } else {
+        format!("检测结束，退出码 {:?}", status.code())
+    };
+
+    Ok(CheckSecurityResponse {
+        success,
+        message,
+        safe_count,
+        warning_count,
+        critical_count,
+        score,
+        report_file,
+    })
+}
 
     let success = status.success();
     let safe = items.iter().filter(|i| i.level == "SAFE").count() as i32;
