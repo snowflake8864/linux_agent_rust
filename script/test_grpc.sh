@@ -3,7 +3,7 @@
 # gRPC 接口测试脚本 — 可手动选择要测试的接口
 # 用法:
 #   ./test_grpc.sh              # 交互式菜单选择
-#   ./test_grpc.sh <编号>        # 直接测试指定接口 (1-34, s1)
+#   ./test_grpc.sh <编号>        # 直接测试指定接口 (1-35, s1)
 #   ./test_grpc.sh all           # 测试全部只读接口 (1-34)
 #   ./test_grpc.sh write         # 测试写接口（需离线模式）
 #   ./test_grpc.sh stream        # 测试流式接口 (17, 18, s1)
@@ -11,7 +11,7 @@
 #   ./test_grpc.sh listen [秒]   # 监听告警流
 # ============================================================================
 
-GRPC_ADDR="${GRPC_ADDR:-192.168.3.4:50051}"
+GRPC_ADDR="${GRPC_ADDR:-192.168.135.114:50051}"
 PROTO_DIR="$(dirname "$0")/../crates/grpc_gateway/src/proto"
 PROTO_DIR="$(cd "$PROTO_DIR" 2>/dev/null && pwd || echo "$PROTO_DIR")"
 
@@ -144,6 +144,11 @@ show_test_help() {
                echo "    返回: token(字符串), is_valid(true=有效/false=未获取到)"
                echo "    无参数，始终可用（在线/离线均可调用）"
                echo "    用法: $0 34" ;;
+        35)    echo -e "${CYAN}[35] SecurityScan(流)${NC} — 系统安全检测（执行 SecurityScan_linux.sh）"
+               echo "    服务端流式返回: started → progress(逐项) → completed/failed"
+               echo "    脚本执行时间较长（约 8~30s），不会阻塞 gRPC 处理"
+               echo "    ⚠️  需要 [GRPC] SECURITY_SCAN=1 才注册该服务"
+               echo "    用法: $0 35" ;;
         s1)    echo -e "${CYAN}[s1] VirusScan流${NC} — 病毒扫描双向流 (StreamControl)"
                echo "    双向流式接口，客户端发送扫描指令，服务端返回扫描结果"
                echo "    用法: $0 s1" ;;
@@ -549,6 +554,32 @@ test_33() { grpc_call "单包敲门(默认测试参数)" \
 test_34() { grpc_call "获取认证Token(缓存)" \
     token.proto token.TokenService GetToken; }
 
+# 35: 系统安全检测（服务端流式）— 执行 SecurityScan_linux.sh 并流式返回结果
+test_35() {
+    local desc="系统安全检测(SecurityScan/RunScan 流)"
+    echo -ne "${CYAN}[TEST]${NC} $desc ... "
+    local output
+    output=$(timeout 120 grpcurl -plaintext -emit-defaults \
+        -import-path "$PROTO_DIR" \
+        -proto common.proto -proto security_scan.proto \
+        -d '{"output_dir":"/tmp"}' \
+        -connect-timeout 3 \
+        "$GRPC_ADDR" security_scan.SecurityScanService/RunScan 2>&1)
+    if echo "$output" | grep -q '"completed"'; then
+        echo -e "${GREEN}PASS${NC} (检测完成)"
+        echo "$output" | sed 's/^/  /'
+        ((pass++))
+    elif echo "$output" | grep -q '"failed"'; then
+        echo -e "${RED}FAIL${NC} (服务端检测失败)"
+        echo "$output" | sed 's/^/  /'
+        ((fail++))
+    else
+        echo -e "${RED}FAIL${NC} (未收到完成事件)"
+        echo "$output" | sed 's/^/  /'
+        ((fail++))
+    fi
+}
+
 # ── 流式接口测试 ────────────────────────────────────────────────────────
 
 # 病毒扫描双向流 — 发 StartScanRequest 并等待响应，测连通性
@@ -711,6 +742,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}  32) ProcRuleQuery(进程白/黑名单表查询)                      ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  33) PortKnock(单包敲门SPA中继)                              ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  34) GetToken(获取认证Token)                                 ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  35) SecurityScan(流)                                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  s1) VirusScan流(StreamControl)                              ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${RED}写接口（仅离线可用，在线应返回 PERMISSION_DENIED）${NC}       ${CYAN}║${NC}"
@@ -762,7 +794,7 @@ run_all_write() {
 }
 
 run_all_stream() {
-    test_17; test_18; test_s1
+    test_17; test_18; test_s1; test_35
 }
 
 # ── main ───────────────────────────────────────────────────────────────
@@ -875,7 +907,7 @@ case "${1:-menu}" in
                 21) test_21 ;; 22) test_22 ;; 23) test_23 ;; 24) test_24 ;;
                 25) test_25 ;; 26) test_26 ;;
                 27) test_27 ;; 28) test_28 ;; 28b) test_28b ;;
-                29) test_29 ;; 30) test_30 ;; 31) test_31 ;; 32) test_32 ;; 33) test_33 ;; 34) test_34 ;;
+                29) test_29 ;; 30) test_30 ;; 31) test_31 ;; 32) test_32 ;; 33) test_33 ;; 34) test_34 ;; 35) test_35 ;;
                 s1) test_s1 ;;
                 03b) test_03b ;; 14b) test_14b ;; 14c) test_14c ;; 14d) test_14d ;;
                 04b) test_04b ;;
@@ -949,6 +981,7 @@ case "${1:-menu}" in
                     echo "  32) ProcRuleQuery(进程白/黑名单表查询)"
                     echo "  33) PortKnock(单包敲门SPA中继)"
                     echo "  34) GetToken(获取认证Token)"
+                    echo "  35) SecurityScan(流)"
                     echo "  s1) VirusScan流"
                     echo ""
                     echo -e "${CYAN}── 扩展测试（filter_status / is_white 过滤）──${NC}"
@@ -1089,6 +1122,7 @@ case "${1:-menu}" in
         ;;
 
     s1) test_s1; print_result ;;
+    35) test_35; print_result ;;
     32) if [ -n "$2" ]; then
             grpc_call "进程规则查询(自定义)" proc_diag.proto proc_diag.ProcDiagService QueryProcessRule "$2"
         else
