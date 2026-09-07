@@ -1541,10 +1541,12 @@ name = "kernel_module"
 version = "0.10.6"
 dependencies = [
  "common",
+ "hex",
  "levenshtein",
  "libc",
  "log 0.4.29",
  "logging",
+ "md-5",
  "tokio",
  "tokio-rustls 0.26.4",
 ]
