@@ -14,6 +14,7 @@ use logging::{log_info, CustomLogger, log_error, log_warn};
 use netlink::netlink::NlSockInfo;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::process::Command;
 use config::net_info::NETINFO_CONFIG;
 use grpc_gateway::agent_mode::{AgentMode, AGENT_MODE, ADMISSION_NETWORK_ANOMALY};
 use udisk::{StartUsbService, StartUsbHotplugHandler};
@@ -52,6 +53,111 @@ fn ensure_single_instance() {
     println!("✔ 单实例检查通过，当前 PID={}", current_pid);
 }
 
+// ====== KYSEC (麒麟安全防护) 升级后恢复 ======
+// 升级前 task_fetcher 会把各安全功能状态保存到 /tmp/kysec_upgrade_pending 并关闭；
+// 升级脚本末尾 `systemctl restart osec` 重启本进程（MagicArmor_0），这里启动时检测标记文件，
+// 对 /opt/osec、/opt/EndpointSecurityApp 加白并恢复各安全功能。
+
+const KYSEC_PENDING_FILE: &str = "/tmp/kysec_upgrade_pending";
+
+fn is_kylin_os() -> bool {
+    fs::read_to_string("/etc/os-release")
+        .map(|c| c.to_lowercase().contains("kylin"))
+        .unwrap_or(false)
+}
+
+async fn command_exists(cmd: &str) -> bool {
+    let script = format!("command -v {} >/dev/null 2>&1", cmd);
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&script)
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+async fn is_kysec_available() -> bool {
+    if !is_kylin_os() {
+        return false;
+    }
+    command_exists("getstatus").await
+        && command_exists("setstatus").await
+        && command_exists("kysec_set").await
+}
+
+/// 对目录下所有可执行文件与库（*.so*/*.a/*.la）加白，与安装脚本规则一致。
+async fn kysec_whitelist_dir(dir: &str) {
+    let mut cmd = Command::new("find");
+    cmd.arg(dir)
+        .arg("-type").arg("f")
+        .arg("(")
+        .arg("-executable")
+        .arg("-o")
+        .arg("-name").arg("*.so*")
+        .arg("-o")
+        .arg("-name").arg("*.a")
+        .arg("-o")
+        .arg("-name").arg("*.la")
+        .arg("-o")
+        .arg("-name").arg("*.ko")
+        .arg(")");
+    if let Ok(output) = cmd.output().await {
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            let f = line.trim();
+            if !f.is_empty() {
+                let _ = Command::new("kysec_set")
+                    .args(["-n", "exectl", "-v", "verified"])
+                    .arg(f)
+                    .status()
+                    .await;
+            }
+        }
+    }
+}
+
+/// 升级后恢复：检测标记文件 → 加白 /opt/osec、/opt/EndpointSecurityApp → 恢复各安全功能 → 删除标记文件。
+async fn kysec_restore_after_upgrade() {
+    if !is_kysec_available().await {
+        return;
+    }
+    if !Path::new(KYSEC_PENDING_FILE).exists() {
+        return;
+    }
+    log_info!("[startup] 检测到 KYSEC 升级标记，恢复安全功能并加白");
+
+    let content = fs::read_to_string(KYSEC_PENDING_FILE).unwrap_or_default();
+
+    kysec_whitelist_dir("/opt/osec").await;
+    kysec_whitelist_dir("/opt/EndpointSecurityApp").await;
+    kysec_whitelist_dir("/opt/vigilixav").await;
+
+    let mut restored = 0;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((feature, value)) = line.split_once('=') {
+            let feature = feature.trim();
+            let value = value.trim();
+            if feature.is_empty() || value.is_empty() {
+                continue;
+            }
+            log_info!("[startup] KYSEC: 恢复 {} -> {}", feature, value);
+            let _ = Command::new("setstatus")
+                .args(["-f", feature, value])
+                .status()
+                .await;
+            restored += 1;
+        }
+    }
+    log_info!("[startup] KYSEC: 已恢复 {} 个安全功能", restored);
+
+    let _ = fs::remove_file(KYSEC_PENDING_FILE);
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     ensure_single_instance(); 
@@ -70,6 +176,9 @@ async fn main() -> std::io::Result<()> {
         }
     }
     log_info!("程序开始启动");
+
+    // 升级后 KYSEC 恢复：若存在标记文件，说明刚经历一次升级，加白并恢复执行控制
+    //kysec_restore_after_upgrade().await;
 
     // 卸载现有内核驱动（driver 模式才会用，ebpf 模式跳过）
     // 如果卸载失败，记录失败次数，后续可能跳过驱动加载
@@ -628,6 +737,8 @@ async fn main() -> std::io::Result<()> {
                 })
         }
     });
+    // 升级后 KYSEC 恢复：若存在标记文件，说明刚经历一次升级，加白并恢复执行控制
+    kysec_restore_after_upgrade().await;
 
     // 等待所有任务完成或接收退出信号
     println!("程序正在运行，按 Ctrl+C 或发送 SIGTERM 退出...");
