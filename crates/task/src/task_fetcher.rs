@@ -392,6 +392,125 @@ fn resolve_upgrade_conf_line(dir: &str, line: &str) -> Vec<PathBuf> {
     }
 }
 
+// ====== KYSEC (麒麟安全防护) 处理 ======
+// 升级由 task_fetcher 最先感知：在麒麟系统上，升级前把各安全功能状态保存到 /tmp 标记文件并关闭，
+// 升级脚本末尾 `systemctl restart osec` 会重启 MagicArmor_0，其启动时读取标记文件完成加白 + 恢复。
+
+/// KYSEC 升级标记文件：每行 `feature=value`，记录升级前的安全功能状态。
+const KYSEC_PENDING_FILE: &str = "/tmp/kysec_upgrade_pending";
+
+/// setstatus -f 支持的功能列表（与 install.sh 的 SUPPORTED_FEATURES 一致）
+const SUPPORTED_FEATURES: [&str; 10] = [
+    "exectl", "netctl", "fpro", "kmod", "ppro", "pblk", "devctl", "ipt", "eperm", "kid",
+];
+
+/// getstatus 显示名 -> setstatus 参数名 映射（与 install.sh 的 FEATURE_MAP 一致）
+fn kysec_feature_map(field: &str) -> Option<&'static str> {
+    match field {
+        "exec control" => Some("exectl"),
+        "net control" => Some("netctl"),
+        "file protect" => Some("fpro"),
+        "kmod protect" => Some("kmod"),
+        "process protect" => Some("ppro"),
+        "device control" => Some("devctl"),
+        "ipt control" => Some("ipt"),
+        "eperm control" => Some("eperm"),
+        "kid protect" => Some("kid"),
+        _ => None,
+    }
+}
+
+/// 是否运行在麒麟系统（读取 /etc/os-release）
+fn is_kylin_os() -> bool {
+    fs::read_to_string("/etc/os-release")
+        .map(|c| c.to_lowercase().contains("kylin"))
+        .unwrap_or(false)
+}
+
+async fn command_exists(cmd: &str) -> bool {
+    let script = format!("command -v {} >/dev/null 2>&1", cmd);
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&script)
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+async fn is_kysec_available() -> bool {
+    if !is_kylin_os() {
+        return false;
+    }
+    command_exists("getstatus").await
+        && command_exists("setstatus").await
+        && command_exists("kysec_set").await
+}
+
+/// 解析 getstatus 输出，提取所有可恢复的安全功能状态（feature -> value）。
+async fn kysec_get_all_status() -> Vec<(String, String)> {
+    let output = match Command::new("getstatus").output().await {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut status = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // 跳过标题行与分隔线
+        if line.contains("KySec status") || line.starts_with("---") {
+            continue;
+        }
+        if let Some((field, value)) = line.split_once(':') {
+            let field = field.trim();
+            let value = value.trim();
+            if let Some(feature) = kysec_feature_map(field) {
+                status.push((feature.to_string(), value.to_string()));
+            }
+        }
+    }
+    status
+}
+
+/// 升级前：保存所有安全功能状态到 /tmp 标记文件，并逐个关闭。
+/// 后续由 MagicArmor_0 启动时读取标记文件完成加白 + 恢复。
+async fn kysec_save_and_disable() {
+    if !is_kysec_available().await {
+        return;
+    }
+    let status = kysec_get_all_status().await;
+    if status.is_empty() {
+        return;
+    }
+
+    // 保存状态：每行 `feature=value`
+    let content = status
+        .iter()
+        .map(|(f, v)| format!("{}={}", f, v))
+        .collect::<Vec<_>>()
+        .join("\n");
+    log_info!("[task_fetcher] KYSEC: 保存 {} 个安全功能状态并关闭", status.len());
+    let _ = fs::write(KYSEC_PENDING_FILE, content);
+
+    // 逐个关闭（pblk 无对应显示名，仅关闭不保存，与 install.sh 一致）
+    let mut disabled = 0;
+    for feature in SUPPORTED_FEATURES.iter() {
+        let ok = Command::new("setstatus")
+            .args(["-f", feature, "off"])
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            disabled += 1;
+        }
+    }
+    log_info!("[task_fetcher] KYSEC: 已关闭 {} 个安全功能", disabled);
+}
+
 impl TaskFetcher {
     pub fn new(base_url: &str, token: Option<String>, pattern_mgr: Arc<Mutex<pattern_rules_mgr::PatternRulesMgr>>, nl_sock: Option<NlSockInfo>) -> Self 
     {
@@ -1228,6 +1347,8 @@ pub async fn task_update(&self, task_type: u64) -> Result<(), String> {
 
     log_info!("✅ 找到升级脚本: {:?}", resolved_scripts);
 
+    // 麒麟系统：升级前保存执行控制状态并关闭，后续由 MagicArmor_0 启动时恢复
+    kysec_save_and_disable().await;
 
     let binary_name = "MagicArmorAgent";
     let running_arch = detect_runtime_arch();
@@ -3203,6 +3324,9 @@ async fn upload_ip_jump_result(&self, source_ip: &str, target_ip: &str, gateway:
         let mut archive = ZipArchive::new(reader).map_err(|e| e.to_string())?;
         archive.extract(temp_dir).map_err(|e| e.to_string())?;
         log_info!("[本地升级] ✅ 升级包已解压到: {}", temp_dir);
+
+        // 麒麟系统：升级前保存执行控制状态并关闭，后续由 MagicArmor_0 启动时恢复
+        kysec_save_and_disable().await;
 
         // ── 3. 通知 agent_manager 执行脚本 ──
         if let Err(e) = send_command_to_agent("update").await {
