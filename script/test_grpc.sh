@@ -723,6 +723,7 @@ _DEF_W12='{"rules": [{"dir":"/opt","pid":0,"typ":1}]}'
 _DEF_W13='{"rules": [{"file_type":"doc","typ":1}]}'
 _DEF_W14='{"mode": 2}'
 _DEF_W15='{"mode": 2}'
+_DEF_W16='{"zipPath":""}'
 _DEF_W17='{"backup_id":"test_bak"}'
 
 exec_w1()  { grpc_call "更新配置"       config.proto         config.ConfigService                UpdateConfig               "${1:-$_DEF_W1}"; }
@@ -740,6 +741,7 @@ exec_w12() { grpc_call "更新目录保护策略" dir_policy.proto      dir_poli
 exec_w13() { grpc_call "更新勒索保护策略" extort_policy.proto   extort_policy.ExtortPolicyService     UpdateExtortPolicy          "${1:-$_DEF_W13}"; }
 exec_w14() { grpc_call "进程防护模式"    protection_mode.proto protection_mode.ProcessDefenseService  UpdateProcessDefenseMode    "${1:-$_DEF_W14}"; }
 exec_w15() { grpc_call "外设防护模式"    protection_mode.proto protection_mode.PeripheralDefenseService UpdatePeripheralDefenseMode "${1:-$_DEF_W15}"; }
+exec_w16() { grpc_call "触发本地升级"     task_local.proto      task_local.LocalTaskService          TriggerLocalUpdate          "${1:-$_DEF_W16}"; }
 exec_w17() { grpc_call "删除备份"       backup.proto          backup.BackupService                 DeleteBackup                "${1:-$_DEF_W17}"; }
 
 # ── 菜单 ───────────────────────────────────────────────────────────────
@@ -902,26 +904,6 @@ case "${1:-menu}" in
             if [[ "$choice" =~ ^(.+)\ ([\?]|help|h)$ ]]; then
                 tid="${BASH_REMATCH[1]}"
                 show_test_help "$tid"
-                continue
-            fi
-
-            # "w16 <json>" direct TriggerLocalUpdate
-            if [[ "$choice" =~ ^w16[[:space:]]+\{ ]]; then
-                json_data="${choice#w16 }"
-                echo -ne "${CYAN}[直接下发]${NC} TriggerLocalUpdate ... "
-                output=$(grpcurl -plaintext -emit-defaults \
-                    -import-path "$PROTO_DIR" \
-                    -proto common.proto -proto task_local.proto \
-                    -d "$json_data" \
-                    -connect-timeout 3 -max-time 10 \
-                    "$GRPC_ADDR" task_local.LocalTaskService/TriggerLocalUpdate 2>&1) && rc=0 || rc=1
-                if [ $rc -eq 0 ]; then
-                    echo -e "${GREEN}成功${NC}"
-                    echo "$output" | sed 's/^/  /'
-                else
-                    echo -e "${RED}失败${NC}"
-                    echo "$output" | sed 's/^/  /'
-                fi
                 continue
             fi
 
@@ -1166,8 +1148,15 @@ case "${1:-menu}" in
 
     *)
         arg="$1"
-        if [[ "$arg" =~ ^w[1-9]$|^w1[0-6]$ ]]; then
-            "test_$arg"
+        if [[ "$arg" =~ ^w[1-9]$|^w1[0-7]$ ]]; then
+            if [ $# -ge 2 ]; then
+                json="$2"
+                shift 2
+                while [ $# -gt 0 ]; do json="$json $1"; shift; done
+                "exec_$arg" "$json"
+            else
+                "test_$arg"
+            fi
         elif [[ "$arg" =~ ^[0-9]+$ ]] && [ "$arg" -ge 1 ] && [ "$arg" -le 33 ]; then
             "test_$(printf '%02d' "$arg")"
         else
