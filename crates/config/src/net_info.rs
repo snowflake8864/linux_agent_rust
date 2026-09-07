@@ -934,7 +934,7 @@ impl NetInfoConfig {
                 };
                 new_content.push('\n');
                 if let Err(e) = std::fs::write(app_conf, &new_content) {
-                    log_error!("写入 app.conf uid 失败: {}", e);
+                    log_error!("写入 .greatwall_app.conf uid 失败: {}", e);
                 } else {
                     log_info!("已同步 uid={} 到 /etc/.greatwall_app.conf", self.dev_uid);
                 }
