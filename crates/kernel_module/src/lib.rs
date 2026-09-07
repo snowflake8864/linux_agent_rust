@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::fs;
+use std::io::Read;
 use std::process::Command;
 use std::pin::Pin;
 use std::future::Future;
@@ -8,6 +9,7 @@ use tokio::time::{interval, Duration};
 use logging::{log_info, log_error, log_warn};
 use common::manager::boot::BootManager;
 use levenshtein::levenshtein;
+use md5::{Md5, Digest};
 
 pub mod driver_backend;
 pub use driver_backend::DriverBackend;
@@ -518,11 +520,31 @@ fn find_best_driver_excluding(kernel_version: &str, failed: &HashSet<PathBuf>) -
     best.map(|(p, _)| p).ok_or("No matching driver found".to_string())
 }
 
+fn compute_file_md5(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let mut hasher = Md5::new();
+    hasher.update(&buf);
+    Ok(hex::encode(hasher.finalize()))
+}
+
 fn setup_module_structure(src_path: &Path, kernel_version: &str) -> Result<(), String> {
     let mod_dir = Path::new("/opt/osec/lib/modules").join(kernel_version);
-    fs::create_dir_all(&mod_dir).map_err(|e| e.to_string())?;
-
     let dst_ko = mod_dir.join("osec_base.ko");
+
+    // MD5 校验：源和目标一致则跳过整个 setup（目录、depmod 等均无需重建）
+    if dst_ko.exists() {
+        if let (Ok(src_md5), Ok(dst_md5)) = (compute_file_md5(src_path), compute_file_md5(&dst_ko)) {
+            if src_md5 == dst_md5 {
+                log_info!("[kernel_module] osec_base.ko MD5 一致，跳过模块目录重建");
+                return Ok(());
+            }
+            log_info!("[kernel_module] osec_base.ko MD5 变更 ({} -> {})，重建模块目录", &dst_md5[..8], &src_md5[..8]);
+        }
+    }
+
+    fs::create_dir_all(&mod_dir).map_err(|e| e.to_string())?;
     fs::copy(src_path, &dst_ko).map_err(|e| e.to_string())?;
 
     fs::write(mod_dir.join("modules.order"), "").map_err(|e| e.to_string())?;
