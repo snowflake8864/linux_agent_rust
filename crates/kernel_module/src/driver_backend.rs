@@ -120,9 +120,21 @@ impl SecurityBackend for DriverBackend {
         }
         Ok(())
     }
-
+/*
     fn write_net_rules(&self, rules: &str) -> Result<(), String> {
         proc_write("/proc/osec/net_rules", rules)
+    }
+*/
+    fn write_net_rules(&self, rules: &str) -> Result<(), String> {
+        for line in rules.lines() {
+            let line = line.trim();
+            // 跳过空行
+            if line.is_empty() {
+                continue;
+            }
+            proc_write("/proc/osec/net_rules", line)?;
+        }
+        Ok(())
     }
 
     fn write_netblock_switch(&self, value: &str) -> Result<(), String> {
