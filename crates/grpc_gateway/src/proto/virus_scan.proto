@@ -30,6 +30,7 @@ service VirusScanService {
     //   - DisposeFileResponse: 处置操作结果
     //   - PauseScanResponse: 暂停操作结果
     //   - ResumeScanResponse: 恢复操作结果
+    //   - StopScanResponse: 停止操作结果
     rpc StreamControl(stream ClientMessage) returns (stream ServerMessage);
 
     // 查询隔离区文件列表
@@ -65,6 +66,7 @@ message ServerMessage {
         DisposeFileResponse dispose_result = 8; // 处置操作结果
         PauseScanResponse pause_response = 9;  // 暂停操作结果
         ResumeScanResponse resume_response = 10; // 恢复操作结果
+        StopScanResponse stop_response = 11;  // 停止操作结果
     }
 }
 
@@ -92,6 +94,15 @@ message StartScanResponse {
 // ============================================================================
 message StopScanRequest {
     string scan_id = 1;    // 要停止的扫描任务 ID
+}
+
+// ============================================================================
+// 停止扫描响应（Agent 返回）
+// ============================================================================
+message StopScanResponse {
+    string scan_id = 1;    // 扫描任务 ID
+    bool success = 2;      // 是否成功停止（scan_id 不存在时为 false）
+    string message = 3;    // 响应消息
 }
 
 // ============================================================================

@@ -297,11 +297,15 @@ impl ScanTaskManager {
         Ok(scan_id)
     }
 
-    pub async fn stop_scan(&self, scan_id: &str) {
+    pub async fn stop_scan(&self, scan_id: &str) -> bool {
         let tasks = self.tasks.lock().await;
         if let Some(task) = tasks.get(scan_id) {
             task.stop();
             log_info!("扫描已停止: {}", scan_id);
+            true
+        } else {
+            log_error!("扫描任务不存在，无法停止: {}", scan_id);
+            false
         }
     }
 

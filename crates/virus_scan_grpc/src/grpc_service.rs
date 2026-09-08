@@ -86,7 +86,23 @@ impl VirusScanService for VirusScanGrpcService {
 
                                 grpc_gateway::virus_scan::client_message::Cmd::StopScan(req) => {
                                     log_info!("[gRPC] 收到停止扫描请求: scan_id={}", req.scan_id);
-                                    task_mgr.stop_scan(&req.scan_id).await;
+                                    let stopped = task_mgr.stop_scan(&req.scan_id).await;
+                                    let (success, message) = if stopped {
+                                        (true, "扫描已停止".to_string())
+                                    } else {
+                                        (false, format!("扫描任务不存在: {}", req.scan_id))
+                                    };
+                                    let _ = tx.send(Ok(ServerMessage {
+                                        event: Some(
+                                            grpc_gateway::virus_scan::server_message::Event::StopResponse(
+                                                grpc_gateway::virus_scan::StopScanResponse {
+                                                    scan_id: req.scan_id,
+                                                    success,
+                                                    message,
+                                                },
+                                            ),
+                                        ),
+                                    })).await;
                                 }
 
                                 grpc_gateway::virus_scan::client_message::Cmd::Ping(ping) => {
