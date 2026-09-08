@@ -421,6 +421,14 @@ async fn main() -> std::io::Result<()> {
                                         ebpf_scan = Some(ebpf.clone());
                                         ebpf.start_proc_event_reader();
                                         ebpf.start_file_event_reader();
+                                        ebpf.start_net_event_reader();
+                                        // 虚开端口告警上报 worker：批量 POST /v1/upOpenPort（对齐驱动模式路径）
+                                        {
+                                            let bm = Arc::new(init.clone());
+                                            tokio::spawn(async move {
+                                                reporter::fake_port_audit::run_open_port_audit_worker(bm).await;
+                                            });
+                                        }
 
                                         // 准入控制：ECN-Echo
                                         if admission_enabled && admission_mode == 1 {

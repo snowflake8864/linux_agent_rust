@@ -394,10 +394,12 @@ int xdp_packet_filter(struct xdp_md *ctx) {
 
     // 2. Try find mod rule (Ingress = 1)，miss 时回退虚开端口区间表
     struct pkt_mod_value vr_val;
+    __u8 is_vir_port = 0;
     struct pkt_mod_value *rule = find_net_rule(protocol, 1, dst_ip, src_port, dst_port);
     if (!rule) {
         if (find_vir_port_rule(protocol, dst_ip, dst_port, &vr_val)) {
             rule = &vr_val;
+            is_vir_port = 1;
         }
     }
     if (!rule) {
@@ -451,6 +453,52 @@ int xdp_packet_filter(struct xdp_md *ctx) {
     __u32 k5 = 5;
     __u64 *c5 = bpf_map_lookup_elem(&debug_stats, &k5);
     if (c5) (*c5)++;
+
+    // 2a. 纯虚开端口（无改写，蜜罐）：仅 TCP 回 SYN-ACK，让探测方以为端口开放。
+    //     重定向/端口改写规则走下方正常转发，由真实后端响应，此处不处理。
+    if (is_vir_port && !rule->ip_mod_enable && !rule->port_mod_enable && protocol == 6) {
+        struct tcphdr *tcp = l4_hdr;
+        if ((void *)(tcp + 1) > data_end) return XDP_PASS;
+        __u8 tcp_flags = *((__u8 *)tcp + 13);
+        if ((tcp_flags & 0x12) == 0x02) {
+            // SYN：交换 L2/L3/L4 方向后回 SYN-ACK
+            unsigned char mac_tmp[6];
+            __builtin_memcpy(mac_tmp, eth->h_source, 6);
+            __builtin_memcpy(eth->h_source, eth->h_dest, 6);
+            __builtin_memcpy(eth->h_dest, mac_tmp, 6);
+
+            // 交换 IP 源/目的（IP 头与 TCP 伪头校验和均不变）
+            __u32 ip_tmp = ip->saddr;
+            ip->saddr = ip->daddr;
+            ip->daddr = ip_tmp;
+
+            // 交换 TCP 源/目的端口（校验和不变）
+            __u16 port_tmp = tcp->source;
+            tcp->source = tcp->dest;
+            tcp->dest = port_tmp;
+
+            // flags: SYN -> SYN|ACK（按 16bit 字增量更新校验和）
+            __u8 new_flags = 0x12;
+            csum_replace2(&tcp->check, (__u16)tcp_flags << 8, (__u16)new_flags << 8);
+            *((__u8 *)tcp + 13) = new_flags;
+
+            // seq: 服务端 ISN；ack: client_seq + 1
+            __u32 client_seq = tcp->seq;
+            __u32 server_isn = dst_ip ^ src_ip ^ ((__u32)bpf_ntohs(dst_port) << 16) ^ (__u32)bpf_ntohs(src_port);
+            csum_replace4(&tcp->check, client_seq, server_isn);
+            tcp->seq = server_isn;
+
+            __u32 ack_val = bpf_htonl(bpf_ntohl(client_seq) + 1);
+            csum_replace4(&tcp->check, tcp->ack_seq, ack_val);
+            tcp->ack_seq = ack_val;
+
+            send_network_event(protocol, src_ip, dst_ip, src_port, dst_port, 0x40);
+            return XDP_TX;
+        }
+        // 非 SYN 的 TCP 包：上报后丢弃，避免内核回 RST 暴露蜜罐
+        send_network_event(protocol, src_ip, dst_ip, src_port, dst_port, 0x40);
+        return XDP_DROP;
+    }
 
     // [removed bpf_printk]
     // [removed bpf_printk]
