@@ -125,15 +125,12 @@ async fn kysec_restore_after_upgrade() {
     if !Path::new(KYSEC_PENDING_FILE).exists() {
         return;
     }
-    log_info!("[startup] 检测到 KYSEC 升级标记，恢复安全功能并加白");
-
     let content = fs::read_to_string(KYSEC_PENDING_FILE).unwrap_or_default();
 
     kysec_whitelist_dir("/opt/osec").await;
     kysec_whitelist_dir("/opt/EndpointSecurityApp").await;
     kysec_whitelist_dir("/opt/vigilixav").await;
 
-    let mut restored = 0;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -145,15 +142,12 @@ async fn kysec_restore_after_upgrade() {
             if feature.is_empty() || value.is_empty() {
                 continue;
             }
-            log_info!("[startup] KYSEC: 恢复 {} -> {}", feature, value);
             let _ = Command::new("setstatus")
                 .args(["-f", feature, value])
                 .status()
                 .await;
-            restored += 1;
         }
     }
-    log_info!("[startup] KYSEC: 已恢复 {} 个安全功能", restored);
 
     let _ = fs::remove_file(KYSEC_PENDING_FILE);
 }

@@ -492,23 +492,15 @@ async fn kysec_save_and_disable() {
         .map(|(f, v)| format!("{}={}", f, v))
         .collect::<Vec<_>>()
         .join("\n");
-    log_info!("[task_fetcher] KYSEC: 保存 {} 个安全功能状态并关闭", status.len());
     let _ = fs::write(KYSEC_PENDING_FILE, content);
 
     // 逐个关闭（pblk 无对应显示名，仅关闭不保存，与 install.sh 一致）
-    let mut disabled = 0;
     for feature in SUPPORTED_FEATURES.iter() {
-        let ok = Command::new("setstatus")
+        let _ = Command::new("setstatus")
             .args(["-f", feature, "off"])
             .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            disabled += 1;
-        }
+            .await;
     }
-    log_info!("[task_fetcher] KYSEC: 已关闭 {} 个安全功能", disabled);
 }
 
 impl TaskFetcher {
