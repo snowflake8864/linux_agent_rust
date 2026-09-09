@@ -28,7 +28,6 @@ pub mod admission { tonic::include_proto!("admission"); }
 pub mod backend { tonic::include_proto!("backend"); }
 pub mod policy_query { tonic::include_proto!("policy_query"); }
 pub mod token { tonic::include_proto!("token"); }
-pub mod security_scan { tonic::include_proto!("security_scan"); }
 
 pub mod notify;
 

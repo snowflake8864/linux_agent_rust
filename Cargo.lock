@@ -2666,19 +2666,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "security_scan_grpc"
-version = "0.1.0"
-dependencies = [
- "futures",
- "grpc_gateway",
- "log 0.4.29",
- "logging",
- "tokio",
- "tokio-stream",
- "tonic",
-]
-
-[[package]]
 name = "semver"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3439,7 +3426,6 @@ dependencies = [
  "net_client",
  "process_mgr",
  "prost",
- "security_scan_grpc",
  "serde",
  "serde_json",
  "tokio",
