@@ -76,6 +76,7 @@ pub struct NetInfoConfig {
     pub vigilixav_host: String,
     pub vigilixav_port: u16,
     pub vigilixav_timeout_secs: u64,
+    pub scan_timeout_secs: u64,
     pub vigilixav_pool_size: usize,
     pub vigilixav_connection_type: String,
     pub vigilixav_socket_path: String,
@@ -187,7 +188,6 @@ impl Default for JumpConfig {
 pub struct GrpcServices {
     pub virus_scan: bool,    // VIRUS_SCAN — 病毒扫描服务（还要 VIGILIXAV）
     pub vuln_scan: bool,     // VULN_SCAN — 漏洞扫描服务
-    pub security_scan: bool, // SECURITY_SCAN — 系统安全检测服务
     pub jump: bool,          // JUMP — 跳变服务（还要 [JUMP] ENABLED）
     pub config: bool,        // CONFIG — 配置读写服务
     pub policy: bool,        // POLICY — 策略管理服务
@@ -203,7 +203,6 @@ impl Default for GrpcServices {
         GrpcServices {
             virus_scan:   true,
             vuln_scan:    false,
-            security_scan: false,
             jump:         false,
             config:       true,
             policy:       true,
@@ -543,9 +542,6 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("GRPC", "VULN_SCAN") {
             config.grpc_svc.vuln_scan = matches!(value.trim(), "1");
         }
-        if let Some(value) = ini.get("GRPC", "SECURITY_SCAN") {
-            config.grpc_svc.security_scan = matches!(value.trim(), "1");
-        }
         if let Some(value) = ini.get("GRPC", "JUMP") {
             config.grpc_svc.jump = matches!(value.trim(), "1");
         }
@@ -587,6 +583,11 @@ impl NetInfoConfig {
             config.vigilixav_timeout_secs = value.parse().unwrap_or(60);
         } else {
             config.vigilixav_timeout_secs = 60;
+        }
+        if let Some(value) = ini.get("VIGILIXAV", "SCAN_TIMEOUT") {
+            config.scan_timeout_secs = value.parse().unwrap_or(120);
+        } else {
+            config.scan_timeout_secs = 120;
         }
         if let Some(value) = ini.get("VIGILIXAV", "POOL_SIZE") {
             config.vigilixav_pool_size = value.parse().unwrap_or(10);
@@ -790,7 +791,6 @@ impl NetInfoConfig {
         writeln!(file, "ALERT_PUSH={}", self.grpc_alert_push as u8)?;
         writeln!(file, "VIRUS_SCAN={}", self.grpc_svc.virus_scan as u8)?;
         writeln!(file, "VULN_SCAN={}", self.grpc_svc.vuln_scan as u8)?;
-        writeln!(file, "SECURITY_SCAN={}", self.grpc_svc.security_scan as u8)?;
         writeln!(file, "JUMP={}", self.grpc_svc.jump as u8)?;
         writeln!(file, "CONFIG={}", self.grpc_svc.config as u8)?;
         writeln!(file, "POLICY={}", self.grpc_svc.policy as u8)?;
@@ -804,6 +804,7 @@ impl NetInfoConfig {
         writeln!(file, "HOST={}", self.vigilixav_host)?;
         writeln!(file, "PORT={}", self.vigilixav_port)?;
         writeln!(file, "TIMEOUT={}", self.vigilixav_timeout_secs)?;
+        writeln!(file, "SCAN_TIMEOUT={}", self.scan_timeout_secs)?;
         writeln!(file, "POOL_SIZE={}", self.vigilixav_pool_size)?;
         writeln!(
             file,

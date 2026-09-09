@@ -3,10 +3,10 @@
 # gRPC 接口测试脚本 — 可手动选择要测试的接口
 # 用法:
 #   ./test_grpc.sh              # 交互式菜单选择
-#   ./test_grpc.sh <编号>        # 直接测试指定接口 (1-35, s1)
+#   ./test_grpc.sh <编号>        # 直接测试指定接口 (1-35, s1-s9)
 #   ./test_grpc.sh all           # 测试全部只读接口 (1-34)
 #   ./test_grpc.sh write         # 测试写接口（需离线模式）
-#   ./test_grpc.sh stream        # 测试流式接口 (17, 18, s1)
+#   ./test_grpc.sh stream        # 测试流式接口 (17, 18, s1-s6)
 #   ./test_grpc.sh full          # 测试全部接口（读写+流）
 #   ./test_grpc.sh listen [秒]   # 监听告警流
 # ============================================================================
@@ -144,14 +144,25 @@ show_test_help() {
                echo "    返回: token(字符串), is_valid(true=有效/false=未获取到)"
                echo "    无参数，始终可用（在线/离线均可调用）"
                echo "    用法: $0 34" ;;
-        35)    echo -e "${CYAN}[35] SecurityScan(流)${NC} — 系统安全检测（执行 SecurityScan_linux.sh）"
-               echo "    服务端流式返回: started → progress(逐项) → completed/failed"
-               echo "    脚本执行时间较长（约 8~30s），不会阻塞 gRPC 处理"
-               echo "    ⚠️  需要 [GRPC] SECURITY_SCAN=1 才注册该服务"
-               echo "    用法: $0 35" ;;
         s1)    echo -e "${CYAN}[s1] VirusScan流${NC} — 病毒扫描双向流 (StreamControl)"
                echo "    双向流式接口，客户端发送扫描指令，服务端返回扫描结果"
                echo "    用法: $0 s1" ;;
+        s2)    echo -e "${CYAN}[s2] 扫描心跳${NC} — Ping/Pong 探测扫描服务存活"
+               echo "    用法: $0 s2" ;;
+        s3)    echo -e "${CYAN}[s3] 停止扫描${NC} — 停止指定 scan_id 的扫描任务"
+               echo "    用法: $0 s3" ;;
+        s4)    echo -e "${CYAN}[s4] 暂停扫描${NC} — 暂停指定 scan_id 的扫描任务"
+               echo "    用法: $0 s4" ;;
+        s5)    echo -e "${CYAN}[s5] 恢复扫描${NC} — 恢复指定 scan_id 的扫描任务"
+               echo "    用法: $0 s5" ;;
+        s6)    echo -e "${CYAN}[s6] 处置文件${NC} — 对扫描发现文件执行隔离/删除/恢复"
+               echo "    用法: $0 s6" ;;
+        s7)    echo -e "${CYAN}[s7] 隔离区列表(未还原)${NC} — ListQuarantine filter=\"\""
+               echo "    用法: $0 s7" ;;
+        s8)    echo -e "${CYAN}[s8] 隔离区列表(全部含已还原)${NC} — ListQuarantine filter=\"all\""
+               echo "    用法: $0 s8" ;;
+        s9)    echo -e "${CYAN}[s9] 隔离区列表(按病毒名)${NC} — ListQuarantine filter=\"virus:xxx\""
+               echo "    用法: $0 s9" ;;
 
         # ── 写接口 ──
         w1)    echo -e "${CYAN}[w1] UpdateConfig${NC} — 更新 Agent 配置（写）"
@@ -221,7 +232,7 @@ show_test_help() {
               echo -e "    ${GREEN}执行模式:${NC} w17 {\"backup_id\":\"root_snap_6_20260626_155713\"} → 实际删除指定快照" ;;
 
         *)     echo -e "${RED}未知测试编号: $tid${NC}"
-                echo "有效范围: 1-33, s1, w1-w17"
+                echo "有效范围: 1-33, s1-s9, w1-w17"
                echo "输入 ? 查看完整菜单，输入 <编号> ? 查看单项说明" ;;
     esac
     echo ""
@@ -554,82 +565,51 @@ test_33() { grpc_call "单包敲门(默认测试参数)" \
 test_34() { grpc_call "获取认证Token(缓存)" \
     token.proto token.TokenService GetToken; }
 
-# 35: 系统安全检测（服务端流式）— 执行 SecurityScan_linux.sh 并流式返回结果
-test_35() {
-    local desc="系统安全检测(SecurityScan/RunScan 流)"
-    echo -ne "${CYAN}[TEST]${NC} $desc ... "
-    local output
-    output=$(timeout 120 grpcurl -plaintext -emit-defaults \
-        -import-path "$PROTO_DIR" \
-        -proto common.proto -proto security_scan.proto \
-        -d '{"output_dir":"/tmp"}' \
-        -connect-timeout 3 \
-        "$GRPC_ADDR" security_scan.SecurityScanService/RunScan 2>&1)
-    if echo "$output" | grep -q '"completed"'; then
-        echo -e "${GREEN}PASS${NC} (检测完成)"
-        echo "$output" | sed 's/^/  /'
-        ((pass++))
-    elif echo "$output" | grep -q '"failed"'; then
-        echo -e "${RED}FAIL${NC} (服务端检测失败)"
-        echo "$output" | sed 's/^/  /'
-        ((fail++))
-    else
-        echo -e "${RED}FAIL${NC} (未收到完成事件)"
-        echo "$output" | sed 's/^/  /'
-        ((fail++))
-    fi
-}
-
-# 36: 系统安全检测（简化版）— 一键获取安全评分与报告路径
-test_36() {
-    local desc="系统安全检测(CheckSecurity/简化版)"
-    echo -ne "${CYAN}[TEST]${NC} $desc ... "
-    local output
-    output=$(timeout 120 grpcurl -plaintext -emit-defaults \
-        -import-path "$PROTO_DIR" \
-        -proto common.proto -proto security_scan.proto \
-        -d '{"output_dir":"/tmp"}' \
-        -connect-timeout 3 \
-        "$GRPC_ADDR" security_scan.SecurityScanServiceSimple/CheckSecurity 2>&1)
-    if echo "$output" | grep -q '"success": true'; then
-        echo -e "${GREEN}PASS${NC} (检测成功)"
-        echo "$output" | sed 's/^/  /'
-        ((pass++))
-    elif echo "$output" | grep -q '"success": false'; then
-        echo -e "${RED}FAIL${NC} (检测失败)"
-        echo "$output" | sed 's/^/  /'
-        ((fail++))
-    else
-        echo -e "${RED}FAIL${NC} (未收到有效响应)"
-        echo "$output" | sed 's/^/  /'
-        ((fail++))
-    fi
-}
-
 # ── 流式接口测试 ────────────────────────────────────────────────────────
 
-# 病毒扫描双向流 — 发 StartScanRequest 并等待响应，测连通性
-test_s1() {
-    local desc="病毒扫描-启动测连通性(VirusScan/StreamControl)"
+# 病毒扫描双向流 — 发送单个 ClientMessage，等待并校验对应 ServerMessage
+virus_scan_stream_test() {
+    local desc="$1" json="$2" marker="$3" duration="${4:-6}"
     echo -ne "${CYAN}[TEST]${NC} $desc ... "
     local output exit_code
-    output=$(echo '{"start_scan":{"target":"/tmp","include_script":false,"full_disk":false}}' | \
-        timeout 6 grpcurl -plaintext -emit-defaults \
+    output=$(echo "$json" | timeout "$duration" grpcurl -plaintext -emit-defaults \
         -import-path "$PROTO_DIR" \
         -proto common.proto -proto virus_scan.proto \
         -d @ \
         -connect-timeout 3 \
         "$GRPC_ADDR" virus_scan.VirusScanService/StreamControl 2>&1) && exit_code=0 || exit_code=$?
-    if [ "$exit_code" = "124" ] || [ "$exit_code" = "0" ]; then
+    if echo "$output" | grep -q "$marker"; then
         echo -e "${GREEN}PASS${NC}"
         echo "$output" | sed 's/^/  /'
         ((pass++))
     else
-        echo -e "${RED}FAIL${NC} (exit=$exit_code)"
+        echo -e "${RED}FAIL${NC} (exit=$exit_code, 未收到预期响应: $marker)"
         echo "$output" | sed 's/^/  /'
         ((fail++))
     fi
 }
+
+# VirusScan/StreamControl 各命令：启动 / 心跳 / 停止 / 暂停 / 恢复 / 处置
+test_s1() { virus_scan_stream_test "病毒扫描-启动扫描" \
+    '{"start_scan":{"target":"/tmp","include_script":false,"full_disk":false}}' '"start_response"'; }
+test_s2() { virus_scan_stream_test "病毒扫描-心跳(Ping/Pong)" \
+    '{"ping":{"timestamp":1234567890}}' '"pong"'; }
+test_s3() { virus_scan_stream_test "病毒扫描-停止扫描" \
+    '{"stop_scan":{"scan_id":"test-scan"}}' '"stop_response"'; }
+test_s4() { virus_scan_stream_test "病毒扫描-暂停扫描" \
+    '{"pause_scan":{"scan_id":"test-scan"}}' '"pause_response"'; }
+test_s5() { virus_scan_stream_test "病毒扫描-恢复扫描" \
+    '{"resume_scan":{"scan_id":"test-scan"}}' '"resume_response"'; }
+test_s6() { virus_scan_stream_test "病毒扫描-处置文件" \
+    '{"dispose_file":{"scan_id":"","file_path":"/tmp/test.txt","action":1}}' '"dispose_result"'; }
+
+# VirusScan/ListQuarantine 隔离区查询（一元 RPC）
+test_s7() { grpc_call "隔离区列表(未还原)" \
+    virus_scan.proto virus_scan.VirusScanService ListQuarantine '{"filter":""}'; }
+test_s8() { grpc_call "隔离区列表(全部含已还原)" \
+    virus_scan.proto virus_scan.VirusScanService ListQuarantine '{"filter":"all"}'; }
+test_s9() { grpc_call "隔离区列表(按病毒名)" \
+    virus_scan.proto virus_scan.VirusScanService ListQuarantine '{"filter":"virus:Eicar-Signature"}'; }
 
 # ── 写接口测试（在线应全部返回 PERMISSION_DENIED）─────────────────────
 
@@ -770,9 +750,9 @@ show_menu() {
     echo -e "${CYAN}║${NC}  32) ProcRuleQuery(进程白/黑名单表查询)                      ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  33) PortKnock(单包敲门SPA中继)                              ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  34) GetToken(获取认证Token)                                 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  35) SecurityScan(流)                                          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  36) CheckSecurity(简化版)                                     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  s1) VirusScan流(StreamControl)                              ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  s2) 扫描Ping   s3) 停止   s4) 暂停   s5) 恢复   s6) 处置   ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  s7) 隔离区(未还原)  s8) 隔离区(全部)  s9) 隔离区(按病毒名) ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${RED}写接口（仅离线可用，在线应返回 PERMISSION_DENIED）${NC}       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   w1) UpdateConfig      w2) UpdateProcessPolicy             ${CYAN}║${NC}"
@@ -789,7 +769,7 @@ show_menu() {
     echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}all${NC}    测试全部只读接口 (1-33)                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${RED}write${NC}  测试全部写接口（验证在线拒绝）                    ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}stream${NC} 测试全部流式接口 (17, 18, s1)                   ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}stream${NC} 测试全部流式接口 (17, 18, s1-s6)                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}full${NC}   测试全部接口（读写+流）                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}listen [秒]${NC} 监听告警流（默认300秒，Ctrl+C停止）         ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  q    退出                                              ${CYAN}║${NC}"
@@ -815,6 +795,7 @@ run_all_readonly() {
     test_25f   # 历史告警-按时间范围
     test_25g   # 历史告警-组合过滤
     test_26b   # 历史告警-identifier+未处理
+    test_s7; test_s8; test_s9   # 病毒扫描隔离区查询
 }
 
 run_all_write() {
@@ -823,7 +804,7 @@ run_all_write() {
 }
 
 run_all_stream() {
-    test_17; test_18; test_s1; test_35; test_36
+    test_17; test_18; test_s1; test_s2; test_s3; test_s4; test_s5; test_s6
 }
 
 # ── main ───────────────────────────────────────────────────────────────
@@ -916,8 +897,9 @@ case "${1:-menu}" in
                 21) test_21 ;; 22) test_22 ;; 23) test_23 ;; 24) test_24 ;;
                 25) test_25 ;; 26) test_26 ;;
                 27) test_27 ;; 28) test_28 ;; 28b) test_28b ;;
-                29) test_29 ;; 30) test_30 ;; 31) test_31 ;; 32) test_32 ;; 33) test_33 ;; 34) test_34 ;; 35) test_35 ;; 36) test_36 ;;
-                s1) test_s1 ;;
+                29) test_29 ;; 30) test_30 ;; 31) test_31 ;; 32) test_32 ;; 33) test_33 ;; 34) test_34 ;;
+                s1) test_s1 ;; s2) test_s2 ;; s3) test_s3 ;; s4) test_s4 ;; s5) test_s5 ;; s6) test_s6 ;;
+                s7) test_s7 ;; s8) test_s8 ;; s9) test_s9 ;;
                 03b) test_03b ;; 14b) test_14b ;; 14c) test_14c ;; 14d) test_14d ;;
                 04b) test_04b ;;
                 25b) test_25b ;; 25c) test_25c ;; 25d) test_25d ;; 25e) test_25e ;;
@@ -990,8 +972,8 @@ case "${1:-menu}" in
                     echo "  32) ProcRuleQuery(进程白/黑名单表查询)"
                     echo "  33) PortKnock(单包敲门SPA中继)"
                     echo "  34) GetToken(获取认证Token)"
-                    echo "  35) SecurityScan(流)"
-                    echo "  s1) VirusScan流"
+                    echo "  s1) VirusScan流(启动)  s2) Ping  s3) 停止  s4) 暂停  s5) 恢复  s6) 处置"
+                    echo "  s7) 隔离区(未还原)  s8) 隔离区(全部)  s9) 隔离区(按病毒名)"
                     echo ""
                     echo -e "${CYAN}── 扩展测试（filter_status / is_white 过滤）──${NC}"
                     echo "  03b) ProcessPolicy-黑名单    04b) PeripheralPolicy-黑名单"
@@ -1013,7 +995,7 @@ case "${1:-menu}" in
                     echo -e "${CYAN}── 快捷命令 ──${NC}"
                     echo "  all    测试全部只读 (1-33)"
                     echo "  write  测试全部写 (w1-w17, 需离线模式)"
-                    echo "  stream 测试全部流式 (17, 18, s1)"
+                    echo "  stream 测试全部流式 (17, 18, s1-s6)"
                     echo "  full   测试全部 (读写+流)"
                     echo "  listen [秒]  监听告警流"
                     echo "  ?|h    显示此帮助    q    退出"
@@ -1092,7 +1074,7 @@ case "${1:-menu}" in
         echo "  menu            同无参数"
         echo ""
         echo "  交互菜单内可用命令:"
-        echo "    1-33, s1       测试指定只读/流式接口"
+        echo "    1-33, s1-s9    测试指定只读/流式接口"
         echo "    03b,14b/14c/14d,23b  filter_status 过滤测试"
         echo "    w1-w17          测试指定写接口"
         echo "    all/write/stream/full  批量测试"
@@ -1106,11 +1088,13 @@ case "${1:-menu}" in
         echo "  $0 1             直接测试 AgentStatus"
         echo "  $0 14c           直接测试 ProcessList(仅黑名单)"
         echo "  $0 23b           直接测试 ExecutableList(仅黑名单)"
-        echo "  $0 s1            直接测试 VirusScan 双向流"
+        echo "  $0 s1            直接测试 VirusScan 双向流(启动)"
+        echo "  $0 s2-s6         扫描心跳/停止/暂停/恢复/处置"
+        echo "  $0 s7-s9         隔离区列表查询"
         echo "  $0 w8            直接测试 CreateBackup"
         echo "  $0 all           测试全部只读接口 (1-33)"
         echo "  $0 write         测试全部写接口 (w1-w17)"
-        echo "  $0 stream        测试流式接口 (17, 18, s1)"
+        echo "  $0 stream        测试流式接口 (17, 18, s1-s6)"
         echo "  $0 full          测试全部接口（读写+流）"
         echo "  $0 listen [秒]   监听告警流（默认300秒）"
         echo ""
@@ -1131,8 +1115,14 @@ case "${1:-menu}" in
         ;;
 
     s1) test_s1; print_result ;;
-    35) test_35; print_result ;;
-    36) test_36; print_result ;;
+    s2) test_s2; print_result ;;
+    s3) test_s3; print_result ;;
+    s4) test_s4; print_result ;;
+    s5) test_s5; print_result ;;
+    s6) test_s6; print_result ;;
+    s7) test_s7; print_result ;;
+    s8) test_s8; print_result ;;
+    s9) test_s9; print_result ;;
     32) if [ -n "$2" ]; then
             grpc_call "进程规则查询(自定义)" proc_diag.proto proc_diag.ProcDiagService QueryProcessRule "$2"
         else
@@ -1161,7 +1151,7 @@ case "${1:-menu}" in
             "test_$(printf '%02d' "$arg")"
         else
             echo "无效参数: $1"
-            echo "用法: $0 [?|help|all|write|stream|full|listen|<1-33>|s1|w1-w17|menu]"
+            echo "用法: $0 [?|help|all|write|stream|full|listen|<1-33>|s1-s9|w1-w17|menu]"
             echo "试试: $0 ?  查看完整帮助"
             exit 1
         fi

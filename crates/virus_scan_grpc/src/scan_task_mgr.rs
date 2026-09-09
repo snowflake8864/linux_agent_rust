@@ -99,6 +99,7 @@ pub struct ScanTask {
     pub start_time: i64,
     pub tx: mpsc::Sender<Result<ServerMessage, Status>>,
     pub resume_notify: Arc<Notify>,
+    pub cancel: Arc<Notify>,
 }
 
 pub struct ScanTaskManager {
@@ -129,6 +130,7 @@ impl ScanTask {
             start_time: Utc::now().timestamp_millis(),
             tx,
             resume_notify: Arc::new(Notify::new()),
+            cancel: Arc::new(Notify::new()),
         }
     }
 
@@ -140,6 +142,8 @@ impl ScanTask {
         self.state.store(SCAN_STATE_STOPPED, Ordering::Relaxed);
         // 如果当前是暂停状态，需要唤醒以便退出循环
         self.resume_notify.notify_waiters();
+        // 唤醒所有正在等待的文件扫描任务，中断它们并关闭到 vigilixd 的连接
+        self.cancel.notify_waiters();
     }
 
     pub fn pause(&self) {
@@ -354,8 +358,26 @@ impl ScanTaskManager {
     ) {
         let path = Path::new(target);
 
+        // 整次扫描总时限：超过 SCAN_TIMEOUT 秒自动终止（0 = 不限）
+        let scan_timeout = config::net_info::NETINFO_CONFIG.lock().unwrap().scan_timeout_secs;
+
         let mut total_scanned = 0;
-        self.scan_directory_recursive(path, excludes, scan_id, task, &mut total_scanned).await;
+        let timed_out = if scan_timeout > 0 {
+            tokio::time::timeout(
+                Duration::from_secs(scan_timeout),
+                self.scan_directory_recursive(path, excludes, scan_id, task, &mut total_scanned),
+            )
+            .await
+            .is_err()
+        } else {
+            self.scan_directory_recursive(path, excludes, scan_id, task, &mut total_scanned).await;
+            false
+        };
+        if timed_out {
+            log_info!("[SCAN] 扫描超时({}s)，自动终止: scan_id={}", scan_timeout, scan_id);
+            // 中断正在进行的文件扫描，关闭到 vigilixd 的连接
+            task.cancel.notify_waiters();
+        }
 
         let duration_ms = Utc::now().timestamp_millis() - task.start_time;
         task.complete();
@@ -433,32 +455,50 @@ impl ScanTaskManager {
                     let scan_id_inner = scan_id.to_string();
                     let file_path_clone = file_path.clone();
                     let semaphore_clone = semaphore.clone();
-                    
+                    let cancel = task.cancel.clone();
+                    let task_state = task.state.clone();
+
                     handles.push(tokio::spawn(async move {
+                        // 已停止则不再发起扫描
+                        if task_state.load(Ordering::Relaxed) != SCAN_STATE_RUNNING {
+                            return (ScanAction::Error("已取消".to_string()), file_path_clone, 0);
+                        }
                         let _permit = semaphore_clone.acquire().await.unwrap();
                         let scan_start = std::time::Instant::now();
-                        
-                        if let Some(scanner) = &scanner {
-                            match scanner.scan_file(&file_path_clone).await {
-                                Ok(ScanResult::Virus { name }) => {
-                                    log_info!("[SCAN] {} -> VIRUS ({})", file_path_clone, name);
-                                    (ScanAction::Virus(name), file_path_clone, scan_start.elapsed().as_millis() as i64)
-                                }
-                                Ok(ScanResult::Clean) => {
-                                    (ScanAction::Clean, file_path_clone, scan_start.elapsed().as_millis() as i64)
-                                }
-                                Ok(ScanResult::Error { message }) => {
-                                    log_error!("[SCAN] {} -> ERROR: {}", file_path_clone, message);
-                                    (ScanAction::Error(message), file_path_clone, scan_start.elapsed().as_millis() as i64)
-                                }
-                                Err(e) => {
-                                    log_error!("[SCAN] {} -> ERROR: {}", file_path_clone, e);
-                                    (ScanAction::Error(e), file_path_clone, scan_start.elapsed().as_millis() as i64)
-                                }
+
+                        // 扫描结果分支需要独占一份路径
+                        let path_for_result = file_path_clone.clone();
+
+                        // stop 时取消正在进行的文件扫描，丢弃 future 关闭到 vigilixd 的连接
+                        tokio::select! {
+                            _ = cancel.notified() => {
+                                log_info!("[SCAN] {} -> 已取消", file_path_clone);
+                                (ScanAction::Error("已取消".to_string()), file_path_clone, 0)
                             }
-                        } else {
-                            log_error!("[SCAN] {} -> ERROR: VigilixAV 不可用", file_path_clone);
-                            (ScanAction::Error("VigilixAV 不可用".to_string()), file_path_clone, scan_start.elapsed().as_millis() as i64)
+                            result = async {
+                                if let Some(scanner) = &scanner {
+                                    match scanner.scan_file(&path_for_result).await {
+                                        Ok(ScanResult::Virus { name }) => {
+                                            log_info!("[SCAN] {} -> VIRUS ({})", path_for_result, name);
+                                            (ScanAction::Virus(name), path_for_result, scan_start.elapsed().as_millis() as i64)
+                                        }
+                                        Ok(ScanResult::Clean) => {
+                                            (ScanAction::Clean, path_for_result, scan_start.elapsed().as_millis() as i64)
+                                        }
+                                        Ok(ScanResult::Error { message }) => {
+                                            log_error!("[SCAN] {} -> ERROR: {}", path_for_result, message);
+                                            (ScanAction::Error(message), path_for_result, scan_start.elapsed().as_millis() as i64)
+                                        }
+                                        Err(e) => {
+                                            log_error!("[SCAN] {} -> ERROR: {}", path_for_result, e);
+                                            (ScanAction::Error(e), path_for_result, scan_start.elapsed().as_millis() as i64)
+                                        }
+                                    }
+                                } else {
+                                    log_error!("[SCAN] {} -> ERROR: VigilixAV 不可用", path_for_result);
+                                    (ScanAction::Error("VigilixAV 不可用".to_string()), path_for_result, scan_start.elapsed().as_millis() as i64)
+                                }
+                            } => result,
                         }
                     }));
                 }
@@ -475,33 +515,45 @@ impl ScanTaskManager {
                 break;
             }
             
-            if let Ok((action, file_path, elapsed)) = handle.await {
-                *total_scanned += 1;
-                
-                match action {
-                    ScanAction::Virus(name) => {
-                        self.send_virus_alert(scan_id, &file_path, &name, task).await;
-                        self.send_file_scan_result(scan_id, &file_path, "VIRUS", Some(&name), None, elapsed, task).await;
-                    }
-                    ScanAction::Clean => {
-                        self.send_file_scan_result(scan_id, &file_path, "OK", None, None, elapsed, task).await;
-                    }
-                    ScanAction::Error(msg) => {
-                        self.send_file_scan_result(scan_id, &file_path, "ERROR", None, Some(&msg), elapsed, task).await;
+            // stop 时立即中断，不等待当前文件扫描完成，保证停止即返回 ScanCompleted
+            let stop_signal = task.resume_notify.clone();
+            tokio::select! {
+                result = handle => {
+                    if let Ok((action, file_path, elapsed)) = result {
+                        *total_scanned += 1;
+
+                        match action {
+                            ScanAction::Virus(name) => {
+                                self.send_virus_alert(scan_id, &file_path, &name, task).await;
+                                self.send_file_scan_result(scan_id, &file_path, "VIRUS", Some(&name), None, elapsed, task).await;
+                            }
+                            ScanAction::Clean => {
+                                self.send_file_scan_result(scan_id, &file_path, "OK", None, None, elapsed, task).await;
+                            }
+                            ScanAction::Error(msg) => {
+                                self.send_file_scan_result(scan_id, &file_path, "ERROR", None, Some(&msg), elapsed, task).await;
+                            }
+                        }
+
+                        if *total_scanned % 10 == 0 {
+                            let progress = ScanProgress {
+                                scan_id: scan_id.to_string(),
+                                scanned: *total_scanned as i32,
+                                total: 0,
+                                viruses_found: task.viruses.load(Ordering::Relaxed) as i32,
+                                current_path: file_path.clone(),
+                            };
+                            let _ = task.tx.send(Ok(ServerMessage {
+                                event: Some(grpc_gateway::virus_scan::server_message::Event::Progress(progress)),
+                            })).await;
+                        }
                     }
                 }
-
-                if *total_scanned % 10 == 0 {
-                    let progress = ScanProgress {
-                        scan_id: scan_id.to_string(),
-                        scanned: *total_scanned as i32,
-                        total: 0,
-                        viruses_found: task.viruses.load(Ordering::Relaxed) as i32,
-                        current_path: file_path.clone(),
-                    };
-                    let _ = task.tx.send(Ok(ServerMessage {
-                        event: Some(grpc_gateway::virus_scan::server_message::Event::Progress(progress)),
-                    })).await;
+                _ = stop_signal.notified() => {
+                    // stop 触发（resume 只发生在 PAUSED→RUNNING，RUNNING 下收到的通知即 stop）
+                    if task.state.load(Ordering::Relaxed) != SCAN_STATE_RUNNING {
+                        break;
+                    }
                 }
             }
         }
