@@ -1792,6 +1792,8 @@ name = "net_client"
 version = "0.10.6"
 dependencies = [
  "futures",
+ "log 0.4.29",
+ "logging",
  "reqwest",
  "serde",
  "serde_json",
