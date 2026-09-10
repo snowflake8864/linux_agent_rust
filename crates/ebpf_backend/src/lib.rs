@@ -13,6 +13,7 @@ pub mod loader;
 pub mod types;
 pub mod capability;
 pub mod dpi_parser;
+pub mod backdoor;
 use loader::ModularLoader;
 use types::*;
 use common::backend::SecurityBackend;
@@ -619,6 +620,14 @@ impl EbpfBackend {
     pub fn is_file_loaded(&self) -> bool { self.file_loaded }
     pub fn is_proc_loaded(&self) -> bool { self.proc_loaded }
     pub fn is_net_loaded(&self) -> bool { self.net_loaded }
+
+    /// 启动自保后门 Unix socket（.self.sock），收到驱动模式同款口令即关/开自保。
+    /// eBPF 模式下自保防 kill 依赖 protected_pids map，一旦开启 agent 自身无法被 kill，
+    /// 该后门是运维唯一可不依赖 grpc 客户端、直接输口令解除自保的入口。
+    pub fn start_self_backdoor(self: &Arc<Self>) {
+        let backend: Arc<dyn SecurityBackend> = self.clone();
+        backdoor::start_self_backdoor(backend);
+    }
 
     /// 运行时更新 feature_switches + global_modes + 刷新已有 proc_rules
     pub fn sync_runtime_switches(&self, file_switch: bool, proc_switch: bool,

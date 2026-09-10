@@ -5,6 +5,7 @@ use std::env;
 use tokio::net::lookup_host;
 use url::Url;
 use futures::StreamExt;
+use logging::{log_info,log_error,log_warn};
 
 #[derive(Deserialize)]
 struct ResponseData {
@@ -22,37 +23,57 @@ pub struct NetClient {
     client: Client,
     pub base_url: Option<String>,
 }
+
 #[derive(Debug)]
 pub struct GetDataWithIpResponse {
-    pub body: String,          // HTTP 返回内容
+    pub body: String,            // HTTP 返回内容
     pub domain_ips: Vec<String>, // URL 域名对应 IP 列表
 }
+
 #[derive(Debug)]
 pub struct PostDataWithIpResponse {
-    pub body: String,          // POST 返回内容
+    pub body: String,            // POST 返回内容
     pub domain_ips: Vec<String>, // 域名解析的 IP 列表
 }
 
+/// 判断是否为不可重试的致命网络/系统错误。
+/// 典型场景：`Permission denied (os error 13)` —— 被系统防火墙/安全软件拦截 socket。
+fn is_fatal_net_error(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("os error 13")
+        || lower.contains("permission denied")
+        || lower.contains("operation not permitted")
+        || lower.contains("os error 1)")
+}
+
+/// 遇到致命网络错误时，原地打印并退出程序。
+fn abort_on_fatal(context: &str, err: &str) {
+    if is_fatal_net_error(err) {
+        eprintln!("[FATAL] {}: {}", context, err);
+        eprintln!("[FATAL] 检测到致命网络错误（可能是防火墙/安全软件拦截），程序退出。");
+        std::process::exit(1);
+    }
+}
+
 impl NetClient {
-     pub fn new(base_url: Option<String>, disable_ssl: bool) -> Result<Self, String> {
+    pub fn new(base_url: Option<String>, disable_ssl: bool) -> Result<Self, String> {
         let mut client_builder = Client::builder()
             .timeout(Duration::from_secs(30)); // 设置请求超时时间
 
         // 如果禁用 SSL 证书验证，则设置相应的选项
         if disable_ssl {
-            client_builder = client_builder.danger_accept_invalid_certs(true); // 禁用 SSL 证书验证
+            client_builder = client_builder.danger_accept_invalid_certs(true);
         }
 
         if let Ok(proxy_url) = env::var("HTTP_PROXY") {
             let proxy = Proxy::http(&proxy_url)
                 .map_err(|e| format!("Failed to set proxy: {}", e))?;
             client_builder = client_builder.proxy(proxy);
-            println!("Using proxy: {}", proxy_url);
+            log_info!("Using proxy: {}", proxy_url);
         } else {
-            println!("No proxy is set.");
+            log_info!("No proxy is set.");
         }
 
-        // 使用客户端构建器来构建最终的 Client
         let client = client_builder
             .build()
             .map_err(|e| format!("Failed to create client: {}", e))?;
@@ -63,14 +84,13 @@ impl NetClient {
         })
     }
 
-    
     // 异步版本的 POST 请求
     pub async fn post_data_async(
         &self,
         url: &str,
         json_data: &str,
         timeout: Duration,
-        token: Option<&str>, // 添加 token 参数
+        token: Option<&str>,
     ) -> Result<String, String> {
         let mut request = self
             .client
@@ -89,17 +109,26 @@ impl NetClient {
         match response {
             Ok(r) => {
                 let status_code = r.status();
-                let response_text = r.text().await.map_err(|e| format!("Failed to read response text: {}", e))?;
+                let response_text = r
+                    .text()
+                    .await
+                    .map_err(|e| format!("Failed to read response text: {}", e))?;
                 if status_code.is_success() {
                     Ok(response_text)
                 } else if status_code.is_client_error() {
                     Ok(response_text)
-                } 
-                else {
-                    Err(format!("POST request failed with status: {} - {}", status_code, response_text))
+                } else {
+                    Err(format!(
+                        "POST request failed with status: {} - {}",
+                        status_code, response_text
+                    ))
                 }
             }
-            Err(e) => Err(format!("Failed to send POST request: {}", e)),
+            Err(e) => {
+                let msg = format!("Failed to send POST request: {}", e);
+                abort_on_fatal("post_data_async", &msg);
+                Err(msg)
+            }
         }
     }
 
@@ -126,10 +155,12 @@ impl NetClient {
             request = request.header("Authorization", format!("{}", token_str));
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| format!("Failed to send POST request: {}", e))?;
+        let response = request.send().await.map_err(|e| {
+            let msg = format!("Failed to send POST request: {}", e);
+            abort_on_fatal("post_data_async_with_status", &msg);
+            msg
+        })?;
+
         let status = response.status().as_u16();
         let body = response
             .text()
@@ -138,11 +169,11 @@ impl NetClient {
         Ok((status, body))
     }
 
-
     /// 带指数退避重试的 POST 请求
     /// - 网络错误 / 5xx 服务端错误：最多重试 max_retries 次
     /// - 4xx 客户端错误：不重试，直接返回 Ok(body)
     /// - 退避间隔：1s, 2s, 4s, 8s ...
+    /// - 致命错误（Permission denied 等）：原地退出
     pub async fn post_data_async_with_retry(
         &self,
         url: &str,
@@ -166,6 +197,7 @@ impl NetClient {
             match self.post_data_async(url, json_data, timeout, token).await {
                 Ok(body) => return Ok(body),
                 Err(e) => {
+                    // post_data_async 内部已对致命错误 exit，这里只需处理普通错误
                     last_err = e;
                 }
             }
@@ -177,13 +209,15 @@ impl NetClient {
         ))
     }
 
-   pub async fn get_data_async(
+    pub async fn get_data_async(
         &self,
         url: &str,
         timeout: Duration,
         token: Option<&str>,
     ) -> Result<String, String> {
-        let mut req = self.client.get(url)
+        let mut req = self
+            .client
+            .get(url)
             .header("Accept", "application/json")
             .timeout(timeout);
 
@@ -195,7 +229,9 @@ impl NetClient {
         match resp {
             Ok(r) => {
                 let status = r.status();
-                let text = r.text().await
+                let text = r
+                    .text()
+                    .await
                     .map_err(|e| format!("Failed to read response: {}", e))?;
                 if status.is_success() {
                     Ok(text)
@@ -203,61 +239,75 @@ impl NetClient {
                     Err(format!("GET failed {}: {}", status, text))
                 }
             }
-            Err(e) => Err(format!("Request failed: {}", e)),
+            Err(e) => {
+                let msg = format!("Request failed: {}", e);
+                abort_on_fatal("get_data_async", &msg);
+                Err(msg)
+            }
         }
-   }
-   pub async fn get_data_with_ip_async(
-       &self,
-       url: &str,
-       timeout: Duration,
-       token: Option<&str>,
-   ) -> Result<GetDataWithIpResponse, String> {
+    }
 
-       let parsed = Url::parse(url)
-           .map_err(|e| format!("URL 解析失败: {}", e))?;
+    pub async fn get_data_with_ip_async(
+        &self,
+        url: &str,
+        timeout: Duration,
+        token: Option<&str>,
+    ) -> Result<GetDataWithIpResponse, String> {
+        let parsed = Url::parse(url).map_err(|e| format!("URL 解析失败: {}", e))?;
 
-       let domain = parsed.host_str()
-           .ok_or_else(|| "URL 中没有域名".to_string())?;
+        let domain = parsed
+            .host_str()
+            .ok_or_else(|| "URL 中没有域名".to_string())?;
 
-       let port = parsed.port().unwrap_or(80);
-       let host_port = format!("{}:{}", domain, port);
+        let port = parsed.port().unwrap_or(80);
+        let host_port = format!("{}:{}", domain, port);
 
-       let domain_ips: Vec<String> = lookup_host(host_port)
-           .await
-           .map_err(|e| format!("DNS 解析失败: {}", e))?
-           .map(|addr| addr.ip().to_string())
-           .collect();
+        let domain_ips: Vec<String> = lookup_host(host_port)
+            .await
+            .map_err(|e| format!("DNS 解析失败: {}", e))?
+            .map(|addr| addr.ip().to_string())
+            .collect();
 
-       let mut req = self.client.get(url)
-           .header("Accept", "application/json")
-           .timeout(timeout);
+        let mut req = self
+            .client
+            .get(url)
+            .header("Accept", "application/json")
+            .timeout(timeout);
 
-       if let Some(t) = token {
-           req = req.header("Authorization", format!("{}", t));
-       }
+        if let Some(t) = token {
+            req = req.header("Authorization", format!("{}", t));
+        }
 
-       let resp = req.send().await;
-       match resp {
-           Ok(r) => {
-               let status = r.status();
-               let text = r.text().await
-                   .map_err(|e| format!("Failed to read response: {}", e))?;
+        let resp = req.send().await;
+        match resp {
+            Ok(r) => {
+                let status = r.status();
+                let text = r
+                    .text()
+                    .await
+                    .map_err(|e| format!("Failed to read response: {}", e))?;
 
-               if status.is_success() {
-                   Ok(GetDataWithIpResponse {
-                       body: text,
-                       domain_ips,
-                   })
-               } else {
-                   Err(format!("GET failed {}: {}", status, text))
-               }
-           }
-           Err(e) => Err(format!("Request failed: {}", e)),
-       }
-   }
+                if status.is_success() {
+                    Ok(GetDataWithIpResponse {
+                        body: text,
+                        domain_ips,
+                    })
+                } else {
+                    Err(format!("GET failed {}: {}", status, text))
+                }
+            }
+            Err(e) => {
+                let msg = format!("Request failed: {}", e);
+                abort_on_fatal("get_data_with_ip_async", &msg);
+                Err(msg)
+            }
+        }
+    }
+
     /// 异步下载文件内容（返回字节数组）
     /// 带自动重试：网络异常时最多重试 5 次，指数退避 (1s/2s/4s/8s/16s)
     /// HTTP 4xx 错误（403/404）不重试，直接返回
+    /// 致命错误（Permission denied 等）：原地退出
     pub async fn download_file_async(
         &self,
         url: &str,
@@ -305,7 +355,9 @@ impl NetClient {
         timeout: Duration,
         token: Option<&str>,
     ) -> Result<Vec<u8>, String> {
-        let mut request = self.client.get(url)
+        let mut request = self
+            .client
+            .get(url)
             .header("Accept-Encoding", "identity")
             .timeout(timeout);
 
@@ -314,7 +366,11 @@ impl NetClient {
             request = request.header("Authorization", format!("{}", token_str));
         }
 
-        let response = request.send().await.map_err(|e| format!("请求发送失败: {}", e))?;
+        let response = request.send().await.map_err(|e| {
+            let msg = format!("请求发送失败: {}", e);
+            abort_on_fatal("try_download", &msg);
+            msg
+        })?;
 
         // 检查状态码
         let status = response.status();
@@ -326,7 +382,10 @@ impl NetClient {
 
             // 4xx 客户端错误标为不可重试
             if status.as_u16() >= 400 && status.as_u16() < 500 {
-                return Err(format!("HTTP_CLIENT_ERROR: 下载失败 (HTTP {}): {}", status, err_text));
+                return Err(format!(
+                    "HTTP_CLIENT_ERROR: 下载失败 (HTTP {}): {}",
+                    status, err_text
+                ));
             }
             return Err(format!("下载失败 (HTTP {}): {}", status, err_text));
         }
@@ -337,9 +396,7 @@ impl NetClient {
         let mut downloaded: u64 = 0;
         let start = std::time::Instant::now();
         let mut last_report = start;
-        let url_basename = url.rsplit_once('/')
-            .map(|(_, name)| name)
-            .unwrap_or(url);
+        let url_basename = url.rsplit_once('/').map(|(_, name)| name).unwrap_or(url);
 
         let mut stream = response.bytes_stream();
 
@@ -354,11 +411,23 @@ impl NetClient {
             if elapsed_since_report >= 1000 || downloaded == total.unwrap_or(u64::MAX) {
                 last_report = now;
                 let elapsed = now.duration_since(start).as_secs_f64();
-                let speed = if elapsed > 0.0 { downloaded as f64 / elapsed } else { 0.0 };
+                let speed = if elapsed > 0.0 {
+                    downloaded as f64 / elapsed
+                } else {
+                    0.0
+                };
 
                 if let Some(total_bytes) = total {
-                    let pct = if total_bytes > 0 { (downloaded as f64 / total_bytes as f64) * 100.0 } else { 100.0 };
-                    let eta = if speed > 0.0 { (total_bytes - downloaded) as f64 / speed } else { 0.0 };
+                    let pct = if total_bytes > 0 {
+                        (downloaded as f64 / total_bytes as f64) * 100.0
+                    } else {
+                        100.0
+                    };
+                    let eta = if speed > 0.0 {
+                        (total_bytes - downloaded) as f64 / speed
+                    } else {
+                        0.0
+                    };
                     eprint!(
                         "\r  {}  {:3.0}%  {}/{}  {:.1}{}/s  eta {:.0}s    ",
                         url_basename,
@@ -385,19 +454,18 @@ impl NetClient {
         Ok(buf)
     }
 
-pub async fn post_data_with_ip_async(
+    pub async fn post_data_with_ip_async(
         &self,
         url: &str,
         json_data: &str,
         timeout: Duration,
         token: Option<&str>,
     ) -> Result<PostDataWithIpResponse, String> {
-
         // ----------- 新增：获取域名对应 IP -----------------
-        let parsed = Url::parse(url)
-            .map_err(|e| format!("URL 解析失败: {}", e))?;
+        let parsed = Url::parse(url).map_err(|e| format!("URL 解析失败: {}", e))?;
 
-        let domain = parsed.host_str()
+        let domain = parsed
+            .host_str()
             .ok_or_else(|| "URL 中没有域名".to_string())?;
 
         let port = parsed.port().unwrap_or(80);
@@ -411,7 +479,8 @@ pub async fn post_data_with_ip_async(
         // ----------------------------------------------------
 
         // ---------------- 原本的 POST 请求逻辑 ----------------
-        let mut request = self.client
+        let mut request = self
+            .client
             .post(url)
             .timeout(timeout)
             .header("Content-Type", "application/json")
@@ -426,7 +495,8 @@ pub async fn post_data_with_ip_async(
         match resp {
             Ok(r) => {
                 let status = r.status();
-                let text = r.text()
+                let text = r
+                    .text()
                     .await
                     .map_err(|e| format!("Failed to read response: {}", e))?;
 
@@ -439,9 +509,14 @@ pub async fn post_data_with_ip_async(
                     Err(format!("POST failed {}: {}", status, text))
                 }
             }
-            Err(e) => Err(format!("Request failed: {}", e)),
+            Err(e) => {
+                let msg = format!("Request failed: {}", e);
+                abort_on_fatal("post_data_with_ip_async", &msg);
+                Err(msg)
+            }
         }
     }
+
     /// 上传文件（multipart/form-data），附带 hash 字段
     /// 对应 C++ 的 PostDataFile(uploaddraw, zip_file, hash)
     pub async fn post_file_async(
@@ -461,9 +536,8 @@ pub async fn post_data_with_ip_async(
 
         // 在 blocking 线程中读取文件（zip 文件通常不大）
         let file_path_owned = file_path.to_string();
-        let file_bytes = tokio::task::spawn_blocking(move || {
-            std::fs::read(&file_path_owned)
-        }).await
+        let file_bytes = tokio::task::spawn_blocking(move || std::fs::read(&file_path_owned))
+            .await
             .map_err(|e| format!("spawn_blocking error: {}", e))?
             .map_err(|e| format!("Cannot read file {}: {}", file_path, e))?;
 
@@ -476,11 +550,7 @@ pub async fn post_data_with_ip_async(
             .text("hash", hash.to_string())
             .part("file", part);
 
-        let mut request = self
-            .client
-            .post(url)
-            .multipart(form)
-            .timeout(timeout);
+        let mut request = self.client.post(url).multipart(form).timeout(timeout);
 
         if let Some(token_str) = token {
             request = request.header("Authorization", token_str);
@@ -490,7 +560,9 @@ pub async fn post_data_with_ip_async(
         match response {
             Ok(r) => {
                 let status = r.status();
-                let text = r.text().await
+                let text = r
+                    .text()
+                    .await
                     .map_err(|e| format!("Failed to read response: {}", e))?;
                 if status.is_success() {
                     Ok(text)
@@ -498,7 +570,11 @@ pub async fn post_data_with_ip_async(
                     Err(format!("File upload failed {}: {}", status, text))
                 }
             }
-            Err(e) => Err(format!("Failed to upload file: {}", e)),
+            Err(e) => {
+                let msg = format!("Failed to upload file: {}", e);
+                abort_on_fatal("post_file_async", &msg);
+                Err(msg)
+            }
         }
     }
 
@@ -528,4 +604,3 @@ fn human_speed(bytes_per_sec: f64) -> f64 {
         bytes_per_sec / 1024.0
     }
 }
-

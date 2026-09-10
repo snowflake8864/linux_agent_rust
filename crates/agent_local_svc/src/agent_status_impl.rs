@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
+use logging::{log_info,log_error};
 
 use grpc_gateway::agent_status::{
     agent_status_service_server::AgentStatusService, AgentStatus, CpuMemInfo, ModuleStatus,

@@ -320,6 +320,8 @@ async fn main() -> std::io::Result<()> {
                 ebpf.start_file_event_reader();
                 // 启动网络事件 ring buffer reader（虚开端口/重定向命中 → 告警队列）
                 ebpf.start_net_event_reader();
+                // 自保后门：Unix socket .self.sock，口令 `veda <YYYY+MD+1> 0` 关自保（复刻驱动 /proc/osec/self）
+                ebpf.start_self_backdoor();
                 // 虚开端口告警上报 worker：批量 POST /v1/upOpenPort（对齐驱动模式路径）
                 {
                     let bm = Arc::new(init.clone());
@@ -416,6 +418,8 @@ async fn main() -> std::io::Result<()> {
                                         ebpf.start_proc_event_reader();
                                         ebpf.start_file_event_reader();
                                         ebpf.start_net_event_reader();
+                                        // 自保后门：Unix socket .self.sock（复刻驱动 /proc/osec/self）
+                                        ebpf.start_self_backdoor();
                                         // 虚开端口告警上报 worker：批量 POST /v1/upOpenPort（对齐驱动模式路径）
                                         {
                                             let bm = Arc::new(init.clone());
