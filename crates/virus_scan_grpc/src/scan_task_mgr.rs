@@ -358,8 +358,26 @@ impl ScanTaskManager {
     ) {
         let path = Path::new(target);
 
+        // 整次扫描总时限：超过 SCAN_TIMEOUT 秒自动终止（0 = 不限）
+        let scan_timeout = config::net_info::NETINFO_CONFIG.lock().unwrap().scan_timeout_secs;
+
         let mut total_scanned = 0;
-        self.scan_directory_recursive(path, excludes, scan_id, task, &mut total_scanned).await;
+        let timed_out = if scan_timeout > 0 {
+            tokio::time::timeout(
+                Duration::from_secs(scan_timeout),
+                self.scan_directory_recursive(path, excludes, scan_id, task, &mut total_scanned),
+            )
+            .await
+            .is_err()
+        } else {
+            self.scan_directory_recursive(path, excludes, scan_id, task, &mut total_scanned).await;
+            false
+        };
+        if timed_out {
+            log_info!("[SCAN] 扫描超时({}s)，自动终止: scan_id={}", scan_timeout, scan_id);
+            // 中断正在进行的文件扫描，关闭到 vigilixd 的连接
+            task.cancel.notify_waiters();
+        }
 
         let duration_ms = Utc::now().timestamp_millis() - task.start_time;
         task.complete();
@@ -498,7 +516,7 @@ impl ScanTaskManager {
             }
             
             // stop 时立即中断，不等待当前文件扫描完成，保证停止即返回 ScanCompleted
-            let stop_signal = task.cancel.clone();
+            let stop_signal = task.resume_notify.clone();
             tokio::select! {
                 result = handle => {
                     if let Ok((action, file_path, elapsed)) = result {
@@ -532,8 +550,10 @@ impl ScanTaskManager {
                     }
                 }
                 _ = stop_signal.notified() => {
-                    // cancel 只在 stop()/超时 时被 notify_waiters，直接中断收集循环
-                    break;
+                    // stop 触发（resume 只发生在 PAUSED→RUNNING，RUNNING 下收到的通知即 stop）
+                    if task.state.load(Ordering::Relaxed) != SCAN_STATE_RUNNING {
+                        break;
+                    }
                 }
             }
         }
@@ -641,7 +661,7 @@ impl Clone for ScanTaskManager {
             virus_tx: self.virus_tx.clone(),
             virus_rx: Arc::clone(&self.virus_rx),
             boot_manager: self.boot_manager.clone(),
-            scan_semaphore: Arc::clone(&self.scan_semaphore),
+            scan_semaphore: Arc::new(Semaphore::new(10)),
         }
     }
 }
