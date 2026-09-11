@@ -79,9 +79,11 @@ impl NetClient {
             let proxy = Proxy::http(&proxy_url)
                 .map_err(|e| format!("Failed to set proxy: {}", e))?;
             client_builder = client_builder.proxy(proxy);
+            /*
             log_info!("Using proxy: {}", proxy_url);
         } else {
             log_info!("No proxy is set.");
+            */
         }
 
         let client = client_builder

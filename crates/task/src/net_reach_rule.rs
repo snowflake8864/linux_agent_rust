@@ -58,7 +58,7 @@ impl OutreachDetectRule {
             format!("http://{}", self.addr)
         };
 
-        log_info!("Probing: {} (method: {})", &url, &self.method);
+        //log_info!("Probing: {} (method: {})", &url, &self.method);
 
         let result = match self.method.to_lowercase().as_str() {
             "get" => {
@@ -82,14 +82,14 @@ impl OutreachDetectRule {
         match result {
             Ok((body, ips)) => {
                 let ip_str = ips.join(","); // 多个 IP 用逗号分隔
-
+/*
                 log_info!(
                     "✅ Probe success: {} (response len: {}, ips: {})",
                     &url,
                     body.len(),
                     ip_str
                 );
-
+*/
                 Some(DomainLog {
                     n_time: now,
                     n_type: 4002,
