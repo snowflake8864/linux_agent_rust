@@ -585,9 +585,9 @@ impl NetInfoConfig {
             config.vigilixav_timeout_secs = 60;
         }
         if let Some(value) = ini.get("VIGILIXAV", "SCAN_TIMEOUT") {
-            config.scan_timeout_secs = value.parse().unwrap_or(120);
+            config.scan_timeout_secs = value.parse().unwrap_or(0);
         } else {
-            config.scan_timeout_secs = 120;
+            config.scan_timeout_secs = 0;
         }
         if let Some(value) = ini.get("VIGILIXAV", "POOL_SIZE") {
             config.vigilixav_pool_size = value.parse().unwrap_or(10);
