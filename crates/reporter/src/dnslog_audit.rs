@@ -80,7 +80,7 @@ impl DnsLogAuditHandler {
             let mut json_str = String::new();
             match crate::build_dns_log_json(&log_vec, &mut json_str) {
                 Ok(()) => {
-                    log_info!("上报DNS日志, url={}, json={}", url, json_str);
+                    //log_info!("上报DNS日志, url={}, json={}", url, json_str);
                     match net_client.post_data_async(
                         &url,
                         &json_str,
