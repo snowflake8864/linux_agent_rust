@@ -2,6 +2,7 @@ use reqwest::{Client, Proxy};
 use std::time::Duration;
 use serde::{Deserialize};
 use std::env;
+use std::sync::LazyLock;
 use tokio::net::lookup_host;
 use url::Url;
 use futures::StreamExt;
@@ -55,6 +56,15 @@ fn abort_on_fatal(context: &str, err: &str) {
     }
 }
 
+/// 全局共享的 reqwest::Client：复用连接池、TLS 会话、DNS 缓存，
+/// 避免高频调用（如连通性探测每 3 秒一次）反复 new 造成的浪费。
+/// 复用 new() 的构建逻辑（disable_ssl=true）；构建失败则 panic（全局一次性初始化）。
+static SHARED_CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    NetClient::new(None, true)
+        .expect("构建共享 NetClient 失败")
+        .client
+});
+
 impl NetClient {
     pub fn new(base_url: Option<String>, disable_ssl: bool) -> Result<Self, String> {
         let mut client_builder = Client::builder()
@@ -82,6 +92,15 @@ impl NetClient {
             client,
             base_url,
         })
+    }
+
+    /// 使用全局共享 Client 构造 NetClient（纯新增，不影响 new 的现有调用方）。
+    /// base_url 仅作为信息性字段（get_base_url 返回），实际请求 URL 由各方法参数决定。
+    pub fn shared(base_url: Option<String>) -> Self {
+        NetClient {
+            client: SHARED_CLIENT.clone(),
+            base_url,
+        }
     }
 
     // 异步版本的 POST 请求

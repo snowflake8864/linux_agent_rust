@@ -125,13 +125,7 @@ pub async fn check_server_reachable() -> bool {
         format!("https://{}:{}", cfg.server_ip, cfg.server_port)
     };
 
-    let net_client = match net_client::core::NetClient::new(Some(base_url.clone()), true) {
-        Ok(c) => c,
-        Err(e) => {
-            log_info!("[connectivity] 创建 NetClient 失败: {}", e);
-            return false;
-        }
-    };
+    let net_client = net_client::core::NetClient::shared(Some(base_url.clone()));
 
     let token = CURRENT_TOKEN.lock().unwrap().clone();
     let token_str = token.as_deref();
@@ -167,7 +161,7 @@ static PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
 /// 由 gRPC handler 调用：触发后台连通性探测（不阻塞，立即返回）。
 /// 探测到不可达时，写入 /proc/osec/tcp_force_ecn 尝试修复准入状态。
 pub fn trigger_connectivity_probe() {
-    log_info!("[admission] >>> trigger_connectivity_probe() 被调用");
+    //log_info!("[admission] >>> trigger_connectivity_probe() 被调用");
     if PROBE_RUNNING.swap(true, Ordering::Relaxed) {
         //log_info!("[admission] >>> trigger_connectivity_probe: 已有探测在跑，跳过");
         return;
@@ -288,13 +282,7 @@ impl AgentDataHub {
             format!("https://{}:{}", cfg.server_ip, cfg.server_port)
         };
 
-        let net_client = match net_client::core::NetClient::new(Some(base_url.clone()), true) {
-            Ok(c) => c,
-            Err(e) => {
-                log_info!("[port_knock] 创建 NetClient 失败: {}", e);
-                return (false, 0, format!("创建 NetClient 失败: {}", e));
-            }
-        };
+        let net_client = net_client::core::NetClient::shared(Some(base_url.clone()));
 
         let token = CURRENT_TOKEN.lock().unwrap().clone();
         let url = format!("{}/v1/portknock", base_url);
@@ -1052,13 +1040,7 @@ impl AgentDataHub {
         let token_ref = CURRENT_TOKEN.lock().unwrap().clone();
         let token_str = token_ref.as_deref();
 
-        let net_client = match net_client::core::NetClient::new(Some(base_url.clone()), true) {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("[newestJumpInfo] 创建 NetClient 失败: {}", e);
-                return;
-            }
-        };
+        let net_client = net_client::core::NetClient::shared(Some(base_url.clone()));
 
         let url = format!("{}/v1/newestJumpInfo", base_url);
         match net_client.get_data_async(&url, tokio::time::Duration::from_secs(5), token_str).await {
