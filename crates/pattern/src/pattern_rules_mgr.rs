@@ -511,6 +511,10 @@ impl PatternRulesMgr {
             // include_file 后缀
             if !dir.include_file.is_empty() {
                 for (j, suffix) in dir.include_file.split('|').enumerate() {
+                    let suffix = suffix.trim();
+                    if suffix.is_empty() {
+                        continue;
+                    }
                     let j_str = format!("_{}", j);
                     self.protect_dir_include_exe_patterns.push_str(&format!(
                             "name=protectIncFileExe_{}{},key=.{},offset=-{}\n",
@@ -551,6 +555,10 @@ impl PatternRulesMgr {
                 self.protect_dir_rules.push_str(",type=2\n");
 
                 for (j, suffix) in dir.file_ext.split('|').enumerate() {
+                    let suffix = suffix.trim();
+                    if suffix.is_empty() {
+                        continue;
+                    }
                     let j_str = format!("_{}", j);
                     self.protect_dir_exclude_exe_patterns.push_str(&format!(
                             "name=protectExcFileExe_{}{},key=.{},offset=-{}\n",

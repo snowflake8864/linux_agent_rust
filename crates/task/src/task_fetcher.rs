@@ -539,8 +539,8 @@ impl TaskFetcher {
         api_interface.insert("uploadBackup".to_string(), "v1/uploadBackup".to_string());
         api_interface.insert("getOutreachDetect".to_string(), "v1/getOutreachDetect".to_string());
         api_interface.insert("getNtpConf".to_string(), "v1/getNtpConf".to_string());
-        api_interface.insert("getdraw".to_string(), "/v1/getdraw".to_string());
-        api_interface.insert("uploaddraw".to_string(), "/v1/uploaddraw".to_string());
+        api_interface.insert("getdraw".to_string(), "v1/getdraw".to_string());
+        api_interface.insert("uploaddraw".to_string(), "v1/uploaddraw".to_string());
         let net_client = NetClient::new(
             Some(base_url.to_string()),
             true,
@@ -900,7 +900,7 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
     let driver_ready = !new.mod_ver.is_empty();
 
     // ── 自保护开关（netlink 0x103，匹配 v2.0） ──
-    if new.self_protect_switch != self.prev_self_protect_switch {
+    if new.self_protect_switch != self.prev_self_protect_switch || true {
         log_info!("[task_fetcher] self_protect:{}→{} → netlink 0x103",
             self.prev_self_protect_switch, new.self_protect_switch);
         self.prev_self_protect_switch = new.self_protect_switch;
@@ -916,7 +916,7 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
     }
 
     // ── 虚拟开端口 ──
-    if new.open_port_switch != self.prev_open_port_switch {
+    if new.open_port_switch != self.prev_open_port_switch || true{
         self.prev_open_port_switch = new.open_port_switch;
         if driver_ready {
             let content = format!("vir_open_port_switch {}\n",
@@ -926,7 +926,7 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
     }
 
     // ── 动态阻断 ──
-    if new.dynamic_switch != self.prev_dynamic_switch {
+    if new.dynamic_switch != self.prev_dynamic_switch ||true{
         self.prev_dynamic_switch = new.dynamic_switch;
         common::backend::with_backend(|b| b.write_netblock_switch(
             &(new.dynamic_switch as u32).to_string()
@@ -934,7 +934,7 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
     }
 
     // ── 文件开关关闭 → 清理保护目录 ──
-    if new.file_switch != self.prev_file_switch {
+    if new.file_switch != self.prev_file_switch || true {
         if driver_ready && !new.file_switch {
             let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
             pattern_mgr.clear_protect_dir();
@@ -943,7 +943,7 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
     }
 
     // ── 勒索保护关闭 → 清理勒索目录 ──
-    if new.extortion_protect != self.prev_extortion_switch {
+    if new.extortion_protect != self.prev_extortion_switch || true {
         if driver_ready && !new.extortion_protect {
             let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
             pattern_mgr.clear_exiport_dir();
@@ -952,7 +952,7 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
     }
 
     // ── 进程日志开关（netlink 0x702，匹配 v2.0） ──
-    if new.proc_switch != self.prev_proc_switch || new.syslog_process_switch != self.prev_syslog_process_switch {
+    if new.proc_switch != self.prev_proc_switch || new.syslog_process_switch != self.prev_syslog_process_switch || true {
         log_info!(
             "[task_fetcher] proc_switch:{}→{} syslog_process:{}→{} → netlink 0x702",
             self.prev_proc_switch, new.proc_switch,
@@ -984,7 +984,7 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
         (new.extortion_protect, 4),
     ].iter().fold(0u32, |acc, &(flag, shift)| acc | ((flag as u32) << shift)) | enable_flag;
 
-    if self.prev_defense_switch != Some(defense_switch) {
+    if self.prev_defense_switch != Some(defense_switch) || true{
         log_info!("[task_fetcher] defense_switch:{:?}→{} → proc_write /proc/osec/defense_switch",
             self.prev_defense_switch, defense_switch);
         self.prev_defense_switch = Some(defense_switch);
@@ -2317,7 +2317,7 @@ async fn task_upload_sample(&self, task_type: u64) -> Result<(), String> {
         return Ok(());
     }
 
-    log_info!("Received {} sample files to upload", samples.len());
+    //log_info!("Received {} sample files to upload", samples.len());
 
     // ── Step 3: 获取 uploaddraw API ──
     let uploaddraw_url = match self.api_interface.get("uploaddraw") {
