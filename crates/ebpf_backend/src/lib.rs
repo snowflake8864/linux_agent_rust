@@ -1056,7 +1056,7 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             n_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             rename_dir: None,
-            notice_remark: Some(format!("eBPF进程{}: pid={} uid={}", action, event.pid, event.uid)),
+            notice_remark: Some(format!("进程{}: pid={} uid={}", action, event.pid, event.uid)),
             exception_process: Some(comm.to_string()),
             peripheral_name: None, peripheral_remark: None, peripheral_eid: None,
             p_param: Some(display_path.clone()),
@@ -1206,7 +1206,7 @@ log::info!("[EbpfBackend] 🔍 未在候选 PID 列表中找到匹配");
             n_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             rename_dir: None,
-            notice_remark: Some(format!("eBPF文件{}: pid={} op=0x{:02X}({}) n_type={}",
+            notice_remark: Some(format!("文件{}: pid={} op=0x{:02X}({}) n_type={}",
                 action, pid, op_type, op_name, n_type)),
             exception_process: Some(comm.to_string()),
             peripheral_name: None, peripheral_remark: None, peripheral_eid: None,
@@ -2021,7 +2021,7 @@ log::info!("[EbpfBackend] 🔍 未在候选 PID 列表中找到匹配");
             n_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             rename_dir: None,
-            notice_remark: Some(format!("eBPF自保保护: pid={} uid={} op=0x{:02X}", pid, uid, op_type)),
+            notice_remark: Some(format!("自保保护: pid={} uid={} op=0x{:02X}", pid, uid, op_type)),
             exception_process: Some(comm.to_string()),
             peripheral_name: None, peripheral_remark: None, peripheral_eid: None,
             p_param: Some(path.to_string()),
