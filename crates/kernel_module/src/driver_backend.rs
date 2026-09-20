@@ -24,7 +24,7 @@ fn proc_write(path: &str, data: &str) -> Result<(), String> {
         }
     };
     let fd = file.as_raw_fd();
-    //log::info!("[DriverBackend] fd={} open_ok", fd);
+    //log::info!("[DriverBackend] {:?}", data.as_bytes());
     // write（write_all 保证大批量多行规则不被内核 proc 缓冲截断）
     match file.write_all(data.as_bytes()) {
         Ok(()) => {/*log::info!("[DriverBackend] fd={} write_ok {}bytes", fd, data.len());*/},
@@ -62,12 +62,25 @@ impl SecurityBackend for DriverBackend {
 
     // ── 进程管控 ──
 
-   
+  /* 
     fn add_md5_rules(&self, data: &str) -> Result<(), String> {
         data.split_inclusive('\n')
         .filter(|line| !line.trim().is_empty())
         .try_for_each(|line| proc_write("/proc/osec/md5_rt", line))
     }
+    */
+    fn add_md5_rules(&self, data: &str) -> Result<(), String> {
+        for line in data.split_inclusive('\n').filter(|line| !line.trim().is_empty()) {
+            //log::info!("add_md5_rules line: {:?}", line);
+            if let Err(e) = proc_write("/proc/osec/md5_rt", line) {
+                // 当前行失败，不退出，继续下一条
+                log::error!("add_md5_rules failed, skip line {:?}: {}", line, e);
+            }
+        }
+
+        Ok(())
+    }
+
     fn notify_process_update(&self) -> Result<(), String> {
         proc_write("/proc/osec/process_rt", "update\n")
     }
@@ -122,10 +135,6 @@ impl SecurityBackend for DriverBackend {
     }
 /*
     fn write_net_rules(&self, rules: &str) -> Result<(), String> {
-        proc_write("/proc/osec/net_rules", rules)
-    }
-*/
-    fn write_net_rules(&self, rules: &str) -> Result<(), String> {
         for line in rules.lines() {
             let line = line.trim();
             // 跳过空行
@@ -136,6 +145,20 @@ impl SecurityBackend for DriverBackend {
         }
         Ok(())
     }
+*/
+    fn write_net_rules(&self, rules: &str) -> Result<(), String> {
+        for line in rules.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Err(e) = proc_write("/proc/osec/net_rules", line) {
+                log::error!("write_net_rules failed, skip line {:?}: {}", line, e);
+            }
+        }
+        Ok(())
+    }
+
 
     fn write_netblock_switch(&self, value: &str) -> Result<(), String> {
         proc_write("/proc/osec/osec_conn/block_switch", &format!("{}\n", value))
