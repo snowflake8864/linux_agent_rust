@@ -92,6 +92,8 @@ pub struct NetInfoConfig {
     pub grpc_svc: GrpcServices,
     // 系统组件开关
     pub system: SystemConfig,
+    // VPN 拨号配置（特定环境先拨 VPN 才能连上服务器）
+    pub vpn: VpnConfig,
     // 后端模式: "driver" | "ebpf"
     pub backend_mode: String,
     // eBPF 模块开关: 控制加载哪些 .bpf.o（[EBPF] 段）
@@ -232,6 +234,28 @@ impl Default for SystemConfig {
             usb_hotplug: true,          // 默认开，兼容旧版
             connectivity_probe: true,   // 核心功能，默认开
             ntp_sync: true,             // 默认开，兼容旧版
+        }
+    }
+}
+
+/// VPN 拨号配置，对应 ini 中的 [VPN] 段
+/// ENABLED=1 时 agent 启动先拨通 VPN（/opt/osec/vpn/vpn.conf）再连接服务器；
+/// 特定网络环境（服务器只允许 VPN 虚地址接入）才需要打开，默认关闭。
+#[derive(Debug, Clone)]
+pub struct VpnConfig {
+    pub enabled: bool,        // ENABLED — VPN 总开关
+    pub helper: String,       // HELPER — 拨号子进程 vpn-helper 全路径
+    pub conf_path: String,    // CONF — vpn.conf 全路径
+    pub client_conf: String,  // CLIENT_CONF — 传给 SDK 的 client.conf 全路径
+}
+
+impl Default for VpnConfig {
+    fn default() -> Self {
+        VpnConfig {
+            enabled: false,
+            helper: "/opt/osec/vpn/vpn-helper".to_string(),
+            conf_path: "/opt/osec/vpn/vpn.conf".to_string(),
+            client_conf: "/opt/osec/vpn/client.conf".to_string(),
         }
     }
 }
@@ -697,6 +721,29 @@ impl NetInfoConfig {
             config.system.ntp_sync = matches!(value.trim(), "1");
         }
 
+        // [VPN] — 特定环境先拨 VPN 才能连上服务器，默认关闭
+        if let Some(value) = ini.get("VPN", "ENABLED") {
+            config.vpn.enabled = matches!(value.trim(), "1");
+        }
+        if let Some(value) = ini.get("VPN", "HELPER") {
+            let v = value.trim().to_string();
+            if !v.is_empty() {
+                config.vpn.helper = v;
+            }
+        }
+        if let Some(value) = ini.get("VPN", "CONF") {
+            let v = value.trim().to_string();
+            if !v.is_empty() {
+                config.vpn.conf_path = v;
+            }
+        }
+        if let Some(value) = ini.get("VPN", "CLIENT_CONF") {
+            let v = value.trim().to_string();
+            if !v.is_empty() {
+                config.vpn.client_conf = v;
+            }
+        }
+
         config
     }
 
@@ -861,6 +908,13 @@ impl NetInfoConfig {
         writeln!(file, "USB_HOTPLUG={}", self.system.usb_hotplug as u8)?;
         writeln!(file, "CONNECTIVITY_PROBE={}", self.system.connectivity_probe as u8)?;
         writeln!(file, "NTP_SYNC={}", self.system.ntp_sync as u8)?;
+
+        // [VPN] 段 — 特定环境先拨 VPN 才能连上服务器
+        writeln!(file, "[VPN]")?;
+        writeln!(file, "ENABLED={}", self.vpn.enabled as u8)?;
+        writeln!(file, "HELPER={}", self.vpn.helper)?;
+        writeln!(file, "CONF={}", self.vpn.conf_path)?;
+        writeln!(file, "CLIENT_CONF={}", self.vpn.client_conf)?;
 
         Ok(())
     }
