@@ -25,10 +25,15 @@ members = [
      "crates/rules_jump_mgr",
      "crates/agent_manager",
     "crates/grpc_gateway",
-    "crates/agent_local_svc",
-    "crates/ebpf_backend",
-    "crates/sqlite_db",
-    "crates/local_store",
+     "crates/agent_local_svc",
+     "crates/ebpf_backend",
+     "crates/sqlite_db",
+     "crates/local_store",
+     "crates/vpn",
+     # vpn-helper 直连厂商 VPN SDK，需 SDK .so 在构建机就绪时显式编译，
+     # 不进默认构建（否则无 SDK 机器/交叉编译会失败）：
+     #   cargo zigbuild -p vpn-helper --target x86_64-unknown-linux-musl --release
+     "crates/vpn-helper",
 ]
 
 # ebfp_backend 通过 main 的 optional feature 按需引入，不作为默认编译成员
@@ -56,6 +61,7 @@ default-members = [
     "crates/agent_local_svc",
     "crates/sqlite_db",
     "crates/local_store",
+    "crates/vpn",
 ]
 
 [profile.dev]

@@ -37,6 +37,10 @@ cargo zigbuild --target x86_64-unknown-linux-musl --release
 # aarch64
 cargo zigbuild --target aarch64-unknown-linux-musl --release
 
+FMVPN_SDK_DIR=/home/zebra/workspace/rustprj/linux_agent_rust_v10/sdk/vpn-aarch64 cargo zigbuild -p vpn-helper --target aarch64-unknown-linux-musl --release
+file target/aarch64-unknown-linux-musl/release/vpn-helper
+
+
 # mips64el
 cargo +nightly zigbuild -Z build-std=std,panic_abort --target mips64el-unknown-linux-gnuabi64 --release --no-default-features
 cargo +nightly zigbuild -Z build-std=std,panic_abort --target mips64el-unknown-linux-muslabi64 --release --no-default-features
@@ -44,3 +48,7 @@ cargo +nightly zigbuild -Z build-std=std,panic_abort --target mips64el-unknown-l
 
 # loongarch64
 cargo zigbuild --target loongarch64-unknown-linux-musl --release --no-default-features
+
+
+
+

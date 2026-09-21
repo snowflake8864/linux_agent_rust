@@ -171,6 +171,20 @@ async fn main() -> std::io::Result<()> {
     }
     log_info!("程序开始启动");
 
+    // VPN 拨号（特定环境先拨 VPN 才能连上服务器）：[VPN] ENABLED=1 时后台拉起拨号子进程并保活
+    {
+        let (vpn_enabled, vpn_helper, vpn_conf, vpn_client_conf) = {
+            let cfg = NETINFO_CONFIG.lock().unwrap();
+            (cfg.vpn.enabled, cfg.vpn.helper.clone(), cfg.vpn.conf_path.clone(), cfg.vpn.client_conf.clone())
+        };
+        if vpn_enabled {
+            log_info!("[vpn] 开关已启用，helper={} conf={}，后台开始拨号", vpn_helper, vpn_conf);
+            vpn::start_background(vpn_helper, vpn_conf, vpn_client_conf);
+        } else {
+            log_info!("[vpn] 开关未启用，跳过 VPN 拨号");
+        }
+    }
+
     // 升级后 KYSEC 恢复：若存在标记文件，说明刚经历一次升级，加白并恢复执行控制
     //kysec_restore_after_upgrade().await;
 
@@ -756,6 +770,9 @@ async fn main() -> std::io::Result<()> {
     if let Some(b) = common::backend::get_backend() {
         b.shutdown();
     }
+
+    // 停止 VPN
+    vpn::stop();
 
     // 卸载驱动
     if let Err(e) = unload_driver() {
