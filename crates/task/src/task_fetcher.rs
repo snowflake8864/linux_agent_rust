@@ -900,7 +900,7 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
     let driver_ready = !new.mod_ver.is_empty();
 
     // ── 自保护开关（netlink 0x103，匹配 v2.0） ──
-    if new.self_protect_switch != self.prev_self_protect_switch || true {
+    if new.self_protect_switch != self.prev_self_protect_switch {
         log_info!("[task_fetcher] self_protect:{}→{} → netlink 0x103",
             self.prev_self_protect_switch, new.self_protect_switch);
         self.prev_self_protect_switch = new.self_protect_switch;
@@ -916,7 +916,7 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
     }
 
     // ── 虚拟开端口 ──
-    if new.open_port_switch != self.prev_open_port_switch || true{
+    if new.open_port_switch != self.prev_open_port_switch {
         self.prev_open_port_switch = new.open_port_switch;
         if driver_ready {
             let content = format!("vir_open_port_switch {}\n",
@@ -926,7 +926,7 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
     }
 
     // ── 动态阻断 ──
-    if new.dynamic_switch != self.prev_dynamic_switch ||true{
+    if new.dynamic_switch != self.prev_dynamic_switch {
         self.prev_dynamic_switch = new.dynamic_switch;
         common::backend::with_backend(|b| b.write_netblock_switch(
             &(new.dynamic_switch as u32).to_string()
@@ -934,7 +934,7 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
     }
 
     // ── 文件开关关闭 → 清理保护目录 ──
-    if new.file_switch != self.prev_file_switch || true {
+    if new.file_switch != self.prev_file_switch {
         if driver_ready && !new.file_switch {
             let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
             pattern_mgr.clear_protect_dir();
@@ -943,7 +943,7 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
     }
 
     // ── 勒索保护关闭 → 清理勒索目录 ──
-    if new.extortion_protect != self.prev_extortion_switch || true {
+    if new.extortion_protect != self.prev_extortion_switch {
         if driver_ready && !new.extortion_protect {
             let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
             pattern_mgr.clear_exiport_dir();
@@ -952,7 +952,7 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
     }
 
     // ── 进程日志开关（netlink 0x702，匹配 v2.0） ──
-    if new.proc_switch != self.prev_proc_switch || new.syslog_process_switch != self.prev_syslog_process_switch || true {
+    if new.proc_switch != self.prev_proc_switch || new.syslog_process_switch != self.prev_syslog_process_switch {
         log_info!(
             "[task_fetcher] proc_switch:{}→{} syslog_process:{}→{} → netlink 0x702",
             self.prev_proc_switch, new.proc_switch,

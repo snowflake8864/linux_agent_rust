@@ -568,7 +568,7 @@ impl NetClient {
             .map_err(|e| format!("Invalid MIME: {}", e))?;
 
         let form = multipart::Form::new()
-            .text("hash", hash.to_string())
+            .text("p_hash", hash.to_string())
             .part("file", part);
 
         let mut request = self.client.post(url).multipart(form).timeout(timeout);
