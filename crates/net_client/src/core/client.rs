@@ -51,6 +51,7 @@ fn is_fatal_net_error(err: &str) -> bool {
 fn abort_on_fatal(context: &str, err: &str) {
     if is_fatal_net_error(err) {
         eprintln!("[FATAL] {}: {}", context, err);
+        log_error!("[FATAL] 检测到致命网络错误（可能是防火墙/安全软件拦截），程序退出。");
         eprintln!("[FATAL] 检测到致命网络错误（可能是防火墙/安全软件拦截），程序退出。");
         std::process::exit(1);
     }
