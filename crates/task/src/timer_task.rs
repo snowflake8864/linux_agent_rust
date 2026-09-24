@@ -3,8 +3,9 @@ use std::pin::Pin;
 use common::manager::boot::BootManager;
 use std::future::Future;
 use tokio::time::{interval, Duration, Interval};
+use std::time::SystemTime;
 use net_client::core::NetClient;
-use logging::{log_info,log_error};
+use logging::{log_info, log_error, CustomLogger};
 use hostinfo::net_app::parser_netstat::update_netstat_info;
 use hostinfo::net_app::parser_dnat::update_dnat_info;
 use hostinfo::net_app::parser_docker::update_docker_info;
@@ -14,6 +15,73 @@ use crate::baseline_task::{process_baselines_from_client};
 use crate::run_outreach_detection;
 use crate::net_reach_rule::build_outreach_detect_list_json;
 use crate::ssh_login_task::SshLoginCollector;
+
+// 日志等配置所在路径（与 main.rs 中 CustomLogger::init 使用的一致）
+const BACKEND_CONFIG_PATH: &str = "/opt/osec/osec_backend.conf";
+
+/// 动态热更新 backend 配置（日志级别等）。
+/// 第一步：先看文件修改时间戳（mtime），没变就直接跳过；
+/// 第二步：mtime 变了再读内容比对，内容确实变化才触发 CustomLogger::reload()。
+async fn reload_backend_config_if_changed(
+    path: &str,
+    last_mtime: &mut Option<SystemTime>,
+    last_content: &mut Option<String>,
+) {
+    let new_mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(e) => {
+            log_error!("获取配置文件 {} 的时间戳失败: {}", path, e);
+            *last_mtime = None;
+            return;
+        }
+    };
+
+    // 第一步：时间戳没变 → 内容没变，跳过
+    if *last_mtime == Some(new_mtime) {
+        return;
+    }
+
+    // 第二步：时间戳变了，读内容确认
+    let new_content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            log_error!("读取配置文件 {} 失败: {}", path, e);
+            return;
+        }
+    };
+
+    // 首次观测：启动时已加载过一次，只记录基线，不重复重载
+    if last_content.is_none() {
+        *last_content = Some(new_content);
+        *last_mtime = Some(new_mtime);
+        return;
+    }
+
+    // 时间戳变了但内容没变（如 touch），只更新时间戳
+    if *last_content == Some(new_content.clone()) {
+        *last_mtime = Some(new_mtime);
+        return;
+    }
+
+    match CustomLogger::reload(path).await {
+        Ok(true) => {
+            log_info!("检测到 {} 配置变更，已热更新生效", path);
+            *last_content = Some(new_content);
+            *last_mtime = Some(new_mtime);
+        }
+        Ok(false) => {
+            log_info!("配置文件 {} 内容有变化但解析结果一致，无需重载", path);
+            *last_content = Some(new_content);
+            *last_mtime = Some(new_mtime);
+        }
+        Err(e) => {
+            log_error!("热更新配置文件 {} 失败: {}", path, e);
+            // 保留 last_content（保持上一份已生效的内容），下一次 mtime 变化再重试
+            *last_mtime = Some(new_mtime);
+        }
+    }
+}
+
 pub trait TimerTask {
     fn start_timer_task(&mut self) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
 }
@@ -37,6 +105,9 @@ impl TimerTask for BootManager {
             let mut baseline_enabled = false;
             let mut outreach_interval: Option<Interval> = None;
             let mut outreach_enabled = false;
+            // backend 配置文件热更新观测状态（时间戳 + 内容）
+            let mut backend_cfg_mtime: Option<SystemTime> = None;
+            let mut backend_cfg_content: Option<String> = None;
 
             loop {
                 let (switch, time_secs) = self.get_baseline_info();
@@ -81,6 +152,13 @@ impl TimerTask for BootManager {
                         update_dnat_info();
                         update_docker_info();
                         write_business_ports_to_proc();
+
+                        // 热更新 /opt/osec/osec_backend.conf（日志级别等）：先看时间戳，再看内容
+                        reload_backend_config_if_changed(
+                            BACKEND_CONFIG_PATH,
+                            &mut backend_cfg_mtime,
+                            &mut backend_cfg_content,
+                        ).await;
                         
                         // SSH登录日志采集
                         if ssh_login_switch {

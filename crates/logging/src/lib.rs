@@ -2,18 +2,19 @@ use log::{LevelFilter, Record, Metadata, SetLoggerError};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use chrono::Local;
 use serde::Deserialize;
 use tokio::fs as async_fs;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone, PartialEq)]
 #[serde(untagged)]
 enum LogLevel {
     String(String),
     Number(u8),
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone, PartialEq)]
 pub struct LogConfig {
     pub log_level: LogLevel,
     pub log_size: u64,
@@ -21,26 +22,9 @@ pub struct LogConfig {
     pub log_backup_path: String,
 }
 
-pub struct CustomLogger {
-    config: LogConfig,
-}
-
-impl CustomLogger {
-    pub fn new(config: LogConfig) -> Self {
-        if let Some(parent) = Path::new(&config.log_path).parent() {
-            fs::create_dir_all(parent).expect("无法创建日志目录");
-        }
-        fs::create_dir_all(&config.log_backup_path).expect("无法创建备份目录");
-        CustomLogger { config }
-    }
-
-    pub async fn init(config_path: &str) -> Result<(), SetLoggerError> {
-        let config_content = async_fs::read_to_string(config_path)
-            .await
-            .expect("无法读取配置文件");
-        let config: LogConfig = serde_json::from_str(&config_content).expect("无法解析配置文件");
-
-        let level_filter = match &config.log_level {
+impl LogConfig {
+    fn level_filter(&self) -> LevelFilter {
+        match &self.log_level {
             LogLevel::String(ref s) => match s.to_lowercase().as_str() {
                 "error" => LevelFilter::Error,
                 "warn" => LevelFilter::Warn,
@@ -57,21 +41,106 @@ impl CustomLogger {
                 4 => LevelFilter::Trace,
                 _ => LevelFilter::Info,
             },
-        };
-        print!("======日志级别: {}", level_filter);
-        let logger = CustomLogger::new(config);
+        }
+    }
+}
+
+impl LogLevel {
+    fn default_level() -> u8 {
+        2
+    }
+}
+
+impl Default for LogLevel {
+    fn default() -> Self {
+        LogLevel::Number(Self::default_level())
+    }
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        LogConfig {
+            log_level: LogLevel::default(),
+            log_size: 10485760,
+            log_path: "/opt/osec/log/osec_backend.log".to_string(),
+            log_backup_path: "/opt/osec/log/backup".to_string(),
+        }
+    }
+}
+
+// 共享的当前日志配置：init/reload 都会更新它，log() 每次实时读取，
+// 使日志级别、日志路径、轮转大小等可以在运行期热更新。
+static SHARED_LOG_CONFIG: OnceLock<Mutex<LogConfig>> = OnceLock::new();
+
+fn log_config() -> &'static Mutex<LogConfig> {
+    // 用 get_or_init 惰性初始化默认配置：即使 init 尚未完成（比如 apply_config
+    // 在 set_boxed_logger 之前就先写配置），也不会 panic。
+    SHARED_LOG_CONFIG.get_or_init(|| Mutex::new(LogConfig::default()))
+}
+
+pub struct CustomLogger;
+
+impl CustomLogger {
+    fn ensure_dirs(config: &LogConfig) {
+        if let Some(parent) = Path::new(&config.log_path).parent() {
+            fs::create_dir_all(parent).expect("无法创建日志目录");
+        }
+        fs::create_dir_all(&config.log_backup_path).expect("无法创建备份目录");
+    }
+
+    async fn load_config(config_path: &str) -> Option<LogConfig> {
+        let config_content = async_fs::read_to_string(config_path).await.ok()?;
+        serde_json::from_str(&config_content).ok()
+    }
+
+    pub async fn init(config_path: &str) -> Result<(), SetLoggerError> {
+        let config = Self::load_config(config_path)
+            .await
+            .expect("无法读取或解析配置文件");
+        Self::apply_config(config);
+        let logger = CustomLogger;
         log::set_boxed_logger(Box::new(logger))?;
-        log::set_max_level(level_filter);
         Ok(())
     }
 
-    fn rotate_log_file(&self) {
-        let log_path = &self.config.log_path;
-        if let Ok(metadata) = fs::metadata(log_path) {
-            if metadata.len() >= self.config.log_size {
+    /// 热加载配置文件（应用日志级别/日志路径/轮转大小等）。
+    /// 文件缺失、解析失败返回 Err；Ok(true)=已应用新配置，Ok(false)=与当前一致无需更新。
+    pub async fn reload(config_path: &str) -> Result<bool, String> {
+        let config =
+            Self::load_config(config_path).await.ok_or_else(|| format!("无法读取或解析配置文件: {}", config_path))?;
+        let changed = *log_config().lock().unwrap() != config;
+        if changed {
+            Self::apply_config(config);
+        }
+        Ok(changed)
+    }
+
+    fn apply_config(config: LogConfig) {
+        Self::ensure_dirs(&config);
+        let level_filter = config.level_filter();
+        print!("======日志级别: {}", level_filter);
+        *log_config().lock().unwrap() = config;
+        log::set_max_level(level_filter);
+    }
+
+    fn current_log_path() -> String {
+        log_config().lock().unwrap().log_path.clone()
+    }
+
+    fn rotate_log_file() {
+        let (log_path, log_size, log_backup_path) = {
+            let guard = log_config().lock().unwrap();
+            (
+                guard.log_path.clone(),
+                guard.log_size,
+                guard.log_backup_path.clone(),
+            )
+        };
+        if let Ok(metadata) = fs::metadata(&log_path) {
+            if metadata.len() >= log_size {
                 let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
-                let backup_file = format!("{}/backend_{}.log", self.config.log_backup_path, timestamp);
-                if let Err(e) = fs::rename(log_path, &backup_file) {
+                let backup_file = format!("{}/backend_{}.log", log_backup_path, timestamp);
+                if let Err(e) = fs::rename(&log_path, &backup_file) {
                     eprintln!("日志轮转失败: {}", e);
                 }
             }
@@ -132,9 +201,9 @@ impl log::Log for CustomLogger {
             if raw_msg.starts_with("[PLAIN] ") {
                 let plain_content = &raw_msg["[PLAIN] ".len()..];
 
-                self.rotate_log_file();
+                Self::rotate_log_file();
 
-                if let Ok(mut file) = File::options().create(true).append(true).open(&self.config.log_path) {
+                if let Ok(mut file) = File::options().create(true).append(true).open(Self::current_log_path()) {
                     writeln!(file, "{}", plain_content).ok();
                 }
 
@@ -154,8 +223,8 @@ impl log::Log for CustomLogger {
                     let content = &stripped[end_idx + 2..];
                     let full_message = format!("[{}] [/{}/{}] {}", timestamp, module, level, content);
 
-                    self.rotate_log_file();
-                    if let Ok(mut file) = File::options().create(true).append(true).open(&self.config.log_path) {
+                    Self::rotate_log_file();
+                    if let Ok(mut file) = File::options().create(true).append(true).open(Self::current_log_path()) {
                         writeln!(file, "{}", full_message).ok();
                     }
                     println!("{}", full_message);
@@ -172,8 +241,8 @@ impl log::Log for CustomLogger {
                 timestamp, file, line, func, level, raw_msg
             );
 
-            self.rotate_log_file();
-            if let Ok(mut file) = File::options().create(true).append(true).open(&self.config.log_path) {
+            Self::rotate_log_file();
+            if let Ok(mut file) = File::options().create(true).append(true).open(Self::current_log_path()) {
                 writeln!(file, "{}", full_message).ok();
             }
             println!("{}", full_message);
