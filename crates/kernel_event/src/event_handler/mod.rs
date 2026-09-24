@@ -498,7 +498,7 @@ impl StartKernelHandler for BootManager {
                             }
                         }
                         None => {
-                            log_error!("无法解析内核消息，格式错误或长度不足: {:x?}", data);
+                            log_info!("无法解析内核消息，格式错误或长度不足: {:x?}", data);
                         }
                     }
                 })

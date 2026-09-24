@@ -281,7 +281,7 @@ pub fn apply_config_diff(old: &NetInfoConfig, new: &NetInfoConfig) -> Result<(),
         (old.extortion_protect, 4),
     ].iter().fold(0u32, |acc, &(flag, shift)| acc | ((flag as u32) << shift)) | old_enable_flag;
 
-    if defense_switch != old_defense_switch {
+    if defense_switch != old_defense_switch || true {
         if driver_ready {
             log_info!("apply_config_diff: 下发 defense_switch={}", defense_switch);
             common::backend::with_backend(|b| b.write_defense_switch(
