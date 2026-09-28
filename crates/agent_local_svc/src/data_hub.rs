@@ -664,15 +664,23 @@ impl AgentDataHub {
             }
             1 | 2 => {
                 let is_white = action == 1;
-                // gRPC 本地调用时合并而非替换：先取现有名单，追加新 hash 后再下发
-                let existing = if is_white { mgr.get_white_list() } else { mgr.get_black_list() };
-                let mut merged: Vec<String> = existing;
+                // gRPC 本地调用时合并而非替换：先取现有名单，追加新 hash 后再下发。
+                // set_policy_process 需白、黑两侧都到齐才统一 diff，因此另一侧按当前值成对下发。
+                let white: Vec<String> = mgr.get_white_list();
+                let black: Vec<String> = mgr.get_black_list();
+                let mut target = if is_white { white.clone() } else { black.clone() };
                 for h in hashes {
-                    if !merged.contains(h) {
-                        merged.push(h.clone());
+                    if !target.contains(h) {
+                        target.push(h.clone());
                     }
                 }
-                mgr.set_policy_process(&merged, is_white, Some(true));
+                if is_white {
+                    mgr.set_policy_process(&target, true, Some(true));
+                    mgr.set_policy_process(&black, false, Some(true));
+                } else {
+                    mgr.set_policy_process(&white, true, Some(true));
+                    mgr.set_policy_process(&target, false, Some(true));
+                }
                 drop(mgr);
                 self.notify(PolicyChangeType::ProcessPolicyChanged);
                 Ok(())
