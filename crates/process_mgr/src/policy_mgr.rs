@@ -11,8 +11,9 @@ const MD5_RULE_FILE: &str = "/proc/osec/md5_rt";
 pub struct ProcessPolicyManager {
     white_set: HashSet<String>,
     black_set: HashSet<String>,
-    prev_white_set: HashSet<String>,
-    prev_black_set: HashSet<String>,
+    pending_white: Option<HashSet<String>>,
+    pending_black: Option<HashSet<String>>,
+    pending_save_to_db: Option<bool>,
     run_process_mode: bool,
 }
 
@@ -46,120 +47,117 @@ impl ProcessPolicyManager {
 
 
     /// save_to_db: Some(true)=离线本地表, Some(false)=在线基线表, None=不写DB
+    /// 收到一侧名单先暂存，等白、黑两侧都到齐后统一 diff 下发（三态：白/黑/未知）。
     pub fn set_policy_process(&mut self, process_list: &[String], is_white: bool, save_to_db: Option<bool>) {
-        let mut is_changed = false;
-
         if is_white {
-            log_info!("[process_policy] 应用白名单: {} 条hash", process_list.len());
-            self.white_set.clear();
-            self.white_set.extend(process_list.iter().cloned());
-
-            // 收集本次 diff 规则（与 prev 集合对比，只下发增量），最后一次性写入内核
-            let mut batch: Vec<String> = Vec::new();
-            let mut n_add = 0usize;  // 新增白名单
-            let mut n_del = 0usize;  // 删除白名单
-            let mut n_move = 0usize; // 黑→白 互转
-
-            // 👇 清理原来的黑名单中的路径（黑→白）
-            for path in &self.white_set {
-                if self.prev_black_set.contains(path) {
-                    batch.push(format!("del 1 {}\n", path));
-                    self.prev_black_set.remove(path); // 同时更新 prev_black_set
-                    n_move += 1;
-                    is_changed = true;
-                }
-            }
-
-            // 新增白名单
-            for path in &self.white_set {
-                if !self.prev_white_set.contains(path) {
-                    batch.push(format!("{}=0\n", path));
-                    n_add += 1;
-                    is_changed = true;
-                }
-            }
-
-            // 删除已不在白名单的路径
-            for path in &self.prev_white_set {
-                if !self.white_set.contains(path) {
-                    batch.push(format!("del 0 {}\n", path));
-                    n_del += 1;
-                    is_changed = true;
-                }
-            }
-
-            if is_changed {
-                self.prev_white_set = self.white_set.clone();
-                Self::add_md5_rules(&batch.concat());
-                Self::notify_kernel_update();
-                log_info!("[process_policy] 白名单已下发内核: 新增 {} 条, 删除 {} 条, 黑→白 {} 条",
-                    n_add, n_del, n_move);
-            }
+            log_info!("[process_policy] 收到白名单: {} 条hash（待合并）", process_list.len());
+            self.pending_white = Some(process_list.iter().cloned().collect());
         } else {
-            log_info!("[process_policy] 应用黑名单: {} 条hash", process_list.len());
-            self.black_set.clear();
-            self.black_set.extend(process_list.iter().cloned());
+            log_info!("[process_policy] 收到黑名单: {} 条hash（待合并）", process_list.len());
+            self.pending_black = Some(process_list.iter().cloned().collect());
 
-            //  杀掉进程
+            // 命中黑名单进程，终止
             for path in process_list {
                 if self.run_process_mode {
                     Self::kill_process(path);
                 }
             }
-
-            // 收集本次 diff 规则，最后一次性写入内核
-            let mut batch: Vec<String> = Vec::new();
-            let mut n_add = 0usize;  // 新增黑名单
-            let mut n_del = 0usize;  // 删除黑名单
-            let mut n_move = 0usize; // 白→黑 互转
-
-            //  清理原来的白名单中的路径（白→黑）
-            for path in &self.black_set {
-                if self.prev_white_set.contains(path) {
-                    batch.push(format!("del 0 {}\n", path));
-                    self.prev_white_set.remove(path); // 同时更新 prev_white_set
-                    n_move += 1;
-                    is_changed = true;
-                }
-            }
-
-            // 新增黑名单
-            for path in &self.black_set {
-                if !self.prev_black_set.contains(path) {
-                    batch.push(format!("{}=1\n", path));
-                    n_add += 1;
-                    is_changed = true;
-                }
-            }
-
-            // 删除已不在黑名单的路径
-            for path in &self.prev_black_set {
-                if !self.black_set.contains(path) {
-                    batch.push(format!("del 1 {}\n", path));
-                    n_del += 1;
-                    is_changed = true;
-                }
-            }
-
-            if is_changed {
-                self.prev_black_set = self.black_set.clone();
-                Self::add_md5_rules(&batch.concat());
-                Self::notify_kernel_update();
-                log_info!("[process_policy] 黑名单已下发内核: 新增 {} 条, 删除 {} 条, 白→黑 {} 条",
-                    n_add, n_del, n_move);
-            }
         }
 
-        // 持久化黑白名单到 SQLite（受 [SQLITE_DB] 和 [DB_POLICY] 开关控制）
-        // save_to_db: Some(true)=离线本地表, Some(false)=在线基线表, None=不写
-        if let Some(local) = save_to_db {
-            self.try_save_policy_to_db(is_white, local);
+        // 直接覆盖（含 None），避免上一次的 save_to_db 残留影响本轮
+        self.pending_save_to_db = save_to_db;
+
+        // 白、黑两侧都到齐，统一比较并下发
+        if self.pending_white.is_some() && self.pending_black.is_some() {
+            self.apply_pending_policy();
         }
     }
 
-    /// 尝试将进程名单持久化到 DB（如果开关已开启）
+    /// 统一三态 diff：对比「当前生效名单(white_set/black_set)」与「待合并名单(pending)」，
+    /// 一次性算出 白↔黑 互转、白/黑→未知、未知→白/黑 的增量，然后下发内核/bpf。
+    fn apply_pending_policy(&mut self) {
+        let new_white = self.pending_white.take().unwrap();
+        let new_black = self.pending_black.take().unwrap();
+        let save_to_db = self.pending_save_to_db.take();
+
+        let mut batch: Vec<String> = Vec::new();
+        let mut n_add_white = 0usize;           // 未知→白
+        let mut n_add_black = 0usize;           // 未知→黑
+        let mut n_del_white = 0usize;           // 白→未知（从内核/bpf 删除）
+        let mut n_del_black = 0usize;           // 黑→未知（从内核/bpf 删除）
+        let mut n_move_white_to_black = 0usize; // 白→黑
+        let mut n_move_black_to_white = 0usize; // 黑→白
+
+        // 黑→白：老黑 ∩ 新白
+        for h in &new_white {
+            if self.black_set.contains(h) {
+                batch.push(format!("del 1 {}\n", h));
+                batch.push(format!("{}=0\n", h));
+                n_move_black_to_white += 1;
+            }
+        }
+
+        // 白→黑：老白 ∩ 新黑
+        for h in &new_black {
+            if self.white_set.contains(h) {
+                batch.push(format!("del 0 {}\n", h));
+                batch.push(format!("{}=1\n", h));
+                n_move_white_to_black += 1;
+            }
+        }
+
+        // 未知→白：新白 - 老白 - 老黑
+        for h in &new_white {
+            if !self.white_set.contains(h) && !self.black_set.contains(h) {
+                batch.push(format!("{}=0\n", h));
+                n_add_white += 1;
+            }
+        }
+
+        // 未知→黑：新黑 - 老黑 - 老白
+        for h in &new_black {
+            if !self.black_set.contains(h) && !self.white_set.contains(h) {
+                batch.push(format!("{}=1\n", h));
+                n_add_black += 1;
+            }
+        }
+
+        // 白→未知：老白 - 新白 - 新黑
+        for h in &self.white_set {
+            if !new_white.contains(h) && !new_black.contains(h) {
+                batch.push(format!("del 0 {}\n", h));
+                n_del_white += 1;
+            }
+        }
+
+        // 黑→未知：老黑 - 新黑 - 新白
+        for h in &self.black_set {
+            if !new_black.contains(h) && !new_white.contains(h) {
+                batch.push(format!("del 1 {}\n", h));
+                n_del_black += 1;
+            }
+        }
+
+        // 更新当前生效名单
+        self.white_set = new_white;
+        self.black_set = new_black;
+
+        if !batch.is_empty() {
+            Self::add_md5_rules(&batch.concat());
+        }
+        Self::notify_kernel_update();
+
+        log_info!("[process_policy] 已下发: 未知→白{} 未知→黑{} 白→未知{} 黑→未知{} 白→黑{} 黑→白{}",
+            n_add_white, n_add_black, n_del_white, n_del_black, n_move_white_to_black, n_move_black_to_white);
+
+        if let Some(local) = save_to_db {
+            self.persist_policy(local);
+        }
+    }
+
+    /// 将内存黑白名单全量持久化到 DB（如果开关已开启）
     /// local: true=离线本地表(process_policy_local), false=在线基线表(process_policy)
-    fn try_save_policy_to_db(&self, is_white: bool, local: bool) {
+    fn persist_policy(&self, local: bool) {
         if !local_store::sqlite_db_enabled() {
             return;
         }
@@ -181,10 +179,12 @@ impl ProcessPolicyManager {
             logging::log_error!("[process_policy] 持久化到{}(local={}) 失败: {}",
                 if local { "离线本地表" } else { "在线基线表" }, local, e);
         }
-        // 同步到 known_executables 表
-        let target = if is_white { &white } else { &black };
-        if let Err(e) = local_store::known_executables::update_policy_status(target, is_white) {
-            logging::log_error!("[known_executables] 同步策略状态失败: {}", e);
+        // 同步到 known_executables 表（白名单 → policy_status=1，黑名单 → policy_status=2）
+        if let Err(e) = local_store::known_executables::update_policy_status(&white, true) {
+            logging::log_error!("[known_executables] 同步白名单策略状态失败: {}", e);
+        }
+        if let Err(e) = local_store::known_executables::update_policy_status(&black, false) {
+            logging::log_error!("[known_executables] 同步黑名单策略状态失败: {}", e);
         }
     }
 
@@ -313,10 +313,7 @@ impl ProcessPolicyManager {
             Self::add_md5_rules(&data);
         }
 
-        // 同步 prev 集合，避免后续 set_policy_process 的 diff 把这些 hash 误判为“新增”重复下发
-        self.prev_white_set = self.white_set.clone();
-        self.prev_black_set = self.black_set.clone();
-
+        // 启动时全量下发，white_set/black_set 本身即「已下发快照」，后续 set_policy_process 直接据此 diff。
         // 无论策略是否为空都通知内核：空策略表示「加载完成」，eBPF 侧据此开启进程检测，
         // 否则无黑白名单时检测会一直关闭。
         Self::notify_kernel_update();

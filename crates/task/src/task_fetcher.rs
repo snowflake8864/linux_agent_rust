@@ -1621,14 +1621,17 @@ async fn task_down_black(&self, task_type: u64) -> Result<(), String> {
 
             if parsed["code"] == "000000" {
 
-                let hash_list = parsed["data"]["proclist"]
+                let proclist = parsed["data"]["proclist"]
                     .as_array()
-                    .ok_or("Missing or invalid proclist in response")?
+                    .ok_or("Missing or invalid proclist in response")?;
+
+                let hash_list: Vec<String> = proclist
                     .iter()
                     .filter_map(|item| item["hash"].as_str().map(|s| s.to_string()))
-                    .collect::<Vec<String>>();
+                    .collect();
 
-                if hash_list.is_empty() {
+                // 空数组表示清空黑名单（全部转未知）；数组非空却无任何 hash 字段才视为异常
+                if hash_list.is_empty() && !proclist.is_empty() {
                     return Err("No hashes found in the response".to_string());
                 }
 
@@ -1680,15 +1683,18 @@ pub async fn task_down_white(&self, task_type: u64) -> Result<(), String> {
             };
 
             if parsed["code"] == "000000" {
-                let hash_list = parsed["data"]["proclist"]
+                let proclist = parsed["data"]["proclist"]
                     .as_array()
-                    .ok_or("Missing or invalid proclist in response")?
+                    .ok_or("Missing or invalid proclist in response")?;
+
+                let hash_list: Vec<String> = proclist
                     .iter()
                     .filter_map(|item| item["hash"].as_str().map(|s| s.to_string()))
-                    .collect::<Vec<String>>();
+                    .collect();
 
-                if hash_list.is_empty() {
-                    log_error!("[task_down_white] proclist 为空或字段不是 hash，原始响应: {}", response);
+                // 空数组表示清空白名单（全部转未知）；数组非空却无任何 hash 字段才视为异常
+                if hash_list.is_empty() && !proclist.is_empty() {
+                    log_error!("[task_down_white] proclist 非空但字段不是 hash，原始响应: {}", response);
                     return Err("No hashes found in the response".to_string());
                 }
 
