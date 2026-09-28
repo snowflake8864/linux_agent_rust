@@ -218,7 +218,8 @@ fn audit_file_oper_rename(&self, info: &AvFileInfo, level: u32, pos: u32) -> Res
         }
 
         if flag_special < 0 {
-            let warn_log_type = G_WARN_LOG_TYPE[file_mode as usize][G_RUN_FILE_MODE][type_ as usize];
+            let mut file_mode = if log_level >= 3 { 1 } else { 0 };
+            let warn_log_type = G_WARN_LOG_TYPE[file_mode as usize][file_mode][type_ as usize];
             let mut info_copy = *info;
             info_copy.log_type = warn_log_type as u16;
             self.audit_file_oper_rename(&info_copy, log_level, 0)?;

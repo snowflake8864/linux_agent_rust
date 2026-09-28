@@ -1,9 +1,109 @@
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Error};
 use std::process::Command;
 
+/// os-release 可能的存放位置
+const OS_RELEASE_PATHS: [&str; 2] = ["/etc/os-release", "/usr/lib/os-release"];
+
+/// os-release 缺失时的兜底文件（老版本 CentOS/Kylin、Alpine、Debian 等）
+const OS_FALLBACK_PATHS: [&str; 4] = [
+    "/etc/redhat-release",
+    "/etc/lsb-release",
+    "/etc/alpine-release",
+    "/etc/debian_version",
+];
+
 pub struct SystemInfo;
+
+/// 解析 os-release 内容为 key -> value（去掉引号，忽略空行与注释）
+fn parse_os_release(content: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        let value = if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\'')))
+        {
+            &value[1..value.len() - 1]
+        } else {
+            value
+        };
+        if !key.is_empty() && !value.is_empty() {
+            map.insert(key.to_string(), value.to_string());
+        }
+    }
+    map
+}
+
+/// 读取并解析 os-release
+fn read_os_release() -> Result<HashMap<String, String>, Error> {
+    let mut last_err: Option<Error> = None;
+    for path in OS_RELEASE_PATHS {
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                let map = parse_os_release(&content);
+                if !map.is_empty() {
+                    return Ok(map);
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "os-release not found")))
+}
+
+/// 兜底：从 /etc/redhat-release、/etc/lsb-release、/etc/alpine-release、/etc/debian_version
+/// 中读取发行版描述
+fn read_os_version_fallback() -> Option<String> {
+    for path in OS_FALLBACK_PATHS {
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        let map = parse_os_release(&content);
+        if let Some(desc) = map
+            .get("DISTRIB_DESCRIPTION")
+            .or_else(|| map.get("PRETTY_NAME"))
+        {
+            return Some(desc.clone());
+        }
+        if let Some(line) = content
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            return Some(line.to_string());
+        }
+    }
+    None
+}
+
+/// 根据 os-release 内容拼出版本描述
+fn resolve_os_version(release: &HashMap<String, String>) -> Option<String> {
+    if let Some(pretty) = release.get("PRETTY_NAME") {
+        return Some(pretty.clone());
+    }
+    let name = release.get("NAME").or_else(|| release.get("ID"));
+    let version = release
+        .get("VERSION_ID")
+        .or_else(|| release.get("VERSION"))
+        .or_else(|| release.get("BUILD_ID"));
+    match (name, version) {
+        (Some(name), Some(v)) => Some(format!("{} {}", name, v)),
+        (Some(name), None) => Some(name.clone()),
+        _ => None,
+    }
+}
 
 impl SystemInfo {
     /// 获取主机名称
@@ -13,15 +113,19 @@ impl SystemInfo {
         Ok(hostname.trim().to_string())
     }
 
-    /// 获取操作系统版本
-    fn get_os_version() -> Result<String, Error> {
-        let os_release = fs::read_to_string("/etc/os-release")?;
-        for line in os_release.lines() {
-            if line.starts_with("NAME=") {
-                return Ok(line.trim_start_matches("NAME=").trim_matches('"').to_string());
-            }
-        }
-        Err(io::Error::new(io::ErrorKind::NotFound, "OS version not found"))
+    /// 获取操作系统版本（包含具体发行版本号）
+    ///
+    /// 优先使用 PRETTY_NAME，例如 "Ubuntu 22.04.3 LTS (Jammy Jellyfish)"、
+    /// "CentOS Linux 7 (Core)"、"Kylin Linux Advanced Server V10 (Sword)"、
+    /// "UnionTech OS 20"、"openEuler 22.03 (LTS-SP3)"；
+    /// 部分发行版（如 Alpine）没有 PRETTY_NAME，此时用 NAME + VERSION_ID
+    /// （如 "Alpine 3.18"）或 NAME + VERSION 兜底；连 os-release 都没有的
+    /// 老系统则回退到 /etc/redhat-release 等传统版本文件。
+    pub fn get_os_version() -> Result<String, Error> {
+        let release = read_os_release().unwrap_or_default();
+        resolve_os_version(&release)
+            .or_else(read_os_version_fallback)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "OS version not found"))
     }
 
     /// 获取内核版本
