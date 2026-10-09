@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::process::Command;
 use config::net_info::NETINFO_CONFIG;
+use vpn::{start_background, stop};
 use grpc_gateway::agent_mode::{AgentMode, AGENT_MODE, ADMISSION_NETWORK_ANOMALY};
 use udisk::{StartUsbService, StartUsbHotplugHandler};
 use docker::StartDockerMonitor;
@@ -206,9 +207,18 @@ async fn main() -> std::io::Result<()> {
         let load_process = cfg.db_policy.process_policy;
         let load_peripheral = cfg.db_policy.peripheral_policy;
         let usb_protect = cfg.usb_protect;
+        let vpn_enabled = cfg.vpn_enabled;
         drop(cfg);
         log_info!("[startup] cfg: sqlite_db.enabled={} db_policy.process_policy={} db_policy.peripheral_policy={} usb_protect={} online={}",
             db_enabled, load_process, load_peripheral, usb_protect, online);
+        if vpn_enabled {
+            log_info!("[vpn] VPN 开启，后台启动拨号子进程...");
+            start_background(
+                "/opt/osec/vpn/vpn-helper".to_string(),
+                "/opt/osec/vpn/vpn.conf".to_string(),
+                "/opt/osec/vpn/client.conf".to_string(),
+            );
+        }
         if db_enabled {
             if load_process && !online {
                 // 启动即离线：合并加载在线基线表(上次服务器策略) + 离线本地表(gRPC 策略)，
@@ -743,8 +753,8 @@ async fn main() -> std::io::Result<()> {
 
     // 等待所有任务完成或接收退出信号
     println!("程序正在运行，按 Ctrl+C 或发送 SIGTERM 退出...");
-
     shutdown_signal().await;
+    stop();
     log_info!("程序退出，执行清理...");
 
     // 后端清理：eBPF 模式还原 NET_AGENT 设置的 sysctl（accept_local / ip_forward）

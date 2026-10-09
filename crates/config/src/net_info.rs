@@ -72,6 +72,7 @@ pub struct NetInfoConfig {
     pub grpc_batch_size: usize,
     pub grpc_allow_config_write_online: bool,
     pub grpc_alert_push: bool,
+    pub vpn_enabled: bool,
     pub vigilixav_enabled: bool,
     pub vigilixav_host: String,
     pub vigilixav_port: u16,
