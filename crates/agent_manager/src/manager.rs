@@ -145,6 +145,9 @@ async fn write_proc_self() -> Result<(), String> {
         .map_err(|e| format!("写入失败: {}", e))?;
 
     log_info!("[agent_manager] ✅ 已写入: {}", content.trim());
+    let show_content = format!("show {} 1\n", formatted);
+    file.write_all(show_content.as_bytes())
+        .map_err(|e| format!("写入失败: {}", e))?;
 
  /*
      let mut read_buf = String::new();

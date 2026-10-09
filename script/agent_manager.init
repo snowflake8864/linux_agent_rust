@@ -13,7 +13,7 @@
 
 MONITOR_PID_FILE=/var/run/agent_manager_monitor.pid
 BINARY_PID_FILE=/var/run/agent_manager.pid
-MONITOR=/opt/osec/agent_manager_monitor
+MONITOR=/opt/osec/agent_manager.monitor
 
 start() {
     if [ -f "$MONITOR_PID_FILE" ]; then
@@ -26,7 +26,7 @@ start() {
         fi
     fi
     
-    nohup $MONITOR >/dev/null 2>&1 &
+    nohup $MONITOR start>/dev/null 2>&1 &
     echo "agent_manager monitor started"
 }
 
