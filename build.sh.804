@@ -3,7 +3,7 @@ set -e
 
 echo "Start packaging osec..."
 
-VERSION="3.0.1_T16"
+VERSION="3.0.1_T17"
 OUTPUT_DIR="804_output"
 INSTALLER_NAME="${OUTPUT_DIR}/osec-installer-${VERSION}.sh"
 

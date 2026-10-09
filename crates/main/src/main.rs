@@ -638,22 +638,17 @@ async fn main() -> std::io::Result<()> {
 
     let event_handler = Arc::new(Mutex::new(EventHandler::new()));
     let event_handler_send = Arc::clone(&event_handler);
-    let mut task_kernel_send_handler = None;
     let mut task_kernel_rcv_handler = None;
     if let Some(nl_sock) = nl_sock {
-        task_kernel_send_handler = Some(tokio::spawn({
-            let mut init = init.clone();
-            let tx = file_audit_log_tx.clone();
-            let nl_sock = nl_sock.clone();
-            async move {
-                init.start_kernel_send_handler(nl_sock, event_handler_send, tx)
-                    .await
-                    .map_err(|e| {
-                        logging::log_error!("start_kernel_send_handler 失败: {}", e);
-                        std::io::Error::new(std::io::ErrorKind::Other, e)
-                    })
-            }
-        }));
+        let tx = file_audit_log_tx.clone();
+        let nl_sock_send = nl_sock.clone();
+        let mut init_send = init.clone();
+        if let Err(e) = init_send
+            .start_kernel_send_handler(nl_sock_send, event_handler_send, tx)
+            .await
+        {
+            logging::log_error!("start_kernel_send_handler 失败: {}", e);
+        }
         let event_handler_rcv = Arc::clone(&event_handler);
         task_kernel_rcv_handler = Some(tokio::spawn({
             let mut init = init.clone();
