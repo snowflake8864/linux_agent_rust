@@ -1,0 +1,13 @@
+[package]
+name = "vpn-helper"
+version = "0.10.6"
+edition = "2021"
+resolver = "2"
+
+[[bin]]
+name = "vpn-helper"
+path = "src/main.rs"
+
+[dependencies]
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }

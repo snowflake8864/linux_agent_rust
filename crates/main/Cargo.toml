@@ -49,6 +49,7 @@ ebpf_backend = { path = "../ebpf_backend", optional = true }
 local_store = { path = "../local_store" }
 process_mgr = { path = "../process_mgr" }
 pattern = { path = "../pattern" }
+vpn = { path = "../vpn" }
 tonic = "0.14"
 prost = "0.14"
 #[CKlibm]
