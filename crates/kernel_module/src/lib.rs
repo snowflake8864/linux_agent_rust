@@ -439,7 +439,7 @@ fn log_osec_holders() {
 // ── 驱动失败计数（持久化到文件，跨重启累计）──
 
 const DRIVER_FAIL_COUNT_FILE: &str = "/opt/osec/driver_fail_count";
-pub const MAX_DRIVER_FAILURES: u32 = 3;
+pub const MAX_DRIVER_FAILURES: u32 = 10;
 
 /// 读取持久化的驱动失败次数
 pub fn read_driver_fail_count() -> u32 {

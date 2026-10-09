@@ -121,12 +121,24 @@ impl SystemInfo {
     /// 部分发行版（如 Alpine）没有 PRETTY_NAME，此时用 NAME + VERSION_ID
     /// （如 "Alpine 3.18"）或 NAME + VERSION 兜底；连 os-release 都没有的
     /// 老系统则回退到 /etc/redhat-release 等传统版本文件。
+    
     pub fn get_os_version() -> Result<String, Error> {
         let release = read_os_release().unwrap_or_default();
         resolve_os_version(&release)
             .or_else(read_os_version_fallback)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "OS version not found"))
     }
+    /*
+    fn get_os_version() -> Result<String, Error> {
+        let os_release = fs::read_to_string("/etc/os-release")?;
+        for line in os_release.lines() {
+            if line.starts_with("NAME=") {
+                return Ok(line.trim_start_matches("NAME=").trim_matches('"').to_string());
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::NotFound, "OS version not found"))
+    }
+    */
 
     /// 获取内核版本
     pub fn get_kernel_version() -> Result<String, Error> {

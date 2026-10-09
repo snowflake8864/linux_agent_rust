@@ -220,22 +220,26 @@ impl EventHandler {
 
 async fn handle_echo(data: &[u8], data_len: u32) -> Result<(), String> {
     let data_str = String::from_utf8_lossy(data);
-    println!("Handling ECHO data: {}", data_str);
+    log_info!("Handling ECHO data: {}", data_str);
     Ok(())
 }
 
 async fn handle_register(data: &[u8], _data_len: u32) -> Result<(), String> {
-    println!("Handling REGISTER data: {:?}", data);
+    log_info!("Handling REGISTER data: {:?}", data);
     Ok(())
 }
 
 async fn handle_add_symbol(data: &[u8], _data_len: u32) -> Result<(), String> {
-    println!("Handling ADD_SYMBOL data: {:?}", data);
+    log_info!("Handling ADD_SYMBOL data: {:?}", data);
     Ok(())
 }
 
 async fn handle_unregister(data: &[u8], _data_len: u32) -> Result<(), String> {
-    println!("Handling UNREGISTER data: {:?}", data);
+    log_info!("Handling UNREGISTER data: {:?}", data);
+    Ok(())
+}
+async fn handle_register_notify(data: &[u8], _data_len: u32) -> Result<(), String> {
+    log_info!("Handling REGISTER notify data: {:?}", data);
     Ok(())
 }
 
@@ -287,6 +291,17 @@ pub async fn register_default_event_handlers(event_handler: &Arc<Mutex<EventHand
             },
         )
         .await;
+    handler
+        .register_event_handler(
+            NLPolicyType::NL_POLICY_CMD_REGISTERED_NOTIFY,
+            move |data, len| {
+                let data = data.to_vec();
+                Box::pin(async move { handle_register_notify(&data, len).await })
+            },
+        )
+        .await;
+
+
 }
 
 
