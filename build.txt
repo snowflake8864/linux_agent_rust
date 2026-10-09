@@ -1,3 +1,12 @@
+编译方法：
+# 一步编主程序 + vpn-helper（自动按架构选 SDK 目录）
+./build_vpn.sh x86_64-unknown-linux-musl
+
+# 或单独编 vpn-helper
+FMVPN_SDK_DIR=/opt/osec/vpn/lib cargo zigbuild -p vpn-helper --target x86_64-unknown-linux-musl --release
+产物：target/x86_64-unknown-linux-musl/release/vpn-helper
+注意：SDK 的 .so 依赖的是 libc.so（musl 版），所以必须用 *-musl target。各架构 SDK 目录：x86_64→/opt/osec/vpn/lib，aarch64→sdk/vpn-aarch64，可用 FMVPN_SDK_DIR 覆盖。
+
 rustup default stable
 rustup target add aarch64-unknown-linux-musl
 cargo zigbuild --target aarch64-unknown-linux-musl --release
