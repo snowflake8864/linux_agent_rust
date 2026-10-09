@@ -16,7 +16,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::process::Command;
 use config::net_info::NETINFO_CONFIG;
-use vpn::{start_background, stop};
 use grpc_gateway::agent_mode::{AgentMode, AGENT_MODE, ADMISSION_NETWORK_ANOMALY};
 use udisk::{StartUsbService, StartUsbHotplugHandler};
 use docker::StartDockerMonitor;
@@ -172,6 +171,20 @@ async fn main() -> std::io::Result<()> {
     }
     log_info!("程序开始启动");
 
+    // VPN 拨号（特定环境先拨 VPN 才能连上服务器）：[VPN] ENABLED=1 时后台拉起拨号子进程并保活
+    {
+        let (vpn_enabled, vpn_helper, vpn_conf, vpn_client_conf) = {
+            let cfg = NETINFO_CONFIG.lock().unwrap();
+            (cfg.vpn.enabled, cfg.vpn.helper.clone(), cfg.vpn.conf_path.clone(), cfg.vpn.client_conf.clone())
+        };
+        if vpn_enabled {
+            log_info!("[vpn] 开关已启用，helper={} conf={}，后台开始拨号", vpn_helper, vpn_conf);
+            vpn::start_background(vpn_helper, vpn_conf, vpn_client_conf);
+        } else {
+            log_info!("[vpn] 开关未启用，跳过 VPN 拨号");
+        }
+    }
+
     // 升级后 KYSEC 恢复：若存在标记文件，说明刚经历一次升级，加白并恢复执行控制
     //kysec_restore_after_upgrade().await;
 
@@ -207,18 +220,9 @@ async fn main() -> std::io::Result<()> {
         let load_process = cfg.db_policy.process_policy;
         let load_peripheral = cfg.db_policy.peripheral_policy;
         let usb_protect = cfg.usb_protect;
-        let vpn_enabled = cfg.vpn_enabled;
         drop(cfg);
         log_info!("[startup] cfg: sqlite_db.enabled={} db_policy.process_policy={} db_policy.peripheral_policy={} usb_protect={} online={}",
             db_enabled, load_process, load_peripheral, usb_protect, online);
-        if vpn_enabled {
-            log_info!("[vpn] VPN 开启，后台启动拨号子进程...");
-            start_background(
-                "/opt/osec/vpn/vpn-helper".to_string(),
-                "/opt/osec/vpn/vpn.conf".to_string(),
-                "/opt/osec/vpn/client.conf".to_string(),
-            );
-        }
         if db_enabled {
             if load_process && !online {
                 // 启动即离线：合并加载在线基线表(上次服务器策略) + 离线本地表(gRPC 策略)，
@@ -754,13 +758,15 @@ async fn main() -> std::io::Result<()> {
     // 等待所有任务完成或接收退出信号
     println!("程序正在运行，按 Ctrl+C 或发送 SIGTERM 退出...");
     shutdown_signal().await;
-    stop();
     log_info!("程序退出，执行清理...");
 
     // 后端清理：eBPF 模式还原 NET_AGENT 设置的 sysctl（accept_local / ip_forward）
     if let Some(b) = common::backend::get_backend() {
         b.shutdown();
     }
+
+    // 停止 VPN
+    vpn::stop();
 
     // 卸载驱动
     if let Err(e) = unload_driver() {
