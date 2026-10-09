@@ -13,7 +13,7 @@
 
 MONITOR_PID_FILE=/var/run/osec_monitor.pid
 BINARY_PID_FILE=/var/run/osec_backend.pid
-MONITOR=/opt/osec/osec_monitor
+MONITOR=/opt/osec/osec.monitor
 
 start() {
     if [ -f "$MONITOR_PID_FILE" ]; then
@@ -26,7 +26,7 @@ start() {
         fi
     fi
     
-    nohup $MONITOR >/dev/null 2>&1 &
+    nohup $MONITOR start>/dev/null 2>&1 &
     echo "osec monitor started"
 }
 
