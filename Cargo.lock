@@ -3499,6 +3499,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vpn-helper"
+version = "0.10.6"
+dependencies = [
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
