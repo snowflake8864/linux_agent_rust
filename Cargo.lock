@@ -3502,7 +3502,10 @@ dependencies = [
 name = "vpn-helper"
 version = "0.10.6"
 dependencies = [
+ "log 0.4.29",
+ "logging",
  "serde",
+ "tokio",
  "toml",
 ]
 

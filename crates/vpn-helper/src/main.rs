@@ -11,6 +11,8 @@ use std::os::raw::{c_char, c_int, c_uchar, c_void};
 
 use serde::Deserialize;
 
+use logging::{log_error, log_info};
+
 #[derive(Debug, Deserialize)]
 struct VpnConf {
     vpn: VpnSection,
@@ -115,11 +117,19 @@ extern "C" {
 }
 
 unsafe extern "C" fn vpn_online_status_callback(online: c_int) {
-    eprintln!("[vpn-helper] online={}", online);
+    if online != 0 {
+        log_info!("[vpn-helper] VPN 在线状态回调: online={}（已连接/重连成功）", online);
+    } else {
+        log_error!("[vpn-helper] VPN 在线状态回调: online={}（已断开）", online);
+    }
 }
 
 unsafe extern "C" fn route_status_callback(finish: c_int) {
-    eprintln!("[vpn-helper] route status={}", finish);
+    if finish == 0 {
+        log_info!("[vpn-helper] 路由状态回调: status={}（路由开启成功）", finish);
+    } else {
+        log_error!("[vpn-helper] 路由状态回调: status={}（失败，未开启路由）", finish);
+    }
 }
 
 fn copy_str_to_u8_array(dst: &mut [u8], value: &str) {
@@ -148,13 +158,34 @@ fn print_error(code: c_int) {
         let msg = unsafe { CStr::from_ptr(buf.as_ptr()) }
             .to_string_lossy()
             .into_owned();
-        eprintln!("[vpn-helper] error: {} -> {}", code, msg);
+        log_error!("[vpn-helper] SDK 错误: {} -> {}", code, msg);
     } else {
-        eprintln!("[vpn-helper] error: {}", code);
+        log_error!("[vpn-helper] SDK 错误: {}", code);
+    }
+}
+
+/// 初始化日志：与主程序共用 logging（日志格式带 file:line）。
+/// vpn-helper 是同步进程，需用 tokio runtime block_on 初始化一次；
+/// 配置缺失时退回 stderr，不阻断拨号。
+fn init_logger() {
+    let conf = "/opt/osec/osec_backend.conf";
+    if !std::path::Path::new(conf).exists() {
+        eprintln!("[vpn-helper] 日志配置 {} 不存在，日志仅输出到 stderr", conf);
+        return;
+    }
+    match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => {
+            if let Err(e) = rt.block_on(logging::CustomLogger::init(conf)) {
+                eprintln!("[vpn-helper] 初始化 logging 失败: {}", e);
+            }
+        }
+        Err(e) => eprintln!("[vpn-helper] 创建 tokio runtime 失败: {}", e),
     }
 }
 
 fn main() {
+    init_logger();
+
     let args: Vec<String> = env::args().collect();
     let conf_path = args.get(1).map(|s| s.as_str()).unwrap_or("/opt/osec/vpn/vpn.conf");
     let client_conf = args.get(2).map(|s| s.as_str()).unwrap_or("/opt/osec/vpn/client.conf");
@@ -162,19 +193,19 @@ fn main() {
     let conf_str = match fs::read_to_string(conf_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[vpn-helper] 读取 {} 失败: {}", conf_path, e);
+            log_error!("[vpn-helper] 读取 {} 失败: {}", conf_path, e);
             std::process::exit(2);
         }
     };
     let conf: VpnConf = match toml::from_str(&conf_str) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[vpn-helper] 解析 {} 失败: {}", conf_path, e);
+            log_error!("[vpn-helper] 解析 {} 失败: {}", conf_path, e);
             std::process::exit(2);
         }
     };
 
-    eprintln!(
+    log_info!(
         "[vpn-helper] vpn={}:{} cosign={}:{} user={}",
         conf.vpn.serv_ip, conf.vpn.serv_port, conf.copysign.serv_ip, conf.copysign.serv_port,
         conf.auth.username,
@@ -196,7 +227,7 @@ fn main() {
         print_error(ret);
         std::process::exit(3);
     }
-    eprintln!("[vpn-helper] FM_vpnclientInit OK");
+    log_info!("[vpn-helper] FM_vpnclientInit OK");
 
     unsafe { FM_setTunTransferMode(0) };
 
@@ -221,7 +252,7 @@ fn main() {
             sign_cert_path.as_ptr() as *const c_uchar,
         )
     };
-    eprintln!("[vpn-helper] FM_coopSignLogin ret = {:#010x}({})", login_ret, login_ret);
+    log_info!("[vpn-helper] FM_coopSignLogin ret = {:#010x}({})", login_ret, login_ret);
     if login_ret != 0 {
         print_error(login_ret);
         unsafe {
@@ -242,7 +273,7 @@ fn main() {
             route_status_callback as *mut c_void,
         )
     };
-    eprintln!("[vpn-helper] FM_StartVPN_KeepAlive5 返回 {:#010x}({})", start_ret, start_ret);
+    log_info!("[vpn-helper] FM_StartVPN_KeepAlive5 返回 {:#010x}({})", start_ret, start_ret);
     unsafe {
         let _ = FM_StopVPN();
         let _ = FM_vpnclientUninit();
