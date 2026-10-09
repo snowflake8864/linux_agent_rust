@@ -81,4 +81,9 @@ ENABLED=1
 MODE=1
 RETRY_INTERVAL=60
 MAX_RETRIES=3
+[VPN]
+ENABLED=0
+HELPER=/opt/osec/vpn/vpn-helper
+CONF=/opt/osec/vpn/vpn.conf
+CLIENT_CONF=/opt/osec/vpn/client.conf
 
