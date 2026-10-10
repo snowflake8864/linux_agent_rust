@@ -537,6 +537,8 @@ rm -rf "\$INSTALL_DIR/x86_64-unknown-linux-musl" \
        "\$INSTALL_DIR/aarch64-unknown-linux-musl" \
        "\$INSTALL_DIR/mips64el-unknown-linux-gnuabi64" \
        "\$INSTALL_DIR/loongarch64-unknown-linux-musl"
+rm -rf /tmp/osec_update
+rm -rf /tmp/opt
 
 # --- Deploy services (systemd preferred, fallback to init.d + monitor) ---
     echo "Setting up services..."
