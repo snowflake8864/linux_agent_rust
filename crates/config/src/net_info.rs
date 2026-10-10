@@ -947,7 +947,8 @@ impl NetInfoConfig {
         if self.os.is_empty() {
             self.os = SystemInfo::get_computer_version().unwrap_or_else(|_| "Unknown".to_string());
         }
-        if self.cpu.is_empty() {
+        //if self.cpu.is_empty() 
+        {
             self.cpu = SystemInfo::get_cpu_cores().unwrap_or_else(|_| "Unknown".to_string());
         }
         if self.memsize.is_empty() {

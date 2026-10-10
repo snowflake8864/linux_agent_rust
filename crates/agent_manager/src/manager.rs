@@ -144,7 +144,7 @@ async fn write_proc_self() -> Result<(), String> {
     file.write_all(content.as_bytes())
         .map_err(|e| format!("写入失败: {}", e))?;
 
-    log_info!("[agent_manager] ✅ 已写入: {}", content.trim());
+    //log_info!("[agent_manager] ✅ 已写入: {}", content.trim());
 
  /*
      let mut read_buf = String::new();
@@ -162,7 +162,7 @@ async fn write_proc_self() -> Result<(), String> {
         .map_err(|e| format!("读取失败: {}", e))?;
     let result = String::from_utf8_lossy(&output.stdout);
 
-    log_info!("[agent_manager] 读取结果: {}", result.trim());
+    //log_info!("[agent_manager] 读取结果: {}", result.trim());
 
     Ok(())
 }
