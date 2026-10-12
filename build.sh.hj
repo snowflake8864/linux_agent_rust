@@ -371,6 +371,8 @@ elif [[ "\$MODE" == "upgrade" ]]; then
 
     # 解压新包（新文件覆盖，包含新增的功能段）
     cp -rf /tmp/opt/osec/* "\$INSTALL_DIR/"
+    rm -rf /tmp/osec_update
+    rm -rf /tmp/opt
 
     # 将旧配置中的关键字段回填到新文件
     # 策略：[CLIENTINFO] 全部、[SERVERINFO] 除 VERSION 外全部、[HOSTINFO] 全部用旧值
@@ -525,7 +527,8 @@ rm -rf "\$INSTALL_DIR/x86_64-unknown-linux-musl" \
        "\$INSTALL_DIR/aarch64-unknown-linux-musl" \
        "\$INSTALL_DIR/mips64el-unknown-linux-gnuabi64" \
        "\$INSTALL_DIR/loongarch64-unknown-linux-musl"
-
+rm -rf /tmp/osec_update
+rm -rf /tmp/opt
 # --- Deploy services (systemd preferred, fallback to init.d + monitor) ---
     echo "Setting up services..."
 # 检测 systemd 是否可用

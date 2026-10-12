@@ -15,6 +15,7 @@ struct LinuxDirProc {
 
 const DIRS: &[&str] = &[
     "/bin/",
+    "/sbin/",
     "/usr/bin/",
     "/usr/sbin/",
     "/usr/local/bin/",
