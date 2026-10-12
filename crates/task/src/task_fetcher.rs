@@ -3490,7 +3490,7 @@ async fn write_proc_self() -> Result<(), String> {
     // 直接用 fs::write，更简洁
     fs::write(proc_path, content.as_bytes())
         .map_err(|e| format!("写入失败: {}", e))?;
-
+/*
     log_info!("[agent_manager] 已写入: {}", content.trim());
 
     // 验证读取
@@ -3498,7 +3498,7 @@ async fn write_proc_self() -> Result<(), String> {
         .map_err(|e| format!("读取失败: {}", e))?;
 
     log_info!("[task_fetcher] 读取结果: {}", read_back.trim());
-
+*/
     Ok(())
 }
 
