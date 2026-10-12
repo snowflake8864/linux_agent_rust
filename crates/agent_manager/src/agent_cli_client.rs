@@ -407,13 +407,13 @@ async fn write_proc_self() -> Result<(), String> {
         .map_err(|e| format!("写入失败: {}", e))?;
 
     log_info!("[agent_manager] 已写入: {}", content.trim());
-
+/*
     // 验证读取
     let read_back = fs::read_to_string(proc_path)
         .map_err(|e| format!("读取失败: {}", e))?;
     
     log_info!("[agent_manager] 读取结果: {}", read_back.trim());
-
+*/
     Ok(())
 }
 

@@ -159,14 +159,14 @@ async fn write_proc_self() -> Result<(), String> {
  
      log_info!("[agent_manager] 读取结果: {}", read_buf.trim());
  */
-
+/*
     let output = Command::new("cat")
         .arg(proc_path)
         .output()
         .await
         .map_err(|e| format!("读取失败: {}", e))?;
     let result = String::from_utf8_lossy(&output.stdout);
-
+*/
     //log_info!("[agent_manager] 读取结果: {}", result.trim());
 
     Ok(())
