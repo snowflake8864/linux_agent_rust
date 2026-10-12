@@ -216,6 +216,7 @@ impl StartOnline for BootManager {
                                     }
                                 }
                             } else {
+                                log_info!("获取系统指标失败");
                                 eprintln!("获取系统指标失败");
                             }
                         }
@@ -252,6 +253,7 @@ impl StartOnline for BootManager {
                                     if let Some(json_data) = get_system_metrics() {
 
                                         // 发送到服务器
+                                        //log_info!("puthardwareinfo:{:?}",json_data);
                                         let url = format!("{}/v1/puthardwareinfo", net_client.get_base_url().unwrap_or_default());
                                         match net_client.post_data_async(
                                             &url,
