@@ -80,7 +80,7 @@ cp -f script/osecmonitor package/opt/osec/
 cp -f script/readme.txt package/opt/osec/
 cp -f script/osec.service package/opt/osec/
 cp -f script/agent_manager.service package/opt/osec/
-cp -f script/uninstall.sh.804 package/opt/osec/uninstall.sh
+#cp -f script/uninstall.sh.804 package/opt/osec/uninstall.sh
 cp certs/root-ca.pem package/opt/osec/certs/
 
 # Update version
