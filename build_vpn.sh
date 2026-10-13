@@ -9,12 +9,12 @@ cd "$(dirname "$0")"
 TARGET="${1:-x86_64-unknown-linux-musl}"
 
 case "$TARGET" in
-    # x86_64 构建机即运行机，直接用 /opt/osec/vpn/lib
-    x86_64-*)   DEFAULT_SDK="/opt/osec/vpn/lib" ;;
-    aarch64-*)  DEFAULT_SDK="sdk/vpn-aarch64" ;;
-    mips64el-*) DEFAULT_SDK="sdk/vpn-mips64el" ;;
-    loongarch64-*) DEFAULT_SDK="sdk/vpn-loongarch64" ;;
-    *)          DEFAULT_SDK="sdk/vpn-unknown" ;;
+    # 各架构 SDK 与 vpn/lib_<tag> 对应（打包 build.sh.vpn 整目录拷入，安装脚本按平台三选一）
+    x86_64-*)   DEFAULT_SDK="vpn/lib_x86_64";      ARCH_TAG="x86_64" ;;
+    aarch64-*)  DEFAULT_SDK="vpn/lib_aarch64";      ARCH_TAG="aarch64" ;;
+    mips64el-*) DEFAULT_SDK="sdk/vpn-mips64el";     ARCH_TAG="mips64el" ;;
+    loongarch64-*) DEFAULT_SDK="vpn/lib_loongarch64"; ARCH_TAG="loongarch64" ;;
+    *)          DEFAULT_SDK="sdk/vpn-unknown";      ARCH_TAG="unknown" ;;
 esac
 SDK_DIR="${FMVPN_SDK_DIR:-$DEFAULT_SDK}"
 
@@ -25,6 +25,7 @@ if [ -f "$SDK_DIR/libVpn.so" ]; then
     echo "===== [2/2] 编译拨号子进程 vpn-helper (SDK: $SDK_DIR) ====="
     FMVPN_SDK_DIR="$SDK_DIR" cargo zigbuild -p vpn-helper --target "$TARGET" --release
     echo "产物：target/$TARGET/release/{MagicArmor_0,vpn-helper}"
+    echo "（vpn-helper 与 MagicArmorAgent 一样留在 target/ 下，由 build.sh.vpn 打包进对应平台目录）"
 else
     echo "===== [2/2] 跳过 vpn-helper：$SDK_DIR/libVpn.so 不存在 ====="
     echo "如需 VPN 功能，请把该架构的 5 个 .so 放入 $SDK_DIR 后重跑，或 FMVPN_SDK_DIR=... ./build_vpn.sh $TARGET"
