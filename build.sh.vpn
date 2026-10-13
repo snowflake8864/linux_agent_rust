@@ -352,6 +352,8 @@ elif [[ "\$MODE" == "upgrade" ]]; then
     # 杀掉所有相关进程
     pkill -9 -f MagicArmor_0 2>/dev/null || true
     pkill -9 -f MagicArmorAgent 2>/dev/null || true
+    # vpn-helper 是 MagicArmor_0 拉起的拨号子进程，主进程被 -9 强杀时可能残留，需一并兜底清理
+    pkill -9 -f vpn-helper 2>/dev/null || true
     sleep 1
     
     # 清理老版本残留（无 systemd 环境）
@@ -570,6 +572,8 @@ if [ -d "\$VPN_SRC" ]; then
     else
         echo "  ⚠ 当前平台 \$ARCH 无对应 VPN 库（仅支持 x86_64/aarch64/loongarch64），跳过 VPN 库部署"
     fi
+    # 清理冗余：各平台 lib_<tag> 只是打包中转，装完只留 $VPN_DST/lib，其余删除省空间
+    rm -rf "\$VPN_DST"/lib_*
     chmod 644 "\$VPN_DST"/*.conf 2>/dev/null || true
     chmod 644 "\$VPN_DST"/ca/* 2>/dev/null || true
     chown -R root:root "\$VPN_DST" 2>/dev/null || true
