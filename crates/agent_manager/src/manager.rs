@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use std::process::Stdio;
 use logging::{log_info, log_error};
+use std::os::unix::net::UnixStream;
 //use netlink::netlink::NlSockInfo;
 
 const MAX_WAIT_SECONDS: u64 = 30;
@@ -111,7 +112,7 @@ pub async fn run_agent_manager(mut cmd_rx: Receiver<AgentCommand>) {
         }
     }
 }
-
+/*
 async fn write_proc_self() -> Result<(), String> {
     let now = Utc::now();
 
@@ -170,8 +171,70 @@ async fn write_proc_self() -> Result<(), String> {
     //log_info!("[agent_manager] 读取结果: {}", result.trim());
 
     Ok(())
-}
+} */
 
+
+async fn write_proc_self() -> Result<(), String> {
+    let now = Utc::now();
+
+    let year  = now.year() as u64;   // 2025
+    let month = now.month() as u64;  // 1~12  (不补0)
+    let day   = now.day() as u64;    // 1~31  (不补0)
+
+    // 核心算法：拼接 → 转数字 → +1 → 转字符串
+    let concatenated = format!("{}{}{}", year, month, day);
+    let num = concatenated.parse::<u64>()
+        .map_err(|e| format!("日期拼接解析失败: {}", e))?;
+
+    let final_value = num + 1;
+    let formatted = final_value.to_string();
+
+    let content = format!("veda {} 0", formatted);
+
+    // 1. 驱动模式：/proc/osec/self
+    let proc_path = "/proc/osec/self";
+    if Path::new(proc_path).exists() {
+        log_info!("[agent_manager] Writing {}", proc_path);
+        fs::write(proc_path, format!("{}\n", content).as_bytes())
+            .map_err(|e| format!("写入 {} 失败: {}", proc_path, e))?;
+        log_info!("[agent_manager] 已写入: {}", content);
+        return Ok(());
+    }
+
+    // 2. eBPF 模式：/tmp/.self.sock
+    //    等价于 echo "$pwd" | nc -U /tmp/.self.sock
+    let sock_path = "/tmp/.self.sock";
+    if Path::new(sock_path).exists() {
+        log_info!("[agent_manager] Writing to unix socket {}", sock_path);
+
+        let mut stream = UnixStream::connect(sock_path)
+            .map_err(|e| format!("连接 {} 失败: {}", sock_path, e))?;
+
+        // 关键：设置写超时，避免对端不读导致写入卡死
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .map_err(|e| format!("设置 {} 写超时失败: {}", sock_path, e))?;
+
+        stream
+            .write_all(format!("{}\n", content).as_bytes())
+            .map_err(|e| format!("写入 {} 失败: {}", sock_path, e))?;
+
+        // flush 同样受 write_timeout 约束
+        stream
+            .flush()
+            .map_err(|e| format!("flush {} 失败: {}", sock_path, e))?;
+
+        log_info!("[agent_manager] 已通过 socket 写入: {}", content);
+        return Ok(());
+    }
+
+    // 3. 两者都不存在，跳过（不报错）
+    log_info!(
+        "[agent_manager] 既没有 {} 也没有 {}，跳过写入",
+        proc_path, sock_path
+    );
+    Ok(())
+}
 async fn is_process_running(name: &str) -> bool {
     let output = Command::new("pgrep").arg("-f").arg(name).output().await;
     match output {
