@@ -424,6 +424,9 @@ elif [[ "\$MODE" == "upgrade" ]]; then
 
     # 解压新包（新文件覆盖，包含新增的功能段）
     cp -rf /tmp/opt/osec/* "\$INSTALL_DIR/"
+    rm -rf /tmp/osec_update
+    rm -rf /tmp/opt
+
 
     # 还原 VPN 用户配置（升级永不覆盖用户账号；新装则保留包内模板）
     if [ -d "\$VPN_BAK_DIR" ]; then
