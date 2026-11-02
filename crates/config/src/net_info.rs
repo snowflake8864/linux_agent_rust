@@ -269,7 +269,7 @@ fn run_cmd_capture(cmd: &str, args: &[&str]) -> Result<String, String> {
 }
 
 impl NetInfoConfig {
-    /// 获取主接口（基于 server_ip）
+/*
     fn get_main_interface(server_ip: &str) -> Result<String, String> {
         let out = run_cmd_capture("ip", &["route", "get", server_ip])
             .map_err(|e| format!("ip route get {} failed: {}", server_ip, e))?;
@@ -287,6 +287,56 @@ impl NetInfoConfig {
             server_ip
         ))
     }
+*/
+ /// 获取主接口（基于 server_ip）
+    fn get_main_interface(server_ip: &str) -> Result<String, String> {
+    //Err(format!("No valid interface found for server_ip {}", server_ip))
+    
+        // 1. 优先尝试 ip route get <server_ip>
+        match Self::get_interface_by_route_get(server_ip) {
+            Ok(iface) => Ok(iface),
+                Err(e) => {
+                    // 2. 回退到默认路由
+                    Self::get_interface_by_default_route().map_err(|e2| {
+                            format!(
+                                    "{}; fallback to default route also failed: {}",
+                                    e, e2
+                                   )
+                            })
+                }
+        }
+        
+    }
+
+    /// 通过 ip route get <server_ip> 获取出口接口
+    fn get_interface_by_route_get(server_ip: &str) -> Result<String, String> {
+        let out = run_cmd_capture("ip", &["route", "get", server_ip])
+            .map_err(|e| format!("ip route get {} failed: {}", server_ip, e))?;
+        Self::extract_dev_from_route_output(&out)
+            .ok_or_else(|| format!("No valid interface found for server_ip {}", server_ip))
+    }
+    /// 通过默认路由获取出口接口
+    fn get_interface_by_default_route() -> Result<String, String> {
+        let out = run_cmd_capture("ip", &["route", "show", "default"])
+            .map_err(|e| format!("ip route show default failed: {}", e))?;
+        Self::extract_dev_from_route_output(&out)
+            .ok_or_else(|| "No valid interface found in default route".to_string())
+    }
+
+    /// 从 ip route 输出中提取 dev <iface>（过滤 lo）
+    fn extract_dev_from_route_output(out: &str) -> Option<String> {
+        let re = regex::Regex::new(r"dev\s+(\S+)").ok()?;
+        for line in out.lines() {
+            if let Some(cap) = re.captures(line) {
+                let iface = cap.get(1).unwrap().as_str();
+                if iface != "lo" {
+                    return Some(iface.to_string());
+                }
+            }
+        }
+        None
+    }
+
 
     fn write_net_rule(&self, rule: NetRule) -> Result<(), String> {
         match rule {
@@ -390,7 +440,7 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("SERVERINFO", "SERVERIPPORT") {
             config.server_ip_port = value;
         }
-
+/*
         if let Some(value) = ini.get("SERVERINFO", "SERVER_IP") {
             config.server_ip = value;
 
@@ -414,6 +464,90 @@ impl NetInfoConfig {
                     );
                     "eth0".to_string()
                 });
+
+                log_info!("Main interface set to: {}", config.ifcfg);
+            }
+        }
+*/
+/*
+        if let Some(value) = ini.get("SERVERINFO", "IFCFG") {
+            config.ifcfg = value;
+        }
+
+        if let Some(value) = ini.get("SERVERINFO", "SERVER_IP") {
+            config.server_ip = value;
+
+            if !config.server_ip.is_empty() {
+                let ip_for_route = match Self::extract_ip(&config.server_ip) {
+                    Some(ip) => ip,
+                        None => {
+                            log_error!(
+                                    "Failed to extract IP from server_ip: '{}', using raw value (may fail)",
+                                    config.server_ip
+                                    );
+                            config.server_ip.clone()
+                        }
+                };
+
+                config.ifcfg = Self::get_main_interface(&ip_for_route).unwrap_or_else(|e| {
+                        log_error!(
+                                "Failed to get main interface for IP '{}': {}",
+                                ip_for_route,
+                                e
+                                );
+
+                        // 回退 1：ini 中配置的 IFCFG
+                        if let Some(ifcfg) = ini.get("SERVERINFO", "IFCFG") {
+                        if !ifcfg.is_empty() {
+                        log_info!("Fallback to IFCFG from ini: {}", ifcfg);
+                        return ifcfg;
+                        }
+                        }
+
+                        // 回退 2：eth0
+                        log_error!("IFCFG not configured in ini, using default 'eth0'");
+                        "eth0".to_string()
+                        });
+
+                log_info!("Main interface set to: {}", config.ifcfg);
+            }
+        }
+*/
+// 先用 ini 的 IFCFG 作为默认值（没配就保持空串）
+        if let Some(value) = ini.get("HOSTINFO", "IFCFG") {
+            config.ifcfg = value;
+        }
+
+        if let Some(value) = ini.get("SERVERINFO", "SERVER_IP") {
+            config.server_ip = value;
+
+            if !config.server_ip.is_empty() {
+                let ip_for_route = match Self::extract_ip(&config.server_ip) {
+                    Some(ip) => ip,
+                        None => {
+                            log_error!(
+                                    "Failed to extract IP from server_ip: '{}', using raw value (may fail)",
+                                    config.server_ip
+                                    );
+                            config.server_ip.clone()
+                        }
+                };
+
+                config.ifcfg = Self::get_main_interface(&ip_for_route).unwrap_or_else(|e| {
+                        log_error!(
+                                "Failed to get main interface for IP '{}': {}",
+                                ip_for_route,
+                                e
+                                );
+
+                        if !config.ifcfg.is_empty() {
+                        log_info!("Fallback to IFCFG from ini: {}", config.ifcfg);
+                        config.ifcfg.clone()
+                        } else {
+                        log_error!("IFCFG not configured in ini, using default 'ens33'");
+                        "ens33".to_string()
+                        }
+                        });
 
                 log_info!("Main interface set to: {}", config.ifcfg);
             }
@@ -774,7 +908,7 @@ impl NetInfoConfig {
         writeln!(file, "DEV_UID={}", self.dev_uid)?;
         writeln!(file, "MACID={}", self.macid)?;
         //writeln!(file, "IPS={}", self.ips)?;
-        //writeln!(file, "IFCFG={}", self.ifcfg)?;
+        writeln!(file, "IFCFG={}", self.ifcfg)?;
         //writeln!(file, "OS={}", self.os)?;
         //writeln!(file, "MEMSIZE={}", self.memsize)?;
         writeln!(file, "CPU={}", self.cpu)?;
