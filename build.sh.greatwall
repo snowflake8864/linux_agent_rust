@@ -12,9 +12,9 @@ echo "Start packaging osec..."
 #x86_64
 #VERSION="1.1.1136"
 #aarch64
-VERSION="1.1.1236"
+#VERSION="1.1.1236"
 #loongarch64
-#VERSION="1.1.1332"
+VERSION="1.1.1336"
 #mips64el
 #VERSION="1.1.1432"
 PLATFORM_CODE=$(printf '%s' "$VERSION" | cut -c6)
