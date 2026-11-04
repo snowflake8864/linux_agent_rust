@@ -66,6 +66,12 @@ pub struct SystemInfo {
     self_info: SelfInfo,
 }
 
+/// 读取 /proc/stat 第一行（总的 cpu 行）并解析。
+///
+/// 兼容性说明：
+/// - CentOS 6（内核 2.6.32）的 cpu 行只有 9 个字段：到 guest 为止，没有 guest_nice；
+/// - 较新内核（>= 2.6.33）会有 10 个字段，包含 guest_nice。
+/// 因此这里把前 9 个字段视为必需，guest_nice 视为可选，缺失时按 0 处理。
 fn get_cpu_use_state() -> io::Result<CpuUseState> {
     let file = File::open("/proc/stat")?;
     let mut reader = BufReader::new(file);
@@ -76,8 +82,9 @@ fn get_cpu_use_state() -> io::Result<CpuUseState> {
     let mut parts = line.split_whitespace();
     parts.next(); // 跳过 "cpu" 字段
 
-    if let (Some(user), Some(nice), Some(system), Some(idle), Some(iowait), Some(irq), Some(softirq), Some(steal), Some(guest), Some(guest_nice)) = (
-        parts.next().and_then(|s| s.parse().ok()),
+    // 前 9 个字段在 2.6.32（CentOS 6）上一定存在
+    if let (Some(user), Some(nice), Some(system), Some(idle), Some(iowait),
+            Some(irq), Some(softirq), Some(steal), Some(guest)) = (
         parts.next().and_then(|s| s.parse().ok()),
         parts.next().and_then(|s| s.parse().ok()),
         parts.next().and_then(|s| s.parse().ok()),
@@ -97,25 +104,48 @@ fn get_cpu_use_state() -> io::Result<CpuUseState> {
         cpu_state.softirq = softirq;
         cpu_state.steal = steal;
         cpu_state.guest = guest;
-        cpu_state.guest_nice = guest_nice;
+        // guest_nice 在 CentOS 6 上不存在，缺失时按 0 处理；高版本内核会正常解析
+        cpu_state.guest_nice = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         Ok(cpu_state)
     } else {
         Err(io::Error::new(io::ErrorKind::InvalidData, "Failed to parse /proc/stat"))
     }
 }
 
+/// 计算两次采样之间的 CPU 使用率（百分比）。
+///
+/// 口径说明：
+/// - 总时间 = 所有字段之和（兼容 guest 可能被重复计入 user/nice 的情况，这里沿用
+///   /proc/stat 的原始值直接相加，足以反映整体趋势）；
+/// - 空闲时间 = idle + iowait，与 top 的默认口径接近；
+/// - 若总时间没有增长，返回 0.0，避免除零。
 fn calc_cpu_use_state(o: &CpuUseState, n: &CpuUseState) -> f32 {
-    let od = o.user + o.nice + o.system + o.idle;
-    let nd = n.user + n.nice + n.system + n.idle;
+    let total = |s: &CpuUseState| -> u64 {
+        s.user
+            .saturating_add(s.nice)
+            .saturating_add(s.system)
+            .saturating_add(s.idle)
+            .saturating_add(s.iowait)
+            .saturating_add(s.irq)
+            .saturating_add(s.softirq)
+            .saturating_add(s.steal)
+            .saturating_add(s.guest)
+            .saturating_add(s.guest_nice)
+    };
+    let idle = |s: &CpuUseState| -> u64 { s.idle.saturating_add(s.iowait) };
 
-    let id = n.user.saturating_sub(o.user);
-    let sd = n.system.saturating_sub(o.system);
+    let od = total(o);
+    let nd = total(n);
 
-    if nd == od {
-        0.0
-    } else {
-        ((id + sd) as f32 * 100.0) / (nd - od) as f32
+    if nd <= od {
+        return 0.0;
     }
+
+    let total_delta = nd - od;
+    let idle_delta = idle(n).saturating_sub(idle(o));
+    let busy_delta = total_delta.saturating_sub(idle_delta);
+
+    (busy_delta as f32 * 100.0) / total_delta as f32
 }
 
 fn get_memory_from_proc_meminfo() -> Option<(u64, u64)> {
@@ -171,8 +201,8 @@ fn compute_process_md5(file_path: &str) -> String {
 
     // 创建 Md5 哈希生成器
     let mut hasher = Md5::new();
-    hasher.update(&file_contents);  // 更新哈希计算器
-    let result = hasher.finalize();  // 获取哈希结果
+    hasher.update(&file_contents); // 更新哈希计算器
+    let result = hasher.finalize(); // 获取哈希结果
 
     // 将 MD5 哈希值转换为十六进制字符串并返回
     hex::encode(result)
@@ -183,7 +213,7 @@ pub fn get_system_metrics() -> Option<String> {
     let now_use = match get_cpu_use_state() {
         Ok(state) => state,
         Err(e) => {
-            eprintln!("获取 CPU 使用信息失败: {}", e);
+            log_info!("获取 CPU 使用信息失败: {}", e);
             return None;
         }
     };
@@ -207,28 +237,29 @@ pub fn get_system_metrics() -> Option<String> {
     let mut user_map: HashMap<Uid, String> = HashMap::new();
     let users = sys.users();
     if users.is_empty() {
-        eprintln!("警告: 用户列表为空，sysinfo 可能无法获取用户数据");
+        log_info!("警告: 用户列表为空，sysinfo 可能无法获取用户数据");
     }
     for user in users {
         let uid = user.id().clone(); // 使用 .clone() 消除警告
-//        eprintln!("调试: UID = {}, 用户名 = {}", uid, user.name());
+        // eprintln!("调试: UID = {}, 用户名 = {}", uid, user.name());
         user_map.insert(uid, user.name().to_string());
     }
 
     // CPU 核心数
     let cpu_number = sys.cpus().len().to_string();
-/*
-    // 内存信息
-    let total_memory = sys.total_memory(); // 单位：KB
-    let used_memory = sys.used_memory();
-    let mem_size = format!("{}KB", total_memory);
-    log_info!("内存总量: {}, 已用内存: {}", mem_size,used_memory);
-    let mem_usage = if total_memory > 0 {
-        ((used_memory as f32 / total_memory as f32) * 100.0).to_string()
-    } else {
-        "0".to_string()
-    };
-*/
+
+    /*
+        // 内存信息
+        let total_memory = sys.total_memory(); // 单位：KB
+        let used_memory = sys.used_memory();
+        let mem_size = format!("{}KB", total_memory);
+        log_info!("内存总量: {}, 已用内存: {}", mem_size,used_memory);
+        let mem_usage = if total_memory > 0 {
+            ((used_memory as f32 / total_memory as f32) * 100.0).to_string()
+        } else {
+            "0".to_string()
+        };
+    */
     let bytes_to_kb = |bytes: u64| (bytes + 1023) / 1024; // 四舍五入
 
     let (total_memory_kb, used_memory_kb) = get_memory_from_proc_meminfo().unwrap_or({
@@ -249,16 +280,16 @@ pub fn get_system_metrics() -> Option<String> {
 
     // 日志用 MiB 显示更直观
     let kb_to_mib = |kb: u64| kb as f64 / 1024.0;
-/*
-    log_info!(
-        "内存总量: {:.2}MiB, 实际已用: {:.2}MiB, 可用: {:.2}MiB (free: {:.2}MiB), 使用率: {}%",
-        kb_to_mib(total_memory_kb),
-        kb_to_mib(used_memory_kb),
-        kb_to_mib(available_memory_kb),
-        kb_to_mib(free_memory_kb),
-        mem_usage
-        );
-*/
+    /*
+        log_info!(
+            "内存总量: {:.2}MiB, 实际已用: {:.2}MiB, 可用: {:.2}MiB (free: {:.2}MiB), 使用率: {}%",
+            kb_to_mib(total_memory_kb),
+            kb_to_mib(used_memory_kb),
+            kb_to_mib(available_memory_kb),
+            kb_to_mib(free_memory_kb),
+            mem_usage
+            );
+    */
 
     // 磁盘信息
     let mut total_disk = 0;
@@ -277,58 +308,83 @@ pub fn get_system_metrics() -> Option<String> {
     // 进程信息
     let mut processes: Vec<_> = sys.processes().iter().collect();
     // 按 CPU 使用率排序（Top 5）
-    processes.sort_by(|a, b| b.1.cpu_usage().partial_cmp(&a.1.cpu_usage()).unwrap_or(std::cmp::Ordering::Equal));
-    let cpu_tops: Vec<ProcessInfo> = processes.iter().take(5).map(|(&pid, proc)| {
-        let user = proc.user_id().map(|uid| {
-            user_map.get(&uid).cloned().unwrap_or_else(|| {
-                eprintln!("用户未找到，UID: {:?}", uid);
-                "unknown".to_string()
-            })
-        }).unwrap_or_else(|| {
-            eprintln!("进程 {} 没有有效的 UID", pid);
-            "unknown".to_string()
-        });
-        ProcessInfo {
-            id: pid.to_string(),
-            dir: proc.exe().to_string_lossy().into_owned(),
-            hash: compute_process_md5(&proc.exe().to_string_lossy()),
-            cpu_usage: proc.cpu_usage().to_string(),
-            mem_size: format!("{}KB", proc.memory()),
-            user,
-        }
-    }).collect();
+    processes.sort_by(|a, b| {
+        b.1.cpu_usage()
+            .partial_cmp(&a.1.cpu_usage())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let cpu_tops: Vec<ProcessInfo> = processes
+        .iter()
+        .take(5)
+        .map(|(&pid, proc)| {
+            let user = proc
+                .user_id()
+                .map(|uid| {
+                    user_map.get(&uid).cloned().unwrap_or_else(|| {
+                        eprintln!("用户未找到，UID: {:?}", uid);
+                        "unknown".to_string()
+                    })
+                })
+                .unwrap_or_else(|| {
+                    eprintln!("进程 {} 没有有效的 UID", pid);
+                    "unknown".to_string()
+                });
+            ProcessInfo {
+                id: pid.to_string(),
+                dir: proc.exe().to_string_lossy().into_owned(),
+                hash: compute_process_md5(&proc.exe().to_string_lossy()),
+                cpu_usage: proc.cpu_usage().to_string(),
+                mem_size: format!("{}KB", proc.memory()),
+                user,
+            }
+        })
+        .collect();
 
     // 按内存使用量排序（Top 5）
-    processes.sort_by(|a, b| b.1.memory().partial_cmp(&a.1.memory()).unwrap_or(std::cmp::Ordering::Equal));
-    let mem_tops: Vec<ProcessInfo> = processes.iter().take(5).map(|(&pid, proc)| {
-        let user = proc.user_id().map(|uid| {
-            user_map.get(&uid).cloned().unwrap_or_else(|| {
-                eprintln!("用户未找到，UID: {:?}", uid);
-                "unknown".to_string()
-            })
-        }).unwrap_or_else(|| {
-            eprintln!("进程 {} 没有有效的 UID", pid);
-            "unknown".to_string()
-        });
-        ProcessInfo {
-            id: pid.to_string(),
-            dir: proc.exe().to_string_lossy().into_owned(),
-            hash: compute_process_md5(&proc.exe().to_string_lossy()),
-            cpu_usage: proc.cpu_usage().to_string(),
-            mem_size: format!("{}KB", proc.memory()),
-            user,
-        }
-    }).collect();
+    processes.sort_by(|a, b| {
+        b.1.memory()
+            .partial_cmp(&a.1.memory())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mem_tops: Vec<ProcessInfo> = processes
+        .iter()
+        .take(5)
+        .map(|(&pid, proc)| {
+            let user = proc
+                .user_id()
+                .map(|uid| {
+                    user_map.get(&uid).cloned().unwrap_or_else(|| {
+                        eprintln!("用户未找到，UID: {:?}", uid);
+                        "unknown".to_string()
+                    })
+                })
+                .unwrap_or_else(|| {
+                    eprintln!("进程 {} 没有有效的 UID", pid);
+                    "unknown".to_string()
+                });
+            ProcessInfo {
+                id: pid.to_string(),
+                dir: proc.exe().to_string_lossy().into_owned(),
+                hash: compute_process_md5(&proc.exe().to_string_lossy()),
+                cpu_usage: proc.cpu_usage().to_string(),
+                mem_size: format!("{}KB", proc.memory()),
+                user,
+            }
+        })
+        .collect();
 
     // 当前进程信息
     let self_pid = Pid::from(std::process::id() as usize);
-    let self_info = sys.process(self_pid).map_or(SelfInfo {
-        mem_size: "0KB".to_string(),
-        cpu_usage: "0".to_string(),
-    }, |proc| SelfInfo {
-        mem_size: format!("{}KB", proc.memory()),
-        cpu_usage: proc.cpu_usage().to_string(),
-    });
+    let self_info = sys.process(self_pid).map_or(
+        SelfInfo {
+            mem_size: "0KB".to_string(),
+            cpu_usage: "0".to_string(),
+        },
+        |proc| SelfInfo {
+            mem_size: format!("{}KB", proc.memory()),
+            cpu_usage: proc.cpu_usage().to_string(),
+        },
+    );
 
     // 构建 SystemInfo
     let system_info = SystemInfo {
@@ -352,7 +408,8 @@ pub fn get_system_metrics() -> Option<String> {
     // 构建最终的 JSON 对象，info 字段为字符串
     let final_json = serde_json::json!({
         "info": info_str
-    }).to_string();
+    })
+    .to_string();
 
     Some(final_json)
 }
