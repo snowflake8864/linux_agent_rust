@@ -3461,7 +3461,7 @@ async fn send_command_to_agent(cmd: &str) -> Result<(), String> {
 
     Ok(())
 }
-
+/*
 async fn write_proc_self() -> Result<(), String> {
     let now = Utc::now();
 
@@ -3499,6 +3499,69 @@ async fn write_proc_self() -> Result<(), String> {
 
     log_info!("[task_fetcher] 读取结果: {}", read_back.trim());
 */
+    Ok(())
+}
+*/
+
+async fn write_proc_self() -> Result<(), String> {
+    let now = Utc::now();
+
+    let year  = now.year() as u64;
+    let month = now.month() as u64;
+    let day   = now.day() as u64;
+
+    let concatenated = format!("{}{}{}", year, month, day);
+    let num = concatenated.parse::<u64>()
+        .map_err(|e| format!("日期拼接解析失败: {}", e))?;
+
+    let final_value = num + 1;
+    let formatted = final_value.to_string();
+
+    let content = format!("veda {} 0", formatted);
+
+    // 1. 驱动模式
+    let proc_path = "/proc/osec/self";
+    if Path::new(proc_path).exists() {
+        log_info!("[agent_manager] Writing {}", proc_path);
+        fs::write(proc_path, format!("{}\n", content).as_bytes())
+            .map_err(|e| format!("写入 {} 失败: {}", proc_path, e))?;
+        log_info!("[agent_manager] 已写入: {}", content);
+        return Ok(());
+    }
+
+    // 2. eBPF 模式
+    let sock_path = "/tmp/.self.sock";
+    if Path::new(sock_path).exists() {
+        log_info!("[agent_manager] Writing to unix socket {}", sock_path);
+
+        let data = format!("{}\n", content);
+        let sock = sock_path.to_string();
+
+        let write_fut = async move {
+            let mut stream = UnixStream::connect(&sock).await?;
+            stream.write_all(data.as_bytes()).await?;
+            stream.flush().await?;
+            Ok::<_, std::io::Error>(())
+        };
+
+        match timeout(Duration::from_secs(2), write_fut).await {
+            Ok(Ok(())) => {
+                log_info!("[agent_manager] 已通过 socket 写入: {}", content);
+            }
+            Ok(Err(e)) => {
+                return Err(format!("socket 写入 {} 失败: {}", sock_path, e));
+            }
+            Err(_) => {
+                return Err(format!("socket 写入 {} 超时", sock_path));
+            }
+        }
+        return Ok(());
+    }
+
+    log_info!(
+        "[agent_manager] 既没有 {} 也没有 {}，跳过写入",
+        proc_path, sock_path
+    );
     Ok(())
 }
 
