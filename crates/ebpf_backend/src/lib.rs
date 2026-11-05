@@ -1945,11 +1945,11 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
     pub fn scan_container_overlays(&self) -> anyhow::Result<usize> {
         use std::os::unix::fs::MetadataExt;
 
-        // 容器 overlay 根目录模式
+        // 容器 overlay 根目录模式（暂时全部关闭，保留，后续可恢复）
         let overlay_roots: &[&str] = &[
-            "/var/lib/docker/overlay2",
-            "/var/lib/containers/storage/overlay",
-            "/var/lib/containerd/io.containerd.snapshot.v1.overlayfs/snapshots",
+            // "/var/lib/docker/overlay2",
+            // "/var/lib/containers/storage/overlay",
+            // "/var/lib/containerd/io.containerd.snapshot.v1.overlayfs/snapshots",
         ];
 
         let mut merged_dirs: Vec<(String, Arc<std::os::fd::OwnedFd>)> = Vec::new();
@@ -2301,10 +2301,11 @@ impl SecurityBackend for EbpfBackend {
     }
 
     fn get_executable_overlay_roots(&self) -> Vec<String> {
+        // 暂时全部关闭容器 overlay 预扫描（保留，后续可恢复）
         let overlay_roots: &[&str] = &[
-            "/var/lib/docker/overlay2",
-            "/var/lib/containers/storage/overlay",
-            "/var/lib/containerd/io.containerd.snapshot.v1.overlayfs/snapshots",
+            // "/var/lib/docker/overlay2",
+            // "/var/lib/containers/storage/overlay",
+            // "/var/lib/containerd/io.containerd.snapshot.v1.overlayfs/snapshots",
         ];
         let mut merged_dirs = Vec::new();
         for root in overlay_roots {
