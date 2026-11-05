@@ -19,3 +19,4 @@ common = { path = "../common" }
 reporter = { path = "../reporter" }
 logging = { path = "../logging" }
 local_store = { path = "../local_store" }
+inotify = "0.10"

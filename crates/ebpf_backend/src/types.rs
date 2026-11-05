@@ -142,6 +142,8 @@ pub struct UnifiedEvent {
     pub event_type: u8,
     pub dev: u64,
     pub inode: u64,
+    /// 进程所属 cgroup v2 id（kernfs inode），与 /sys/fs/cgroup 目录 stat 的 inode 一致
+    pub cgid: u64,
     pub pid: u32,
     pub uid: u32,
     pub blocked: u8,
@@ -151,8 +153,8 @@ pub struct UnifiedEvent {
 
 unsafe impl aya::Pod for UnifiedEvent {}
 
-/// Size of proc UnifiedEvent in eBPF = 184 bytes
-pub const UNIFIED_EVENT_SIZE: usize = 184;
+/// Size of proc UnifiedEvent in eBPF = 192 bytes
+pub const UNIFIED_EVENT_SIZE: usize = 192;
 
 const _: () = assert!(std::mem::size_of::<UnifiedEvent>() == UNIFIED_EVENT_SIZE);
 

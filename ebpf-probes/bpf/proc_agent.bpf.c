@@ -105,11 +105,12 @@ struct {
 
 // ===== Helper Structures =====
 // 内存布局必须与 Rust 侧 types.rs 的 UnifiedEvent 完全一致：
-// repr(C): event_type 后填充 7 字节对齐到 8，总大小 = 184 字节。
+// repr(C): event_type 后填充 7 字节对齐到 8，总大小 = 192 字节。
 struct unified_event {
     __u8 type;
     __u64 dev;
     __u64 inode;
+    __u64 cgid;          // 进程所属 cgroup v2 id（kernfs inode），用于容器归属判定
     __u32 pid;
     __u32 uid;
     __u8 blocked;
@@ -127,6 +128,7 @@ static __always_inline void send_monitor_event(__u8 type, const char *path, __u8
     e->type = type;
     e->dev = dev;
     e->inode = inode;
+    e->cgid = bpf_get_current_cgroup_id();
     e->pid = bpf_get_current_pid_tgid() >> 32;
     e->uid = bpf_get_current_uid_gid();
     e->blocked = blocked;
