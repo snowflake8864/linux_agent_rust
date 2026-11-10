@@ -111,6 +111,8 @@ pub struct Md5Entry {
     pub inode: u64,
     pub dev: u64,
     pub path: String,
+    /// 文件 mtime（秒）；容器条目为 0（宿主机不可 stat），用于规避 inode 复用误映射。
+    pub mtime: u64,
 }
 
 // ── 虚拟开端口（端口虚开/重定向）──
@@ -1268,6 +1270,151 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         Some(hex::encode(md5::compute(&data).0))
     }
 
+    /// 文件 mtime（秒）；不可读取时返回 0。
+    fn file_mtime_secs(path: &str) -> u64 {
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// 进程身份路径：去掉容器 /proc/<pid>/root 前缀，保留可持久化的逻辑路径。
+    fn clean_identity_path(path: &str) -> String {
+        Self::strip_proc_root_prefix(path).to_string()
+    }
+
+    /// 读取 md5_map 中某 hash 的全部 (dev,inode) 快照（克隆后立即释放读锁）。
+    fn md5_entries(&self, hash: &str) -> Option<Vec<Md5Entry>> {
+        let map = match self.md5_map.read() {
+            Ok(g) => g,
+            Err(e) => {
+                log::error!("[EbpfBackend] ❌ md5_map read poisoned (md5_entries), recovering");
+                e.into_inner()
+            }
+        };
+        map.get(hash).cloned()
+    }
+
+    /// 校验宿主条目的 (dev,inode,mtime) 仍与磁盘一致；容器条目（mtime=0）跳过校验。
+    /// 用于规则下发前过滤 inode 复用/文件替换产生的过期映射。
+    fn md5_entry_valid(entry: &Md5Entry) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        if entry.mtime == 0 {
+            return true;
+        }
+        match std::fs::metadata(&entry.path) {
+            Ok(m) => {
+                let mtime = m.modified().ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                m.dev() == entry.dev && m.ino() == entry.inode && mtime == entry.mtime
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// 记录一次已解析的进程身份（不涉及策略动作）：
+    /// - inode_md5_map 反查（后续事件免重复算 MD5）
+    /// - md5_map 正查（规则下发时把 hash 翻译成 (dev,inode)）
+    /// - md5_inode_cache 持久化（重启后 load_md5_inode_cache 重建 md5_map）
+    /// 按 (dev,inode) 去重，避免同一进程反复上报导致表膨胀。
+    fn record_process_identity(&self, dev: u64, inode: u64, hash: &str, path: &str, mtime: u64) {
+        if hash.is_empty() || path.is_empty() {
+            return;
+        }
+
+        // 同一 inode 内容变化（hash 变了）时，从旧 hash 桶移除，避免残留过期映射。
+        let prev_hash = match self.inode_md5_map.read() {
+            Ok(g) => g.get(&(dev, inode)).map(|r| r.md5.clone()),
+            Err(e) => e.into_inner().get(&(dev, inode)).map(|r| r.md5.clone()),
+        };
+        if let Some(old_hash) = prev_hash {
+            if old_hash != hash {
+                if let Ok(mut map) = self.md5_map.write() {
+                    if let Some(entries) = map.get_mut(&old_hash) {
+                        entries.retain(|e| !(e.dev == dev && e.inode == inode));
+                    }
+                }
+            }
+        }
+
+        {
+            let mut map = match self.inode_md5_map.write() {
+                Ok(g) => g,
+                Err(e) => {
+                    log::error!("[EbpfBackend] ❌ inode_md5_map write poisoned (record), recovering");
+                    e.into_inner()
+                }
+            };
+            map.insert(
+                (dev, inode),
+                InodeMd5Rec { md5: hash.to_string(), mtime, path: path.to_string() },
+            );
+        }
+
+        let inserted = {
+            let mut map = match self.md5_map.write() {
+                Ok(g) => g,
+                Err(e) => {
+                    log::error!("[EbpfBackend] ❌ md5_map write poisoned (record), recovering");
+                    e.into_inner()
+                }
+            };
+            let entries = map.entry(hash.to_string()).or_insert_with(Vec::new);
+            if let Some(existing) = entries.iter_mut().find(|e| e.dev == dev && e.inode == inode) {
+                // 同一身份再次出现：刷新 path/mtime，避免残留过期校验值。
+                existing.path = path.to_string();
+                existing.mtime = mtime;
+                false
+            } else {
+                entries.push(Md5Entry { inode, dev, path: path.to_string(), mtime });
+                true
+            }
+        };
+
+        if inserted {
+            local_store::md5_inode_cache::persist_if_enabled(hash, path);
+        }
+    }
+
+    /// 规则下发时若 md5_map 尚无该 hash，尝试用持久化的 hash→path 反查文件：
+    /// stat 校验 (dev,inode) 并按内容重算 MD5，命中后补全身份，供直接写 BPF。
+    fn resolve_identity_from_cache(&self, hash: &str) -> Option<Md5Entry> {
+        use std::os::unix::fs::MetadataExt;
+
+        let path = local_store::md5_inode_cache::get_path(hash)?;
+        if !path.starts_with('/') {
+            return None;
+        }
+        let data = std::fs::read(&path).ok()?;
+        if data.len() < 4 || &data[..4] != b"\x7fELF" {
+            return None;
+        }
+        // 文件内容已变化则放弃，避免沿用旧 hash 误放行/误拦。
+        if hex::encode(md5::compute(&data).0) != hash {
+            return None;
+        }
+        let meta = std::fs::metadata(&path).ok()?;
+        let mtime = meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let entry = Md5Entry {
+            inode: meta.ino(),
+            dev: meta.dev(),
+            path: path.clone(),
+            mtime,
+        };
+        self.record_process_identity(entry.dev, entry.inode, hash, &path, mtime);
+        if let Ok(mut cache) = self.path_hash_cache.write() {
+            cache.insert(path, (hash.to_string(), mtime));
+        }
+        Some(entry)
+    }
+
     /// 上报文件告警
     fn report_file_event(&self, path: &str, comm: &str, n_type: u16, action: &str, pid: u32, op_type: u8, op_name: &str) {
         let md5_hash = self.get_md5_cached(path);
@@ -1585,74 +1732,51 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             }
         };
 
+        // 3. 无论是否命中名单，都记录该进程身份（去重）。
+        //    这样后续服务器下发规则、或重启后重建 md5_map 时，可把 hash 直接翻译成
+        //    (dev,inode) 写入 BPF，而不必等第一次 exec 被拦后再补。
+        let (dev, inode) = key;
+        if !path.is_empty() {
+            let clean_path = Self::clean_identity_path(path);
+            // 容器逻辑路径宿主机不可 stat，mtime 记 0；宿主路径取真实 mtime。
+            let mtime = if clean_path == path {
+                Self::file_mtime_secs(&clean_path)
+            } else {
+                0
+            };
+            self.record_process_identity(dev, inode, hash, &clean_path, mtime);
+        }
+
         let action = match action {
             Some(a) => a,
-            None => return None, // 不在任何名单：真正的不明进程
+            None => return None, // 不在任何名单：真正的不明进程（身份已记录）
         };
 
-        // 3. 命中黑白名单 → 把同 MD5 的所有已知 (dev,inode) 都补写入 BPF proc_rules
+        // 4. 命中黑白名单 → 把同 MD5 的所有已知 (dev,inode) 都补写入 BPF proc_rules
         //    不仅当前命中这对，md5_map 中同一 MD5 的其他 (dev,inode) 也必须覆盖，
         //    否则同一二进制在不同 mount ns / overlay 路径执行时仍会被当作未知进程。
-        let (dev, inode) = key;
         let mode = if self.proc_protect { 2u8 } else { 1u8 };
         if let Err(e) = self.add_proc_rule_by_inode(dev as u32, inode, action, mode) {
             log::warn!("[EbpfBackend] 补写 proc_rules 失败 (当前 key): {}", e);
         }
-        // 先把当前 (dev,inode) 写入 md5_map，再读取全量条目一次性补写
-        if !path.is_empty() {
-            let clean_path = {
-                let mut slash_count = 0u32;
-                let mut cut_pos = 0usize;
-                for (i, c) in path.char_indices() {
-                    if c == '/' {
-                        slash_count += 1;
-                        if slash_count == 4 {
-                            cut_pos = i + 1;
-                            break;
-                        }
-                    }
+        // 读取 md5_map 中该 MD5 的全部 (dev,inode)，批量补写 BPF proc_rules
+        if let Some(entries) = self.md5_entries(hash) {
+            let mut written = 0;
+            for entry in entries {
+                if entry.dev == dev && entry.inode == inode {
+                    continue; // 当前 key 已写过，跳过
                 }
-                if cut_pos > 0 && cut_pos < path.len() {
-                    path[cut_pos..].to_string()
+                if !Self::md5_entry_valid(&entry) {
+                    continue; // 过期映射，跳过
+                }
+                if let Err(err) = self.add_proc_rule_by_inode(entry.dev as u32, entry.inode, action, mode) {
+                    log::warn!("[EbpfBackend] 批量补写 proc_rules 失败: dev={} inode={} err={}", entry.dev, entry.inode, err);
                 } else {
-                    path.to_string()
-                }
-            };
-            match self.md5_map.write() {
-                Ok(mut map) => {
-                    map.entry(hash.to_string()).or_insert_with(Vec::new)
-                        .push(Md5Entry { inode, dev, path: clean_path.clone() });
-                }
-                Err(e) => {
-                    log::error!("[EbpfBackend] ❌ md5_map mutex poisoned! recovering... err={}", e);
-                    let mut map = e.into_inner();
-                    map.entry(hash.to_string()).or_insert_with(Vec::new)
-                        .push(Md5Entry { inode, dev, path: clean_path.clone() });
+                    written += 1;
                 }
             }
-            local_store::md5_inode_cache::persist_if_enabled(hash, &clean_path);
-        }
-        // 读取 md5_map 中该 MD5 的全部 (dev,inode)，批量补写 BPF proc_rules
-        {
-            let md5_map = match self.md5_map.read() {
-                Ok(g) => g,
-                Err(e) => { log::error!("[EbpfBackend] ❌ md5_map read poisoned (batch补写), recovering"); e.into_inner() }
-            };
-            if let Some(entries) = md5_map.get(hash) {
-                let mut written = 0;
-                for entry in entries {
-                    if entry.dev as u64 == dev && entry.inode == inode {
-                        continue; // 当前 key 已写过，跳过
-                    }
-                    if let Err(err) = self.add_proc_rule_by_inode(entry.dev as u32, entry.inode, action, mode) {
-                        log::warn!("[EbpfBackend] 批量补写 proc_rules 失败: dev={} inode={} err={}", entry.dev, entry.inode, err);
-                    } else {
-                        written += 1;
-                    }
-                }
-                if written > 0 {
-                    log::info!("[EbpfBackend] 🔎 同 MD5 批量补写 {} 条 proc_rules (hash={})", written, &hash[..8.min(hash.len())]);
-                }
+            if written > 0 {
+                log::info!("[EbpfBackend] 🔎 同 MD5 批量补写 {} 条 proc_rules (hash={})", written, &hash[..8.min(hash.len())]);
             }
         }
         {
@@ -1694,7 +1818,12 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         let to_remove: Vec<String> = pending.iter()
             .filter_map(|(hash, action)| {
                 if let Some(entries) = md5_map.get(hash.as_str()) {
-                    for e in entries {
+                    let valid: Vec<&Md5Entry> =
+                        entries.iter().filter(|e| Self::md5_entry_valid(e)).collect();
+                    if valid.is_empty() {
+                        return None; // 仅有过期映射，继续等待扫描/反查
+                    }
+                    for e in valid {
                         let _ = self.add_proc_rule_by_inode(e.dev as u32, e.inode, *action, mode);
                     }
                     replayed += 1;
@@ -1715,6 +1844,9 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             for (hash, &action) in applied.iter() {
                 if let Some(entries) = md5_map.get(hash.as_str()) {
                     for e in entries {
+                        if !Self::md5_entry_valid(e) {
+                            continue;
+                        }
                         if self.add_proc_rule_by_inode(e.dev as u32, e.inode, action, mode).is_ok() {
                             patched += 1;
                         }
@@ -1846,7 +1978,7 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                         .unwrap_or(0);
                     let key = (meta.dev(), meta.ino());
                     path_cache_entries.push((path_str.clone(), (hash.clone(), mtime)));
-                    md5_entries.push((hash.clone(), Md5Entry { inode: key.1, dev: key.0, path: path_str.clone() }));
+                    md5_entries.push((hash.clone(), Md5Entry { inode: key.1, dev: key.0, path: path_str.clone(), mtime }));
                     inode_recs.push((key, InodeMd5Rec { md5: hash, mtime, path: path_str }));
                     count += 1;
                 }
@@ -1906,7 +2038,7 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                 .unwrap_or(0);
             path_cache.insert(path.clone(), (hash.clone(), mtime));
             map.entry(hash.clone()).or_insert_with(Vec::new)
-                .push(Md5Entry { inode: md.ino(), dev: md.dev(), path: path.clone() });
+                .push(Md5Entry { inode: md.ino(), dev: md.dev(), path: path.clone(), mtime });
             self.inode_md5_map.write().unwrap()
                 .insert((md.dev(), md.ino()), InodeMd5Rec { md5: hash, mtime, path });
             count += 1;
@@ -2070,7 +2202,7 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                     let mtime = 0; // 容器条目 mtime=0，不参与失效校验
 
                     md5_entries.push((hash.clone(), Md5Entry {
-                        inode: key.1, dev: key.0, path: container_path.to_string(),
+                        inode: key.1, dev: key.0, path: container_path.to_string(), mtime,
                     }));
                     inode_recs.push((key, InodeMd5Rec {
                         md5: hash.clone(), mtime, path: container_path.to_string(),
@@ -2172,7 +2304,6 @@ impl SecurityBackend for EbpfBackend {
         // 注意：批处理可能混合「新增 + 删除 + 黑↔白互转」，必须逐行解析 action，不能按整批判断黑白。
         // mode: 1=监控(MONITOR) 2=保护(PROTECT)，由 PROC_PROTECT/FILE_PROTECT 控制
         let mode = if self.proc_protect { 2u8 } else { 1u8 };
-        let md5_map = self.md5_map.read().unwrap();
         let mut applied = 0;
         let mut pending = 0;
 
@@ -2199,27 +2330,44 @@ impl SecurityBackend for EbpfBackend {
             let hash = &line[..idx];
             let action = if line[idx + 1..].starts_with('0') { 0u8 } else { 1u8 };
 
-            if let Some(entries) = md5_map.get(hash) {
-                for e in entries {
+            // 1) md5_map 已有映射：直接翻译为 (dev,inode) 写 BPF。
+            // 2) md5_map 没有：先用持久化的 hash→path 反查文件，校验 MD5 后补全身份再写 BPF，
+            //    避免规则已下发却因未扫描而进 pending、等首次 exec 被拦后才补。
+            // 3) 仍无法解析：暂存 pending_rules，等扫描/replay 补写。
+            let mut entries = self.md5_entries(hash).unwrap_or_default();
+            // 过滤过期映射（inode 复用/文件替换）。
+            entries.retain(Self::md5_entry_valid);
+            if entries.is_empty() {
+                if let Some(entry) = self.resolve_identity_from_cache(hash) {
+                    log::info!(
+                        "[EbpfBackend] 🎯 规则下发前反查命中: hash={} dev={} inode={} path={}",
+                        &hash[..8.min(hash.len())], entry.dev, entry.inode, entry.path
+                    );
+                    entries.push(entry);
+                }
+            }
+
+            if !entries.is_empty() {
+                for e in &entries {
                     let _ = self.add_proc_rule_by_inode(e.dev as u32, e.inode, action, mode);
                 }
                 self.applied_rules.lock().unwrap().insert(hash.to_string(), action);
                 applied += 1;
             } else {
-                // md5_map 尚未包含此 hash，暂存到 pending_rules，等扫描填充后补写
                 self.pending_rules.lock().unwrap().insert(hash.to_string(), action);
                 pending += 1;
             }
 
-            // 同步 process_cache（追加，不整体覆盖）
-            if action == 0 {
-                self.process_cache.lock().unwrap().0.push(hash.to_string());
-            } else {
-                self.process_cache.lock().unwrap().1.push(hash.to_string());
+            // 同步 process_cache（追加，不整体覆盖；同一 hash 不重复入列）
+            let mut cache = self.process_cache.lock().unwrap();
+            let list = if action == 0 { &mut cache.0 } else { &mut cache.1 };
+            if !list.iter().any(|x| x == hash) {
+                list.push(hash.to_string());
             }
+            drop(cache);
         }
 
-        //log::info!("[EbpfBackend] add_md5_rules: 已下发 {} 条, 待扫描 {} 条", applied, pending);
+        log::info!("[EbpfBackend] add_md5_rules: 已下发 {} 条, 待扫描/反查未命中 {} 条", applied, pending);
         // 有规则真正写入 proc_rules（在线 push 且 md5_map 已就绪）→ 首次加载完成，开启进程检测
         if applied > 0 {
             self.enable_proc_detection();
