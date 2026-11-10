@@ -43,6 +43,7 @@ const PROCESS_PATTERNS: &[ProcessPattern] = &[
     ProcessPattern { key: "/bin/login", typ: 1, param: ",match_full_path=1" },
     ProcessPattern { key: "bin/du", typ: 1, param: ",pkt_len=-1" },
     ProcessPattern { key: "bin/dash", typ: 1, param: ",pkt_len=-1" },
+    ProcessPattern { key: "bin/nc", typ: 1, param: ",pkt_len=-1" },
     ProcessPattern { key: "/bin/run-parts", typ: 1, param: ",match_full_path=1" },
     ProcessPattern { key: "/sbin/dhclient-script", typ: 1, param: ",match_full_path=1" },
     ProcessPattern { key: "bin/sort", typ: 1, param: ",pkt_len=-1" },
