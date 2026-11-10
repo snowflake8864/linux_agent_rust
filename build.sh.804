@@ -212,7 +212,7 @@ check_and_enable_bpf_lsm() {
     if [ -n "\$LSM_LINE" ]; then
         LINE_NUM=\$(echo "\$LSM_LINE" | cut -d: -f1)
         echo "   📝 Appending bpf to lsm= at line \$LINE_NUM"
-        sed -i "\${LINE_NUM}s/lsm=\([^\"]*\)/lsm=\1,bpf/" /etc/default/grub
+        sed -i "\${LINE_NUM}s/lsm=\([^\" ]*\)/lsm=\1,bpf/" /etc/default/grub
     else
         echo "   📝 Adding lsm=bpf to GRUB_CMDLINE_LINUX"
         if grep -q '^GRUB_CMDLINE_LINUX=' /etc/default/grub; then
