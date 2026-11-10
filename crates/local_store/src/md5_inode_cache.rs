@@ -39,6 +39,27 @@ pub fn load_all() -> Result<Vec<(String, String)>> {
     rows.collect()
 }
 
+/// 按 hash 查询持久化的 path（开关关闭或未命中时返回 None）。
+pub fn get_path(hash: &str) -> Option<String> {
+    if !crate::sqlite_db_enabled() {
+        return None;
+    }
+    let db_ok = config::net_info::NETINFO_CONFIG
+        .lock()
+        .map(|c| c.db_policy.md5_inode_cache)
+        .unwrap_or(false);
+    if !db_ok {
+        return None;
+    }
+    let conn = sqlite_db::db::open_conn(DB_PATH).ok()?;
+    conn.query_row(
+        "SELECT path FROM md5_inode_cache WHERE hash = ?1",
+        params![hash],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
 /// 插入或更新（hash 去重）
 pub fn upsert(hash: &str, path: &str) -> Result<()> {
     let conn = sqlite_db::db::open_conn(DB_PATH)?;
