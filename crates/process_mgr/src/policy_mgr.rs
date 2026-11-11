@@ -246,43 +246,30 @@ impl ProcessPolicyManager {
         self.white_set.clear();
         self.black_set.clear();
 
-        // 1. 在线基线表（上次服务器策略）
-        let mut online_white = 0usize;
-        let mut online_black = 0usize;
-        match local_store::process_policy::load_all() {
-            Ok(entries) => {
-                for (hash, is_white) in entries {
-                    if is_white {
-                        self.white_set.insert(hash);
-                        online_white += 1;
-                    } else {
-                        self.black_set.insert(hash);
-                        online_black += 1;
-                    }
-                }
-            }
-            Err(e) => logging::log_error!("[process_policy] 加载在线基线表失败: {}", e),
+        // 基线表是当前生效策略（服务器与 gRPC 同等写入）。
+        // 兼容旧版本：基线为空且旧本地表有数据时才回退本地表。
+        let mut entries = local_store::process_policy::load_all()
+            .map_err(|e| logging::log_error!("[process_policy] 加载基线表失败: {}", e))
+            .unwrap_or_default();
+        let mut source = "baseline";
+        if entries.is_empty() && local_store::process_policy::local_present().unwrap_or(false) {
+            entries = local_store::process_policy::load_all_local()
+                .map_err(|e| logging::log_error!("[process_policy] 加载本地表失败: {}", e))
+                .unwrap_or_default();
+            source = "legacy-local";
         }
 
-        // 2. 离线本地表（gRPC 策略），同 hash 覆盖在线
-        match local_store::process_policy::load_all_local() {
-            Ok(entries) => {
-                for (hash, is_white) in entries {
-                    self.white_set.remove(&hash);
-                    self.black_set.remove(&hash);
-                    if is_white {
-                        self.white_set.insert(hash);
-                    } else {
-                        self.black_set.insert(hash);
-                    }
-                }
+        for (hash, is_white) in entries {
+            if is_white {
+                self.white_set.insert(hash);
+            } else {
+                self.black_set.insert(hash);
             }
-            Err(e) => logging::log_error!("[process_policy] 加载离线本地表失败: {}", e),
         }
 
         log::info!(
-            "[process_policy] 合并加载完成: 在线基线(白{} 黑{}) + 本地覆盖 => 最终 白{} 黑{}",
-            online_white, online_black, self.white_set.len(), self.black_set.len()
+            "[process_policy] 从 DB({}) 加载完成: 白{} 黑{}",
+            source, self.white_set.len(), self.black_set.len()
         );
     }
 
@@ -335,7 +322,7 @@ impl ProcessPolicyManager {
         if !db_ok {
             return;
         }
-        match local_store::process_policy::save_all_local(&[], &[]) {
+        match local_store::process_policy::clear_local() {
             Ok(()) => log_info!("[process_policy] 已清空离线本地表（上线，服务器策略接管）"),
             Err(e) => log_error!("[process_policy] 清空离线本地表失败: {}", e),
         }
@@ -354,6 +341,11 @@ impl ProcessPolicyManager {
         if !db_ok {
             return;
         }
+        let local_present = local_store::process_policy::local_present().unwrap_or(false);
+        if !local_present {
+            log_info!("[process_policy] 离线本地表未写入，保留当前服务器策略");
+            return;
+        }
         let entries = match local_store::process_policy::load_all_local() {
             Ok(e) => e,
             Err(e) => {
@@ -361,10 +353,6 @@ impl ProcessPolicyManager {
                 return;
             }
         };
-        if entries.is_empty() {
-            log_info!("[process_policy] 离线本地表为空，保留当前服务器策略");
-            return;
-        }
         let mut white = Vec::new();
         let mut black = Vec::new();
         for (hash, is_white) in entries {

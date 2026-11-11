@@ -5,6 +5,8 @@ pub mod jump_status;
 pub mod known_executables;
 pub mod md5_inode_cache;
 pub mod peripheral_policy;
+pub mod policy_meta;
+pub mod policy_snapshot;
 pub mod process_policy;
 pub mod quarantine;
 pub mod trust_dir;
@@ -57,22 +59,20 @@ pub fn init_all() {
             logging::log_error!("[local_store] jump_status 建表失败: {}", e);
         }
     }
-    if db.peripheral_policy {
-        if let Err(e) = peripheral_policy::init_table() {
-            logging::log_error!("[local_store] peripheral_policy 建表失败: {}", e);
-        }
-        if let Err(e) = peripheral_policy::init_local_table() {
-            logging::log_error!("[local_store] peripheral_policy_local 建表失败: {}", e);
-        }
-    }
     if db.quarantine {
         if let Err(e) = quarantine::init_table() {
             logging::log_error!("[local_store] quarantine 建表失败: {}", e);
         }
     }
 
-    // 服务器下发的目录/后缀/信任目录策略（离线重启恢复用）。
+    // 服务器/gRPC 下发的策略表（DB 单一来源，离线重启恢复用）。
     // 无独立 [DB_POLICY] 开关，随 [SQLITE_DB] ENABLED 一并启用。
+    if let Err(e) = peripheral_policy::init_table() {
+        logging::log_error!("[local_store] peripheral_policy 建表失败: {}", e);
+    }
+    if let Err(e) = peripheral_policy::init_local_table() {
+        logging::log_error!("[local_store] peripheral_policy_local 建表失败: {}", e);
+    }
     if let Err(e) = dir_policy::init_table() {
         logging::log_error!("[local_store] dir_policy 建表失败: {}", e);
     }
@@ -90,5 +90,8 @@ pub fn init_all() {
     }
     if let Err(e) = trust_dir::init_local_table() {
         logging::log_error!("[local_store] trust_dir_local 建表失败: {}", e);
+    }
+    if let Err(e) = policy_snapshot::init_table() {
+        logging::log_error!("[local_store] policy_snapshot 建表失败: {}", e);
     }
 }
