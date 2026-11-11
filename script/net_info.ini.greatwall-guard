@@ -83,7 +83,7 @@ RETRY_INTERVAL=60
 MAX_RETRIES=3
 [VPN]
 ENABLED=0
-HELPER=/opt/osec/vpn/vpn-helper
-CONF=/opt/osec/vpn/vpn.conf
-CLIENT_CONF=/opt/osec/vpn/client.conf
+HELPER=/opt/greatwall_vpn/vpn-helper
+CONF=/opt/greatwall_vpn/vpn.conf
+CLIENT_CONF=/opt/greatwall_vpn/client.conf
 

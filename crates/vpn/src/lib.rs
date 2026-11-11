@@ -7,7 +7,7 @@
 //! - agent 本体（常为静态 musl，不支持 dlopen，且不能因缺厂商 .so 而无法启动）
 //!   不直连 VPN SDK，而是拉起拨号子进程 `vpn-helper` 并保活；
 //! - `vpn-helper`（本 crate `src/bin/vpn_helper.rs`，需 `--features helper` 单独编译）
-//!   直连 /opt/osec/vpn/lib 下的厂商 .so，KeepAlive5 内部阻塞+自动重连；
+//!   直连 /opt/greatwall_vpn/lib 下的厂商 .so，KeepAlive5 内部阻塞+自动重连；
 //! - 子进程退出即视为隧道中断，supervisor 按退避间隔重新拉起。
 
 use logging::{log_error, log_info};
@@ -20,13 +20,13 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 /// vpn.conf 默认全路径
-pub const DEFAULT_VPN_CONF: &str = "/opt/osec/vpn/vpn.conf";
+pub const DEFAULT_VPN_CONF: &str = "/opt/greatwall_vpn/vpn.conf";
 /// SDK client.conf 默认全路径（传给 helper → FM_vpnclientInit）
-pub const DEFAULT_CLIENT_CONF: &str = "/opt/osec/vpn/client.conf";
+pub const DEFAULT_CLIENT_CONF: &str = "/opt/greatwall_vpn/client.conf";
 /// 拨号子进程默认全路径
-pub const DEFAULT_HELPER: &str = "/opt/osec/vpn/vpn-helper";
+pub const DEFAULT_HELPER: &str = "/opt/greatwall_vpn/vpn-helper";
 /// vpn.conf 内相对路径的基准目录
-pub const VPN_BASE_DIR: &str = "/opt/osec/vpn";
+pub const VPN_BASE_DIR: &str = "/opt/greatwall_vpn";
 /// 子进程异常退出后的重拉间隔
 pub const RESTART_BACKOFF: Duration = Duration::from_secs(10);
 
@@ -81,7 +81,7 @@ pub struct LogSection {
     pub level: u8,
 }
 
-/// 把 vpn.conf 里的相对路径按 /opt/osec/vpn 补成全路径；已经是绝对路径则原样返回。
+/// 把 vpn.conf 里的相对路径按 /opt/greatwall_vpn 补成全路径；已经是绝对路径则原样返回。
 pub fn resolve_vpn_path(p: &str) -> String {
     if p.is_empty() || Path::new(p).is_absolute() {
         return p.to_string();
@@ -111,9 +111,17 @@ fn spawn_helper(helper: &str, conf_path: &str, client_conf: &str) -> Result<Chil
     if !Path::new(helper).exists() {
         return Err(format!("拨号子进程不存在: {}（需部署 vpn-helper）", helper));
     }
+    // vpn-helper 为 musl 动态链接，SDK 库在 <VPN_BASE_DIR>/lib；显式带上
+    // LD_LIBRARY_PATH，兼容旧 helper 二进制里编译期 rpath 仍指向旧目录的情况。
+    let lib_dir = format!("{}/lib", VPN_BASE_DIR);
+    let ld_library_path = match std::env::var("LD_LIBRARY_PATH") {
+        Ok(existing) if !existing.is_empty() => format!("{}:{}", lib_dir, existing),
+        _ => lib_dir,
+    };
     Command::new(helper)
         .arg(conf_path)
         .arg(client_conf)
+        .env("LD_LIBRARY_PATH", ld_library_path)
         .spawn()
         .map_err(|e| format!("拉起 {} 失败: {}", helper, e))
 }
@@ -224,18 +232,18 @@ mod tests {
     fn resolve_relative_to_full_path() {
         assert_eq!(
             resolve_vpn_path("cosignsdk.conf"),
-            "/opt/osec/vpn/cosignsdk.conf"
+            "/opt/greatwall_vpn/cosignsdk.conf"
         );
         assert_eq!(
             resolve_vpn_path("ca/20241016_ca.cer"),
-            "/opt/osec/vpn/ca/20241016_ca.cer"
+            "/opt/greatwall_vpn/ca/20241016_ca.cer"
         );
         assert_eq!(resolve_vpn_path("/already/abs.conf"), "/already/abs.conf");
     }
 
     #[test]
     fn load_system_vpn_conf_paths_are_absolute() {
-        let conf = load_conf(DEFAULT_VPN_CONF).expect("应能解析 /opt/osec/vpn/vpn.conf");
+        let conf = load_conf(DEFAULT_VPN_CONF).expect("应能解析 /opt/greatwall_vpn/vpn.conf");
         for p in [
             &conf.copysign.ssl_config,
             &conf.copysign.ca_path,

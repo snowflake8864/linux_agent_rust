@@ -68,6 +68,7 @@ const PROCESS_PATTERNS: &[ProcessPattern] = &[
     ProcessPattern { key: "awk", typ: 1, param: ",pkt_len=-1" },
     ProcessPattern { key: "bin/tc", typ: 1, param: ",pkt_len=-1" },
     ProcessPattern { key: "/opt/osec/MagicArmorAgent", typ: 0, param: ",match_full_path=1" },
+    ProcessPattern { key: "/opt/greatwall_vpn/vpn-helper", typ: 0, param: ",match_full_path=1" },
     ProcessPattern { key: "/usr/bin/bash", typ: 0, param: ",match_full_path=1" },
     ProcessPattern { key: "/opt/EndpointSecurityApp/scripts/SecurityScan_linux.sh", typ: 0, param: ",match_full_path=1" },
     ProcessPattern { key: "/opt/EndpointSecurityApp/EndpointSecurityApp", typ: 0, param: ",match_full_path=1" },
