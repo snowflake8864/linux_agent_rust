@@ -2203,6 +2203,7 @@ dependencies = [
 name = "procinfo"
 version = "0.1.0"
 dependencies = [
+ "common",
  "libc",
  "log 0.4.29",
  "logging",

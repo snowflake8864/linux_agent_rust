@@ -510,7 +510,7 @@ async fn main() -> std::io::Result<()> {
     #[cfg(feature = "ebpf")]
     if let Some(ebpf) = ebpf_scan {
         let scan_dirs: Vec<String> = [
-            "/bin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/lib/systemd",
+            "/bin", "/usr/bin", "/usr/sbin", "/usr/local/bin",
         ].iter().map(|s| s.to_string()).collect();
         tokio::task::spawn_blocking(move || {
             if let Err(e) = ebpf.scan_executables(&scan_dirs, true) {

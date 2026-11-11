@@ -170,7 +170,7 @@ impl DataQueryService for DataQueryServiceImpl {
     ) -> Result<Response<ExecutableList>, Status> {
         let filter_status = request.into_inner().filter_status;
 
-        // 扫描系统可执行文件目录（/bin /usr/bin /usr/sbin /usr/local/bin /usr/lib/systemd），
+        // 扫描系统可执行文件目录（/bin /usr/bin /usr/sbin /usr/local/bin），
         // 仅保留 ELF 文件。total = 去重前文件数，unique = 按 MD5 去重后数量。
         let files = procinfo::scan_executable_files();
         let total = files.len() as i32;

@@ -4,6 +4,7 @@ use arc_swap::ArcSwap;
 use pattern::pattern_rules_mgr;
 pub mod manager;
 pub mod backend;
+pub mod exec_scan;
 
 #[derive(Debug, Default, Clone)]
 pub struct NetClient {

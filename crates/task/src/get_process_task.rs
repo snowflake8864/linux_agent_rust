@@ -19,7 +19,6 @@ const DIRS: &[&str] = &[
     "/usr/bin/",
     "/usr/sbin/",
     "/usr/local/bin/",
-    "/usr/lib/systemd/",
 ];
 
 /// 容器 overlay rootfs 下需要扫描的子目录（与 scan_container_overlays 保持一致）
@@ -61,6 +60,11 @@ fn scan_one_dir(path: &str, vec_info: &mut Vec<LinuxDirProc>) {
             Some(s) => s,
             None => continue,
         };
+
+        // 只上报真正可执行的文件：x 权限 + (ELF 或 shebang 脚本)
+        if !common::exec_scan::is_executable_path(&path_buf) {
+            continue;
+        }
 
         let md5 = match get_md5_global(path_str) {
             Ok(m) => m,
