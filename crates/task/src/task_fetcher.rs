@@ -15,15 +15,14 @@ use logging::{log_info,log_error,log_warn};
 use common::manager::boot::BootManager;
 use crate::virtual_port_rule::VirtualPortRule;
 use crate::get_process_task::process_all_dirs;
-use crate::net_reach_rule::{OutreachDetectRule,update_global_outreach_rules};
+use crate::net_reach_rule::OutreachDetectRule;
 use crate::scan_directory_task::{DirectionScanRule,scan_single_dir};
 use pattern::{pattern_rules_mgr,process_pattern_rules_mgr::PROCESS_PATTERN_RULES_MGR, GlobalTrustDir};
 use tokio::sync::mpsc;
-use process_mgr::POLICY_MANAGER;
 use netlink::netlink::NlSockInfo; // 引入 NLPolicyType
 use hostinfo::net_app::model::get_netapp_json; 
-use netblock::ip_policy::{IpPolicy, update_and_write_policies, is_ipv6};
-use udisk::{list::SHARED_USB_LIST, device::UsbInfo,monitor::{get_all_local_usb_devices, build_usb_json}};
+use netblock::ip_policy::{IpPolicy, is_ipv6};
+use udisk::{device::UsbInfo,monitor::{get_all_local_usb_devices, build_usb_json}};
 use procinfo::{get_running_process_infos,build_process_list_json};
 use tokio::task;
 use serde_json::json;
@@ -44,7 +43,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use grpc_gateway::agent_mode::{notify_network_failure, set_online};
 use std::sync::OnceLock;
-use grpc_gateway::notify::{notify_policy_change, init_local_task_rx, DIR_POLICY_CACHE, EXTORT_POLICY_CACHE, VIRTUAL_PORT_CACHE, TRUST_DIR_CACHE};
+use grpc_gateway::notify::{notify_policy_change, init_local_task_rx};
 use grpc_gateway::policy_watch::PolicyChangeType;
 
 static AUTO_IP_JUMP_DAEMON_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -575,14 +574,8 @@ impl TaskFetcher {
         GLOBAL_NL_SOCK.set(Mutex::new(nl_sock.clone())).ok();
         GLOBAL_PATTERN_MGR.set(pattern_mgr.clone()).ok();
 
-        // 启动时从 DB 恢复服务器下发策略（防篡改目录/勒索后缀/信任目录）。
-        // 离线模式读 *_local 表，在线模式读在线基线表，表为空时保持现状。
-        // 必须在 GLOBAL_PATTERN_MGR 注册之后执行（main.rs 已 set_backend + init_dpi_writer）。
-        let restore_local = config::net_info::NETINFO_CONFIG
-            .lock()
-            .map(|c| c.is_offline_mode)
-            .unwrap_or(false);
-        crate::policy_persistence::restore_policies_from_db(restore_local);
+        // 策略加载统一由 policy_store 在 main 启动阶段完成（DB 单一来源），
+        // 这里不再重复 restore，避免 token 到达后二次加载。
 
         TaskFetcher {
             base_url: base_url.to_string(),
@@ -1507,28 +1500,8 @@ async fn task_down_dir_policy(&self, task_type: u64) -> Result<(), String> {
             if parsed["code"] == "000000" {
                 //                    log_info!("{}", parsed["data"]);
                 let rules = pattern_rules_mgr::PatternRulesMgr::parse_policy_from_json(&parsed["data"])?;
-                crate::policy_persistence::save_dir_policy(&rules, false);
-                //if (rules.len() > 0)
-                {
-                    let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
-                    pattern_mgr.set_protect_dir(rules);
-                }
-
-                // Update gRPC cache
-                if let Some(data) = parsed["data"].as_array() {
-                    let proto_rules: Vec<grpc_gateway::dir_policy::DirectionScanRule> = data
-                        .iter()
-                        .filter_map(|v| {
-                            Some(grpc_gateway::dir_policy::DirectionScanRule {
-                                dir: v.get("dir")?.as_str()?.to_string(),
-                                pid: 0,
-                                typ: v.get("type")?.as_u64()? as u32,
-                            })
-                        })
-                        .collect();
-                    *grpc_gateway::notify::DIR_POLICY_CACHE.lock().unwrap() = proto_rules;
-                    notify_policy_change(PolicyChangeType::DirPolicyChanged);
-                }
+                // 只写在线基线表，由 policy_store 从 DB 加载并下发内核/刷新 gRPC 缓存。
+                crate::policy_store::commit_dir_policy(&rules)?;
             } else {
                 eprintln!("Error: Invalid response code: {}", parsed["code"]);
                 return Err("Invalid response code.".to_string());
@@ -1635,8 +1608,8 @@ async fn task_down_black(&self, task_type: u64) -> Result<(), String> {
                     return Err("No hashes found in the response".to_string());
                 }
 
-                let mut mgr = POLICY_MANAGER.lock().unwrap();
-                mgr.set_policy_process(&hash_list, false, Some(false));
+                // 只写 DB（在线基线），由 policy_store 从 DB 加载并下发内核。
+                crate::policy_store::stage_process_baseline(false, &hash_list)?;
             } else {
                 eprintln!("Error: Invalid response code: {}", parsed["code"]);
                 // 返回错误的 Result 类型
@@ -1698,9 +1671,9 @@ pub async fn task_down_white(&self, task_type: u64) -> Result<(), String> {
                     return Err("No hashes found in the response".to_string());
                 }
 
-                let mut mgr = POLICY_MANAGER.lock().unwrap();
-                mgr.set_policy_process(&hash_list, true, Some(false));
-                log_info!("[task_down_white] 白名单 {} 条已写入内存", hash_list.len());
+                // 只写 DB（在线基线），由 policy_store 从 DB 加载并下发内核。
+                crate::policy_store::stage_process_baseline(true, &hash_list)?;
+                log_info!("[task_down_white] 白名单 {} 条已写入 DB 基线", hash_list.len());
             } else {
                 log_error!("[task_down_white] 响应 code != 000000: code={}", parsed["code"]);
                 return Err("Invalid response code.".to_string());
@@ -1791,86 +1764,10 @@ pub async fn task_down_virtual_port(&self, task_type: u64) -> Result<(), String>
     let valid_rules: Vec<_> = conf.into_iter()
         .filter(|r| !r.source_ip.is_empty())
         .collect();
+    log_info!("virtual port: {} 条有效规则", valid_rules.len());
 
-    let total = valid_rules.len();
-    log_info!("virtual port ==============================================");
-    // Update gRPC cache BEFORE proc write (cache works even without kernel module)
-    {
-        let proto_rules: Vec<grpc_gateway::virtual_port::VirtualPortRule> = valid_rules
-            .iter()
-            .map(|r| grpc_gateway::virtual_port::VirtualPortRule {
-                alarm_level: r.alarm_level,
-                dest_ip: r.dest_ip.clone(),
-                dest_port: r.dest_port.clone(),
-                dest_port_type: r.dest_port_type,
-                id: r.id,
-                protocol: r.protocol.clone(),
-                source_ip: r.source_ip.clone(),
-                source_port_start: r.source_port_range.0 as u32,
-                source_port_end: r.source_port_range.1 as u32,
-                r#type: r.r#type.clone(),
-            })
-            .collect();
-        log_info!("=======proto_rules{:?}",proto_rules);
-        *VIRTUAL_PORT_CACHE.lock().unwrap() = proto_rules;
-        notify_policy_change(PolicyChangeType::VirtualPortChanged);
-    }
-    log_info!("================valid_rules:{:?}",valid_rules);
-    if total == 0 {
-        log_error!("No valid rules to write to /proc/osec/net_rules");
-        return Ok(());
-    }
-
-    // 通过 SecurityBackend 抽象下发：
-    // driver 后端 → 原样写 /proc/osec/net_rules（内容与直写完全一致）；
-    // eBPF  后端 → 解析 VIR_OPEN_PORT 行写入 pkt_mod_rules map
-    let mut batch = String::new();
-    for (index, rule) in valid_rules.iter().enumerate() {
-        // protocol 转数字: tcp=1, udp=2, 其他=0
-        let protocol_num = match rule.protocol.to_lowercase().as_str() {
-            "tcp" => 1,
-            "udp" => 2,
-            _ => 0,
-        };
-
-        let is_ipv4 = if rule.dest_ip.contains(':') { 0u8 } else { 1u8 }; // ':' 表示 IPv6
-                                                                          // if
-
-        let addr_type = (rule.alarm_level & 0x1f) as u8;
-
-        let rule_str = format!(
-            "VIR_OPEN_PORT index={} total={} id={} protocol={} type={} is_ipv4={} source_ip={} start_port={} end_port={}  dest_ip={} dest_port_type={} redirectPort={} addr_type={}\n",
-            index,
-            total,
-            rule.id,
-            protocol_num,
-            rule.r#type,
-            is_ipv4,
-            rule.source_ip,
-            rule.source_port_range.0,
-            rule.source_port_range.1,
-            if rule.dest_ip.trim().is_empty() {
-                "\"\""
-            } else {
-                &rule.dest_ip
-            },
-            rule.dest_port_type,
-            if rule.dest_port_type == 0 {
-                rule.dest_port.parse::<u16>().unwrap_or(0)
-            } else {
-                0
-            },
-            addr_type,
-            );
-
-        log_info!("{}", rule_str);
-        batch.push_str(&rule_str);
-    }
-
-    common::backend::with_backend(|b| b.write_net_rules(&batch))?;
-
-    log_info!("Successfully wrote {} rules via backend", total);
-
+    // 只写 DB 快照，由 policy_store 从 DB 加载并下发内核/刷新 gRPC 缓存。
+    crate::policy_store::commit_virtual_port(&valid_rules)?;
     Ok(())
 }
 
@@ -1932,7 +1829,8 @@ async fn task_down_netblock_policy(&self, task_type: u64) -> Result<(), String> 
         }
     }
 
-    update_and_write_policies(policies, "netblocks").await
+    // 只写 DB 快照，由 policy_store 从 DB 加载并下发内核。
+    crate::policy_store::commit_ip_block(&policies)
 }
 
 async fn task_down_black_ip_policy(&self, task_type: u64) -> Result<(), String> {
@@ -1991,8 +1889,8 @@ async fn task_down_black_ip_policy(&self, task_type: u64) -> Result<(), String> 
         }
     }
    log_info!("black ip policies:{:?}", policies);
-    // 更新全局 Map 并下发到内核
-    update_and_write_policies(policies, "policies").await
+    // 只写 DB 快照，由 policy_store 从 DB 加载并下发内核。
+    crate::policy_store::commit_ip_black(&policies)
 }
 async fn task_down_extort(&self, task_type: u64) -> Result<(), String> {
 
@@ -2023,33 +1921,8 @@ async fn task_down_extort(&self, task_type: u64) -> Result<(), String> {
 
             if parsed["code"] == "000000" {
                 let rules = pattern_rules_mgr::PatternRulesMgr::parse_exipor_policy_from_json(&parsed["data"])?;
-                crate::policy_persistence::save_extort_policy(&rules, false);
-                let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
-                pattern_mgr.set_exiport_dir(rules);
-
-                // Update gRPC cache
-                if let Some(data) = parsed["data"].as_array() {
-                    let proto_rules: Vec<grpc_gateway::extort_policy::ExtortProtectRule> = data
-                        .iter()
-                        .filter_map(|v| {
-                            let process_arr = v.get("process")?.as_array()?;
-                            let mut map_comm = std::collections::HashMap::new();
-                            for p in process_arr {
-                                if let (Some(h), Some(n)) = (p.get("hash")?.as_str(), p.get("name")?.as_str()) {
-                                    map_comm.insert(h.to_string(), n.to_string());
-                                }
-                            }
-                            Some(grpc_gateway::extort_policy::ExtortProtectRule {
-                                file_type: v.get("file_suffix")?.as_str()?.to_string(),
-                                typ: v.get("type")?.as_u64()? as u32,
-                                map_comm,
-                            })
-                        })
-                        .collect();
-                    *grpc_gateway::notify::EXTORT_POLICY_CACHE.lock().unwrap() = proto_rules;
-                    notify_policy_change(PolicyChangeType::ExtortPolicyChanged);
-                }
-
+                // 只写在线基线表，由 policy_store 从 DB 加载并下发内核/刷新 gRPC 缓存。
+                crate::policy_store::commit_extort_policy(&rules)?;
             } else {
                 eprintln!("Error: Invalid response code: {}", parsed["code"]);
                 // 返回错误的 Result 类型
@@ -2167,8 +2040,18 @@ async fn task_get_white_peripherals(&self, task_type: u64) -> Result<(), String>
                     })
                 .collect();
 
-                let mut guard = SHARED_USB_LIST.lock().unwrap();
-                guard.update_whitelist(whitelist);
+                let rows: Vec<local_store::peripheral_policy::PeripheralPolicyRow> = whitelist
+                    .iter()
+                    .map(|d| local_store::peripheral_policy::PeripheralPolicyRow {
+                        peripheral_eid: d.perpheral_eid.clone(),
+                        peripheral_name: d.perpheral_name.clone(),
+                        intro: d.intro.clone(),
+                        type_: d.type_.clone(),
+                        is_white: true,
+                    })
+                    .collect();
+                // 只写在线基线表，由 policy_store 从 DB 加载并下发。
+                crate::policy_store::commit_peripheral_baseline_side(true, &rows)?;
             }
         }
         Err(err) => {
@@ -2224,8 +2107,18 @@ async fn task_get_black_peripherals(&self, task_type: u64) -> Result<(), String>
                     })
                 .collect();
 
-                let mut guard = SHARED_USB_LIST.lock().unwrap();
-                guard.update_blacklist(blacklist, true);
+                let rows: Vec<local_store::peripheral_policy::PeripheralPolicyRow> = blacklist
+                    .iter()
+                    .map(|d| local_store::peripheral_policy::PeripheralPolicyRow {
+                        peripheral_eid: d.perpheral_eid.clone(),
+                        peripheral_name: d.perpheral_name.clone(),
+                        intro: d.intro.clone(),
+                        type_: d.type_.clone(),
+                        is_white: false,
+                    })
+                    .collect();
+                // 只写在线基线表，由 policy_store 从 DB 加载并下发。
+                crate::policy_store::commit_peripheral_baseline_side(false, &rows)?;
             }
         }
         Err(err) => {
@@ -2438,19 +2331,8 @@ async fn task_global_dir(&self,task_type: u64) -> Result<(), String> {
                     }
                 };
 
-                PROCESS_PATTERN_RULES_MGR.lock().set_global_trust_dir(trust_dirs.clone());
-
-                // Update gRPC cache
-                {
-                    let proto_dirs: Vec<grpc_gateway::trust_dir::GlobalTrustDir> = trust_dirs.iter().map(|d| grpc_gateway::trust_dir::GlobalTrustDir {
-                        dir: d.dir.clone(), r#type: d.typ as u32, is_extend: d.is_extend as u32,
-                    }).collect();
-                    *TRUST_DIR_CACHE.lock().unwrap() = proto_dirs;
-                    notify_policy_change(PolicyChangeType::TrustDirChanged);
-                }
-                crate::policy_persistence::save_trust_dir(&trust_dirs, false);
-                let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
-                pattern_mgr.set_global_trust_dir(trust_dirs);
+                // 只写在线基线表，由 policy_store 从 DB 加载并同时更新进程/文件 DPI。
+                crate::policy_store::commit_trust_dir(&trust_dirs)?;
             } else {
                 eprintln!("Error: Invalid response code: {}", parsed["code"]);
                 return Err("Invalid response code.".to_string());
@@ -2508,8 +2390,8 @@ async fn task_outreach_detect(&self, task_type: u64) -> Result<(), String> {
                 .map_err(|e| format!("Failed to parse VirtualPortRule: {}", e))
         })
     .collect::<Result<Vec<OutreachDetectRule>, _>>()?;
-    update_global_outreach_rules(rules);
-    //log_info!("rules:{:?}",rules);
+    // 只写 DB 快照，由 policy_store 从 DB 加载并更新全局规则。
+    crate::policy_store::commit_outreach(&rules)?;
     Ok(())
 }
 

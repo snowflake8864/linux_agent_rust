@@ -33,7 +33,7 @@ pub struct OutreachDetect {
     pub data_list: Vec<DomainLog>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutreachDetectRule {
     pub addr: String,
     pub method: String,

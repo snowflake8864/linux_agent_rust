@@ -89,11 +89,9 @@ pub fn set_offline_and_check_admission() {
     // 导致 reporter 等模块无法感知离线状态。
     let switched = set_offline();
 
-    // 首次切离线：加载离线本地表（gRPC 策略）并下发内核。
-    // 本地表非空时替换内存策略；为空则保留当前（服务器）策略。
+    // 首次切离线：重新检查 DB（本地表优先），仅加载版本变化的策略域。
     if switched {
-        process_mgr::POLICY_MANAGER.lock().unwrap().load_local_policy_and_apply();
-        task::policy_persistence::restore_policies_from_db(true);
+        task::policy_store::reload_changed_domains();
     }
 
     // OFF/ON 模式是固定设置，不需要准入 repair，直接返回
@@ -111,10 +109,9 @@ pub fn set_offline_and_check_admission() {
     run_admission_repair();
 }
 
-/// 上线时清空离线本地进程策略表，使旧 gRPC 策略作废（服务器策略接管）。
+/// 上线时清空离线本地策略表，使旧 gRPC 策略作废（服务器策略接管）。
 pub fn clear_local_process_policy() {
-    process_mgr::POLICY_MANAGER.lock().unwrap().clear_local_policy();
-    task::policy_persistence::clear_local_policies();
+    task::policy_store::clear_local_policies();
 }
 
 /// 检测服务器是否可达：向 /v1/getinfo 发送空请求，验证返回 code=="000000"。
@@ -320,7 +317,7 @@ impl AgentDataHub {
 
     /// Get IP block policies (async due to tokio::sync::RwLock in netblock).
     pub async fn get_ip_block_policy(&self) -> Vec<netblock::ip_policy::IpPolicy> {
-        let guard = netblock::ip_policy::IP_POLICIES.read().await;
+        let guard = netblock::ip_policy::NETBLOCK_POLICIES.read().await;
         guard.values().cloned().collect()
     }
 
@@ -648,45 +645,37 @@ impl AgentDataHub {
         hashes: &[String],
         action: i32,
     ) -> Result<(), String> {
-        let mut mgr = process_mgr::POLICY_MANAGER.lock().unwrap();
+        let (mut white, mut black) = {
+            let mgr = process_mgr::POLICY_MANAGER.lock().unwrap();
+            (mgr.get_white_list(), mgr.get_black_list())
+        };
+
         match action {
             0 => {
-                // 移除：从两个名单中都删除这些 hash
-                let whitelist: Vec<String> = mgr.get_white_list().into_iter()
-                    .filter(|h| !hashes.contains(h)).collect();
-                let blacklist: Vec<String> = mgr.get_black_list().into_iter()
-                    .filter(|h| !hashes.contains(h)).collect();
-                mgr.set_policy_process(&whitelist, true, Some(true));
-                mgr.set_policy_process(&blacklist, false, Some(true));
-                drop(mgr);
-                self.notify(PolicyChangeType::ProcessPolicyChanged);
-                return Ok(());
+                white.retain(|h| !hashes.contains(h));
+                black.retain(|h| !hashes.contains(h));
             }
             1 | 2 => {
                 let is_white = action == 1;
-                // gRPC 本地调用时合并而非替换：先取现有名单，追加新 hash 后再下发。
-                // set_policy_process 需白、黑两侧都到齐才统一 diff，因此另一侧按当前值成对下发。
-                let white: Vec<String> = mgr.get_white_list();
-                let black: Vec<String> = mgr.get_black_list();
-                let mut target = if is_white { white.clone() } else { black.clone() };
                 for h in hashes {
-                    if !target.contains(h) {
-                        target.push(h.clone());
+                    if is_white {
+                        black.retain(|x| x != h);
+                        if !white.contains(h) {
+                            white.push(h.clone());
+                        }
+                    } else {
+                        white.retain(|x| x != h);
+                        if !black.contains(h) {
+                            black.push(h.clone());
+                        }
                     }
                 }
-                if is_white {
-                    mgr.set_policy_process(&target, true, Some(true));
-                    mgr.set_policy_process(&black, false, Some(true));
-                } else {
-                    mgr.set_policy_process(&white, true, Some(true));
-                    mgr.set_policy_process(&target, false, Some(true));
-                }
-                drop(mgr);
-                self.notify(PolicyChangeType::ProcessPolicyChanged);
-                Ok(())
             }
-            _ => Err(format!("无效 action: {}", action)),
+            _ => return Err(format!("无效 action: {}", action)),
         }
+
+        // 只写离线本地表，由 policy_store 从 DB 加载并下发内核。
+        task::policy_store::commit_process_policy(&white, &black)
     }
 
     /// Update peripheral (USB) policy. action: 0=移除, 1=白名单, 2=黑名单
@@ -696,21 +685,34 @@ impl AgentDataHub {
         action: i32,
     ) -> Result<(), String> {
         let usb_protect = config::net_info::NETINFO_CONFIG.lock().unwrap().usb_protect;
-        {
-            let mut guard = udisk::list::SHARED_USB_LIST.lock().unwrap();
+
+        // 在副本上计算修改后的完整黑白名单，然后写离线本地表并由 policy_store 重载。
+        let (white_rows, black_rows) = {
+            let mut list = udisk::list::SHARED_USB_LIST.lock().unwrap().clone();
             match action {
                 0 => {
                     let eids: Vec<String> = devices.iter().map(|d| d.perpheral_eid.clone()).collect();
-                    guard.remove_from_both(&eids);
+                    list.remove_from_both(&eids);
                 }
-                1 => guard.update_whitelist(devices.to_vec()),
-                2 => guard.update_blacklist(devices.to_vec(), usb_protect),
+                1 => list.update_whitelist(devices.to_vec()),
+                2 => list.update_blacklist(devices.to_vec(), usb_protect),
                 _ => return Err(format!("无效 action: {}", action)),
             }
-        } // SHARED_USB_LIST 锁在此释放，避免 save_peripheral_policy_to_db 内部再次加锁死锁
-        self.notify(PolicyChangeType::PeripheralPolicyChanged);
-        // 持久化外设黑白名单到离线本地表（受开关控制）
-        save_peripheral_policy_to_db();
+            let to_row = |d: &udisk::device::UsbInfo, is_white: bool| {
+                local_store::peripheral_policy::PeripheralPolicyRow {
+                    peripheral_eid: d.perpheral_eid.clone(),
+                    peripheral_name: d.perpheral_name.clone(),
+                    intro: d.intro.clone(),
+                    type_: d.type_.clone(),
+                    is_white,
+                }
+            };
+            let white = list.get_whitelist().iter().map(|d| to_row(d, true)).collect::<Vec<_>>();
+            let black = list.get_blacklist().iter().map(|d| to_row(d, false)).collect::<Vec<_>>();
+            (white, black)
+        };
+
+        task::policy_store::commit_peripheral_policy(&white_rows, &black_rows)?;
 
         // 黑名单 + usb_protect 开启时，物理禁用设备（锁已释放，不会死锁）
         if action == 2 && usb_protect {
@@ -724,24 +726,28 @@ impl AgentDataHub {
         Ok(())
     }
 
-    /// Update IP block policies (async — writes to kernel via netblock).
+    /// Update IP block policies: 只写 DB，由 policy_store 加载并下发。
     pub async fn update_ip_block_policy(
         &self,
         items: &[netblock::ip_policy::IpPolicy],
     ) -> Result<(), String> {
-        netblock::ip_policy::update_and_write_policies(items.to_vec(), "netblocks").await?;
-        self.notify(PolicyChangeType::IpBlockPolicyChanged);
-        Ok(())
+        task::policy_store::commit_ip_block(items)
     }
 
-    /// Update outreach detection rules.
+    /// Update IP black policies: 只写 DB，由 policy_store 加载并下发。
+    pub async fn update_ip_black_policy(
+        &self,
+        items: &[netblock::ip_policy::IpPolicy],
+    ) -> Result<(), String> {
+        task::policy_store::commit_ip_black(items)
+    }
+
+    /// Update outreach detection rules: 只写 DB，由 policy_store 加载。
     pub fn update_outreach_rules(
         &self,
         rules: Vec<task::net_reach_rule::OutreachDetectRule>,
     ) -> Result<(), String> {
-        task::net_reach_rule::update_global_outreach_rules(rules);
-        self.notify(PolicyChangeType::OutreachRulesChanged);
-        Ok(())
+        task::policy_store::commit_outreach(&rules)
     }
 
     // ========================================================================
@@ -830,89 +836,21 @@ impl AgentDataHub {
             .collect()
     }
 
-    /// Update global trust directories and push to kernel + cache.
+    /// Update global trust directories: 只写离线本地表，由 policy_store 从 DB 加载。
     pub fn update_trust_dir(&self, dirs: Vec<pattern::GlobalTrustDir>) -> Result<(), String> {
-        // Update cache (proto types)
-        *grpc_gateway::notify::TRUST_DIR_CACHE.lock().unwrap() = dirs
-            .iter()
-            .map(|d| grpc_gateway::trust_dir::GlobalTrustDir {
-                dir: d.dir.clone(),
-                r#type: d.typ as u32,
-                is_extend: d.is_extend as u32,
-            })
-            .collect();
-        // Push to kernel
-        task::policy_persistence::save_trust_dir(&dirs, true);
-        pattern::process_pattern_rules_mgr::PROCESS_PATTERN_RULES_MGR
-            .lock()
-            .set_global_trust_dir(dirs);
-        self.notify(PolicyChangeType::TrustDirChanged);
-        Ok(())
+        task::policy_store::commit_trust_dir(&dirs)
     }
 
     // ========================================================================
     // VirtualPort operations
     // ========================================================================
 
-    /// Write virtual port rules to /proc/osec/net_rules + cache.
+    /// Write virtual port rules: 只写 DB，由 policy_store 加载并下发。
     pub async fn update_virtual_port(
         &self,
         rules: Vec<task::virtual_port_rule::VirtualPortRule>,
     ) -> Result<(), String> {
-        // Update cache (proto types)
-        let proto_rules: Vec<grpc_gateway::virtual_port::VirtualPortRule> = rules
-            .iter()
-            .map(|r| grpc_gateway::virtual_port::VirtualPortRule {
-                alarm_level: r.alarm_level,
-                dest_ip: r.dest_ip.clone(),
-                dest_port: r.dest_port.clone(),
-                dest_port_type: r.dest_port_type,
-                id: r.id,
-                protocol: r.protocol.clone(),
-                source_ip: r.source_ip.clone(),
-                source_port_start: r.source_port_range.0 as u32,
-                source_port_end: r.source_port_range.1 as u32,
-                r#type: r.r#type.clone(),
-            })
-            .collect();
-        *grpc_gateway::notify::VIRTUAL_PORT_CACHE.lock().unwrap() = proto_rules;
-        let valid_rules: Vec<_> = rules.into_iter()
-            .filter(|r| !r.source_ip.is_empty())
-            .collect();
-
-        if valid_rules.is_empty() {
-            return Ok(());
-        }
-
-        // 通过 SecurityBackend 抽象下发：
-        // driver 后端 → 原样写 /proc/osec/net_rules（内容与直写完全一致）；
-        // eBPF  后端 → 解析 VIR_OPEN_PORT 行写入 pkt_mod_rules map
-        let total = valid_rules.len();
-        let mut batch = String::new();
-        for (index, rule) in valid_rules.iter().enumerate() {
-            let protocol_num = match rule.protocol.to_lowercase().as_str() {
-                "tcp" => 1,
-                "udp" => 2,
-                _ => 0,
-            };
-            let is_ipv4 = if rule.dest_ip.contains(':') { 0u8 } else { 1u8 };
-            let addr_type = (rule.alarm_level & 0x1f) as u8;
-
-            let rule_str = format!(
-                "VIR_OPEN_PORT index={} total={} id={} protocol={} type={} is_ipv4={} source_ip={} start_port={} end_port={} dest_ip={} dest_port_type={} redirectPort={} addr_type={}\n",
-                index, total, rule.id, protocol_num, rule.r#type, is_ipv4,
-                rule.source_ip, rule.source_port_range.0, rule.source_port_range.1,
-                if rule.dest_ip.trim().is_empty() { "\"\"" } else { &rule.dest_ip },
-                rule.dest_port_type,
-                if rule.dest_port_type == 0 { rule.dest_port.parse::<u16>().unwrap_or(0) } else { 0 },
-                addr_type,
-            );
-            batch.push_str(&rule_str);
-        }
-        common::backend::with_backend(|b| b.write_net_rules(&batch))?;
-
-        self.notify(PolicyChangeType::VirtualPortChanged);
-        Ok(())
+        task::policy_store::commit_virtual_port(&rules)
     }
 
     // ========================================================================

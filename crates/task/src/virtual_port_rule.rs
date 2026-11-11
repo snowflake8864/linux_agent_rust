@@ -1,6 +1,6 @@
 // crates/task/src/virtual_port_rule.rs
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde::de;
 use std::str::FromStr;
 
@@ -53,7 +53,7 @@ where
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtualPortRule {
     pub alarm_level: u32,
     pub dest_ip: String,

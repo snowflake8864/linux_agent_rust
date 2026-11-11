@@ -355,6 +355,11 @@ impl PatternRulesMgr {
         self.set_pattern_rules();
     }
 
+    /// 内置默认信任目录（DB 中没有任何信任目录策略时作为兜底基线）。
+    pub fn default_trust_dirs(&self) -> Vec<GlobalTrustDir> {
+        self.default_global_trust_dirs.clone()
+    }
+
     // 设置全局信任目录
     pub fn set_global_trust_dir(&mut self, dirs: Vec<GlobalTrustDir>) {
         self.global_trust_dir_patterns.clear();

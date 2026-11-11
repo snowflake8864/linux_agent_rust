@@ -94,7 +94,7 @@ impl IpPolicyService for IpPolicyServiceImpl {
             })
             .collect();
         self.data_hub
-            .update_ip_block_policy(&items)
+            .update_ip_black_policy(&items)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(SimpleResponse {
