@@ -66,7 +66,6 @@ pub const EXECUTABLE_SCAN_DIRS: &[&str] = &[
     "/usr/bin",
     "/usr/sbin",
     "/usr/local/bin",
-    "/usr/lib/systemd",
 ];
 
 /// 扫描系统可执行文件目录，返回 (路径, MD5)，仅保留 ELF 文件。
@@ -105,14 +104,10 @@ fn scan_dir_recursive(dir: &str, out: &mut Vec<(String, String)>) {
             Some(s) => s.to_string(),
             None => continue,
         };
-        // 仅保留 ELF 可执行文件
-        if let Ok(mut f) = fs::File::open(&path) {
-            use std::io::Read;
-            let mut magic = [0u8; 4];
-            if f.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF" {
-                if let Ok(md5) = process_mgr::get_md5_global(&path_str) {
-                    out.push((path_str, md5));
-                }
+        // 仅保留真正可执行的文件：x 权限 + (ELF 或 shebang 脚本)
+        if common::exec_scan::is_executable_path(&path) {
+            if let Ok(md5) = process_mgr::get_md5_global(&path_str) {
+                out.push((path_str, md5));
             }
         }
     }
