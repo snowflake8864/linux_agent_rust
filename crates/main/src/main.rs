@@ -56,7 +56,7 @@ fn ensure_single_instance() {
 // ====== KYSEC (麒麟安全防护) 升级后恢复 ======
 // 升级前 task_fetcher 会把各安全功能状态保存到 /tmp/kysec_upgrade_pending 并关闭；
 // 升级脚本末尾 `systemctl restart osec` 重启本进程（MagicArmor_0），这里启动时检测标记文件，
-// 对 /opt/osec、/opt/EndpointSecurityApp 加白并恢复各安全功能。
+// 对 /opt/osec、/opt/greatwall_vpn、/opt/EndpointSecurityApp 加白并恢复各安全功能。
 
 const KYSEC_PENDING_FILE: &str = "/tmp/kysec_upgrade_pending";
 
@@ -117,7 +117,7 @@ async fn kysec_whitelist_dir(dir: &str) {
     }
 }
 
-/// 升级后恢复：检测标记文件 → 加白 /opt/osec、/opt/EndpointSecurityApp → 恢复各安全功能 → 删除标记文件。
+/// 升级后恢复：检测标记文件 → 加白 /opt/osec、/opt/greatwall_vpn、/opt/EndpointSecurityApp → 恢复各安全功能 → 删除标记文件。
 async fn kysec_restore_after_upgrade() {
     if !is_kysec_available().await {
         return;
@@ -128,6 +128,7 @@ async fn kysec_restore_after_upgrade() {
     let content = fs::read_to_string(KYSEC_PENDING_FILE).unwrap_or_default();
 
     kysec_whitelist_dir("/opt/osec").await;
+    kysec_whitelist_dir("/opt/greatwall_vpn").await;
     kysec_whitelist_dir("/opt/EndpointSecurityApp").await;
     kysec_whitelist_dir("/opt/vigilixav").await;
 

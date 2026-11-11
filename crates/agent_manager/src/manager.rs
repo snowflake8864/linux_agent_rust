@@ -298,6 +298,9 @@ async fn stop_osec_services() -> Result<(), String> {
     let _ = Command::new("killall").arg("-9").arg("MagicArmor_0").status().await;
     let _ = Command::new("pkill").arg("-9").arg("-f").arg("osecmonitor").status().await;
     let _ = Command::new("killall").arg("-9").arg("osecmonitor").status().await;
+    // vpn-helper 是 MagicArmor_0 拉起的拨号子进程，主进程被强杀时可能残留
+    let _ = Command::new("pkill").arg("-9").arg("-f").arg("vpn-helper").status().await;
+    let _ = Command::new("killall").arg("-9").arg("vpn-helper").status().await;
 
     sleep(Duration::from_millis(500)).await;
 
@@ -672,6 +675,10 @@ async fn uninstall_all() {
     let _ = fs::remove_file("/var/run/osec_monitor.pid");
     let _ = fs::remove_file("/var/run/agent_manager_monitor.pid");
 
+    // 兜底清理 vpn-helper 残留进程
+    let _ = Command::new("pkill").arg("-9").arg("-f").arg("vpn-helper").status().await;
+    let _ = Command::new("killall").arg("-9").arg("vpn-helper").status().await;
+
     log_info!("[agent_manager] 检查并卸载 osec_base 模块");
     let modinfo = Command::new("modinfo").arg("osec_base").output().await;
     if let Ok(out) = modinfo {
@@ -689,6 +696,17 @@ async fn uninstall_all() {
             }
         }
     }
+
+    // 删除独立 VPN 目录（/opt/greatwall_vpn）及动态库配置
+    let vpn_path = "/opt/greatwall_vpn";
+    if PathBuf::from(vpn_path).exists() {
+        if Command::new("rm").args(["-rf", vpn_path]).status().await.is_ok() {
+            log_info!("[agent_manager] 已删除 VPN 目录: {}", vpn_path);
+        } else {
+            log_error!("[agent_manager] 删除 {} 失败", vpn_path);
+        }
+    }
+    let _ = fs::remove_file("/etc/ld.so.conf.d/osec-vpn.conf");
 
     // 删除安装目录
     let install_path = "/opt/osec";

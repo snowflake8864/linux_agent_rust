@@ -10,9 +10,9 @@ echo "Start packaging osec..."
 #   3 = loongarch64  例: 1.1.1332
 #   4 = mips64el     例: 1.1.1432
 #x86_64
-#VERSION="1.1.1136"
+VERSION="1.1.1136"
 #aarch64
-VERSION="1.1.1236"
+#VERSION="1.1.1236"
 #loongarch64
 #VERSION="1.1.1332"
 #mips64el
@@ -30,7 +30,7 @@ OUTPUT_DIR="vpn_output"
 INSTALLER_NAME="${OUTPUT_DIR}/osec-installer-${VERSION}-${ARCH_TAG}.sh"
 
 # ====== 1. Clean and create dirs ======
-rm -rf package/opt/osec "$OUTPUT_DIR"
+rm -rf package/opt/osec package/opt/greatwall_vpn "$OUTPUT_DIR"
 mkdir -p "package/opt/osec/${TARGET_TRIPLE}"
 mkdir -p package/opt/osec/{certs,log}
 mkdir -p "$OUTPUT_DIR"
@@ -87,10 +87,10 @@ cp certs/root-ca.pem package/opt/osec/certs/
 # 以 target/<triple>/release/vpn-helper 为唯一来源，随 TARGET_TRIPLE 进包（见 §5.2）。
 echo "Copying VPN directory..."
 if [ -d vpn ]; then
-    cp -r vpn package/opt/osec/vpn
+    cp -r vpn package/opt/greatwall_vpn
     # 排除 vpn/ 下的零散 helper 二进制，避免与 triple 版歧义（安装脚本只认 $BIN_DIR 版）
-    rm -f package/opt/osec/vpn/vpn-helper* 2>/dev/null || true
-    echo "  ✅ vpn/ → package/opt/osec/vpn ($(du -sh package/opt/osec/vpn | cut -f1))"
+    rm -f package/opt/greatwall_vpn/vpn-helper* 2>/dev/null || true
+    echo "  ✅ vpn/ → package/opt/greatwall_vpn ($(du -sh package/opt/greatwall_vpn | cut -f1))"
     for _t in x86_64 aarch64 loongarch64; do
         if ls "vpn/lib_${_t}/libVpn.so" >/dev/null 2>&1; then
             echo "  ✅ vpn/lib_${_t}/ (`ls vpn/lib_${_t}/lib*.so | wc -l` 个 .so) 就绪"
@@ -325,6 +325,8 @@ esac
 echo "Detected architecture: \$ARCH"
 
 INSTALL_DIR="/opt/osec"
+# VPN 运行目录独立于 /opt/osec，避免被自保目录保护误伤（vpn-helper 会写 SignCert/ca）
+VPN_DST="/opt/greatwall_vpn"
 
 if [[ "\$MODE" == "install" ]]; then
     PAYLOAD_LINE=\$(awk '/^__PAYLOAD_BELOW__/ {print NR + 1; exit}' "\$0")
@@ -333,6 +335,14 @@ if [[ "\$MODE" == "install" ]]; then
     cp -rf /tmp/opt/osec/* "\$INSTALL_DIR/"
     chmod 755 "\$INSTALL_DIR" -R
     chown -R root:root "\$INSTALL_DIR"
+
+    # VPN 独立目录（不在 /opt/osec 下，避免自保目录保护误伤 vpn-helper）
+    if [ -d /tmp/opt/greatwall_vpn ]; then
+        mkdir -p "\$VPN_DST"
+        cp -rf /tmp/opt/greatwall_vpn/* "\$VPN_DST/"
+        chmod 755 "\$VPN_DST" -R
+        chown -R root:root "\$VPN_DST"
+    fi
 
     # eBPF LSM detect and auto-enable in GRUB (install only)
     check_and_enable_bpf_lsm
@@ -414,34 +424,45 @@ elif [[ "\$MODE" == "upgrade" ]]; then
     # 升级前备份 VPN 用户配置（vpn.conf 含 VPN 账号/密码/uuid，绝不能被包内模板覆盖）
     VPN_BAK_DIR="/tmp/.osec_vpn_bak.\$\$"
     rm -rf "\$VPN_BAK_DIR"
-    if [ -d "\$INSTALL_DIR/vpn" ]; then
+    if [ -d "\$VPN_DST" ]; then
         mkdir -p "\$VPN_BAK_DIR"
         for _vf in vpn.conf client.conf cosignsdk.conf; do
-            [ -f "\$INSTALL_DIR/vpn/\$_vf" ] && cp -f "\$INSTALL_DIR/vpn/\$_vf" "\$VPN_BAK_DIR/\$_vf"
+            [ -f "\$VPN_DST/\$_vf" ] && cp -f "\$VPN_DST/\$_vf" "\$VPN_BAK_DIR/\$_vf"
         done
-        [ -d "\$INSTALL_DIR/vpn/ca" ] && cp -rf "\$INSTALL_DIR/vpn/ca" "\$VPN_BAK_DIR/ca"
+        [ -d "\$VPN_DST/ca" ] && cp -rf "\$VPN_DST/ca" "\$VPN_BAK_DIR/ca"
+        [ -d "\$VPN_DST/pem" ] && cp -rf "\$VPN_DST/pem" "\$VPN_BAK_DIR/pem"
     fi
 
     # 解压新包（新文件覆盖，包含新增的功能段）
     cp -rf /tmp/opt/osec/* "\$INSTALL_DIR/"
+    # 新版 VPN 独立目录
+    if [ -d /tmp/opt/greatwall_vpn ]; then
+        mkdir -p "\$VPN_DST"
+        cp -rf /tmp/opt/greatwall_vpn/* "\$VPN_DST/"
+    fi
     rm -rf /tmp/osec_update
     rm -rf /tmp/opt
 
 
     # 还原 VPN 用户配置（升级永不覆盖用户账号；新装则保留包内模板）
     if [ -d "\$VPN_BAK_DIR" ]; then
+        mkdir -p "\$VPN_DST"
         for _vf in vpn.conf client.conf cosignsdk.conf; do
             if [ -f "\$VPN_BAK_DIR/\$_vf" ]; then
-                cp -f "\$VPN_BAK_DIR/\$_vf" "\$INSTALL_DIR/vpn/\$_vf"
+                cp -f "\$VPN_BAK_DIR/\$_vf" "\$VPN_DST/\$_vf"
                 echo "vpn/\$_vf 已还原用户配置（升级不覆盖）"
             fi
         done
         if [ -d "\$VPN_BAK_DIR/ca" ]; then
-            mkdir -p "\$INSTALL_DIR/vpn/ca"
+            mkdir -p "\$VPN_DST/ca"
             for _cer in "\$VPN_BAK_DIR"/ca/*; do
                 [ -f "\$_cer" ] || continue
-                cp -f "\$_cer" "\$INSTALL_DIR/vpn/ca/\$(basename "\$_cer")"
+                cp -f "\$_cer" "\$VPN_DST/ca/\$(basename "\$_cer")"
             done
+        fi
+        if [ -d "\$VPN_BAK_DIR/pem" ]; then
+            mkdir -p "\$VPN_DST/pem"
+            cp -rf "\$VPN_BAK_DIR"/pem/* "\$VPN_DST/pem/" 2>/dev/null || true
         fi
         rm -rf "\$VPN_BAK_DIR"
     fi
@@ -538,8 +559,8 @@ else
 fi
 
 # --- Deploy VPN（helper 与 MagicArmorAgent 一样随 BIN_DIR，lib 按平台 lib_<tag> 三选一） ---
-# 包内布局（打包侧 §5.1/§5.2）：$INSTALL_DIR/$BIN_DIR/vpn-helper、$INSTALL_DIR/vpn/{vpn.conf,client.conf,cosignsdk.conf,ca/,lib_<tag>/,pem/}
-# 落点（与 net_info.ini [VPN] 段一致）：helper→$INSTALL_DIR/vpn/vpn-helper，.so→$INSTALL_DIR/vpn/lib/
+# 包内布局（打包侧 §5.1/§5.2）：$INSTALL_DIR/$BIN_DIR/vpn-helper、/opt/greatwall_vpn/{vpn.conf,client.conf,cosignsdk.conf,ca/,lib_<tag>/,pem/}
+# 落点（与 net_info.ini [VPN] 段一致）：helper→$VPN_DST/vpn-helper，.so→$VPN_DST/lib/
 echo "Deploying VPN..."
 VPN_TAG=""
 case "\$ARCH" in
@@ -547,8 +568,7 @@ case "\$ARCH" in
     aarch64|arm64) VPN_TAG="aarch64" ;;
     loongarch64)   VPN_TAG="loongarch64" ;;
 esac
-VPN_SRC="\$INSTALL_DIR/vpn"
-VPN_DST="\$INSTALL_DIR/vpn"
+VPN_SRC="\$VPN_DST"
 if [ -d "\$VPN_SRC" ]; then
     mkdir -p "\$VPN_DST/lib" "\$VPN_DST/ca" "\$VPN_DST/pem"
     # helper：与 MagicArmorAgent 同源，从当前平台 triple 目录取

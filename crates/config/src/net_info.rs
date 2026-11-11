@@ -239,7 +239,7 @@ impl Default for SystemConfig {
 }
 
 /// VPN 拨号配置，对应 ini 中的 [VPN] 段
-/// ENABLED=1 时 agent 启动先拨通 VPN（/opt/osec/vpn/vpn.conf）再连接服务器；
+/// ENABLED=1 时 agent 启动先拨通 VPN（/opt/greatwall_vpn/vpn.conf）再连接服务器；
 /// 特定网络环境（服务器只允许 VPN 虚地址接入）才需要打开，默认关闭。
 #[derive(Debug, Clone)]
 pub struct VpnConfig {
@@ -253,9 +253,9 @@ impl Default for VpnConfig {
     fn default() -> Self {
         VpnConfig {
             enabled: false,
-            helper: "/opt/osec/vpn/vpn-helper".to_string(),
-            conf_path: "/opt/osec/vpn/vpn.conf".to_string(),
-            client_conf: "/opt/osec/vpn/client.conf".to_string(),
+            helper: "/opt/greatwall_vpn/vpn-helper".to_string(),
+            conf_path: "/opt/greatwall_vpn/vpn.conf".to_string(),
+            client_conf: "/opt/greatwall_vpn/client.conf".to_string(),
         }
     }
 }

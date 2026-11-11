@@ -2,7 +2,7 @@
 //!
 //! 由 agent（crates/vpn supervisor）拉起并保活；KeepAlive5 内部阻塞+自动重连，
 //! 进程退出即代表隧道中断，supervisor 会按退避间隔重新拉起。
-//! 用法：vpn-helper [/opt/osec/vpn/vpn.conf [/opt/osec/vpn/client.conf]]
+//! 用法：vpn-helper [/opt/greatwall_vpn/vpn.conf [/opt/greatwall_vpn/client.conf]]
 
 use std::env;
 use std::ffi::{CStr, CString};
@@ -187,8 +187,8 @@ fn main() {
     init_logger();
 
     let args: Vec<String> = env::args().collect();
-    let conf_path = args.get(1).map(|s| s.as_str()).unwrap_or("/opt/osec/vpn/vpn.conf");
-    let client_conf = args.get(2).map(|s| s.as_str()).unwrap_or("/opt/osec/vpn/client.conf");
+    let conf_path = args.get(1).map(|s| s.as_str()).unwrap_or("/opt/greatwall_vpn/vpn.conf");
+    let client_conf = args.get(2).map(|s| s.as_str()).unwrap_or("/opt/greatwall_vpn/client.conf");
 
     let conf_str = match fs::read_to_string(conf_path) {
         Ok(s) => s,
