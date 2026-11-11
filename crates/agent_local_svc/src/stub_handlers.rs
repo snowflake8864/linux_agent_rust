@@ -60,12 +60,9 @@ impl DirPolicyService for DirPolicyServiceImpl {
             })
             .collect();
 
-        // Write to pattern_mgr (→ /proc/osec/)
-        task::policy_persistence::save_dir_policy(&protect_dirs, true);
-        self.pattern_mgr.lock().unwrap().set_protect_dir(protect_dirs);
-
-        // Update cache for subsequent GetDirPolicy calls
-        self.data_hub.set_cached_dir_policy(rules);
+        // 只写离线本地表，由 policy_store 从 DB 加载并下发内核/刷新缓存。
+        task::policy_store::commit_dir_policy(&protect_dirs)
+            .map_err(Status::internal)?;
 
         Ok(Response::new(SimpleResponse { success: true, message: "目录保护策略已更新".into() }))
     }
@@ -105,12 +102,9 @@ impl ExtortPolicyService for ExtortPolicyServiceImpl {
             })
             .collect();
 
-        // Write to pattern_mgr (→ /proc/osec/)
-        task::policy_persistence::save_extort_policy(&extort_rules, true);
-        self.pattern_mgr.lock().unwrap().set_exiport_dir(extort_rules);
-
-        // Update cache
-        self.data_hub.set_cached_extort_policy(rules);
+        // 只写离线本地表，由 policy_store 从 DB 加载并下发内核/刷新缓存。
+        task::policy_store::commit_extort_policy(&extort_rules)
+            .map_err(Status::internal)?;
 
         Ok(Response::new(SimpleResponse { success: true, message: "勒索保护策略已更新".into() }))
     }

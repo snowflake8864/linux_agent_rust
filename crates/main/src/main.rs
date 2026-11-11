@@ -199,7 +199,8 @@ async fn main() -> std::io::Result<()> {
         None => { log_info!("[startup] 在线探测失败（拿不到 token），按离线处理"); false }
     };
 
-    // 从 DB 恢复策略到内存（仅 SQLite 开关开启时生效）
+    // 从 DB 恢复策略到内存（仅 SQLite 开关开启时生效）。
+    // 具体加载统一由 task::policy_store 在后端就绪后执行（DB 单一来源）。
     {
         let cfg = NETINFO_CONFIG.lock().unwrap();
         let db_enabled = cfg.sqlite_db.enabled;
@@ -209,29 +210,6 @@ async fn main() -> std::io::Result<()> {
         drop(cfg);
         log_info!("[startup] cfg: sqlite_db.enabled={} db_policy.process_policy={} db_policy.peripheral_policy={} usb_protect={} online={}",
             db_enabled, load_process, load_peripheral, usb_protect, online);
-        if db_enabled {
-            if load_process && !online {
-                // 启动即离线：合并加载在线基线表(上次服务器策略) + 离线本地表(gRPC 策略)，
-                // 延用上次在线时服务器下发的策略，不丢；在线交给服务器重推，避免与 scan 的 md5_map 锁互锁
-                process_mgr::POLICY_MANAGER.lock().unwrap().load_policy_from_db_merged();
-            }
-            if load_peripheral {
-                // 合并加载在线表 + 本地表，避免在线启动时丢失用户本地策略修改
-                agent_local_svc::AgentDataHub::load_peripheral_policy_merged();
-            }
-        }
-
-        // 启动时若 usb_protect 开启，物理禁用所有已加载的黑名单设备
-        if usb_protect {
-            let black_eids: Vec<String> = {
-                let guard = udisk::list::SHARED_USB_LIST.lock().unwrap();
-                guard.get_blacklist().iter().map(|d| d.perpheral_eid.clone()).collect()
-            };
-            if !black_eids.is_empty() {
-                log_info!("[startup] usb_protect 开启，禁用 {} 个已加载黑名单设备", black_eids.len());
-                udisk::monitor::handle_blacklist_update(&black_eids);
-            }
-        }
     }
 
     // 创建通信通道
@@ -466,8 +444,11 @@ async fn main() -> std::io::Result<()> {
 
         // 启动时根据配置文件应用自保开关（离线/在线都生效，不依赖 token/服务器）。
         // 自保走专用 self_protect_dirs + protected_pids，与 DPI dir_policies 完全独立。
-        // 仅 eBPF 模式；driver 模式自保仍走其原有 netlink/驱动逻辑，不受影响。
-        if backend_mode == "ebpf" {
+        // 仅 eBPF 后端（含 driver 失败后的 ebpf-fallback）；driver 模式走 netlink/驱动逻辑。
+        let is_ebpf_backend = common::backend::get_backend()
+            .map(|b| b.name() == "ebpf")
+            .unwrap_or(false);
+        if is_ebpf_backend {
             let self_protect = cfg.self_protect_switch;
             if let Err(e) = common::backend::with_backend(|b| b.write_self_protection(self_protect as u32)) {
                 log_warn!("[eBPF] 启动应用自保开关失败: {}", e);
@@ -490,13 +471,39 @@ async fn main() -> std::io::Result<()> {
         drop(cfg);
     }
 
-    // 后端就绪后，仅在离线时把启动恢复的进程黑白名单下发到内核。
-    // 在线时服务器会通过 task_fetcher 重推策略，这里跳过，避免与后台 MD5 扫描抢 md5_map 锁。
-    // 注意：必须在 drop(cfg) 之后调用。apply_loaded_policy_to_kernel 内部会再次
-    // lock NETINFO_CONFIG（检查 [SQLITE_DB]/[DB_POLICY] 开关）；若在 cfg 仍被持有
-    // 的作用域内调用，会自死锁（std::sync::Mutex 不可重入），导致 gRPC 无法启动。
-    if !online {
-        process_mgr::POLICY_MANAGER.lock().unwrap().apply_loaded_policy_to_kernel();
+    // ── 策略单一来源：后端就绪后统一从 SQLite 加载并下发 ──
+    // 默认进程白名单是代码内常量，不属于服务器/gRPC 策略，先初始化。
+    pattern::process_pattern_rules_mgr::PROCESS_PATTERN_RULES_MGR.lock().init();
+    // GLOBAL_PATTERN_MGR 由 policy_store 读取 DB 后使用，必须先注册。
+    task::task_fetcher::GLOBAL_PATTERN_MGR.set(init.pattern_mgr()).ok();
+    task::policy_store::mark_backend_ready();
+
+    // 自保目录文件规则由配置开关驱动（非服务器策略），在 DB 策略加载后叠加。
+    {
+        let (mod_ver, self_protect_switch) = {
+            let cfg = NETINFO_CONFIG.lock().unwrap();
+            (cfg.mod_ver.clone(), cfg.self_protect_switch)
+        };
+        if !mod_ver.is_empty() {
+            let mgr = init.pattern_mgr();
+            let mut pm = mgr.lock().unwrap();
+            pm.add_file_pattern(self_protect_switch);
+        }
+    }
+
+    // 启动时若 usb_protect 开启，物理禁用所有已加载的黑名单设备（策略已从 DB 加载）
+    {
+        let usb_protect = NETINFO_CONFIG.lock().unwrap().usb_protect;
+        if usb_protect {
+            let black_eids: Vec<String> = {
+                let guard = udisk::list::SHARED_USB_LIST.lock().unwrap();
+                guard.get_blacklist().iter().map(|d| d.perpheral_eid.clone()).collect()
+            };
+            if !black_eids.is_empty() {
+                log_info!("[startup] usb_protect 开启，禁用 {} 个已加载黑名单设备", black_eids.len());
+                udisk::monitor::handle_blacklist_update(&black_eids);
+            }
+        }
     }
 
     // 策略下发完成后再启动 eBPF 后台 MD5 扫描，避免与下发争抢 md5_map 锁阻塞主线程。
@@ -562,6 +569,15 @@ async fn main() -> std::io::Result<()> {
             sock.send_message(0x703, &bytes)?; // 或者用 match 处理错误
         } else {
             log_error!("Invalid IP address: {}", cfg.server_ip);
+        }
+
+        // driver 模式：启动时按配置下发自保防 kill 开关（离线/从未上线也生效）。
+        // eBPF 模式的自保已在后端初始化阶段写入专用 map，避免重复。
+        if !cfg.mod_ver.starts_with("ebpf") && cfg.self_protect_switch {
+            match sock.send_uint32(0x103, 1) {
+                Ok(_) => log_info!("启动下发自保开关: 开 (netlink 0x103)"),
+                Err(e) => log_warn!("启动下发自保开关失败: {}", e),
+            }
         }
 
         drop(cfg);
