@@ -1950,7 +1950,7 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
     }
 
     pub fn scan_executables(&self, dirs: &[String], recursive: bool) -> anyhow::Result<usize> {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         // 先在本地累积，最后一次性批量入表：避免整个扫描期间持有写锁，
         // 阻塞进程事件路径上的 inode_md5_map 查表。
         let mut md5_entries: Vec<(String, Md5Entry)> = Vec::new();
@@ -1963,25 +1963,28 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                 let path = entry.path();
                 if !path.is_file() { continue; }
                 let path_str = path.to_string_lossy().to_string();
-                if let Ok(data) = std::fs::read(path) {
-                    if data.len() < 4 || &data[..4] != b"\x7fELF" { continue; }
-                } else { continue; }
-                if let Ok(data) = std::fs::read(path) {
-                    let hash = hex::encode(md5::compute(&data).0);
-                    let meta = match std::fs::metadata(path) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-                    let mtime = meta.modified().ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d: std::time::Duration| d.as_secs())
-                        .unwrap_or(0);
-                    let key = (meta.dev(), meta.ino());
-                    path_cache_entries.push((path_str.clone(), (hash.clone(), mtime)));
-                    md5_entries.push((hash.clone(), Md5Entry { inode: key.1, dev: key.0, path: path_str.clone(), mtime }));
-                    inode_recs.push((key, InodeMd5Rec { md5: hash, mtime, path: path_str }));
-                    count += 1;
+                let data = match std::fs::read(path) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let meta = match std::fs::metadata(path) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                // 只保留真正可执行的文件：x 权限 + (ELF 或 shebang 脚本)
+                if !common::exec_scan::is_executable_payload(&data, meta.permissions().mode()) {
+                    continue;
                 }
+                let hash = hex::encode(md5::compute(&data).0);
+                let mtime = meta.modified().ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d: std::time::Duration| d.as_secs())
+                    .unwrap_or(0);
+                let key = (meta.dev(), meta.ino());
+                path_cache_entries.push((path_str.clone(), (hash.clone(), mtime)));
+                md5_entries.push((hash.clone(), Md5Entry { inode: key.1, dev: key.0, path: path_str.clone(), mtime }));
+                inode_recs.push((key, InodeMd5Rec { md5: hash, mtime, path: path_str }));
+                count += 1;
             }
         }
         // 批量入表（短临界区）
@@ -2075,7 +2078,7 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
     /// 路径存储为容器内逻辑路径（如 /bin/ls），不含 overlay 前缀。
     /// 枚举 Docker overlay2 + Podman/cri-o overlay 目录下所有 merged/ 子目录。
     pub fn scan_container_overlays(&self) -> anyhow::Result<usize> {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         // 容器 overlay 根目录模式（暂时全部关闭，保留，后续可恢复）
         let overlay_roots: &[&str] = &[
@@ -2179,8 +2182,8 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                             continue;
                         }
                     }
-                    // 只保留 ELF 文件
-                    if data.len() < 4 || &data[..4] != b"\x7fELF" {
+                    // 只保留真正可执行的文件：x 权限 + (ELF 或 shebang 脚本)
+                    if !common::exec_scan::is_executable_payload(&data, meta.permissions().mode()) {
                         continue;
                     }
 

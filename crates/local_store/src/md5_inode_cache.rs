@@ -3,7 +3,7 @@
 //! 持久化「非扫描目录」可执行文件的 hash → path 映射。
 //!
 //! 这些映射在运行期由不明进程命中白/黑名单时即时解析（ebpf_backend::try_resolve_pending_rule）
-//! 得到。重启后 md5_map 只从 /bin /usr/bin /usr/sbin /usr/local/bin /usr/lib/systemd 等
+//! 得到。重启后 md5_map 只从 /bin /usr/bin /usr/sbin /usr/local/bin 等
 //! 标准目录扫描重建，若不持久化，/opt 等路径的白名单进程会再次被拦截一次、再走一遍即时补写。
 //!
 //! hash 为主键；path 是解析时的绝对路径。启动加载时重新 stat(path) 得到当前 (dev,inode)，
