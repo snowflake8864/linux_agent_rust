@@ -79,6 +79,9 @@ struct pattern_rule {
     __u8 reserved[6];
 };
 
+// 已停用查询：eBPF 后端从不写该表（PROCESS_PATTERNS 统一在用户态解析成
+// (dev,inode) 写入 proc_rules），exec 路径查它恒 miss，属纯开销。
+// 定义暂时保留以兼容历史 map 布局，后续如确认无外部依赖可整体删除。
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 256);
@@ -319,6 +322,9 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
         }
     }
 
+    // proc_patterns 已停用：该表在 eBPF 后端从未被写入，两次查询恒 miss。
+    // 命中 proc_rules / proc_rules_ino 之外的都直接进入未知进程判定。
+#if 0
     // Fallback to pattern-based rules
     if (!rule) {
         struct pattern_key pkey = {};
@@ -360,6 +366,7 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
             }
         }
     }
+#endif
 
     if (rule) {
         // 命中规则：从 action_mode 解包
