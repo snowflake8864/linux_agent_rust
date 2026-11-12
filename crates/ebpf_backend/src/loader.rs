@@ -44,6 +44,7 @@ impl ModularLoader {
         let mut loader = BpfLoader::new();
         if proc_rules_max_entries > 0 {
             loader.set_max_entries("proc_rules", proc_rules_max_entries);
+            loader.set_max_entries("proc_rules_ino", proc_rules_max_entries);
             info!("[EbpfBackend]   proc_rules max_entries = {}", proc_rules_max_entries);
         }
         let bpf = loader.load_file(path)?;
