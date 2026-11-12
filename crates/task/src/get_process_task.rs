@@ -22,7 +22,7 @@ const DIRS: &[&str] = &[
 ];
 
 /// 容器 overlay rootfs 下需要扫描的子目录（与 scan_container_overlays 保持一致）
-const OVERLAY_SUBDIRS: &[&str] = &["bin", "sbin", "usr/bin", "usr/sbin", "usr/local/bin"];
+const OVERLAY_SUBDIRS: &[&str] = &["bin", "sbin", "usr/bin", "usr/sbin", "usr/local/bin", "usr/local/sbin"];
 
 fn build_linux_dir_json(vec_info: &Vec<LinuxDirProc>) -> String {
     // 服务器 AllPut.list 字段是 string 类型，需要先序列化为 JSON 字符串再作为值
@@ -34,7 +34,7 @@ fn build_linux_dir_json(vec_info: &Vec<LinuxDirProc>) -> String {
 }
 
 /// 扫描单个目录下的可执行文件，计算 MD5 并追加到 vec_info
-fn scan_one_dir(path: &str, vec_info: &mut Vec<LinuxDirProc>) {
+fn scan_one_dir(path: &str, display_base: Option<&str>, vec_info: &mut Vec<LinuxDirProc>) {
     let entries = match read_dir(path) {
         Ok(e) => e,
         Err(e) => {
@@ -74,8 +74,15 @@ fn scan_one_dir(path: &str, vec_info: &mut Vec<LinuxDirProc>) {
             }
         };
 
+        let display = match display_base {
+            Some(base) => path_str
+                .strip_prefix(base)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| path_str.to_string()),
+            None => path_str.to_string(),
+        };
         vec_info.push(LinuxDirProc {
-            dir: path_str.to_string(),
+            dir: display,
             hash: md5,
             introduce: "linux".to_string(),
             copyright: "linux_gnu".to_string(),
@@ -106,7 +113,7 @@ pub async fn process_all_dirs(
 
     // 1. 扫描宿主机标准目录
     for &path in DIRS {
-        scan_one_dir(path, &mut vec_info);
+        scan_one_dir(path, None, &mut vec_info);
         if vec_info.len() >= 200 {
             flush_to_server(&mut vec_info, &net_client, url, token).await;
         }
@@ -119,10 +126,13 @@ pub async fn process_all_dirs(
             for root in &overlay_roots {
                 for subdir in OVERLAY_SUBDIRS {
                     let scan_dir = format!("{}/{}", root, subdir);
-                    if !std::path::Path::new(&scan_dir).is_dir() {
-                        continue;
+                    // 只走真实目录：/bin、/sbin 常是指向 usr/bin 的符号链接，
+                    // 跟随后会与 usr/bin 重复扫描。
+                    match std::fs::symlink_metadata(&scan_dir) {
+                        Ok(m) if m.is_dir() => {}
+                        _ => continue,
                     }
-                    scan_one_dir(&scan_dir, &mut vec_info);
+                    scan_one_dir(&scan_dir, Some(root.as_str()), &mut vec_info);
                     if vec_info.len() >= 200 {
                         flush_to_server(&mut vec_info, &net_client, url, token).await;
                     }

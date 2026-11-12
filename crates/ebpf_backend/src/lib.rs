@@ -64,6 +64,13 @@ pub struct EbpfBackend {
     /// BPF 进程事件与后台扫描共用；inode 全局唯一，宿主机/容器(其它 mount ns)进程
     /// 统一按此查表，不依赖路径字符串。与 md5_map 互为正反查询。
     pub inode_md5_map: Arc<RwLock<std::collections::HashMap<(u64, u64), InodeMd5Rec>>>,
+    /// 容器 overlay 底层 inode → 文件记录（跨挂载稳定，供首启/磁盘扫描兜底）。
+    /// 同一 inode 可能对应多条记录：冲突（不同 md5）时拒绝写 ino allow。
+    overlay_inode_index: Arc<RwLock<std::collections::HashMap<u64, Vec<OverlayInodeRec>>>>,
+    /// 已下发的 proc_rules_ino keys（用于清除/刷新）
+    active_ino_rules: Arc<Mutex<Vec<u64>>>,
+    /// 已扫描的容器层目录 → 目录 mtime（秒），用于增量扫描跳过未变化层
+    layer_scan_cache: Arc<Mutex<std::collections::HashMap<String, i64>>>,
     /// 进程规则缓存 (whitelist, blacklist)
     process_cache: Arc<Mutex<(Vec<String>, Vec<String>)>>,
     /// 待下发规则缓存: hash → action (0=white, 1=black), 用于 md5_map 尚未包含该 hash 时暂存
@@ -113,6 +120,17 @@ pub struct Md5Entry {
     pub path: String,
     /// 文件 mtime（秒）；容器条目为 0（宿主机不可 stat），用于规避 inode 复用误映射。
     pub mtime: u64,
+}
+
+/// 容器 overlay 层文件的底层身份记录。inode 为底层 fs inode（与 overlay i_ino 一致），
+/// underlying_dev 为底层 fs 设备号，用于跨 data-root/文件系统冲突检测。
+#[derive(Debug, Clone)]
+pub struct OverlayInodeRec {
+    pub md5: String,
+    pub path: String,
+    pub underlying_dev: u64,
+    pub size: u64,
+    pub prefix_hash: u64,
 }
 
 // ── 虚拟开端口（端口虚开/重定向）──
@@ -387,6 +405,9 @@ impl EbpfBackend {
             engine: engine.to_string(),
             md5_map: Arc::new(RwLock::new(std::collections::HashMap::new())),
             inode_md5_map: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            overlay_inode_index: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            active_ino_rules: Arc::new(Mutex::new(Vec::new())),
+            layer_scan_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             process_cache: Arc::new(Mutex::new((Vec::new(), Vec::new()))),
             pending_rules: Arc::new(Mutex::new(std::collections::HashMap::new())),
             applied_rules: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -681,17 +702,26 @@ impl EbpfBackend {
             Err(e) => { log::error!("[EbpfBackend] ❌ md5_map mutex poisoned (refresh), recovering"); e.into_inner() }
         };
         let mut refreshed = 0;
+        let mut ino_refreshed = 0;
 
         for (hash, &action) in applied.iter() {
             if let Some(entries) = md5_map.get(hash) {
                 for e in entries {
                     let _ = self.add_proc_rule_by_inode(e.dev as u32, e.inode, action, mode);
+                    if action == 0 {
+                        if let Some(rec) = self.overlay_index_lookup(e.inode) {
+                            if rec.md5 == *hash
+                                && self.add_proc_rule_ino_by_inode(e.inode, action, mode, rec.size, rec.prefix_hash).is_ok() {
+                                ino_refreshed += 1;
+                            }
+                        }
+                    }
                 }
                 refreshed += 1;
             }
         }
-        log::info!("[EbpfBackend] 🔄 模式切换: 已刷新 {} 条 proc_rules (mode={})", refreshed,
-            if protect { "PROTECT" } else { "MONITOR" });
+        log::info!("[EbpfBackend] 🔄 模式切换: 已刷新 {} 条 proc_rules + {} 条 overlay ino (mode={})",
+            refreshed, ino_refreshed, if protect { "PROTECT" } else { "MONITOR" });
     }
 
     /// 从 ringbuf 中读取所有待处理事件（epoll + 同步读取）
@@ -742,6 +772,24 @@ impl EbpfBackend {
         else { 3 }  // OP_READ → open (idx=3), and fallback
     }
 
+    /// 周期性扫描容器层目录：覆盖“agent 启动后新建但尚未 start”的容器。
+    /// 层目录 mtime 未变时跳过，稳态下开销很小。
+    pub fn start_container_scan_loop(self: &Arc<Self>) {
+        if !self.proc_loaded { return; }
+        let backend = self.clone();
+        std::thread::spawn(move || {
+            info!("[EbpfBackend] 容器层周期扫描线程已启动 (10s)");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                match backend.scan_container_overlays_layers_only() {
+                    Ok(0) => {}
+                    Ok(n) => info!("[EbpfBackend] 周期扫描容器层: {} 个文件", n),
+                    Err(e) => warn!("[EbpfBackend] 周期扫描容器层失败: {}", e),
+                }
+            }
+        });
+    }
+
     /// 启动 eBPF 进程事件 ring buffer 读取器
     /// 当 eBPF proc_agent 拦截/监控进程时，通过 ringbuf 发送事件，这里读取并上报告警
     pub fn start_proc_event_reader(self: &Arc<Self>) {
@@ -764,8 +812,8 @@ impl EbpfBackend {
                     match Self::parse_event(data) {
                         Some((event, path, comm)) => {
                             let is_black = event.event_type == 2; // EVENT_PROC
-                            log::info!("[EbpfBackend] 📨 事件解析: type={} blocked={} pid={} uid={} dev={} inode={} cgid={} path={} comm={}",
-                                event.event_type, event.blocked, event.pid, event.uid, event.dev, event.inode, event.cgid, path, comm);
+                            log::info!("[EbpfBackend] 📨 事件解析: type={} overlay={} blocked={} pid={} uid={} dev={} inode={} cgid={} path={} comm={}",
+                                event.event_type, event.is_overlay, event.blocked, event.pid, event.uid, event.dev, event.inode, event.cgid, path, comm);
                             let n_type = if event.blocked == 1 {
                                 if is_black { 1102 } else { 1101 }
                             } else if is_black { 1002 } else { 1001 };
@@ -961,7 +1009,24 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         let container = self.container_watcher.lookup(event.cgid);
         let (mut md5_hash, mut real_path) =
             self.resolve_proc_md5(event.pid, key, path, container.as_ref());
-        let is_container = container.is_some() || real_path.starts_with("/proc/");
+        // 容器未识别/瞬时进程已退出时，按 overlay 底层 inode 从磁盘扫描索引兜底。
+        if md5_hash.is_none() && event.is_overlay != 0 {
+            match self.overlay_index_lookup(event.inode) {
+                Some(rec) => {
+                    info!("[EbpfBackend] 🔍 overlay inode 兜底命中: inode={} md5={} path={}",
+                        event.inode, &rec.md5[..8.min(rec.md5.len())], rec.path);
+                    md5_hash = Some(rec.md5);
+                    real_path = rec.path;
+                }
+                None => {
+                    log::info!("[EbpfBackend] 🔍 overlay inode 兜底未命中: inode={} (索引未覆盖或存在冲突)",
+                        event.inode);
+                }
+            }
+        }
+        let is_container = event.is_overlay != 0
+            || container.is_some()
+            || real_path.starts_with("/proc/");
         log::info!(
             "[EbpfBackend] 📋 进程归属: pid={} cgid={} container={:?} md5={} real_path={}",
             event.pid,
@@ -1447,6 +1512,69 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         Ok(())
     }
 
+    /// 写 overlay 文件 inode-only 规则（proc_rules_ino）。
+    fn add_proc_rule_ino_by_inode(&self, inode: u64, action: u8, mode: u8,
+                                  size: u64, prefix_hash: u64) -> anyhow::Result<()> {
+        let mut loader = self.loader.lock().unwrap();
+        let bpf = loader.proc_bpf_mut().ok_or_else(|| anyhow::anyhow!("Proc agent not loaded"))?;
+        let map_data = bpf.map_mut("proc_rules_ino")
+            .ok_or_else(|| anyhow::anyhow!("proc_rules_ino map not found"))?;
+        let mut map: AyaHashMap<_, u64, ProcRuleInoVal> = AyaHashMap::try_from(map_data)?;
+        map.insert(inode, ProcRuleInoVal::new(action, mode, size, prefix_hash), 0)?;
+        drop(map);
+        drop(loader);
+        let mut active = self.active_ino_rules.lock().unwrap();
+        if !active.contains(&inode) {
+            active.push(inode);
+        }
+        Ok(())
+    }
+
+    fn remove_proc_rule_ino_by_inode(&self, inode: u64) {
+        if let Ok(mut loader) = self.loader.lock() {
+            if let Some(bpf) = loader.proc_bpf_mut() {
+                if let Some(map_data) = bpf.map_mut("proc_rules_ino") {
+                    if let Ok(mut map) = AyaHashMap::<_, u64, ProcRuleInoVal>::try_from(map_data) {
+                        let _ = map.remove(&inode);
+                    }
+                }
+            }
+        }
+        self.active_ino_rules.lock().unwrap().retain(|x| *x != inode);
+    }
+
+    /// 记录/更新 overlay 底层 inode 索引。同一 inode 出现不同 md5 时保留多条，
+    /// 查询阶段会判定为冲突并拒绝用于 allow。
+    fn overlay_index_insert(&self, inode: u64, rec: OverlayInodeRec) {
+        let mut idx = self.overlay_inode_index.write().unwrap();
+        let list = idx.entry(inode).or_insert_with(Vec::new);
+        if let Some(existing) = list.iter_mut().find(|r| r.underlying_dev == rec.underlying_dev && r.md5 == rec.md5) {
+            existing.path = rec.path;
+            existing.size = rec.size;
+            existing.prefix_hash = rec.prefix_hash;
+            return;
+        }
+        if let Some(other) = list.iter().find(|r| r.underlying_dev != rec.underlying_dev || r.md5 != rec.md5) {
+            if other.md5 != rec.md5 {
+                log::warn!("[EbpfBackend] ⚠️ overlay inode 冲突: inode={} md5_a={} md5_b={} dev_a={} dev_b={}",
+                    inode, &other.md5[..8.min(other.md5.len())], &rec.md5[..8.min(rec.md5.len())],
+                    other.underlying_dev, rec.underlying_dev);
+            }
+        }
+        list.push(rec);
+    }
+
+    /// 查询 overlay inode 的 md5/path；若存在多个不同 md5（冲突）返回 None。
+    fn overlay_index_lookup(&self, inode: u64) -> Option<OverlayInodeRec> {
+        let idx = self.overlay_inode_index.read().unwrap();
+        let list = idx.get(&inode)?;
+        let first = list.first()?;
+        if list.iter().any(|r| r.md5 != first.md5) {
+            return None;
+        }
+        Some(first.clone())
+    }
+
     // ── 进程信任白名单（PROCESS_PATTERNS）→ proc_rules (dev,inode) ──
 
     /// 移除之前下发的信任进程白名单 proc_rules 条目。
@@ -1667,15 +1795,33 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
 
     /// 按 hash 删除 proc_rule（从 proc_rules map 中移除所有匹配 inode）
     fn remove_proc_rule_by_hash(&self, hash: &str) -> anyhow::Result<()> {
-        let md5_map = self.md5_map.read().unwrap();
-        if let Some(entries) = md5_map.get(hash) {
+        let entries: Vec<(u64, u64)> = {
+            let md5_map = self.md5_map.read().unwrap();
+            md5_map.get(hash)
+                .map(|es| es.iter().map(|e| (e.dev, e.inode)).collect())
+                .unwrap_or_default()
+        };
+        {
             let mut loader = self.loader.lock().unwrap();
             let bpf = loader.proc_bpf_mut().ok_or_else(|| anyhow::anyhow!("Proc agent not loaded"))?;
             let mut proc_rules: AyaHashMap<_, ProcKey, ProcRuleVal> =
                 AyaHashMap::try_from(bpf.map_mut("proc_rules").unwrap())?;
-            for e in entries {
-                proc_rules.remove(&ProcKey { dev: e.dev as u32, inode: e.inode })?;
+            for (dev, inode) in &entries {
+                let _ = proc_rules.remove(&ProcKey { dev: *dev as u32, inode: *inode });
             }
+        }
+        let mut inodes: Vec<u64> = entries.iter().map(|(_, inode)| *inode).collect();
+        // md5_map 可能没有该 hash（例如规则来自其它路径），再从 overlay 索引按 hash 兜底收集。
+        {
+            let idx = self.overlay_inode_index.read().unwrap();
+            for (inode, list) in idx.iter() {
+                if list.iter().any(|r| r.md5 == hash) && !inodes.contains(inode) {
+                    inodes.push(*inode);
+                }
+            }
+        }
+        for inode in inodes {
+            self.remove_proc_rule_ino_by_inode(inode);
         }
         Ok(())
     }
@@ -1759,6 +1905,14 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         if let Err(e) = self.add_proc_rule_by_inode(dev as u32, inode, action, mode) {
             log::warn!("[EbpfBackend] 补写 proc_rules 失败 (当前 key): {}", e);
         }
+        // overlay 文件：同步写 inode-only allow（当前 inode 及同 md5 的其它 inode）
+        if action == 0 {
+            if let Some(rec) = self.overlay_index_lookup(inode) {
+                if rec.md5 == hash {
+                    let _ = self.add_proc_rule_ino_by_inode(inode, action, mode, rec.size, rec.prefix_hash);
+                }
+            }
+        }
         // 读取 md5_map 中该 MD5 的全部 (dev,inode)，批量补写 BPF proc_rules
         if let Some(entries) = self.md5_entries(hash) {
             let mut written = 0;
@@ -1825,6 +1979,13 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                     }
                     for e in valid {
                         let _ = self.add_proc_rule_by_inode(e.dev as u32, e.inode, *action, mode);
+                        if *action == 0 {
+                            if let Some(rec) = self.overlay_index_lookup(e.inode) {
+                                if rec.md5 == *hash {
+                                    let _ = self.add_proc_rule_ino_by_inode(e.inode, *action, mode, rec.size, rec.prefix_hash);
+                                }
+                            }
+                        }
                     }
                     replayed += 1;
                     Some(hash.clone())
@@ -1849,6 +2010,13 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                         }
                         if self.add_proc_rule_by_inode(e.dev as u32, e.inode, action, mode).is_ok() {
                             patched += 1;
+                            if action == 0 {
+                                if let Some(rec) = self.overlay_index_lookup(e.inode) {
+                                    if rec.md5 == *hash {
+                                        let _ = self.add_proc_rule_ino_by_inode(e.inode, action, mode, rec.size, rec.prefix_hash);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2074,77 +2242,173 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         }
     }
 
-    /// 扫描容器 overlay rootfs 中的可执行文件，计算 MD5 填充 md5_map + inode_md5_map。
-    /// 路径存储为容器内逻辑路径（如 /bin/ls），不含 overlay 前缀。
-    /// 枚举 Docker overlay2 + Podman/cri-o overlay 目录下所有 merged/ 子目录。
-    pub fn scan_container_overlays(&self) -> anyhow::Result<usize> {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    /// 判断路径是否为挂载点（与父目录 dev 不同）。
+    /// 用于区分 containerd snapshot 的 fs：active=mount，committed=普通层目录。
+    fn path_is_mountpoint(path: &str) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let p = std::path::Path::new(path);
+        let Ok(meta) = std::fs::metadata(p) else { return false; };
+        let Some(parent) = p.parent() else { return false; };
+        let Ok(pmeta) = std::fs::metadata(parent) else { return false; };
+        meta.dev() != pmeta.dev()
+    }
 
-        // 容器 overlay 根目录模式（暂时全部关闭，保留，后续可恢复）
-        let overlay_roots: &[&str] = &[
-            // "/var/lib/docker/overlay2",
-            // "/var/lib/containers/storage/overlay",
-            // "/var/lib/containerd/io.containerd.snapshot.v1.overlayfs/snapshots",
-        ];
+    /// 枚举 Docker/Podman/containerd 的容器层目录：
+    /// - diff/fs：底层（停止/创建态也可读），用于 inode 索引
+    /// - merged：运行中 overlay 挂载点，用于记录 (overlay_dev, inode)
+    /// 返回 (路径, root_fd, 是否为 overlay 挂载点)。
+    fn read_json_string_field(path: &str, key: &str) -> Option<String> {
+        let s = std::fs::read_to_string(path).ok()?;
+        let pat = format!("\"{}\"", key);
+        let idx = s.find(&pat)?;
+        let rest = &s[idx + pat.len()..];
+        let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+        let rest = rest.strip_prefix('"')?;
+        Some(rest.split('"').next()?.to_string())
+    }
 
-        let mut merged_dirs: Vec<(String, Arc<std::os::fd::OwnedFd>)> = Vec::new();
-        for root in overlay_roots {
-            if let Ok(entries) = std::fs::read_dir(root) {
-                for entry in entries.flatten() {
-                    // Docker: overlay2/<id>/merged (union mount point, 可读)
-                    let merged = entry.path().join("merged");
-                    if merged.is_dir() {
-                        let s = merged.to_string_lossy().into_owned();
-                        if let Some(fd) = container_watch::open_dir_fd(&s) {
-                            merged_dirs.push((s, fd));
-                        }
-                    }
-                    // containerd: snapshots/<id>/fs/ (可读)
-                    let fs_dir = entry.path().join("fs");
-                    if fs_dir.is_dir() {
-                        let s = fs_dir.to_string_lossy().into_owned();
-                        if let Some(fd) = container_watch::open_dir_fd(&s) {
-                            merged_dirs.push((s, fd));
-                        }
-                    }
-                    // 注意: Podman/CRI-O 的 diff 目录只是 upper layer，
-                    // 不含 lower layer 的文件（如 busybox 二进制），跳过。
+    fn read_toml_string_field(path: &str, key: &str) -> Option<String> {
+        let s = std::fs::read_to_string(path).ok()?;
+        for line in s.lines() {
+            let line = line.trim();
+            if line.starts_with('#') { continue; }
+            let Some(rest) = line.strip_prefix(key) else { continue; };
+            let rest = rest.trim_start();
+            let Some(rest) = rest.strip_prefix('=') else { continue; };
+            let rest = rest.trim_start();
+            let Some(quote) = rest.chars().next() else { continue; };
+            if quote != '"' && quote != '\'' { continue; }
+            let rest = &rest[quote.len_utf8()..];
+            return rest.split(quote).next().map(|v| v.to_string());
+        }
+        None
+    }
+
+    fn push_containerd_roots(roots: &mut Vec<String>, base: &str) {
+        roots.push(format!("{}/io.containerd.snapshot.v1.overlayfs/snapshots", base));
+        if let Ok(entries) = std::fs::read_dir(base) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.contains("snapshot") && name.ends_with("overlayfs") {
+                    roots.push(entry.path().join("snapshots").to_string_lossy().into_owned());
                 }
             }
         }
+    }
 
-        if merged_dirs.is_empty() {
-            info!("[EbpfBackend] 未发现容器 overlay 目录，跳过容器扫描");
+    /// 收集常见容器运行时的层/rootfs 根目录，兼容自定义 data-root/graphroot。
+    fn container_scan_roots() -> Vec<String> {
+        let mut roots: Vec<String> = vec![
+            "/var/lib/docker/overlay2".into(),
+            "/var/lib/containers/storage/overlay".into(),
+            "/var/lib/containerd/io.containerd.snapshot.v1.overlayfs/snapshots".into(),
+            "/var/lib/rancher/k3s/agent/containerd/io.containerd.snapshot.v1.overlayfs/snapshots".into(),
+            "/var/lib/rancher/rke2/agent/containerd/io.containerd.snapshot.v1.overlayfs/snapshots".into(),
+            "/var/snap/microk8s/common/var/lib/containerd/io.containerd.snapshot.v1.overlayfs/snapshots".into(),
+        ];
+        if let Some(dr) = Self::read_json_string_field("/etc/docker/daemon.json", "data-root") {
+            roots.push(format!("{}/overlay2", dr));
+        }
+        let containerd_cfg = [
+            "/etc/containerd/config.toml",
+            "/var/lib/rancher/k3s/agent/etc/containerd/config.toml",
+            "/var/lib/rancher/rke2/agent/etc/containerd/config.toml",
+        ];
+        for cfg in containerd_cfg {
+            if let Some(base) = Self::read_toml_string_field(cfg, "root") {
+                Self::push_containerd_roots(&mut roots, &base);
+            }
+        }
+        if let Some(gr) = Self::read_toml_string_field("/etc/containers/storage.conf", "graphroot") {
+            roots.push(format!("{}/overlay", gr));
+        }
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    fn discover_container_scan_dirs() -> Vec<(String, Arc<std::os::fd::OwnedFd>, bool)> {
+        let mut candidates: Vec<(String, bool)> = Vec::new();
+        for root in Self::container_scan_roots() {
+            let Ok(entries) = std::fs::read_dir(&root) else { continue; };
+            for entry in entries.flatten() {
+                for name in ["diff", "merged", "fs"] {
+                    let p = entry.path().join(name);
+                    if !p.is_dir() { continue; }
+                    let s = p.to_string_lossy().into_owned();
+                    // diff 恒为底层；merged 恒为运行中 overlay 挂载；
+                    // fs 需区分 containerd committed（层）与 active（挂载）。
+                    let is_mount = match name {
+                        "merged" => true,
+                        "diff" => false,
+                        _ => Self::path_is_mountpoint(&s),
+                    };
+                    candidates.push((s, is_mount));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        candidates.dedup_by(|a, b| a.0 == b.0);
+        let mut out = Vec::new();
+        for (s, is_ov) in candidates {
+            if let Some(fd) = container_watch::open_dir_fd(&s) {
+                out.push((s, fd, is_ov));
+            }
+        }
+        out
+    }
+
+    /// 扫描容器 overlay 层/rootfs 中的可执行文件，计算 MD5 填充：
+    /// - md5_map / inode_md5_map：常规 (dev,inode) 索引（运行中 merged 用 overlay dev）
+    /// - overlay_inode_index：底层 inode 索引（diff/fs，跨挂载稳定，供 proc_rules_ino）
+    /// 停止/创建态容器也能通过 diff/fs 扫描到，不依赖 merged 挂载。
+    fn scan_container_overlays_impl(&self, include_mounts: bool) -> anyhow::Result<usize> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let scan_dirs: Vec<(String, Arc<std::os::fd::OwnedFd>, bool)> =
+            Self::discover_container_scan_dirs()
+                .into_iter()
+                .filter(|(_, _, is_ov)| include_mounts || !*is_ov)
+                .collect();
+        if scan_dirs.is_empty() {
+            log::debug!("[EbpfBackend] 未发现容器 overlay 目录，跳过容器扫描");
             return Ok(0);
         }
-
-        info!("[EbpfBackend] 发现 {} 个容器 rootfs 目录，开始扫描", merged_dirs.len());
-        for (i, (d, _)) in merged_dirs.iter().enumerate() {
-            info!("[EbpfBackend]   容器[{}]: {}", i, d);
+        log::debug!("[EbpfBackend] 发现 {} 个容器 rootfs/层目录，开始扫描", scan_dirs.len());
+        for (i, (d, _, is_ov)) in scan_dirs.iter().enumerate() {
+            log::debug!("[EbpfBackend]   容器[{}]: {} (overlay_mount={})", i, d, is_ov);
         }
 
-        // 宿主标准扫描目录前缀（容器内也有这些目录，避免重复）
-        let std_subdirs: &[&str] = &["bin", "sbin", "usr/bin", "usr/sbin", "usr/local/bin"];
+        let std_subdirs: &[&str] = &["bin", "sbin", "usr/bin", "usr/sbin", "usr/local/bin", "usr/local/sbin"];
 
         let mut md5_entries: Vec<(String, Md5Entry)> = Vec::new();
         let mut inode_recs: Vec<((u64, u64), InodeMd5Rec)> = Vec::new();
+        let mut overlay_index_recs: Vec<(u64, OverlayInodeRec)> = Vec::new();
         let mut path_cache_entries: Vec<(String, (String, u64))> = Vec::new();
         let mut count = 0usize;
-        let mut host_dup_count = 0usize; // 与宿主机 MD5 相同的文件数
+        let mut host_dup_count = 0usize;
+        let mut scanned_layer_cache: Vec<(String, i64)> = Vec::new();
 
-        for (merged_dir, root_fd) in &merged_dirs {
-            // 打印容器 overlay 下的目录结构，便于排查
-            if let Ok(entries) = std::fs::read_dir(merged_dir) {
-                let dirs: Vec<String> = entries.flatten()
-                    .filter(|e| e.path().is_dir())
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect();
-                info!("[EbpfBackend]   容器 {} 下的目录: {:?}", merged_dir, dirs);
+        for (root_dir, root_fd, is_overlay_mount) in &scan_dirs {
+            // 底层层目录增量：目录 mtime 未变则跳过（merged 运行期会变化，不做缓存）
+            let dir_mtime = if *is_overlay_mount {
+                0
+            } else {
+                std::fs::metadata(root_dir).ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0)
+            };
+            if !*is_overlay_mount && dir_mtime != 0 {
+                let cache = self.layer_scan_cache.lock().unwrap();
+                if cache.get(root_dir) == Some(&dir_mtime) {
+                    continue;
+                }
             }
+
             for subdir in std_subdirs {
-                let scan_dir = format!("{}/{}", merged_dir, subdir);
-                // 只走真实目录：如果 subdir 本身是绝对符号链接，跳过，
-                // 避免 walkdir 从宿主机目录开始遍历。
+                let scan_dir = format!("{}/{}", root_dir, subdir);
                 match std::fs::symlink_metadata(&scan_dir) {
                     Ok(m) if m.is_dir() => {}
                     _ => continue,
@@ -2154,25 +2418,26 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                     .max_depth(3);
                 for entry in walker.into_iter().filter_map(|e| e.ok()) {
                     let ft = entry.file_type();
-                    // 符号链接也要处理：exec 最终会解析到目标文件
                     if !(ft.is_file() || ft.is_symlink()) {
                         continue;
                     }
-
                     let full_path_str = entry.path().to_string_lossy().to_string();
                     let rel = full_path_str
-                        .strip_prefix(merged_dir.as_str())
+                        .strip_prefix(root_dir.as_str())
                         .unwrap_or(&full_path_str)
                         .trim_start_matches('/');
 
-                    // 关键：以容器根 fd 为锚点打开，绝对符号链接不会逃逸到宿主机
-                    let Some(fd) = container_watch::open_file_in_root(root_fd.as_raw_fd(), rel)
-                    else {
+                    let Some(fd) = container_watch::open_file_in_root(root_fd.as_raw_fd(), rel) else {
                         continue;
                     };
                     let mut file = std::fs::File::from(fd);
                     let Ok(meta) = file.metadata() else { continue; };
                     if !meta.is_file() {
+                        continue;
+                    }
+                    // 先按权限位过滤，避免读取大量非可执行文件的完整内容。
+                    let mode = meta.permissions().mode();
+                    if mode & 0o111 == 0 || meta.len() > 1024 * 1024 * 1024 {
                         continue;
                     }
                     let mut data = Vec::new();
@@ -2182,45 +2447,56 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                             continue;
                         }
                     }
-                    // 只保留真正可执行的文件：x 权限 + (ELF 或 shebang 脚本)
-                    if !common::exec_scan::is_executable_payload(&data, meta.permissions().mode()) {
+                    if !common::exec_scan::is_executable_payload(&data, mode) {
                         continue;
                     }
 
                     let hash = hex::encode(md5::compute(&data).0);
                     let key = (meta.dev(), meta.ino());
                     let container_path = format!("/{}", rel);
+                    let size = meta.len();
+                    let prefix_hash = types::prefix_hash16(&data);
 
-                    // 检测与宿主机 MD5 重复（md5_map 已有此 hash）
-                    let md5_map = self.md5_map.read().unwrap();
-                    let is_host_dup = md5_map.contains_key(&hash);
-                    drop(md5_map);
-
+                    let is_host_dup = {
+                        let md5_map = self.md5_map.read().unwrap();
+                        md5_map.contains_key(&hash)
+                    };
                     if is_host_dup {
                         host_dup_count += 1;
-                        info!("[EbpfBackend]   🔗 容器文件与宿主机 MD5 相同: {} hash={} dev={} inode={}",
-                            container_path, hash, key.0, key.1);
                     }
 
-                    let mtime = 0; // 容器条目 mtime=0，不参与失效校验
-
+                    let mtime = 0;
                     md5_entries.push((hash.clone(), Md5Entry {
-                        inode: key.1, dev: key.0, path: container_path.to_string(), mtime,
+                        inode: key.1, dev: key.0, path: container_path.clone(), mtime,
                     }));
                     inode_recs.push((key, InodeMd5Rec {
-                        md5: hash.clone(), mtime, path: container_path.to_string(),
+                        md5: hash.clone(), mtime, path: container_path.clone(),
                     }));
+                    if !*is_overlay_mount {
+                        overlay_index_recs.push((key.1, OverlayInodeRec {
+                            md5: hash.clone(),
+                            path: container_path,
+                            underlying_dev: key.0,
+                            size,
+                            prefix_hash,
+                        }));
+                    }
                     path_cache_entries.push((full_path_str, (hash, mtime)));
                     count += 1;
                 }
             }
+            if !*is_overlay_mount && dir_mtime != 0 {
+                scanned_layer_cache.push((root_dir.clone(), dir_mtime));
+            }
         }
 
-        // 批量入表
         {
             let mut map = self.md5_map.write().unwrap();
             for (hash, entry) in &md5_entries {
-                map.entry(hash.clone()).or_insert_with(Vec::new).push(entry.clone());
+                let list = map.entry(hash.clone()).or_insert_with(Vec::new);
+                if !list.iter().any(|e| e.dev == entry.dev && e.inode == entry.inode) {
+                    list.push(entry.clone());
+                }
             }
             let mut imap = self.inode_md5_map.write().unwrap();
             for (key, rec) in inode_recs {
@@ -2231,11 +2507,33 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                 path_cache.insert(p, v);
             }
         }
+        for (inode, rec) in overlay_index_recs {
+            self.overlay_index_insert(inode, rec);
+        }
+        {
+            let mut cache = self.layer_scan_cache.lock().unwrap();
+            for (dir, mtime) in scanned_layer_cache {
+                cache.insert(dir, mtime);
+            }
+        }
 
-        info!("[EbpfBackend] 容器 overlay 扫描完成: {} 个文件, {} 个 unique MD5, {} 个与宿主机重复",
-            count, self.md5_map.read().unwrap().len(), host_dup_count);
-        self.replay_pending_rules();
+        if count > 0 {
+            info!("[EbpfBackend] 容器 overlay 扫描完成: {} 个文件, {} 个 unique MD5, {} 个与宿主机重复",
+                count, self.md5_map.read().unwrap().len(), host_dup_count);
+            self.replay_pending_rules();
+        }
         Ok(count)
+    }
+
+
+    /// 扫描容器层 + 运行中 merged（完整扫描）
+    pub fn scan_container_overlays(&self) -> anyhow::Result<usize> {
+        self.scan_container_overlays_impl(true)
+    }
+
+    /// 仅扫描底层 diff/fs（不读运行中 merged），供周期增量扫描使用，避免反复读 merged。
+    pub fn scan_container_overlays_layers_only(&self) -> anyhow::Result<usize> {
+        self.scan_container_overlays_impl(false)
     }
 
     /// 上报自保目录保护告警（/opt/osec 等自保目录被操作）。
@@ -2351,8 +2649,22 @@ impl SecurityBackend for EbpfBackend {
             }
 
             if !entries.is_empty() {
+                let mut ino_written = 0;
                 for e in &entries {
                     let _ = self.add_proc_rule_by_inode(e.dev as u32, e.inode, action, mode);
+                    // overlay 文件额外写 inode-only 规则（仅 allow，跨挂载稳定）。
+                    if action == 0 {
+                        if let Some(rec) = self.overlay_index_lookup(e.inode) {
+                            if rec.md5 == hash
+                                && self.add_proc_rule_ino_by_inode(e.inode, action, mode, rec.size, rec.prefix_hash).is_ok() {
+                                ino_written += 1;
+                            }
+                        }
+                    }
+                }
+                if ino_written > 0 {
+                    log::info!("[EbpfBackend] 🎯 hash={} 同步写入 {} 条 overlay ino allow",
+                        &hash[..8.min(hash.len())], ino_written);
                 }
                 self.applied_rules.lock().unwrap().insert(hash.to_string(), action);
                 applied += 1;
@@ -2452,28 +2764,10 @@ impl SecurityBackend for EbpfBackend {
     }
 
     fn get_executable_overlay_roots(&self) -> Vec<String> {
-        // 暂时全部关闭容器 overlay 预扫描（保留，后续可恢复）
-        let overlay_roots: &[&str] = &[
-            // "/var/lib/docker/overlay2",
-            // "/var/lib/containers/storage/overlay",
-            // "/var/lib/containerd/io.containerd.snapshot.v1.overlayfs/snapshots",
-        ];
-        let mut merged_dirs = Vec::new();
-        for root in overlay_roots {
-            if let Ok(entries) = std::fs::read_dir(root) {
-                for entry in entries.flatten() {
-                    let merged = entry.path().join("merged");
-                    if merged.is_dir() {
-                        merged_dirs.push(merged.to_string_lossy().into_owned());
-                    }
-                    let fs_dir = entry.path().join("fs");
-                    if fs_dir.is_dir() {
-                        merged_dirs.push(fs_dir.to_string_lossy().into_owned());
-                    }
-                }
-            }
-        }
-        merged_dirs
+        Self::discover_container_scan_dirs()
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .collect()
     }
 
     fn trigger_overlay_rescan(&self) {
