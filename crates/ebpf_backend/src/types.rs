@@ -96,6 +96,46 @@ impl ProcRuleVal {
 
 unsafe impl aya::Pod for ProcRuleVal {}
 
+/// overlay 文件专用规则：key 为底层 inode（overlay i_ino），与挂载无关。
+/// 仅用于 allow；size + prefix_hash 用于降低跨 fs inode 碰撞风险。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ProcRuleInoVal {
+    pub action_mode: u8,
+    pub _pad: [u8; 3],
+    pub size: u32,
+    pub prefix_hash: u64,
+}
+
+impl ProcRuleInoVal {
+    pub fn new(action: u8, mode: u8, size: u64, prefix_hash: u64) -> Self {
+        Self {
+            action_mode: (action & 0x01) | ((mode & 0x03) << 1),
+            _pad: [0; 3],
+            size: size as u32,
+            prefix_hash,
+        }
+    }
+    pub fn action(&self) -> u8 { self.action_mode & 0x01 }
+    pub fn mode(&self) -> u8 { (self.action_mode >> 1) & 0x03 }
+}
+
+unsafe impl aya::Pod for ProcRuleInoVal {}
+
+const _: () = assert!(std::mem::size_of::<ProcRuleInoVal>() == 16);
+
+/// 计算文件前 16 字节的 FNV-1a（不足补 0），必须与 proc_agent.bpf.c 的
+/// bprm_prefix_hash 完全一致（bprm->buf 为 0 补齐）。
+pub fn prefix_hash16(data: &[u8]) -> u64 {
+    let mut h: u64 = 1469598103934665603;
+    for i in 0..16 {
+        let c = data.get(i).copied().unwrap_or(0);
+        h ^= c as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    h
+}
+
 // --- 网络管控 ---
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
@@ -140,6 +180,9 @@ unsafe impl aya::Pod for PktModValue {}
 #[derive(Debug, Clone, Copy)]
 pub struct UnifiedEvent {
     pub event_type: u8,
+    /// 1=可执行文件位于 overlayfs（proc_agent 用 s_magic 判断）
+    pub is_overlay: u8,
+    pub _pad: [u8; 6],
     pub dev: u64,
     pub inode: u64,
     /// 进程所属 cgroup v2 id（kernfs inode），与 /sys/fs/cgroup 目录 stat 的 inode 一致
@@ -261,5 +304,18 @@ impl Default for PktModValue {
             allowed_mask: 0,
             padding: [0; 3],
         }
+    }
+}
+
+#[cfg(test)]
+mod prefix_hash_tests {
+    use super::prefix_hash16;
+
+    #[test]
+    fn matches_fnv1a_reference() {
+        assert_eq!(prefix_hash16(b"hello"), 13472657469116519915);
+        assert_eq!(prefix_hash16(b"#!/bin/bash\n"), 8819452956040667282);
+        let bytes: Vec<u8> = (0..16u8).collect();
+        assert_eq!(prefix_hash16(&bytes), 615731795747517251);
     }
 }

@@ -53,6 +53,22 @@ struct {
     __type(value, struct proc_rule);
 } proc_rules SEC(".maps");
 
+// overlay 文件专用：key 为底层 inode（overlay i_ino），与挂载无关。
+// 仅用于 allow（白名单）；value 带 size + 前缀指纹，降低跨 fs inode 碰撞风险。
+struct proc_rule_ino {
+    __u8 action_mode;   // bit0=action(0=allow,1=deny), bit1-2=mode
+    __u8 pad[3];
+    __u32 size;         // i_size 低 32 位
+    __u64 prefix_hash;  // bprm->buf 前 16 字节 FNV-1a
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);
+    __type(value, struct proc_rule_ino);
+} proc_rules_ino SEC(".maps");
+
 struct pattern_key {
     char pattern[32];
 };
@@ -98,6 +114,7 @@ struct {
 #define ACTION_ALLOW 0
 #define ACTION_DENY 1
 #define FEATURE_PROC 1
+#define OVERLAYFS_SUPER_MAGIC 0x794c7630
 
 #ifndef EPERM
 #define EPERM 1
@@ -108,6 +125,8 @@ struct {
 // repr(C): event_type 后填充 7 字节对齐到 8，总大小 = 192 字节。
 struct unified_event {
     __u8 type;
+    __u8 is_overlay;     // 1=可执行文件位于 overlayfs
+    __u8 _pad[6];
     __u64 dev;
     __u64 inode;
     __u64 cgid;          // 进程所属 cgroup v2 id（kernfs inode），用于容器归属判定
@@ -120,12 +139,26 @@ struct unified_event {
 
 // ===== Helper Functions =====
 
-static __always_inline void send_monitor_event(__u8 type, const char *path, __u8 blocked,
-                                               __u64 dev, __u64 inode) {
+// bprm->buf 前 16 字节 FNV-1a；不足 16 字节按 0 补齐（与用户态一致）。
+static __always_inline __u64 bprm_prefix_hash(struct linux_binprm *bprm) {
+    __u64 h = 1469598103934665603ULL;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        __u8 c = 0;
+        bpf_probe_read_kernel(&c, sizeof(c), &bprm->buf[i]);
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static __always_inline void send_monitor_event(__u8 type, __u8 is_overlay, const char *path,
+                                               __u8 blocked, __u64 dev, __u64 inode) {
     struct unified_event *e = bpf_ringbuf_reserve(&event_ringbuf, sizeof(*e), 0);
     if (!e) return;
 
     e->type = type;
+    e->is_overlay = is_overlay;
     e->dev = dev;
     e->inode = inode;
     e->cgid = bpf_get_current_cgroup_id();
@@ -259,8 +292,32 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
     __u64 udev = key.dev;
     __u64 uinode = key.inode;
 
+    __u32 sb_magic = BPF_CORE_READ(inode, i_sb, s_magic);
+    __u8 is_overlay = (sb_magic == OVERLAYFS_SUPER_MAGIC);
+
     // Try inode-based rule first
     struct proc_rule *rule = bpf_map_lookup_elem(&proc_rules, &key);
+
+    // overlay 文件：按底层 inode + size/prefix 指纹匹配（跨挂载稳定）
+    if (!rule && is_overlay) {
+        struct proc_rule_ino *irule = bpf_map_lookup_elem(&proc_rules_ino, &uinode);
+        if (irule) {
+            __u64 isize = BPF_CORE_READ(inode, i_size);
+            __u64 phash = bprm_prefix_hash(bprm);
+            if ((__u32)isize == irule->size && phash == irule->prefix_hash) {
+                if ((irule->action_mode & 0x01) == ACTION_ALLOW) {
+                    return 0;
+                }
+                __u8 effective_mode = resolve_mode((irule->action_mode >> 1) & 0x03, FEATURE_PROC);
+                if (effective_mode == MODE_PROTECT) {
+                    send_monitor_event(EVENT_PROC_UNKNOWN, is_overlay, buf, 1, udev, uinode);
+                    return -EPERM;
+                }
+                send_monitor_event(EVENT_PROC_UNKNOWN, is_overlay, buf, 0, udev, uinode);
+                return 0;
+            }
+        }
+    }
 
     // Fallback to pattern-based rules
     if (!rule) {
@@ -271,10 +328,10 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
             __u8 effective_mode = resolve_mode(prule->mode, FEATURE_PROC);
             if (effective_mode == MODE_PROTECT && prule->action == ACTION_DENY) {
                 //bpf_printk("[PROC] BLOCKED (pattern): %s", buf);
-                send_monitor_event(EVENT_PROC, buf, 1, udev, uinode);
+                send_monitor_event(EVENT_PROC, is_overlay, buf, 1, udev, uinode);
                 return -EPERM;
             }
-            send_monitor_event(EVENT_PROC, buf, 0, udev, uinode);
+            send_monitor_event(EVENT_PROC, is_overlay, buf, 0, udev, uinode);
             return 0;
         }
     }
@@ -295,10 +352,10 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
                 __u8 effective_mode = resolve_mode(prule->mode, FEATURE_PROC);
                 if (effective_mode == MODE_PROTECT && prule->action == ACTION_DENY) {
                     //bpf_printk("[PROC] BLOCKED (basename): %s", buf);
-                    send_monitor_event(EVENT_PROC, buf, 1, udev, uinode);
+                    send_monitor_event(EVENT_PROC, is_overlay, buf, 1, udev, uinode);
                     return -EPERM;
                 }
-                send_monitor_event(EVENT_PROC, buf, 0, udev, uinode);
+                send_monitor_event(EVENT_PROC, is_overlay, buf, 0, udev, uinode);
                 return 0;
             }
         }
@@ -316,11 +373,11 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
         __u8 effective_mode = resolve_mode(rule_mode, FEATURE_PROC);
         if (effective_mode == MODE_PROTECT) {
             //bpf_printk("[PROC] BLOCKED(black): dev=%llu ino=%llu %s", udev, uinode, buf);
-            send_monitor_event(EVENT_PROC, buf, 1, udev, uinode);
+            send_monitor_event(EVENT_PROC, is_overlay, buf, 1, udev, uinode);
             return -EPERM;
         }
         //bpf_printk("[PROC] MONITOR(black): dev=%llu ino=%llu %s", udev, uinode, buf);
-        send_monitor_event(EVENT_PROC, buf, 0, udev, uinode);
+        send_monitor_event(EVENT_PROC, is_overlay, buf, 0, udev, uinode);
         return 0;
     }
 
@@ -329,11 +386,11 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
         __u8 effective_mode = resolve_mode(0, FEATURE_PROC);
         if (effective_mode == MODE_PROTECT) {
             //bpf_printk("[PROC] BLOCKED(unknown): dev=%llu ino=%llu %s", udev, uinode, buf);
-            send_monitor_event(EVENT_PROC_UNKNOWN, buf, 1, udev, uinode);
+            send_monitor_event(EVENT_PROC_UNKNOWN, is_overlay, buf, 1, udev, uinode);
             return -EPERM;
         }
         //bpf_printk("[PROC] MONITOR(unknown): dev=%llu ino=%llu %s", udev, uinode, buf);
-        send_monitor_event(EVENT_PROC_UNKNOWN, buf, 0, udev, uinode);
+        send_monitor_event(EVENT_PROC_UNKNOWN, is_overlay, buf, 0, udev, uinode);
     }
 
     return 0;
