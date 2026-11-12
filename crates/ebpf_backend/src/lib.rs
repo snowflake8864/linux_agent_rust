@@ -744,12 +744,18 @@ impl EbpfBackend {
         }
     }
 
+    /// C 字符串字节数组转 String：按首个 NUL 截断，忽略 NUL 之后的残留字节。
+    fn bytes_to_string(bytes: &[u8]) -> String {
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..end]).to_string()
+    }
+
     /// 解析进程 ringbuf 事件
     fn parse_event(data: &[u8]) -> Option<(&UnifiedEvent, String, String)> {
         if data.len() < UNIFIED_EVENT_SIZE { return None; }
         let event: &UnifiedEvent = unsafe { &*(data.as_ptr() as *const UnifiedEvent) };
-        let path = String::from_utf8_lossy(&event.path).trim_end_matches('\0').to_string();
-        let comm = String::from_utf8_lossy(&event.comm).trim_end_matches('\0').to_string();
+        let path = Self::bytes_to_string(&event.path);
+        let comm = Self::bytes_to_string(&event.comm);
         Some((event, path, comm))
     }
 
@@ -757,8 +763,8 @@ impl EbpfBackend {
     fn parse_file_event(data: &[u8]) -> Option<(&FileEvent, String, String)> {
         if data.len() < FILE_EVENT_SIZE { return None; }
         let event: &FileEvent = unsafe { &*(data.as_ptr() as *const FileEvent) };
-        let path = String::from_utf8_lossy(&event.path).trim_end_matches('\0').to_string();
-        let comm = String::from_utf8_lossy(&event.comm).trim_end_matches('\0').to_string();
+        let path = Self::bytes_to_string(&event.path);
+        let comm = Self::bytes_to_string(&event.comm);
         Some((event, path, comm))
     }
 
