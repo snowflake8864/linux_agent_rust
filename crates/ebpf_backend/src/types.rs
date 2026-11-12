@@ -264,13 +264,15 @@ pub struct FileEvent {
     pub pid: u32,
     pub uid: u32,
     pub comm: [u8; 16],
-    pub path: [u8; 128],
+    pub path: [u8; 64],
 }
 
 unsafe impl aya::Pod for FileEvent {}
 
 /// Size of FileEvent in eBPF = 92 bytes (1+1+1+1 + 4+4 + 16 + 64)
 pub const FILE_EVENT_SIZE: usize = 92;
+
+const _: () = assert!(std::mem::size_of::<FileEvent>() == FILE_EVENT_SIZE);
 
 // OP_* bitmask constants (file_agent.bpf.c)
 pub const OP_READ: u8   = 1;
