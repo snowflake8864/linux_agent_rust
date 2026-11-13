@@ -151,7 +151,10 @@ impl TimerTask for BootManager {
                         update_netstat_info();
                         update_dnat_info();
                         update_docker_info();
-                        write_business_ports_to_proc();
+                        // business_ports 是驱动 /proc 接口，eBPF 后端不加载驱动，跳过
+                        if common::backend::is_driver_backend() {
+                            write_business_ports_to_proc();
+                        }
 
                         // 热更新 /opt/osec/osec_backend.conf（日志级别等）：先看时间戳，再看内容
                         reload_backend_config_if_changed(

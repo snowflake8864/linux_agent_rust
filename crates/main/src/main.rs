@@ -407,6 +407,9 @@ async fn main() -> std::io::Result<()> {
                                         cfg.mod_ver = "noop".to_string();
                                         Arc::new(NoopBackend)
                                     } else {
+                                        // init() 内会关闭 feature_switches[1] 避免空表误报，
+                                        // 此时信任白名单已写入 proc_rules，可以安全开启进程检测。
+                                        ebpf.enable_proc_detection();
                                         // 后台扫描同样后移（与主 eBPF 分支一致）
                                         ebpf_scan = Some(ebpf.clone());
                                         ebpf.start_proc_event_reader();
@@ -561,13 +564,18 @@ async fn main() -> std::io::Result<()> {
     }
     log_info!("当前模式: {}", if online { "在线" } else { "离线" });
 
-    // 创建 Netlink 套接字（在离线模式下仍尝试创建，供内核事件使用）
-    let nl_sock = NlSockInfo::create_socket()
-        .map_err(|e| {
-            logging::log_error!("Netlink套接字创建失败: {}", e);
-            e
-        })
-        .ok();
+    // 创建 Netlink 套接字（仅驱动后端需要；eBPF/noop 不加载 osec_base，跳过）
+    let nl_sock = if common::backend::is_driver_backend() {
+        NlSockInfo::create_socket()
+            .map_err(|e| {
+                logging::log_error!("Netlink套接字创建失败: {}", e);
+                e
+            })
+            .ok()
+    } else {
+        logging::log_info!("[backend] 当前非 driver 后端，跳过 Netlink 套接字初始化");
+        None
+    };
 
 
     if let Some(ref sock) = nl_sock {
@@ -742,7 +750,7 @@ async fn main() -> std::io::Result<()> {
         None
     };
 
-    let start_docker_monitor_handle = if sys_docker {
+    let start_docker_monitor_handle = if sys_docker && common::backend::is_driver_backend() {
         Some(tokio::spawn({
             let mut init = init.clone();
             async move {
@@ -755,7 +763,11 @@ async fn main() -> std::io::Result<()> {
             }
         }))
     } else {
-        log_info!("[SYSTEM] DOCKER_MONITOR=0，跳过 Docker 监控服务启动");
+        if sys_docker {
+            log_info!("[SYSTEM] 当前非 driver 后端，跳过 Docker /proc/osec/docker_rt 监控");
+        } else {
+            log_info!("[SYSTEM] DOCKER_MONITOR=0，跳过 Docker 监控服务启动");
+        }
         None
     };
 
