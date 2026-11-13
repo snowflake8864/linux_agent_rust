@@ -189,8 +189,9 @@ fn apply_trust_dirs(dirs: Vec<GlobalTrustDir>) -> Result<(), String> {
 
 fn apply_process() -> Result<(), String> {
     let mut mgr = process_mgr::POLICY_MANAGER.lock().unwrap();
-    mgr.load_policy_from_db_merged();
-    mgr.apply_loaded_policy_to_kernel();
+    // 不清空内存快照：保留旧名单作为 diff 基准，只把 DB 与内存的差异增量下发内核。
+    // 首次启动内存为空，diff 结果即全量下发。
+    mgr.apply_policy_from_db_diff();
     drop(mgr);
     notify_policy_change(PolicyChangeType::ProcessPolicyChanged);
     Ok(())
