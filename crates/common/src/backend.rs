@@ -155,6 +155,18 @@ pub fn get_backend() -> Option<Arc<dyn SecurityBackend>> {
     BACKEND.get().cloned()
 }
 
+/// 当前实际生效的是否为驱动后端。
+/// 注意：必须基于已初始化的后端判断，而不是 net_info.ini 的 BACKEND_MODE；
+/// driver 加载失败回退 eBPF 时，配置仍是 driver，但实际后端是 ebpf。
+pub fn is_driver_backend() -> bool {
+    get_backend().map(|b| b.name() == "driver").unwrap_or(false)
+}
+
+/// 当前实际生效的是否为 eBPF 后端（含 driver 失败后的 ebpf-fallback）。
+pub fn is_ebpf_backend() -> bool {
+    get_backend().map(|b| b.name() == "ebpf").unwrap_or(false)
+}
+
 /// 便捷：对后端执行操作
 pub fn with_backend<F, R>(f: F) -> Result<R, String>
 where
