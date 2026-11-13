@@ -273,6 +273,52 @@ impl ProcessPolicyManager {
         );
     }
 
+    /// 从 DB 读取当前生效名单，与内存中「已下发快照」做三态 diff 后增量下发内核。
+    ///
+    /// 与 `load_policy_from_db_merged` 的区别：不清空 `white_set/black_set`，
+    /// 保留旧快照作为 diff 基准。首次启动时内存为空，diff 结果等价于全量下发。
+    pub fn apply_policy_from_db_diff(&mut self) {
+        if !local_store::sqlite_db_enabled() {
+            return;
+        }
+        let db_ok = config::net_info::NETINFO_CONFIG
+            .lock()
+            .map(|c| c.db_policy.process_policy)
+            .unwrap_or(false);
+        if !db_ok {
+            return;
+        }
+
+        // 基线表是当前生效策略；兼容旧版本：基线为空且旧本地表有数据时才回退本地表。
+        let mut entries = local_store::process_policy::load_all()
+            .map_err(|e| logging::log_error!("[process_policy] 加载基线表失败: {}", e))
+            .unwrap_or_default();
+        let mut source = "baseline";
+        if entries.is_empty() && local_store::process_policy::local_present().unwrap_or(false) {
+            entries = local_store::process_policy::load_all_local()
+                .map_err(|e| logging::log_error!("[process_policy] 加载本地表失败: {}", e))
+                .unwrap_or_default();
+            source = "legacy-local";
+        }
+
+        let mut white = Vec::new();
+        let mut black = Vec::new();
+        for (hash, is_white) in entries {
+            if is_white {
+                white.push(hash);
+            } else {
+                black.push(hash);
+            }
+        }
+
+        log::info!(
+            "[process_policy] 从 DB({}) 读取: 白{} 黑{}（与内存快照 diff）",
+            source, white.len(), black.len()
+        );
+        self.set_policy_process(&white, true, None);
+        self.set_policy_process(&black, false, None);
+    }
+
     /// 将内存中已加载（DB 恢复）的黑白名单全量下发到内核。
     /// 离线启动时服务器不会下发进程策略，后端初始化完成后必须主动推给 eBPF/驱动，
     /// 否则 gRPC 能读到内存里的策略，但内核 proc_rules 没有对应规则、不会触发拦截。

@@ -5,10 +5,13 @@
 //!   - process_policy_local 离线本地（gRPC 下发）
 //!
 //! hash 为主键，is_white=1 表示白名单，0 表示黑名单。
-//! 每次保存都会在同一个事务内递增 policy_meta.version，读侧据此做变更检测。
+//! 保存时与表内现有内容做 diff，只增删变化行；内容无变化时不递增 policy_meta.version，
+//! 读侧据此跳过重复加载。
+
+use std::collections::HashMap;
 
 use logging::log_info;
-use rusqlite::{params, Result};
+use rusqlite::{params, Result, TransactionBehavior};
 
 const DB_PATH: &str = "/opt/osec/db/process_policy.db";
 
@@ -36,22 +39,65 @@ fn load(table: &str) -> Result<Vec<(String, bool)>> {
 fn save(table: &str, white: &[String], black: &[String]) -> Result<u64> {
     let mut conn = sqlite_db::db::open_conn(DB_PATH)?;
     crate::policy_meta::ensure_meta(&conn)?;
-    let tx = conn.transaction()?;
-    tx.execute(&format!("DELETE FROM {table}"), [])?;
+    // 读-比较-写必须在同一事务内完成，避免与服务器任务/gRPC 的并发写入互相覆盖。
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
+    let mut desired: HashMap<String, bool> = HashMap::with_capacity(white.len() + black.len());
+    for h in white {
+        desired.insert(h.clone(), true);
+    }
+    for h in black {
+        desired.insert(h.clone(), false);
+    }
+
+    let mut existing: HashMap<String, bool> = HashMap::new();
+    {
+        let mut stmt = tx.prepare(&format!("SELECT hash, is_white FROM {table}"))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)? != 0))
+        })?;
+        for row in rows {
+            let (hash, is_white) = row?;
+            existing.insert(hash, is_white);
+        }
+    }
+
+    // 内容完全一致：不写库、不递增版本，返回当前版本供调用方判断是否变更。
+    if existing == desired {
+        let version = crate::policy_meta::current_version(&tx, table)?;
+        tx.commit()?;
+        log_info!("[process_policy] {table} 内容未变化，跳过写入");
+        return Ok(version);
+    }
+
+    // 删除：老记录中被移除或黑白身份发生变化的行。
+    let mut deleted = 0usize;
+    {
+        let mut stmt = tx.prepare(&format!("DELETE FROM {table} WHERE hash = ?1"))?;
+        for (hash, old_white) in &existing {
+            if desired.get(hash) != Some(old_white) {
+                stmt.execute(params![hash])?;
+                deleted += 1;
+            }
+        }
+    }
+
+    // 插入：新增或黑白身份发生变化的行。
+    let mut inserted = 0usize;
     {
         let mut stmt =
             tx.prepare(&format!("INSERT INTO {table} (hash, is_white) VALUES (?1, ?2)"))?;
-        for h in white {
-            stmt.execute(params![h, 1])?;
-        }
-        for h in black {
-            stmt.execute(params![h, 0])?;
+        for (hash, new_white) in &desired {
+            if existing.get(hash) != Some(new_white) {
+                stmt.execute(params![hash, if *new_white { 1 } else { 0 }])?;
+                inserted += 1;
+            }
         }
     }
 
     let version = crate::policy_meta::bump_version(&tx, table)?;
     tx.commit()?;
+    log_info!("[process_policy] {table} 增量写入: +{inserted} -{deleted}");
     Ok(version)
 }
 
