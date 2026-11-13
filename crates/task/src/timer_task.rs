@@ -10,7 +10,6 @@ use hostinfo::net_app::parser_netstat::update_netstat_info;
 use hostinfo::net_app::parser_dnat::update_dnat_info;
 use hostinfo::net_app::parser_docker::update_docker_info;
 use hostinfo::net_app::model::write_business_ports_to_proc;
-use config::net_info::NETINFO_CONFIG;
 use crate::baseline_task::{process_baselines_from_client};
 use crate::run_outreach_detection;
 use crate::net_reach_rule::build_outreach_detect_list_json;
@@ -113,13 +112,18 @@ impl TimerTask for BootManager {
                 let (switch, time_secs) = self.get_baseline_info();
 
                 if switch && time_secs > 0 {
-                    if !baseline_enabled || baseline_interval.is_none() {
-                        log_info!("启用 Baseline 拉取，间隔: {} 秒", time_secs);
-                        baseline_interval = Some(interval(Duration::from_secs(time_secs as u64)));
+                    let period = Duration::from_secs(time_secs as u64);
+                    let period_changed = baseline_interval
+                        .as_ref()
+                        .map(|i| i.period() != period)
+                        .unwrap_or(true);
+                    if !baseline_enabled || period_changed {
+                        log_info!("启用基线检查，间隔: {} 秒", time_secs);
+                        baseline_interval = Some(interval(period));
                         baseline_enabled = true;
                     }
                 } else if baseline_enabled {
-                    log_info!("停用 Baseline 拉取");
+                    log_info!("停用基线检查");
                     baseline_interval = None;
                     baseline_enabled = false;
                 }
@@ -174,26 +178,11 @@ impl TimerTask for BootManager {
                             std::future::pending().await
                         }
                     }, if baseline_interval.is_some() => {
-                        /*
-                        let base_url = self.get_base_url();
-                        match NetClient::new(Some(base_url), true) {
-                            Ok(net_client) => {
-                                let url = format!(
-                                    "{}/v1/getBaselines",
-                                    net_client.get_base_url().unwrap_or_default()
-                                );
-                                let token = self.get_token().await;
-                                let _ = process_baselines_from_client(&net_client, &url, token.as_deref()).await;
-                            }
-                            Err(err) => {
-                                eprintln!("创建 NetClient 失败: {}", err);
-                            }
-                        }
-                        */
                         let url = format!("{}/v1/getBaselines", shared_net_client.get_base_url().unwrap_or_default());
                         let token = self.get_token().await;
-                        let _ = process_baselines_from_client(&shared_net_client, &url, token.as_deref()).await;
-
+                        if let Err(e) = process_baselines_from_client(&shared_net_client, &url, token.as_deref()).await {
+                            log_error!("基线检查任务处理失败: {}", e);
+                        }
                     }
 
                     _ = async {
