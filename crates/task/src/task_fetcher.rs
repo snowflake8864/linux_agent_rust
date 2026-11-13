@@ -1606,7 +1606,7 @@ async fn task_down_black(&self, task_type: u64) -> Result<(), String> {
                     return Err("No hashes found in the response".to_string());
                 }
 
-                // 只写 DB（在线基线），由 policy_store 从 DB 加载并下发内核。
+                // 暂存到 policy_store，待白/黑两侧到齐后 diff 写库并由 policy_store 增量下发。
                 crate::policy_store::stage_process_baseline(false, &hash_list)?;
             } else {
                 eprintln!("Error: Invalid response code: {}", parsed["code"]);
@@ -1669,9 +1669,9 @@ pub async fn task_down_white(&self, task_type: u64) -> Result<(), String> {
                     return Err("No hashes found in the response".to_string());
                 }
 
-                // 只写 DB（在线基线），由 policy_store 从 DB 加载并下发内核。
+                // 暂存到 policy_store，待白/黑两侧到齐后 diff 写库并由 policy_store 增量下发。
                 crate::policy_store::stage_process_baseline(true, &hash_list)?;
-                log_info!("[task_down_white] 白名单 {} 条已写入 DB 基线", hash_list.len());
+                log_info!("[task_down_white] 白名单 {} 条已暂存，待黑白合并后 diff 落库", hash_list.len());
             } else {
                 log_error!("[task_down_white] 响应 code != 000000: code={}", parsed["code"]);
                 return Err("Invalid response code.".to_string());
