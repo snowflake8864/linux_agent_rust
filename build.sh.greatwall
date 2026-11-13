@@ -390,18 +390,24 @@ elif [[ "\$MODE" == "upgrade" ]]; then
     #       其余段（[VIRUS_SCAN]/[ADMISSION] 等）保留新包的值
     if [ -f "\$BAK" ] && [ -f "\$INSTALL_DIR/net_info.ini" ]; then
         # 回填 [CLIENTINFO] 所有 key
-        while IFS='=' read -r key val; do
-            [[ -z "\$key" || "\$key" =~ ^# ]] && continue
+        while IFS= read -r line; do
+            [[ -z "\$line" || "\$line" =~ ^[[:space:]]*# ]] && continue
+            [[ "\$line" != *=* ]] && continue
+            key=\${line%%=*}
             key=\$(echo "\$key" | tr -d ' ')
+            val=\${line#*=}
             val=\$(echo "\$val" | tr -d '\r')
             sed -i "s|^[[:space:]]*\${key}[[:space:]]*=.*|\${key}=\${val}|" "\$INSTALL_DIR/net_info.ini"
         done < <(awk '/^\[CLIENTINFO\]/{f=1;next} /^\[/{f=0} f && /=/' "\$BAK")
 
         # 回填 [SERVERINFO] 所有 key（VERSION 除外，后面单独写新版本号）
-        while IFS='=' read -r key val; do
-            [[ -z "\$key" || "\$key" =~ ^# ]] && continue
+        while IFS= read -r line; do
+            [[ -z "\$line" || "\$line" =~ ^[[:space:]]*# ]] && continue
+            [[ "\$line" != *=* ]] && continue
+            key=\${line%%=*}
             key=\$(echo "\$key" | tr -d ' ')
             [[ "\$key" == "VERSION" ]] && continue
+            val=\${line#*=}
             val=\$(echo "\$val" | tr -d '\r')
             if grep -q "^[[:space:]]*\${key}[[:space:]]*=" "\$INSTALL_DIR/net_info.ini"; then
                 sed -i "s|^[[:space:]]*\${key}[[:space:]]*=.*|\${key}=\${val}|" "\$INSTALL_DIR/net_info.ini"
@@ -411,9 +417,12 @@ elif [[ "\$MODE" == "upgrade" ]]; then
         done < <(awk '/^\[SERVERINFO\]/{f=1;next} /^\[/{f=0} f && /=/' "\$BAK")
 
         # 回填 [HOSTINFO] 所有 key
-        while IFS='=' read -r key val; do
-            [[ -z "\$key" || "\$key" =~ ^# ]] && continue
+        while IFS= read -r line; do
+            [[ -z "\$line" || "\$line" =~ ^[[:space:]]*# ]] && continue
+            [[ "\$line" != *=* ]] && continue
+            key=\${line%%=*}
             key=\$(echo "\$key" | tr -d ' ')
+            val=\${line#*=}
             val=\$(echo "\$val" | tr -d '\r')
             if grep -q "^[[:space:]]*\${key}[[:space:]]*=" "\$INSTALL_DIR/net_info.ini"; then
                 sed -i "s|^[[:space:]]*\${key}[[:space:]]*=.*|\${key}=\${val}|" "\$INSTALL_DIR/net_info.ini"
@@ -496,7 +505,7 @@ if [[ "\$MODE" == "install" ]]; then
 
     # Update net_info.ini
     if [ -f /opt/config.ini ]; then
-        RAW_URL=\$(grep -E '^[[:space:]]*URL' /opt/config.ini | cut -d= -f2 | tr -d ' ' | tr -d '\r')
+        RAW_URL=\$(grep -E '^[[:space:]]*URL' /opt/config.ini | cut -d= -f2- | tr -d ' ' | tr -d '\r')
         RAW_URL=\${RAW_URL// /}
         CLEAN_URL=\$(echo "\$RAW_URL" | sed -E 's#^https?://##')
         if [[ "\$CLEAN_URL" == *:* ]]; then
