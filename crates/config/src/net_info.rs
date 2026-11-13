@@ -332,7 +332,12 @@ impl NetInfoConfig {
 
     fn write_raw(&self, rule_type: &str, value: &str) -> Result<(), String> {
         let content = format!("{} {}\n", rule_type, value);
-        fs::write("/proc/osec/net_rules", content)
+        // /proc/osec 是驱动接口；eBPF/noop 模式或驱动尚未加载时直接跳过，避免无效写入
+        let path = "/proc/osec/net_rules";
+        if !std::path::Path::new(path).exists() {
+            return Ok(());
+        }
+        fs::write(path, content)
             .map_err(|e| format!("Failed to write to /proc/osec/net_rules: {}", e))
     }
 
