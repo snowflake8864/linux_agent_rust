@@ -26,10 +26,10 @@ fn detect_local_os_type() -> i32 {
         .unwrap_or_default()
         .to_lowercase();
 
-    if content.contains("kylin") {
-        1130
-    } else if content.contains("neokylin") {
+    if content.contains("neokylin") {
         1131
+    } else if content.contains("kylin") {
+        1130
     } else if content.contains("uos") || content.contains("uniontech") {
         1132
     } else if content.contains("centos") {
@@ -54,10 +54,10 @@ pub fn get_local_os_type() -> i32 {
 
 const LINUX_PROXY_DISABLE: u64 = 1203;
 const LINUX_ANTIVIRUS_ENABLE: u64 = 1302;
-const LINUX_FIREWALL_ENABLE: u64 = 1303;
-const LINUX_FILESHARE_DISABLE: u64 = 1403;
+const LINUX_FIREWALL_ENABLE: u64 = 1301;
+const LINUX_FILESHARE_DISABLE: u64 = 1401;
 const LINUX_GUEST_ACCOUNT_DISABLE: u64 = 1501;
-const LINUX_REMOTE_DESKTOP_DISABLE: u64 = 1601;
+const LINUX_REMOTE_DESKTOP_DISABLE: u64 = 1600;
 
 fn command_ok(program: &str, args: &[&str]) -> bool {
     Command::new(program)
@@ -75,10 +75,12 @@ fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
-fn is_process_running(names: &[&str]) -> bool {
+fn matched_processes(names: &[&str]) -> Vec<String> {
     let Ok(dir) = fs::read_dir("/proc") else {
-        return false;
+        return Vec::new();
     };
+
+    let mut matched = Vec::new();
 
     for entry in dir.flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
@@ -101,11 +103,21 @@ fn is_process_running(names: &[&str]) -> bool {
 
         for &name in names {
             if comm.eq_ignore_ascii_case(name) || exe_base.eq_ignore_ascii_case(name) {
-                return true;
+                matched.push(format!(
+                    "{}({})",
+                    if comm.is_empty() { name } else { comm.as_str() },
+                    pid
+                ));
+                break;
             }
         }
     }
-    false
+
+    matched
+}
+
+fn is_process_running(names: &[&str]) -> bool {
+    !matched_processes(names).is_empty()
 }
 
 fn check_proxy() -> (i32, String) {
@@ -134,22 +146,80 @@ fn check_proxy() -> (i32, String) {
     }
 }
 
+fn binary_in_path(name: &str) -> bool {
+    let mut dirs: Vec<String> = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .map(|d| d.to_string())
+        .collect();
+
+    for dir in ["/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin", "/bin", "/sbin"] {
+        if !dirs.iter().any(|d| d == dir) {
+            dirs.push(dir.to_string());
+        }
+    }
+
+    dirs.iter()
+        .any(|dir| std::path::Path::new(dir).join(name).exists())
+}
+
 fn check_antivirus() -> (i32, String) {
     let active = is_process_running(&[
+        // ClamAV
         "clamd",
         "clamav",
+        "freshclam",
+        // 奇安信天擎
         "qianxin",
+        "qaxsafe",
+        "tianqing",
+        // 360
         "360",
+        "360sd",
+        "360safe",
+        "360tray",
+        // 卡巴斯基
         "kaspersky",
         "kesl",
+        // 火绒
         "huorong",
+        "hips",
+        // 瑞星
+        "rav",
+        "ravagent",
+        "rising",
+        // 金山
+        "kscan",
+        "kingsoft",
+        // 腾讯
+        "txav",
+        "tencent",
+        // 麒麟安全中心/kysec
+        "kysec",
+        "kylin-security-center",
+        "kylin-sec-center",
+        "security-center",
+        "vigilixav",
     ]);
 
     if active {
-        (1, String::new())
-    } else {
-        (0, "未检测到正在运行的杀毒软件进程".to_string())
+        return (1, String::new());
     }
+
+    // rkhunter/chkrootkit 为按需扫描器，无常驻进程，按“已安装”判定
+    if binary_in_path("rkhunter")
+        || binary_in_path("chkrootkit")
+        || binary_in_path("clamscan")
+        || binary_in_path("kysec_set")
+    {
+        return (1, String::new());
+    }
+
+    (
+        0,
+        "未检测到正在运行的杀毒软件/安全中心，也未安装 ClamAV/rkhunter/chkrootkit".to_string(),
+    )
 }
 
 fn check_firewall() -> (i32, String) {
@@ -173,26 +243,45 @@ fn check_firewall() -> (i32, String) {
 }
 
 fn check_fileshare() -> (i32, String) {
-    let active = is_process_running(&[
+    let matched = matched_processes(&[
         "smbd",
         "nmbd",
+        "winbindd",
         "nfsd",
+        "rpc.nfsd",
         "rpc.mountd",
         "vsftpd",
         "proftpd",
+        "pure-ftpd",
+        "tftpd",
+        "in.tftpd",
+        "atftpd",
+        "syncthing",
     ]);
 
-    if active {
+    if matched.is_empty() {
+        (1, String::new())
+    } else {
         (
             0,
-            "检测到Samba/NFS/FTP等网络文件共享服务正在运行".to_string(),
+            format!(
+                "检测到网络文件共享服务正在运行: {}",
+                matched.join(", ")
+            ),
         )
-    } else {
-        (1, String::new())
     }
 }
 
 fn check_guest_account() -> (i32, String) {
+    if let Ok(passwd) = fs::read_to_string("/etc/passwd") {
+        for line in passwd.lines() {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.first().is_some_and(|name| name.eq_ignore_ascii_case("guest")) {
+                return (0, "检测到存在 guest 账号".to_string());
+            }
+        }
+    }
+
     if let Ok(shadow) = fs::read_to_string("/etc/shadow") {
         for line in shadow.lines() {
             let parts: Vec<&str> = line.split(':').collect();
@@ -206,22 +295,47 @@ fn check_guest_account() -> (i32, String) {
 }
 
 fn check_remote_desktop() -> (i32, String) {
-    let active = is_process_running(&[
+    let matched = matched_processes(&[
         "xrdp",
         "xrdp-sesman",
         "Xvnc",
+        "Xvnc4",
+        "Xtightvnc",
+        "Xtigervnc",
         "x11vnc",
         "vncserver",
+        "vncserver-x11",
+        "vncserver-x11-serviced",
+        "x2goserver",
+        "x2gocleansessions",
+        "x2goagent",
+        "nxagent",
+        "nxserver",
+        "nxnode",
+        "nxexec",
+        "vsmserver",
+        "vsmagent",
+        "tlwebaccess",
         "gnome-remote-de",
+        "sunloginclient",
+        "sunloginclientd",
+        "todesk",
+        "todeskd",
+        "rustdesk",
+        "teamviewer",
+        "teamviewerd",
+        "anydesk",
+        "SRService",
+        "SRServer",
     ]);
 
-    if active {
+    if matched.is_empty() {
+        (1, String::new())
+    } else {
         (
             0,
-            "检测到xrdp/VNC等远程桌面服务正在运行".to_string(),
+            format!("检测到远程桌面服务正在运行: {}", matched.join(", ")),
         )
-    } else {
-        (1, String::new())
     }
 }
 
@@ -288,6 +402,7 @@ pub async fn process_baselines_from_client(
     }
 
     let local_os_type = get_local_os_type();
+    log_info!("本机操作系统类型: {}", local_os_type);
 
     for b in baselines.iter_mut() {
         if let Some((pass, failed)) = run_baseline_check(b.val) {

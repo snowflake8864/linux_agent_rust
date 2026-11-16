@@ -110,8 +110,10 @@ impl TimerTask for BootManager {
 
             loop {
                 let (switch, time_secs) = self.get_baseline_info();
+                // 未拿到 token 时不创建基线定时器，等下一轮有 token 再创建
+                let token_ready = self.get_token().await.is_some();
 
-                if switch && time_secs > 0 {
+                if switch && time_secs > 0 && token_ready {
                     let period = Duration::from_secs(time_secs as u64);
                     let period_changed = baseline_interval
                         .as_ref()
@@ -123,7 +125,11 @@ impl TimerTask for BootManager {
                         baseline_enabled = true;
                     }
                 } else if baseline_enabled {
-                    log_info!("停用基线检查");
+                    if switch && time_secs > 0 {
+                        log_info!("暂停基线检查: 尚未获取到 token");
+                    } else {
+                        log_info!("停用基线检查");
+                    }
                     baseline_interval = None;
                     baseline_enabled = false;
                 }
@@ -170,7 +176,11 @@ impl TimerTask for BootManager {
                         // SSH登录日志采集
                         if ssh_login_switch {
                             let token = self.get_token().await;
-                            ssh_login_collector.collect_and_report(&shared_net_client, token.as_deref()).await;
+                            if token.is_some() {
+                                ssh_login_collector.collect_and_report(&shared_net_client, token.as_deref()).await;
+                            } else {
+                                log_info!("SSH登录日志采集跳过: 尚未获取到 token");
+                            }
                         }
                     }
 
@@ -183,8 +193,13 @@ impl TimerTask for BootManager {
                     }, if baseline_interval.is_some() => {
                         let url = format!("{}/v1/getBaselines", shared_net_client.get_base_url().unwrap_or_default());
                         let token = self.get_token().await;
-                        if let Err(e) = process_baselines_from_client(&shared_net_client, &url, token.as_deref()).await {
-                            log_error!("基线检查任务处理失败: {}", e);
+                        if let Some(token) = token {
+                            log_info!("开始执行基线检查任务, url={}", url);
+                            if let Err(e) = process_baselines_from_client(&shared_net_client, &url, Some(&token)).await {
+                                log_error!("基线检查任务处理失败: {}", e);
+                            }
+                        } else {
+                            log_info!("基线检查跳过: 尚未获取到 token");
                         }
                     }
 
