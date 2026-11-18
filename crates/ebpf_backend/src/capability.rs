@@ -41,15 +41,19 @@ impl EbpfCapability {
             ));
         }
         if !self.btf_ok {
-            reasons.push("BTF 不支持: /sys/kernel/btf/vmlinux 不存在，请开启 CONFIG_DEBUG_INFO_BTF".into());
+            reasons.push(
+                "BTF 不支持: /sys/kernel/btf/vmlinux 不存在，请开启 CONFIG_DEBUG_INFO_BTF".into(),
+            );
         }
         if !self.bpf_lsm_ok {
             reasons.push(
-                "BPF LSM 未启用: /sys/kernel/security/lsm 中不含 bpf，请在 GRUB 添加 lsm=...,bpf".into(),
+                "BPF LSM 未启用: /sys/kernel/security/lsm 中不含 bpf，请在 GRUB 添加 lsm=...,bpf"
+                    .into(),
             );
         }
         if !self.bpf_fs_ok {
-            reasons.push("bpffs 未挂载: /sys/fs/bpf 不存在，请 mount -t bpf bpffs /sys/fs/bpf".into());
+            reasons
+                .push("bpffs 未挂载: /sys/fs/bpf 不存在，请 mount -t bpf bpffs /sys/fs/bpf".into());
         }
         reasons
     }
@@ -84,7 +88,9 @@ fn check_bpf_lsm() -> bool {
 
 fn check_bpf_fs() -> bool {
     if let Ok(content) = fs::read_to_string("/proc/mounts") {
-        content.lines().any(|l| l.contains("bpf") && l.contains("/sys/fs/bpf"))
+        content
+            .lines()
+            .any(|l| l.contains("bpf") && l.contains("/sys/fs/bpf"))
     } else {
         false
     }

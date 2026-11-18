@@ -240,20 +240,23 @@ pub fn match_patterns_to_rules(
                 }
             }
         } else {
-            by_key.insert(dk, ResolvedDirPolicy {
-                key: dir_key,
-                policy: DirPolicy {
-                    ops_mask,
-                    action,
-                    mode: 0,
-                    recursive,
-                    filter_type,
-                    suffix_count,
-                    reserved: [0; 2],
-                    suffixes,
-                    exact_filename: [0; 32],
+            by_key.insert(
+                dk,
+                ResolvedDirPolicy {
+                    key: dir_key,
+                    policy: DirPolicy {
+                        ops_mask,
+                        action,
+                        mode: 0,
+                        recursive,
+                        filter_type,
+                        suffix_count,
+                        reserved: [0; 2],
+                        suffixes,
+                        exact_filename: [0; 32],
+                    },
                 },
-            });
+            );
         }
     }
 
@@ -469,7 +472,10 @@ mod tests {
     fn test_parse_chained_rule() {
         let line = "target=protectIncFileExe_0,pattern=ProtectDir_0>protectIncFileExe_0_0,rule_idx=0,action=3,protect_rw=31,type=2";
         let r = parse_rule_line(line).unwrap();
-        assert_eq!(r.pattern_refs, vec!["ProtectDir_0", "protectIncFileExe_0_0"]);
+        assert_eq!(
+            r.pattern_refs,
+            vec!["ProtectDir_0", "protectIncFileExe_0_0"]
+        );
         assert_eq!(r.action, 3);
     }
 
