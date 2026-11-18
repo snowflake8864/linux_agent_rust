@@ -55,10 +55,18 @@ unsafe impl aya::Pod for SelfProtectRule {}
 
 impl SelfProtectRule {
     pub fn whole_dir() -> Self {
-        Self { whole_dir: 1, prefix_count: 0, prefixes: [[0; 16]; 2] }
+        Self {
+            whole_dir: 1,
+            prefix_count: 0,
+            prefixes: [[0; 16]; 2],
+        }
     }
     pub fn with_prefixes(prefixes: &[&str]) -> Self {
-        let mut s = Self { whole_dir: 0, prefix_count: 0, prefixes: [[0; 16]; 2] };
+        let mut s = Self {
+            whole_dir: 0,
+            prefix_count: 0,
+            prefixes: [[0; 16]; 2],
+        };
         for (i, p) in prefixes.iter().take(2).enumerate() {
             let b = p.as_bytes();
             for (j, &c) in b.iter().take(16).enumerate() {
@@ -83,15 +91,21 @@ unsafe impl aya::Pod for ProcKey {}
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ProcRuleVal {
-    pub action_mode: u8,  // bit0=action(0=allow,1=deny), bit1-2=mode(0=inherit,1=monitor,2=protect)
+    pub action_mode: u8, // bit0=action(0=allow,1=deny), bit1-2=mode(0=inherit,1=monitor,2=protect)
 }
 
 impl ProcRuleVal {
     pub fn new(action: u8, mode: u8) -> Self {
-        Self { action_mode: (action & 0x01) | ((mode & 0x03) << 1) }
+        Self {
+            action_mode: (action & 0x01) | ((mode & 0x03) << 1),
+        }
     }
-    pub fn action(&self) -> u8 { self.action_mode & 0x01 }
-    pub fn mode(&self) -> u8 { (self.action_mode >> 1) & 0x03 }
+    pub fn action(&self) -> u8 {
+        self.action_mode & 0x01
+    }
+    pub fn mode(&self) -> u8 {
+        (self.action_mode >> 1) & 0x03
+    }
 }
 
 unsafe impl aya::Pod for ProcRuleVal {}
@@ -116,8 +130,12 @@ impl ProcRuleInoVal {
             prefix_hash,
         }
     }
-    pub fn action(&self) -> u8 { self.action_mode & 0x01 }
-    pub fn mode(&self) -> u8 { (self.action_mode >> 1) & 0x03 }
+    pub fn action(&self) -> u8 {
+        self.action_mode & 0x01
+    }
+    pub fn mode(&self) -> u8 {
+        (self.action_mode >> 1) & 0x03
+    }
 }
 
 unsafe impl aya::Pod for ProcRuleInoVal {}
@@ -140,8 +158,8 @@ pub fn prefix_hash16(data: &[u8]) -> u64 {
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct PktModKey {
-    pub protocol: u8,   // 6=TCP, 17=UDP
-    pub direction: u8,  // 0=any, 1=ingress, 2=egress
+    pub protocol: u8,  // 6=TCP, 17=UDP
+    pub direction: u8, // 0=any, 1=ingress, 2=egress
     pub padding: [u8; 2],
     pub dst_ip: u32,
     pub src_port: u16,
@@ -218,14 +236,14 @@ pub struct InodeMd5Rec {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct PktEvent {
-    pub event_type: u8,      // EVENT_NET = 3
-    pub protocol: u8,        // IPPROTO: 6=TCP, 17=UDP
-    pub tcp_flags_set: u8,   // 动作标记
+    pub event_type: u8,    // EVENT_NET = 3
+    pub protocol: u8,      // IPPROTO: 6=TCP, 17=UDP
+    pub tcp_flags_set: u8, // 动作标记
     pub _pad: u8,
-    pub src_ip: u32,         // 攻击源 IP（网络字节序）
-    pub dst_ip: u32,         // 原始目的 IP = 本机虚开地址（网络字节序，改写前）
-    pub src_port: u16,       // 源端口（网络字节序）
-    pub dst_port: u16,       // 虚开端口（网络字节序，改写前）
+    pub src_ip: u32,   // 攻击源 IP（网络字节序）
+    pub dst_ip: u32,   // 原始目的 IP = 本机虚开地址（网络字节序，改写前）
+    pub src_port: u16, // 源端口（网络字节序）
+    pub dst_port: u16, // 虚开端口（网络字节序，改写前）
 }
 
 unsafe impl aya::Pod for PktEvent {}
@@ -238,14 +256,14 @@ pub const PKT_EVENT_SIZE: usize = 16;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct VirPortBpfRule {
-    pub protocol: u8,        // IPPROTO: 6=TCP, 17=UDP；0=空槽位
-    pub keep_port: u8,       // 1=保持原端口转发
-    pub start_port: u16,     // 主机字节序
-    pub end_port: u16,       // 主机字节序
-    pub redirect_port: u16,  // 主机字节序，0=不改端口
-    pub dst_ip: u32,         // 虚开本机地址（网络序），0=任意
-    pub new_dst_ip: u32,     // 重定向目标（网络序），0=纯告警不改写
-    pub addr_type: u8,       // 告警等级
+    pub protocol: u8,       // IPPROTO: 6=TCP, 17=UDP；0=空槽位
+    pub keep_port: u8,      // 1=保持原端口转发
+    pub start_port: u16,    // 主机字节序
+    pub end_port: u16,      // 主机字节序
+    pub redirect_port: u16, // 主机字节序，0=不改端口
+    pub dst_ip: u32,        // 虚开本机地址（网络序），0=任意
+    pub new_dst_ip: u32,    // 重定向目标（网络序），0=纯告警不改写
+    pub addr_type: u8,      // 告警等级
     pub pad: [u8; 3],
 }
 
@@ -257,10 +275,10 @@ unsafe impl aya::Pod for VirPortBpfRule {}
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct FileEvent {
-    pub event_type: u8,   // __u8 type;  EVENT_FILE(1)
-    pub op_type: u8,      // __u8 op_type; OP_READ|OP_WRITE|OP_CREATE|OP_DELETE
-    pub blocked: u8,      // __u8 blocked; 1=拦截, 0=监控
-    pub _pad: u8,         // alignment to 32bit
+    pub event_type: u8, // __u8 type;  EVENT_FILE(1)
+    pub op_type: u8,    // __u8 op_type; OP_READ|OP_WRITE|OP_CREATE|OP_DELETE
+    pub blocked: u8,    // __u8 blocked; 1=拦截, 0=监控
+    pub _pad: u8,       // alignment to 32bit
     pub pid: u32,
     pub uid: u32,
     pub comm: [u8; 16],
@@ -275,8 +293,8 @@ pub const FILE_EVENT_SIZE: usize = 92;
 const _: () = assert!(std::mem::size_of::<FileEvent>() == FILE_EVENT_SIZE);
 
 // OP_* bitmask constants (file_agent.bpf.c)
-pub const OP_READ: u8   = 1;
-pub const OP_WRITE: u8  = 2;
+pub const OP_READ: u8 = 1;
+pub const OP_WRITE: u8 = 2;
 pub const OP_MODIFY: u8 = 4;
 pub const OP_CREATE: u8 = 8;
 pub const OP_DELETE: u8 = 16;

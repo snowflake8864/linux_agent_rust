@@ -91,7 +91,10 @@ pub struct ContainerWatcher {
 #[derive(Clone, Copy)]
 enum MatchKind {
     /// systemd 风格：<prefix><id><suffix>，如 docker-<id>.scope
-    Scope { prefix: &'static str, suffix: &'static str },
+    Scope {
+        prefix: &'static str,
+        suffix: &'static str,
+    },
     /// cgroupfs 风格：目录名本身就是 64 位十六进制容器 ID
     RawHex,
 }
@@ -109,25 +112,37 @@ fn probes() -> Vec<Probe> {
         Probe {
             runtime: Runtime::Docker,
             roots: &["system.slice", "user.slice"],
-            kind: MatchKind::Scope { prefix: "docker-", suffix: ".scope" },
+            kind: MatchKind::Scope {
+                prefix: "docker-",
+                suffix: ".scope",
+            },
             pod_from_parent: false,
         },
         Probe {
             runtime: Runtime::Containerd,
             roots: &["kubepods.slice", "system.slice", "user.slice"],
-            kind: MatchKind::Scope { prefix: "cri-containerd-", suffix: ".scope" },
+            kind: MatchKind::Scope {
+                prefix: "cri-containerd-",
+                suffix: ".scope",
+            },
             pod_from_parent: true,
         },
         Probe {
             runtime: Runtime::Crio,
             roots: &["kubepods.slice", "system.slice", "user.slice"],
-            kind: MatchKind::Scope { prefix: "crio-", suffix: ".scope" },
+            kind: MatchKind::Scope {
+                prefix: "crio-",
+                suffix: ".scope",
+            },
             pod_from_parent: true,
         },
         Probe {
             runtime: Runtime::Podman,
             roots: &["system.slice", "user.slice", "machine.slice"],
-            kind: MatchKind::Scope { prefix: "libpod-", suffix: ".scope" },
+            kind: MatchKind::Scope {
+                prefix: "libpod-",
+                suffix: ".scope",
+            },
             pod_from_parent: false,
         },
         // cgroupfs 布局（非 systemd cgroup driver）：
@@ -390,9 +405,7 @@ fn walk(
             // 只有 cgroup 路径、容器 id、init pid 都一致才复用旧 fd；
             // 容器退出/重启/重建都会重新打开。
             let reused_fd = reuse.get(&cgid).and_then(|r| {
-                if r.cgroup_path.as_path() == dir
-                    && r.container_id == cid
-                    && r.init_pid == init_pid
+                if r.cgroup_path.as_path() == dir && r.container_id == cid && r.init_pid == init_pid
                 {
                     Some(Arc::clone(&r.fd))
                 } else {
@@ -535,11 +548,7 @@ fn run_loop(watcher: Arc<ContainerWatcher>, rx: Receiver<()>) {
     loop {
         let counts = reconcile(&watcher.table);
         if last != Some(counts) {
-            log::info!(
-                "[container_watch] 容器={} cgid别名={}",
-                counts.0,
-                counts.1
-            );
+            log::info!("[container_watch] 容器={} cgid别名={}", counts.0, counts.1);
             last = Some(counts);
         }
         match rx.recv_timeout(RECONCILE_INTERVAL) {
@@ -690,5 +699,38 @@ impl ContainerWatcher {
             .values()
             .find(|e| e.pids.iter().any(|p| p.pid == pid))
             .cloned()
+    }
+
+    /// cgid 未命中时的补充路径：读取 `/proc/<pid>/cgroup`，从当前 cgroup
+    /// 逐级向上找已登记的容器根。
+    ///
+    /// 用于新子 cgroup 还没被下一次 reconcile 收录的短窗口；runc nsexec
+    /// 这种仍在 containerd.service 下的进程不会被误判为容器。
+    pub fn lookup_pid_cgroup(&self, pid: i32) -> Option<ContainerEntry> {
+        if pid <= 0 {
+            return None;
+        }
+        let content = fs::read_to_string(format!("/proc/{}/cgroup", pid)).ok()?;
+        let cg_path = content
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))?
+            .trim();
+        if !cg_path.starts_with('/') {
+            return None;
+        }
+
+        let t = self.table.read().unwrap_or_else(|e| e.into_inner());
+        let mut dir = Path::new(CGROUP_ROOT).join(cg_path.trim_start_matches('/'));
+        loop {
+            if let Some(ino) = stat_ino(&dir) {
+                if let Some(root) = t.alias.get(&ino) {
+                    return t.containers.get(root).cloned();
+                }
+            }
+            if !dir.pop() || !dir.starts_with(CGROUP_ROOT) {
+                break;
+            }
+        }
+        None
     }
 }

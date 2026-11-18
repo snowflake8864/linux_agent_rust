@@ -1,34 +1,36 @@
-use aya::maps::HashMap as AyaHashMap;
 use aya::maps::Array as AyaArray;
+use aya::maps::HashMap as AyaHashMap;
 use aya::maps::RingBuf;
 use log::{info, warn};
 use logging::log_info;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
+pub mod backdoor;
+pub mod capability;
+pub mod container_watch;
+pub mod dpi_parser;
 pub mod loader;
 pub mod types;
-pub mod capability;
-pub mod dpi_parser;
-pub mod backdoor;
-pub mod container_watch;
+use common::backend::SecurityBackend;
 use loader::ModularLoader;
 use types::*;
-use common::backend::SecurityBackend;
 
 /// Maps (file_mode, run_mode, type_idx) → n_type for alert reporting.
 /// file_mode: 0=file, 1=directory
 /// run_mode:  0=monitor, 1=protect
 /// type_idx:  0=CREATE, 1=DELETE, 2=MODIFY, 3=OPEN, 4=RENAME
 static WARN_LOG_TYPE: [[[u16; 5]; 2]; 2] = [
-    [ // file_mode=0 (regular file)
+    [
+        // file_mode=0 (regular file)
         [3001, 3002, 3003, 3004, 3005], // monitor
         [3101, 3102, 3103, 3104, 3105], // protect
     ],
-    [ // file_mode=1 (directory)
+    [
+        // file_mode=1 (directory)
         [2001, 2002, 2003, 2004, 2005], // monitor
         [2101, 2102, 2103, 2104, 2105], // protect
     ],
@@ -39,7 +41,11 @@ static WARN_LOG_TYPE: [[[u16; 5]; 2]; 2] = [
 const SELF_PROTECT_DIRS: &[(&str, bool, &[&str])] = &[
     ("/opt/osec", true, &[]),
     ("/var/lib/dpkg/info", false, &["osec."]),
-    ("/etc/systemd/system/multi-user.target.wants", false, &["osec.", "agent_manager."]),
+    (
+        "/etc/systemd/system/multi-user.target.wants",
+        false,
+        &["osec.", "agent_manager."],
+    ),
 ];
 
 /// eBPF 后端 — 按需加载 proc/file/net 模块，通过 BPF maps 下发规则
@@ -122,8 +128,11 @@ pub struct Md5Entry {
     pub mtime: u64,
 }
 
-/// 容器 overlay 层文件的底层身份记录。inode 为底层 fs inode（与 overlay i_ino 一致），
+/// overlay 文件身份的底层记录。inode 为底层 fs inode（与 overlay i_ino 一致），
 /// underlying_dev 为底层 fs 设备号，用于跨 data-root/文件系统冲突检测。
+/// 既包含容器层文件，也包含宿主机可执行文件：runc-dmz 等运行时会把宿主机
+/// 二进制通过 overlayfs 重新 exec，此时 dev 变成 overlay 匿名设备号，但 inode
+/// 仍保留底层 inode，必须靠该索引才能跨挂载命中。
 #[derive(Debug, Clone)]
 pub struct OverlayInodeRec {
     pub md5: String,
@@ -131,6 +140,8 @@ pub struct OverlayInodeRec {
     pub underlying_dev: u64,
     pub size: u64,
     pub prefix_hash: u64,
+    /// 该路径是否属于容器 rootfs；仅影响告警展示，不影响规则匹配。
+    pub is_container: bool,
 }
 
 // ── 虚拟开端口（端口虚开/重定向）──
@@ -189,9 +200,15 @@ fn apply_net_sysctls(interface: &str) -> NetSysctlState {
         ("/proc/sys/net/ipv4/ip_forward", "1"),
     ];
     let state = NetSysctlState {
-        accept_local_all: std::fs::read_to_string(items[0].0).ok().map(|s| s.trim().to_string()),
-        accept_local_iface: std::fs::read_to_string(items[1].0).ok().map(|s| s.trim().to_string()),
-        ip_forward: std::fs::read_to_string(items[2].0).ok().map(|s| s.trim().to_string()),
+        accept_local_all: std::fs::read_to_string(items[0].0)
+            .ok()
+            .map(|s| s.trim().to_string()),
+        accept_local_iface: std::fs::read_to_string(items[1].0)
+            .ok()
+            .map(|s| s.trim().to_string()),
+        ip_forward: std::fs::read_to_string(items[2].0)
+            .ok()
+            .map(|s| s.trim().to_string()),
         interface: interface.to_string(),
     };
 
@@ -207,9 +224,18 @@ fn apply_net_sysctls(interface: &str) -> NetSysctlState {
 
 fn restore_net_sysctls(state: &NetSysctlState) {
     let pairs = [
-        (format!("/proc/sys/net/ipv4/conf/{}/accept_local", state.interface), &state.accept_local_iface),
-        ("/proc/sys/net/ipv4/conf/all/accept_local".to_string(), &state.accept_local_all),
-        ("/proc/sys/net/ipv4/ip_forward".to_string(), &state.ip_forward),
+        (
+            format!("/proc/sys/net/ipv4/conf/{}/accept_local", state.interface),
+            &state.accept_local_iface,
+        ),
+        (
+            "/proc/sys/net/ipv4/conf/all/accept_local".to_string(),
+            &state.accept_local_all,
+        ),
+        (
+            "/proc/sys/net/ipv4/ip_forward".to_string(),
+            &state.ip_forward,
+        ),
     ];
     info!("[EbpfBackend] 还原网络转发 sysctl...");
     for (path, orig) in pairs {
@@ -249,7 +275,9 @@ fn parse_vir_open_port_line(line: &str) -> Option<(usize, usize, Option<VirPortR
 
     // 按 key=value 词法解析，兼容字段间的多余空格（下发端格式串里有双空格）
     for tok in rest.split_whitespace() {
-        let Some((k, v)) = tok.split_once('=') else { continue };
+        let Some((k, v)) = tok.split_once('=') else {
+            continue;
+        };
         match k {
             "index" => index = v.parse::<usize>().ok(),
             "total" => total = v.parse::<usize>().ok(),
@@ -273,8 +301,11 @@ fn parse_vir_open_port_line(line: &str) -> Option<(usize, usize, Option<VirPortR
 
     let mut r = Some(rule);
     if !is_ipv4 || proto_num == 0 {
-        warn!("[EbpfBackend] VIR_OPEN_PORT id={} {} 规则，XDP 仅支持 IPv4 tcp/udp，跳过",
-            id, if is_ipv4 { "协议未知" } else { "为 IPv6" });
+        warn!(
+            "[EbpfBackend] VIR_OPEN_PORT id={} {} 规则，XDP 仅支持 IPv4 tcp/udp，跳过",
+            id,
+            if is_ipv4 { "协议未知" } else { "为 IPv6" }
+        );
         r = None;
     } else {
         let mut rule = r.take().unwrap();
@@ -286,7 +317,10 @@ fn parse_vir_open_port_line(line: &str) -> Option<(usize, usize, Option<VirPortR
         // 以"零改写"条目写入 pkt_mod_rules，命中后仍产生事件用于上报告警，
         // 对齐驱动行为（端口区间命中即上报 openport 审计，无论是否转发）。
         // 协议换算：文本 1=tcp 2=udp → IPPROTO 6/17
-        rule.protocol = match proto_num { 1 => 6, _ => 17 };
+        rule.protocol = match proto_num {
+            1 => 6,
+            _ => 17,
+        };
         r = Some(rule);
     }
     Some((i, t, r))
@@ -317,14 +351,21 @@ fn stat_path_to_proc_key(path: &str) -> Option<ProcKey> {
     if !meta.is_file() {
         return None;
     }
-    Some(ProcKey { dev: meta.st_dev() as u32, inode: meta.st_ino() })
+    Some(ProcKey {
+        dev: meta.st_dev() as u32,
+        inode: meta.st_ino(),
+    })
 }
 
 impl EbpfBackend {
     pub fn new(
         bpf_dir: &str,
-        file_enabled: bool, file_switch: bool, file_protect: bool,
-        proc_enabled: bool, proc_switch: bool, proc_protect: bool,
+        file_enabled: bool,
+        file_switch: bool,
+        file_protect: bool,
+        proc_enabled: bool,
+        proc_switch: bool,
+        proc_protect: bool,
         net_enabled: bool,
         interface: &str,
         engine: &str,
@@ -384,8 +425,10 @@ impl EbpfBackend {
             info!("[EbpfBackend] NET_AGENT=0，跳过 net agent");
         }
 
-        info!("[EbpfBackend] ===== ELF 解析完成: file={}, proc={}, net={} =====",
-            file_loaded, proc_loaded, net_loaded);
+        info!(
+            "[EbpfBackend] ===== ELF 解析完成: file={}, proc={}, net={} =====",
+            file_loaded, proc_loaded, net_loaded
+        );
 
         // 容器收集仅在 eBPF 模式、且启用进程模块时启动；驱动模式不会走到这里。
         let container_watcher = if proc_enabled {
@@ -397,10 +440,14 @@ impl EbpfBackend {
 
         Ok(Self {
             loader: Arc::new(Mutex::new(loader)),
-            file_loaded, proc_loaded, net_loaded,
-            file_switch, proc_switch: AtomicBool::new(proc_switch),
+            file_loaded,
+            proc_loaded,
+            net_loaded,
+            file_switch,
+            proc_switch: AtomicBool::new(proc_switch),
             proc_detection_enabled: AtomicBool::new(false),
-            file_protect, proc_protect,
+            file_protect,
+            proc_protect,
             interface: interface.to_string(),
             engine: engine.to_string(),
             md5_map: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -438,9 +485,11 @@ impl EbpfBackend {
         const VIR_PORT_MAX: u32 = 16;
         let st = self.vir_port_state.lock().unwrap();
         let mut loader = self.loader.lock().unwrap();
-        let bpf = loader.net_bpf_mut()
+        let bpf = loader
+            .net_bpf_mut()
             .ok_or_else(|| "net agent 未加载".to_string())?;
-        let map_ref = bpf.map_mut("vir_port_rules")
+        let map_ref = bpf
+            .map_mut("vir_port_rules")
             .ok_or_else(|| "vir_port_rules map 不存在".to_string())?;
         // ARRAY 类型 map，必须用 Array 接口（HashMap::try_from 会报 invalid map type 2）
         let mut tbl: AyaArray<_, VirPortBpfRule> =
@@ -448,8 +497,15 @@ impl EbpfBackend {
 
         // 全量替换：先清空所有槽位（protocol=0 即空槽，XDP 侧跳过）
         let empty = VirPortBpfRule {
-            protocol: 0, keep_port: 0, start_port: 0, end_port: 0,
-            redirect_port: 0, dst_ip: 0, new_dst_ip: 0, addr_type: 0, pad: [0; 3],
+            protocol: 0,
+            keep_port: 0,
+            start_port: 0,
+            end_port: 0,
+            redirect_port: 0,
+            dst_ip: 0,
+            new_dst_ip: 0,
+            addr_type: 0,
+            pad: [0; 3],
         };
         for i in 0..VIR_PORT_MAX {
             let _ = tbl.set(i, &empty, 0);
@@ -462,8 +518,11 @@ impl EbpfBackend {
 
         let latest = &st.latest;
         if latest.len() > VIR_PORT_MAX as usize {
-            warn!("[EbpfBackend] 虚开端口规则 {} 条超过表容量 {}，截断",
-                latest.len(), VIR_PORT_MAX);
+            warn!(
+                "[EbpfBackend] 虚开端口规则 {} 条超过表容量 {}，截断",
+                latest.len(),
+                VIR_PORT_MAX
+            );
         }
         for (i, r) in latest.iter().take(VIR_PORT_MAX as usize).enumerate() {
             // 纯告警规则（无 dest_ip 且不保端口无 redirect）：new_dst_ip=0/redirect=0
@@ -483,10 +542,10 @@ impl EbpfBackend {
                 .map_err(|e| format!("vir_port_rules insert[{}]: {}", i, e))?;
         }
         // 计数放最后写：XDP 侧以此做热路径短路，未配置时一次查找即返回
-        let meta_ref = bpf.map_mut("vir_port_meta")
+        let meta_ref = bpf
+            .map_mut("vir_port_meta")
             .ok_or_else(|| "vir_port_meta map 不存在".to_string())?;
-        let mut meta: AyaArray<_, u32> =
-            AyaArray::try_from(meta_ref).map_err(|e| e.to_string())?;
+        let mut meta: AyaArray<_, u32> = AyaArray::try_from(meta_ref).map_err(|e| e.to_string())?;
         let count = if st.enabled.unwrap_or(true) {
             (latest.len() as u32).min(VIR_PORT_MAX)
         } else {
@@ -506,9 +565,11 @@ impl EbpfBackend {
         let mut tracked = self.saddr_block_keys.lock().unwrap();
 
         let mut loader = self.loader.lock().unwrap();
-        let bpf = loader.net_bpf_mut()
+        let bpf = loader
+            .net_bpf_mut()
             .ok_or_else(|| "net agent 未加载".to_string())?;
-        let map_ref = bpf.map_mut("saddr_block_rules")
+        let map_ref = bpf
+            .map_mut("saddr_block_rules")
             .ok_or_else(|| "saddr_block_rules map 不存在".to_string())?;
         let mut m: AyaHashMap<_, u32, u8> =
             AyaHashMap::try_from(map_ref).map_err(|e| e.to_string())?;
@@ -538,13 +599,16 @@ impl EbpfBackend {
             }
         }
         // 计数放最后写：XDP 侧以此做热路径短路，未配置阻断时一次 ARRAY 读即返回
-        let meta_ref = bpf.map_mut("saddr_block_meta")
+        let meta_ref = bpf
+            .map_mut("saddr_block_meta")
             .ok_or_else(|| "saddr_block_meta map 不存在".to_string())?;
-        let mut meta: AyaArray<_, u32> =
-            AyaArray::try_from(meta_ref).map_err(|e| e.to_string())?;
+        let mut meta: AyaArray<_, u32> = AyaArray::try_from(meta_ref).map_err(|e| e.to_string())?;
         meta.set(0u32, &(n as u32), 0)
             .map_err(|e| format!("saddr_block_meta update: {}", e))?;
-        info!("[EbpfBackend] ✅ 源地址阻断下发完成: {} 条 (开关={})", n, enabled as u8);
+        info!(
+            "[EbpfBackend] ✅ 源地址阻断下发完成: {} 条 (开关={})",
+            n, enabled as u8
+        );
         Ok(())
     }
 
@@ -627,7 +691,10 @@ impl EbpfBackend {
                     warn!("[EbpfBackend] ⚠ net_agent 无 pkt_events map，虚开端口不上报告警");
                 }
             }
-            info!("[EbpfBackend] ✅ Net agent 挂载完成 ({}@{})", self.interface, self.engine);
+            info!(
+                "[EbpfBackend] ✅ Net agent 挂载完成 ({}@{})",
+                self.interface, self.engine
+            );
         } else {
             info!("[EbpfBackend] net_loaded=false，跳过 net agent 挂载");
         }
@@ -647,14 +714,22 @@ impl EbpfBackend {
         let mut loader = self.loader.lock().unwrap();
         if let Some(bpf) = loader.proc_bpf_mut() {
             let _ = ModularLoader::enable_feature(bpf, 1, self.proc_switch.load(Ordering::SeqCst));
-            info!("[EbpfBackend] ✅ 进程策略已加载，启用进程检测 (proc_switch={})",
-                self.proc_switch.load(Ordering::SeqCst));
+            info!(
+                "[EbpfBackend] ✅ 进程策略已加载，启用进程检测 (proc_switch={})",
+                self.proc_switch.load(Ordering::SeqCst)
+            );
         }
     }
 
-    pub fn is_file_loaded(&self) -> bool { self.file_loaded }
-    pub fn is_proc_loaded(&self) -> bool { self.proc_loaded }
-    pub fn is_net_loaded(&self) -> bool { self.net_loaded }
+    pub fn is_file_loaded(&self) -> bool {
+        self.file_loaded
+    }
+    pub fn is_proc_loaded(&self) -> bool {
+        self.proc_loaded
+    }
+    pub fn is_net_loaded(&self) -> bool {
+        self.net_loaded
+    }
 
     /// 启动自保后门 Unix socket（.self.sock），收到驱动模式同款口令即关/开自保。
     /// eBPF 模式下自保防 kill 依赖 protected_pids map，一旦开启 agent 自身无法被 kill，
@@ -665,8 +740,13 @@ impl EbpfBackend {
     }
 
     /// 运行时更新 feature_switches + global_modes + 刷新已有 proc_rules
-    pub fn sync_runtime_switches(&self, file_switch: bool, proc_switch: bool,
-                                  file_protect: bool, proc_protect: bool) {
+    pub fn sync_runtime_switches(
+        &self,
+        file_switch: bool,
+        proc_switch: bool,
+        file_protect: bool,
+        proc_protect: bool,
+    ) {
         // 记录运行时进程开关，供 enable_proc_detection 按最新值开启检测
         self.proc_switch.store(proc_switch, Ordering::SeqCst);
         {
@@ -680,7 +760,8 @@ impl EbpfBackend {
             if self.proc_loaded {
                 if let Some(bpf) = loader.proc_bpf_mut() {
                     // 进程检测需在黑白名单策略加载后才允许开启，避免启动空表误报。
-                    let effective = proc_switch && self.proc_detection_enabled.load(Ordering::SeqCst);
+                    let effective =
+                        proc_switch && self.proc_detection_enabled.load(Ordering::SeqCst);
                     let _ = ModularLoader::enable_feature(bpf, 1, effective);
                     let _ = ModularLoader::set_global_mode(bpf, 1, proc_protect);
                 }
@@ -695,11 +776,17 @@ impl EbpfBackend {
         let mode: u8 = if protect { 2 } else { 1 };
         let applied = match self.applied_rules.lock() {
             Ok(g) => g,
-            Err(e) => { log::error!("[EbpfBackend] ❌ applied_rules mutex poisoned (refresh), recovering"); e.into_inner() }
+            Err(e) => {
+                log::error!("[EbpfBackend] ❌ applied_rules mutex poisoned (refresh), recovering");
+                e.into_inner()
+            }
         };
         let md5_map = match self.md5_map.read() {
             Ok(g) => g,
-            Err(e) => { log::error!("[EbpfBackend] ❌ md5_map mutex poisoned (refresh), recovering"); e.into_inner() }
+            Err(e) => {
+                log::error!("[EbpfBackend] ❌ md5_map mutex poisoned (refresh), recovering");
+                e.into_inner()
+            }
         };
         let mut refreshed = 0;
         let mut ino_refreshed = 0;
@@ -711,7 +798,16 @@ impl EbpfBackend {
                     if action == 0 {
                         if let Some(rec) = self.overlay_index_lookup(e.inode) {
                             if rec.md5 == *hash
-                                && self.add_proc_rule_ino_by_inode(e.inode, action, mode, rec.size, rec.prefix_hash).is_ok() {
+                                && self
+                                    .add_proc_rule_ino_by_inode(
+                                        e.inode,
+                                        action,
+                                        mode,
+                                        rec.size,
+                                        rec.prefix_hash,
+                                    )
+                                    .is_ok()
+                            {
                                 ino_refreshed += 1;
                             }
                         }
@@ -720,16 +816,25 @@ impl EbpfBackend {
                 refreshed += 1;
             }
         }
-        log::info!("[EbpfBackend] 🔄 模式切换: 已刷新 {} 条 proc_rules + {} 条 overlay ino (mode={})",
-            refreshed, ino_refreshed, if protect { "PROTECT" } else { "MONITOR" });
+        log::info!(
+            "[EbpfBackend] 🔄 模式切换: 已刷新 {} 条 proc_rules + {} 条 overlay ino (mode={})",
+            refreshed,
+            ino_refreshed,
+            if protect { "PROTECT" } else { "MONITOR" }
+        );
     }
 
     /// 从 ringbuf 中读取所有待处理事件（epoll + 同步读取）
-    fn drain_ringbuf(ringbuf_mutex: &Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>) -> Vec<Vec<u8>> {
+    fn drain_ringbuf(
+        ringbuf_mutex: &Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
+    ) -> Vec<Vec<u8>> {
         let mut guard = match ringbuf_mutex.lock() {
             Ok(g) => g,
             Err(e) => {
-                log::error!("[EbpfBackend] ❌ drain_ringbuf mutex poisoned! recovering... err={}", e);
+                log::error!(
+                    "[EbpfBackend] ❌ drain_ringbuf mutex poisoned! recovering... err={}",
+                    e
+                );
                 e.into_inner()
             }
         };
@@ -752,7 +857,9 @@ impl EbpfBackend {
 
     /// 解析进程 ringbuf 事件
     fn parse_event(data: &[u8]) -> Option<(&UnifiedEvent, String, String)> {
-        if data.len() < UNIFIED_EVENT_SIZE { return None; }
+        if data.len() < UNIFIED_EVENT_SIZE {
+            return None;
+        }
         let event: &UnifiedEvent = unsafe { &*(data.as_ptr() as *const UnifiedEvent) };
         let path = Self::bytes_to_string(&event.path);
         let comm = Self::bytes_to_string(&event.comm);
@@ -761,7 +868,9 @@ impl EbpfBackend {
 
     /// 解析文件 ringbuf 事件 (92 bytes, 含 op_type)
     fn parse_file_event(data: &[u8]) -> Option<(&FileEvent, String, String)> {
-        if data.len() < FILE_EVENT_SIZE { return None; }
+        if data.len() < FILE_EVENT_SIZE {
+            return None;
+        }
         let event: &FileEvent = unsafe { &*(data.as_ptr() as *const FileEvent) };
         let path = Self::bytes_to_string(&event.path);
         let comm = Self::bytes_to_string(&event.comm);
@@ -771,17 +880,27 @@ impl EbpfBackend {
     /// 按 op_type 位掩码推导 type_idx (匹配 G_WARN_LOG_TYPE 列)
     /// OP_CREATE=0, OP_DELETE=1, OP_MODIFY=2, OP_OPEN=3, OP_RENAME=4
     fn op_type_to_idx(op: u8) -> usize {
-        if op & OP_CREATE != 0 { 0 }
-        else if op & OP_DELETE != 0 { 1 }
-        else if op & OP_MODIFY != 0 { 2 }
-        else if op & OP_WRITE != 0 { 2 }  // OP_WRITE → modify
-        else { 3 }  // OP_READ → open (idx=3), and fallback
+        if op & OP_CREATE != 0 {
+            0
+        } else if op & OP_DELETE != 0 {
+            1
+        } else if op & OP_MODIFY != 0 {
+            2
+        } else if op & OP_WRITE != 0 {
+            2
+        }
+        // OP_WRITE → modify
+        else {
+            3
+        } // OP_READ → open (idx=3), and fallback
     }
 
     /// 周期性扫描容器层目录：覆盖“agent 启动后新建但尚未 start”的容器。
     /// 层目录 mtime 未变时跳过，稳态下开销很小。
     pub fn start_container_scan_loop(self: &Arc<Self>) {
-        if !self.proc_loaded { return; }
+        if !self.proc_loaded {
+            return;
+        }
         let backend = self.clone();
         std::thread::spawn(move || {
             info!("[EbpfBackend] 容器层周期扫描线程已启动 (10s)");
@@ -799,7 +918,9 @@ impl EbpfBackend {
     /// 启动 eBPF 进程事件 ring buffer 读取器
     /// 当 eBPF proc_agent 拦截/监控进程时，通过 ringbuf 发送事件，这里读取并上报告警
     pub fn start_proc_event_reader(self: &Arc<Self>) {
-        if !self.proc_loaded { return; }
+        if !self.proc_loaded {
+            return;
+        }
         let rb = self.proc_ringbuf.clone();
         let backend = self.clone();
         std::thread::spawn(move || {
@@ -814,30 +935,63 @@ impl EbpfBackend {
                 }
                 total_events += items.len() as u64;
                 for data in &items {
-                    log::info!("[EbpfBackend] 📨 事件原始数据: len={} first_bytes={:02x?}", data.len(), &data[..std::cmp::min(data.len(), 16)]);
+                    log::info!(
+                        "[EbpfBackend] 📨 事件原始数据: len={} first_bytes={:02x?}",
+                        data.len(),
+                        &data[..std::cmp::min(data.len(), 16)]
+                    );
                     match Self::parse_event(data) {
                         Some((event, path, comm)) => {
                             let is_black = event.event_type == 2; // EVENT_PROC
                             log::info!("[EbpfBackend] 📨 事件解析: type={} overlay={} blocked={} pid={} uid={} dev={} inode={} cgid={} path={} comm={}",
                                 event.event_type, event.is_overlay, event.blocked, event.pid, event.uid, event.dev, event.inode, event.cgid, path, comm);
                             let n_type = if event.blocked == 1 {
-                                if is_black { 1102 } else { 1101 }
-                            } else if is_black { 1002 } else { 1001 };
-                            let action_str = if event.blocked == 1 { "拦截" } else { "监控" };
-                            log::info!("[EbpfBackend] 📨 开始上报: n_type={} action={} pid={}", n_type, action_str, event.pid);
-                            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                backend.report_process_event(event, &path, &comm, n_type, action_str);
-                            })) {
+                                if is_black {
+                                    1102
+                                } else {
+                                    1101
+                                }
+                            } else if is_black {
+                                1002
+                            } else {
+                                1001
+                            };
+                            let action_str = if event.blocked == 1 {
+                                "拦截"
+                            } else {
+                                "监控"
+                            };
+                            log::info!(
+                                "[EbpfBackend] 📨 开始上报: n_type={} action={} pid={}",
+                                n_type,
+                                action_str,
+                                event.pid
+                            );
+                            if let Err(e) =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    backend.report_process_event(
+                                        event, &path, &comm, n_type, action_str,
+                                    );
+                                }))
+                            {
                                 total_errors += 1;
                                 log::error!("[EbpfBackend] ❌ report_process_event panic! pid={} err={:?} (total_errors={})",
                                     event.pid, e, total_errors);
                             } else {
-                                log::info!("[EbpfBackend] 📨 上报完成: n_type={} pid={}", n_type, event.pid);
+                                log::info!(
+                                    "[EbpfBackend] 📨 上报完成: n_type={} pid={}",
+                                    n_type,
+                                    event.pid
+                                );
                             }
                         }
                         None => {
                             total_errors += 1;
-                            log::warn!("[EbpfBackend] 📨 事件解析失败: len={} (total_errors={})", data.len(), total_errors);
+                            log::warn!(
+                                "[EbpfBackend] 📨 事件解析失败: len={} (total_errors={})",
+                                data.len(),
+                                total_errors
+                            );
                         }
                     }
                 }
@@ -858,7 +1012,9 @@ impl EbpfBackend {
     /// 启动 eBPF 文件事件 ring buffer 读取器
     /// 当 eBPF file_agent 拦截/监控文件操作时，通过 ringbuf 发送事件，这里读取并上报告警
     pub fn start_file_event_reader(self: &Arc<Self>) {
-        if !self.file_loaded { return; }
+        if !self.file_loaded {
+            return;
+        }
         let rb = self.file_ringbuf.clone();
         let backend = self.clone();
         std::thread::spawn(move || {
@@ -868,24 +1024,50 @@ impl EbpfBackend {
                 for data in &items {
                     if let Some((event, path, comm)) = Self::parse_file_event(data) {
                         if event.event_type == EVENT_SELF_PROTECT {
-                            backend.report_self_protect_event(&path, &comm, event.pid, event.uid, event.op_type);
+                            backend.report_self_protect_event(
+                                &path,
+                                &comm,
+                                event.pid,
+                                event.uid,
+                                event.op_type,
+                            );
                             continue;
                         }
                         let type_idx = Self::op_type_to_idx(event.op_type);
                         let run_mode: usize = if event.blocked == 1 { 1 } else { 0 };
                         let n_type = WARN_LOG_TYPE[0][run_mode][type_idx];
                         let op_name = match type_idx {
-                            0 => "CREATE", 1 => "DELETE", 2 => "MODIFY",
-                            3 => "OPEN", 4 => "RENAME", _ => "?",
+                            0 => "CREATE",
+                            1 => "DELETE",
+                            2 => "MODIFY",
+                            3 => "OPEN",
+                            4 => "RENAME",
+                            _ => "?",
                         };
                         if event.blocked == 1 {
                             log::warn!("[EbpfBackend] 🚫 文件拦截: path={} comm={} pid={} op_type=0x{:02X}→{} n_type={}",
                                 path, comm, event.pid, event.op_type, op_name, n_type);
-                            backend.report_file_event(&path, &comm, n_type, "拦截", event.pid, event.op_type, op_name);
+                            backend.report_file_event(
+                                &path,
+                                &comm,
+                                n_type,
+                                "拦截",
+                                event.pid,
+                                event.op_type,
+                                op_name,
+                            );
                         } else {
                             log::info!("[EbpfBackend] 👀 文件监控: path={} comm={} pid={} op_type=0x{:02X}→{} n_type={}",
                                 path, comm, event.pid, event.op_type, op_name, n_type);
-                            backend.report_file_event(&path, &comm, n_type, "监控", event.pid, event.op_type, op_name);
+                            backend.report_file_event(
+                                &path,
+                                &comm,
+                                n_type,
+                                "监控",
+                                event.pid,
+                                event.op_type,
+                                op_name,
+                            );
                         }
                     }
                 }
@@ -900,7 +1082,9 @@ impl EbpfBackend {
     /// net_agent XDP 命中虚开端口/重定向规则时通过 pkt_events 发送事件，
     /// 这里转换为 OpenPortLog 上报（对齐驱动 openport 审计 → /v1/upOpenPort）。
     pub fn start_net_event_reader(self: &Arc<Self>) {
-        if !self.net_loaded { return; }
+        if !self.net_loaded {
+            return;
+        }
         let rb = self.net_ringbuf.clone();
         let backend = self.clone();
         std::thread::spawn(move || {
@@ -911,10 +1095,15 @@ impl EbpfBackend {
             loop {
                 let items = Self::drain_ringbuf(&rb);
                 for data in &items {
-                    if data.len() < PKT_EVENT_SIZE { continue; }
-                    let ev: PktEvent = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const PktEvent) };
+                    if data.len() < PKT_EVENT_SIZE {
+                        continue;
+                    }
+                    let ev: PktEvent =
+                        unsafe { std::ptr::read_unaligned(data.as_ptr() as *const PktEvent) };
                     // 只关心 XDP ingress 命中 pkt_mod 规则的事件（0x40），阻断(0x80)走别的告警
-                    if ev.event_type != 3 || ev.tcp_flags_set != 0x40 { continue; }
+                    if ev.event_type != 3 || ev.tcp_flags_set != 0x40 {
+                        continue;
+                    }
 
                     let attack_ip = u32::from_be(ev.src_ip);
                     let dest_ip = u32::from_be(ev.dst_ip);
@@ -929,14 +1118,17 @@ impl EbpfBackend {
                         }
                     }
                     last_seen.insert(key, now);
-                    last_seen.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(120));
+                    last_seen.retain(|_, t| {
+                        now.duration_since(*t) < std::time::Duration::from_secs(120)
+                    });
 
                     // 用本地规则缓存补全 redirect_ip / redirect_port / weight(addr_type)
                     let (weight, redirect_ip, redirect_port) = {
                         let st = backend.vir_port_state.lock().unwrap();
                         match st.latest.iter().find(|r| {
                             r.protocol == ev.protocol
-                                && dport >= r.start_port && dport <= r.end_port
+                                && dport >= r.start_port
+                                && dport <= r.end_port
                                 && (r.dst_ip == 0 || r.dst_ip == ev.dst_ip)
                         }) {
                             Some(r) => (
@@ -946,7 +1138,11 @@ impl EbpfBackend {
                                 } else {
                                     String::new()
                                 },
-                                if !r.keep_port && r.redirect_port != 0 { r.redirect_port as i32 } else { 0 },
+                                if !r.keep_port && r.redirect_port != 0 {
+                                    r.redirect_port as i32
+                                } else {
+                                    0
+                                },
                             ),
                             None => (0, String::new(), 0),
                         }
@@ -955,16 +1151,25 @@ impl EbpfBackend {
                     let log = reporter::OpenPortLog {
                         weight,
                         time: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i32,
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i32,
                         attack_ip: Ipv4Addr::from(attack_ip).to_string(),
                         destination_ip: Ipv4Addr::from(dest_ip).to_string(),
                         open_port: dport as i32,
                         redirect_ip,
                         redirect_port,
                     };
-                    info!("[EbpfBackend] 🚨 虚开端口命中: {}:{} -> {}:{} redirect={}:{} weight={}",
-                        log.attack_ip, u16::from_be(ev.src_port), log.destination_ip,
-                        log.open_port, log.redirect_ip, log.redirect_port, log.weight);
+                    info!(
+                        "[EbpfBackend] 🚨 虚开端口命中: {}:{} -> {}:{} redirect={}:{} weight={}",
+                        log.attack_ip,
+                        u16::from_be(ev.src_port),
+                        log.destination_ip,
+                        log.open_port,
+                        log.redirect_ip,
+                        log.redirect_port,
+                        log.weight
+                    );
                     reporter::fake_port_audit::push_open_port_log(log);
                 }
                 if items.is_empty() {
@@ -981,7 +1186,8 @@ impl EbpfBackend {
             let cache = self.path_hash_cache.read().unwrap();
             if let Some((cached_md5, cached_mtime)) = cache.get(path) {
                 if let Ok(meta) = std::fs::metadata(path) {
-                    if let Some(cur_mtime) = meta.modified()
+                    if let Some(cur_mtime) = meta
+                        .modified()
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     {
@@ -1001,28 +1207,57 @@ impl EbpfBackend {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
         {
-            self.path_hash_cache.write().unwrap()
+            self.path_hash_cache
+                .write()
+                .unwrap()
                 .insert(path.to_string(), (hash.clone(), mtime_secs));
         }
         Some(hash)
     }
 
-/// 上报进程告警（拦截: n_type=1101, 监控: n_type=1001）
-fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_type: u16, action: &str) {
-//            log::info!("[EbpfBackend] 📋 report_process_event BEGIN: n_type={} pid={} uid={} dev={} inode={} path={} comm={}", n_type, event.pid, event.uid, event.dev, event.inode, path, comm);
+    /// 上报进程告警（拦截: n_type=1101, 监控: n_type=1001）
+    fn report_process_event(
+        &self,
+        event: &UnifiedEvent,
+        path: &str,
+        comm: &str,
+        n_type: u16,
+        action: &str,
+    ) {
+        //            log::info!("[EbpfBackend] 📋 report_process_event BEGIN: n_type={} pid={} uid={} dev={} inode={} path={} comm={}", n_type, event.pid, event.uid, event.dev, event.inode, path, comm);
         let key = (event.dev, event.inode);
         // cgid -> 容器（O(1)）。命中=容器进程，未命中=宿主机进程（或新容器尚未扫描到）。
-        let container = self.container_watcher.lookup(event.cgid);
-        let (mut md5_hash, mut real_path) =
-            self.resolve_proc_md5(event.pid, key, path, container.as_ref());
+        // 新子 cgroup 可能还没被 reconcile 收录，用 /proc/<pid>/cgroup 向上补查一次。
+        let container = self.container_watcher.lookup(event.cgid).or_else(|| {
+            if event.pid > 0 {
+                self.container_watcher.lookup_pid_cgroup(event.pid as i32)
+            } else {
+                None
+            }
+        });
+        let (mut md5_hash, mut real_path) = self.resolve_proc_md5(
+            event.pid,
+            key,
+            path,
+            container.as_ref(),
+            event.is_overlay != 0,
+        );
         // 容器未识别/瞬时进程已退出时，按 overlay 底层 inode 从磁盘扫描索引兜底。
+        // 该索引现在同时包含宿主机可执行文件，用于 runc-dmz：dev 变化但 inode 保留。
+        let mut is_container = container.is_some();
         if md5_hash.is_none() && event.is_overlay != 0 {
             match self.overlay_index_lookup(event.inode) {
                 Some(rec) => {
-                    info!("[EbpfBackend] 🔍 overlay inode 兜底命中: inode={} md5={} path={}",
-                        event.inode, &rec.md5[..8.min(rec.md5.len())], rec.path);
+                    info!(
+                        "[EbpfBackend] 🔍 overlay inode 兜底命中: inode={} md5={} path={} container={}",
+                        event.inode,
+                        &rec.md5[..8.min(rec.md5.len())],
+                        rec.path,
+                        rec.is_container
+                    );
                     md5_hash = Some(rec.md5);
                     real_path = rec.path;
+                    is_container |= rec.is_container;
                 }
                 None => {
                     log::info!("[EbpfBackend] 🔍 overlay inode 兜底未命中: inode={} (索引未覆盖或存在冲突)",
@@ -1030,27 +1265,54 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                 }
             }
         }
-        let is_container = event.is_overlay != 0
-            || container.is_some()
-            || real_path.starts_with("/proc/");
+        // 展示层只把真正的容器路径标记为 container；overlay 只代表文件在 overlayfs 上，
+        // 不能直接等同容器（runc-dmz 就是宿主机进程 exec overlay 克隆文件）。
+        is_container |= real_path.starts_with("/proc/");
         log::info!(
             "[EbpfBackend] 📋 进程归属: pid={} cgid={} container={:?} md5={} real_path={}",
             event.pid,
             event.cgid,
-            container.as_ref().map(|c| (c.runtime.as_str(), c.container_id.as_str())),
+            container
+                .as_ref()
+                .map(|c| (c.runtime.as_str(), c.container_id.as_str())),
             md5_hash.as_deref().unwrap_or("(none)"),
             real_path
         );
-        // 容器进程且 md5 未命中 → 按需补扫容器 overlay（防止启动后新容器的可执行文件漏扫）
-        if is_container && md5_hash.is_none() {
+        // 容器进程或 overlay 文件且 md5 未命中 → 按需补扫容器 overlay
+        //（防止启动后新容器的可执行文件漏扫，也兼容 dev 变化的 overlay 克隆）。
+        if (is_container || event.is_overlay != 0) && md5_hash.is_none() {
             self.maybe_rescan_container_overlays();
             // 补扫后重新解析 md5（新扫描的数据已入 md5_map/inode_md5_map）
-            let (h, p) = self.resolve_proc_md5(event.pid, key, path, container.as_ref());
+            let (h, p) = self.resolve_proc_md5(
+                event.pid,
+                key,
+                path,
+                container.as_ref(),
+                event.is_overlay != 0,
+            );
             md5_hash = h;
             real_path = p;
+            if md5_hash.is_none() && event.is_overlay != 0 {
+                if let Some(rec) = self.overlay_index_lookup(event.inode) {
+                    info!(
+                        "[EbpfBackend] 🔍 补扫后 overlay inode 命中: inode={} md5={} path={} container={}",
+                        event.inode,
+                        &rec.md5[..8.min(rec.md5.len())],
+                        rec.path,
+                        rec.is_container
+                    );
+                    md5_hash = Some(rec.md5);
+                    real_path = rec.path;
+                    is_container |= rec.is_container;
+                }
+            }
             if md5_hash.is_some() {
-                info!("[EbpfBackend] 🔍 补扫后命中: dev={} inode={} md5={}",
-                    event.dev, event.inode, md5_hash.as_deref().unwrap_or(""));
+                info!(
+                    "[EbpfBackend] 🔍 补扫后命中: dev={} inode={} md5={}",
+                    event.dev,
+                    event.inode,
+                    md5_hash.as_deref().unwrap_or("")
+                );
             }
         }
         // 不明进程命中时，通过 inode→MD5→全量名单表查找，即时补写 proc_rules，
@@ -1063,23 +1325,32 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                 resolved_action = self.try_resolve_pending_rule(key, h, &real_path);
                 //log::info!("[EbpfBackend] 📋 resolved_action={:?} (None=真未知,0=白名单,1=黑名单)", resolved_action);
             } else {
-
                 log::info!("[EbpfBackend] 📋 无 md5，跳过 try_resolve_pending_rule");
             }
         }
 
         if resolved_action == Some(0) {
-            log::info!("[EbpfBackend] 白名单进程放行: pid={} uid={} comm={} dev={} inode={}",
-                event.pid, event.uid, comm, event.dev, event.inode);
+            log::info!(
+                "[EbpfBackend] 白名单进程放行: pid={} uid={} comm={} dev={} inode={}",
+                event.pid,
+                event.uid,
+                comm,
+                event.dev,
+                event.inode
+            );
             return;
         }
 
         let final_n_type = match resolved_action {
             Some(1) => {
                 // 黑名单：修改标记（与 EVENT_PROC 的 n_type 对齐）
-                if event.blocked == 1 { 1102 } else { 1002 }
+                if event.blocked == 1 {
+                    1102
+                } else {
+                    1002
+                }
             }
-            _ => n_type,                  // 真未知（None 或意外值）
+            _ => n_type, // 真未知（None 或意外值）
         };
 
         // 黑名单命中：同步 BPF 后仍上报告警（标记为黑名单 n_type）
@@ -1098,20 +1369,39 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             n_type: final_n_type,
             n_level: if final_n_type >= 1100 { 3 } else { 2 },
             n_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
             rename_dir: None,
-            notice_remark: Some(format!("进程{}: pid={} uid={}", action, event.pid, event.uid)),
+            notice_remark: Some(format!(
+                "进程{}: pid={} uid={}",
+                action, event.pid, event.uid
+            )),
             exception_process: Some(comm.to_string()),
-            peripheral_name: None, peripheral_remark: None, peripheral_eid: None,
+            peripheral_name: None,
+            peripheral_remark: None,
+            peripheral_eid: None,
             p_param: Some(display_path.clone()),
         };
-        log::info!("[EbpfBackend] 📋 broadcasting alert: n_type={} level={} path={}", final_n_type, log.n_level, display_path);
+        log::info!(
+            "[EbpfBackend] 📋 broadcasting alert: n_type={} level={} path={}",
+            final_n_type,
+            log.n_level,
+            display_path
+        );
         reporter::broadcast_audit_log(&log);
-        log::info!("[EbpfBackend] 📋 sending http upload: n_type={}", final_n_type);
+        log::info!(
+            "[EbpfBackend] 📋 sending http upload: n_type={}",
+            final_n_type
+        );
         reporter::send_to_http_upload(&log);
 
         if matches!(final_n_type, 1001 | 1101) {
-            log::info!("[EbpfBackend] 📋 sending autoupload_process: pid={} hash={}", event.pid, md5_hash.as_deref().unwrap_or("(none)"));
+            log::info!(
+                "[EbpfBackend] 📋 sending autoupload_process: pid={} hash={}",
+                event.pid,
+                md5_hash.as_deref().unwrap_or("(none)")
+            );
             reporter::send_to_autoupload_process(&reporter::AuditProcess {
                 n_time: 0,
                 str_name: String::new(),
@@ -1129,7 +1419,36 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                 map_depends: vec![],
             });
         }
-        log::info!("[EbpfBackend] 📋 report_process_event END: n_type={} pid={}", final_n_type, event.pid);
+        log::info!(
+            "[EbpfBackend] 📋 report_process_event END: n_type={} pid={}",
+            final_n_type,
+            event.pid
+        );
+    }
+
+    /// 把 `/proc/self/...` 展开成 `/proc/<pid>/...`。
+    /// 事件里的 `self` 指触发 exec 的进程，不是 agent 进程；直接在 agent 上
+    /// stat `/proc/self/fd/N` 会读到 agent 自己的 fd，这是错误的。
+    fn expand_proc_self_path(pid: u32, path: &str) -> String {
+        if pid != 0 && path.starts_with("/proc/self/") {
+            return format!("/proc/{}/{}", pid, &path["/proc/self/".len()..]);
+        }
+        path.to_string()
+    }
+
+    /// 从已知 MD5 记录里挑一个适合展示的路径，优先真实宿主路径。
+    fn preferred_path_for_md5(&self, hash: &str) -> Option<String> {
+        let map = self.md5_map.read().ok()?;
+        let entries = map.get(hash)?;
+        entries
+            .iter()
+            .find(|e| e.mtime > 0 && e.path.starts_with('/') && !e.path.starts_with("/proc/"))
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|e| e.path.starts_with('/') && !e.path.starts_with("/proc/"))
+            })
+            .map(|e| e.path.clone())
     }
 
     /// 候选路径：绝对路径直接用；相对路径按常见 bin 目录补全。
@@ -1138,10 +1457,17 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             return vec![hint_path.to_string()];
         }
         let name = hint_path.trim_start_matches("./");
-        ["/bin", "/usr/bin", "/usr/local/bin", "/sbin", "/usr/sbin", "/usr/local/sbin"]
-            .iter()
-            .map(|prefix| format!("{}/{}", prefix, name))
-            .collect()
+        [
+            "/bin",
+            "/usr/bin",
+            "/usr/local/bin",
+            "/sbin",
+            "/usr/sbin",
+            "/usr/local/sbin",
+        ]
+        .iter()
+        .map(|prefix| format!("{}/{}", prefix, name))
+        .collect()
     }
 
     /// 去掉容器内路径的 `/proc/<pid>/root` 前缀。
@@ -1166,6 +1492,7 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         key: (u64, u64),
         hint_path: &str,
         container: Option<&container_watch::ContainerEntry>,
+        is_overlay: bool,
     ) -> (Option<String>, String) {
         // 1) (dev,inode) 缓存命中（inode 全局唯一，不区分宿主/容器）
         if let Ok(map) = self.inode_md5_map.read() {
@@ -1174,6 +1501,10 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             }
         }
 
+        // runc-dmz 等场景会把执行路径写成 /proc/self/fd/N 或 /proc/self/exe。
+        // 这里的 self 是事件进程，不是 agent 自己，必须展开成事件 pid。
+        let expanded_hint = Self::expand_proc_self_path(pid, hint_path);
+        let hint_path = expanded_hint.as_str();
         let candidates = Self::candidate_paths(hint_path);
 
         // 2) 容器进程：优先用扫描阶段打开的容器根目录 fd（与 pid 生命周期解耦），
@@ -1229,6 +1560,15 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                     }
                 }
             }
+            if let Some((hash, rp)) = self.read_md5_via_proc_exe(pid, key, hint_path, is_overlay) {
+                log::info!(
+                    "[EbpfBackend] 🔍 容器进程 /proc/<pid>/exe 命中: pid={} md5={} exe={}",
+                    pid,
+                    &hash[..8.min(hash.len())],
+                    rp
+                );
+                return (Some(hash), rp);
+            }
             log::info!(
                 "[EbpfBackend] 🔍 容器内未找到匹配: pid={} init_pid={:?} cgid={} cid={} dev={} inode={}",
                 pid, entry.init_pid, entry.root_cgid, entry.container_id, key.0, key.1
@@ -1266,7 +1606,67 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             }
         }
 
+        // 5) 最后兜底：直接读取事件进程的 /proc/<pid>/exe。
+        //    适配 runc-dmz、/proc/self/fd/N、临时克隆文件、已被 unlink 的 exe 等
+        //    路径无法稳定 stat 的情况；用 inode 校验避免 pid 复用误判。
+        if let Some((hash, rp)) = self.read_md5_via_proc_exe(pid, key, hint_path, is_overlay) {
+            log::info!(
+                "[EbpfBackend] 🔍 /proc/<pid>/exe 兜底命中: pid={} md5={} exe={}",
+                pid,
+                &hash[..8.min(hash.len())],
+                rp
+            );
+            return (Some(hash), rp);
+        }
+
         (None, hint_path.to_string())
+    }
+
+    /// 直接读取事件进程的 `/proc/<pid>/exe` 计算 MD5。
+    /// - 普通文件要求 (dev,inode) 完全一致；
+    /// - overlay 文件 dev 会随 dmz 挂载变化，允许只校验 inode。
+    /// - 命中后优先用 md5_map 中的真实宿主路径作为展示路径。
+    fn read_md5_via_proc_exe(
+        &self,
+        pid: u32,
+        key: (u64, u64),
+        hint_path: &str,
+        is_overlay: bool,
+    ) -> Option<(String, String)> {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        if pid == 0 {
+            return None;
+        }
+        let link = format!("/proc/{}/exe", pid);
+        let mut file = std::fs::File::open(&link).ok()?;
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let same_identity = (meta.dev(), meta.ino()) == key;
+        let same_overlay_inode = is_overlay && meta.ino() == key.1;
+        if !same_identity && !same_overlay_inode {
+            return None;
+        }
+        // 避免异常大文件拖垮事件处理线程；正常可执行文件远小于该上限。
+        if meta.len() > 1024 * 1024 * 1024 {
+            return None;
+        }
+        let mut data = Vec::with_capacity(meta.len().min(16 * 1024 * 1024) as usize);
+        file.read_to_end(&mut data).ok()?;
+        let hash = hex::encode(md5::compute(&data).0);
+        let mut rp = std::fs::read_link(&link)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| hint_path.to_string());
+        if let Some(stripped) = rp.strip_suffix(" (deleted)") {
+            rp = stripped.to_string();
+        }
+        if let Some(known) = self.preferred_path_for_md5(&hash) {
+            rp = known;
+        }
+        Some((hash, rp))
     }
 
     /// 以容器根 fd 为锚点，用 openat2(RESOLVE_IN_ROOT) 打开容器内文件：
@@ -1323,14 +1723,34 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         if (meta.dev(), meta.ino()) != key {
             return None; // 身份不符：路径只是同名巧合，不可信
         }
-        let mtime = meta.modified().ok()?
-            .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+        let mtime = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
         let hash = Self::compute_file_md5(real_path)?;
         match self.inode_md5_map.write() {
-            Ok(mut map) => { map.insert(key, InodeMd5Rec { md5: hash.clone(), mtime, path: real_path.to_string() }); }
+            Ok(mut map) => {
+                map.insert(
+                    key,
+                    InodeMd5Rec {
+                        md5: hash.clone(),
+                        mtime,
+                        path: real_path.to_string(),
+                    },
+                );
+            }
             Err(e) => {
                 log::error!("[EbpfBackend] ❌ inode_md5_map write poisoned (lookup_or_compute_md5), recovering");
-                e.into_inner().insert(key, InodeMd5Rec { md5: hash.clone(), mtime, path: real_path.to_string() });
+                e.into_inner().insert(
+                    key,
+                    InodeMd5Rec {
+                        md5: hash.clone(),
+                        mtime,
+                        path: real_path.to_string(),
+                    },
+                );
             }
         }
         Some((hash, real_path.to_string()))
@@ -1377,7 +1797,9 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         }
         match std::fs::metadata(&entry.path) {
             Ok(m) => {
-                let mtime = m.modified().ok()
+                let mtime = m
+                    .modified()
+                    .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
@@ -1416,13 +1838,19 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             let mut map = match self.inode_md5_map.write() {
                 Ok(g) => g,
                 Err(e) => {
-                    log::error!("[EbpfBackend] ❌ inode_md5_map write poisoned (record), recovering");
+                    log::error!(
+                        "[EbpfBackend] ❌ inode_md5_map write poisoned (record), recovering"
+                    );
                     e.into_inner()
                 }
             };
             map.insert(
                 (dev, inode),
-                InodeMd5Rec { md5: hash.to_string(), mtime, path: path.to_string() },
+                InodeMd5Rec {
+                    md5: hash.to_string(),
+                    mtime,
+                    path: path.to_string(),
+                },
             );
         }
 
@@ -1435,13 +1863,21 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                 }
             };
             let entries = map.entry(hash.to_string()).or_insert_with(Vec::new);
-            if let Some(existing) = entries.iter_mut().find(|e| e.dev == dev && e.inode == inode) {
+            if let Some(existing) = entries
+                .iter_mut()
+                .find(|e| e.dev == dev && e.inode == inode)
+            {
                 // 同一身份再次出现：刷新 path/mtime，避免残留过期校验值。
                 existing.path = path.to_string();
                 existing.mtime = mtime;
                 false
             } else {
-                entries.push(Md5Entry { inode, dev, path: path.to_string(), mtime });
+                entries.push(Md5Entry {
+                    inode,
+                    dev,
+                    path: path.to_string(),
+                    mtime,
+                });
                 true
             }
         };
@@ -1469,7 +1905,9 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             return None;
         }
         let meta = std::fs::metadata(&path).ok()?;
-        let mtime = meta.modified().ok()
+        let mtime = meta
+            .modified()
+            .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
@@ -1487,7 +1925,16 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
     }
 
     /// 上报文件告警
-    fn report_file_event(&self, path: &str, comm: &str, n_type: u16, action: &str, pid: u32, op_type: u8, op_name: &str) {
+    fn report_file_event(
+        &self,
+        path: &str,
+        comm: &str,
+        n_type: u16,
+        action: &str,
+        pid: u32,
+        op_type: u8,
+        op_name: &str,
+    ) {
         let md5_hash = self.get_md5_cached(path);
         let log = reporter::AuditLogInfo {
             file_path: Some(path.to_string()),
@@ -1495,23 +1942,37 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             n_type,
             n_level: if action == "拦截" { 3 } else { 2 },
             n_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
             rename_dir: None,
-            notice_remark: Some(format!("文件{}: pid={} op=0x{:02X}({}) n_type={}",
-                action, pid, op_type, op_name, n_type)),
+            notice_remark: Some(format!(
+                "文件{}: pid={} op=0x{:02X}({}) n_type={}",
+                action, pid, op_type, op_name, n_type
+            )),
             exception_process: Some(comm.to_string()),
-            peripheral_name: None, peripheral_remark: None, peripheral_eid: None,
+            peripheral_name: None,
+            peripheral_remark: None,
+            peripheral_eid: None,
             p_param: Some(path.to_string()),
         };
-        reporter::broadcast_audit_log(&log);   // gRPC 推送
-        reporter::send_to_http_upload(&log);   // HTTP 上报到服务器
+        reporter::broadcast_audit_log(&log); // gRPC 推送
+        reporter::send_to_http_upload(&log); // HTTP 上报到服务器
     }
 
     // ── 内部 helper ──
 
-    fn add_proc_rule_by_inode(&self, dev: u32, inode: u64, action: u8, mode: u8) -> anyhow::Result<()> {
+    fn add_proc_rule_by_inode(
+        &self,
+        dev: u32,
+        inode: u64,
+        action: u8,
+        mode: u8,
+    ) -> anyhow::Result<()> {
         let mut loader = self.loader.lock().unwrap();
-        let bpf = loader.proc_bpf_mut().ok_or_else(|| anyhow::anyhow!("Proc agent not loaded"))?;
+        let bpf = loader
+            .proc_bpf_mut()
+            .ok_or_else(|| anyhow::anyhow!("Proc agent not loaded"))?;
         let mut proc_rules: AyaHashMap<_, ProcKey, ProcRuleVal> =
             AyaHashMap::try_from(bpf.map_mut("proc_rules").unwrap())?;
         proc_rules.insert(ProcKey { dev, inode }, ProcRuleVal::new(action, mode), 0)?;
@@ -1519,14 +1980,27 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
     }
 
     /// 写 overlay 文件 inode-only 规则（proc_rules_ino）。
-    fn add_proc_rule_ino_by_inode(&self, inode: u64, action: u8, mode: u8,
-                                  size: u64, prefix_hash: u64) -> anyhow::Result<()> {
+    fn add_proc_rule_ino_by_inode(
+        &self,
+        inode: u64,
+        action: u8,
+        mode: u8,
+        size: u64,
+        prefix_hash: u64,
+    ) -> anyhow::Result<()> {
         let mut loader = self.loader.lock().unwrap();
-        let bpf = loader.proc_bpf_mut().ok_or_else(|| anyhow::anyhow!("Proc agent not loaded"))?;
-        let map_data = bpf.map_mut("proc_rules_ino")
+        let bpf = loader
+            .proc_bpf_mut()
+            .ok_or_else(|| anyhow::anyhow!("Proc agent not loaded"))?;
+        let map_data = bpf
+            .map_mut("proc_rules_ino")
             .ok_or_else(|| anyhow::anyhow!("proc_rules_ino map not found"))?;
         let mut map: AyaHashMap<_, u64, ProcRuleInoVal> = AyaHashMap::try_from(map_data)?;
-        map.insert(inode, ProcRuleInoVal::new(action, mode, size, prefix_hash), 0)?;
+        map.insert(
+            inode,
+            ProcRuleInoVal::new(action, mode, size, prefix_hash),
+            0,
+        )?;
         drop(map);
         drop(loader);
         let mut active = self.active_ino_rules.lock().unwrap();
@@ -1546,7 +2020,10 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                 }
             }
         }
-        self.active_ino_rules.lock().unwrap().retain(|x| *x != inode);
+        self.active_ino_rules
+            .lock()
+            .unwrap()
+            .retain(|x| *x != inode);
     }
 
     /// 记录/更新 overlay 底层 inode 索引。同一 inode 出现不同 md5 时保留多条，
@@ -1554,13 +2031,20 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
     fn overlay_index_insert(&self, inode: u64, rec: OverlayInodeRec) {
         let mut idx = self.overlay_inode_index.write().unwrap();
         let list = idx.entry(inode).or_insert_with(Vec::new);
-        if let Some(existing) = list.iter_mut().find(|r| r.underlying_dev == rec.underlying_dev && r.md5 == rec.md5) {
+        if let Some(existing) = list
+            .iter_mut()
+            .find(|r| r.underlying_dev == rec.underlying_dev && r.md5 == rec.md5)
+        {
             existing.path = rec.path;
             existing.size = rec.size;
             existing.prefix_hash = rec.prefix_hash;
+            existing.is_container |= rec.is_container;
             return;
         }
-        if let Some(other) = list.iter().find(|r| r.underlying_dev != rec.underlying_dev || r.md5 != rec.md5) {
+        if let Some(other) = list
+            .iter()
+            .find(|r| r.underlying_dev != rec.underlying_dev || r.md5 != rec.md5)
+        {
             if other.md5 != rec.md5 {
                 log::warn!("[EbpfBackend] ⚠️ overlay inode 冲突: inode={} md5_a={} md5_b={} dev_a={} dev_b={}",
                     inode, &other.md5[..8.min(other.md5.len())], &rec.md5[..8.min(rec.md5.len())],
@@ -1622,13 +2106,18 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         }
 
         let search_dirs = self.trusted_process_search_dirs();
-        log_info!("[EbpfBackend] 信任进程白名单: 开始解析 {} 行, search_dirs={:?}",
-            text.lines().count(), search_dirs);
+        log_info!(
+            "[EbpfBackend] 信任进程白名单: 开始解析 {} 行, search_dirs={:?}",
+            text.lines().count(),
+            search_dirs
+        );
         let mut keys: Vec<ProcKey> = Vec::new();
         let mut seen = std::collections::HashSet::<(u64, u64)>::new();
 
         for line in text.lines() {
-            let Some((name, key, full_path)) = parse_process_pattern_line(line) else { continue; };
+            let Some((name, key, full_path)) = parse_process_pattern_line(line) else {
+                continue;
+            };
             // 只处理信任进程，跳过信任目录
             if name.starts_with("trueDir_") {
                 continue;
@@ -1662,14 +2151,18 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                     if let Some(dk) = stat_path_to_proc_key(&cand) {
                         if seen.insert((dk.dev as u64, dk.inode)) {
                             /*log_info!("[EbpfBackend] 信任进程白名单 ✅ {} (basename={}) -> {} dev={} inode={}",
-                                key, basename, cand, dk.dev, dk.inode);*/
+                            key, basename, cand, dk.dev, dk.inode);*/
                             keys.push(dk);
                         }
                         hit = true;
                     }
                 }
                 if !hit {
-                    log_info!("[EbpfBackend] 信任进程白名单 ⚠️ {} (basename={}) 在 search_dirs 中未找到", key, basename);
+                    log_info!(
+                        "[EbpfBackend] 信任进程白名单 ⚠️ {} (basename={}) 在 search_dirs 中未找到",
+                        key,
+                        basename
+                    );
                 }
             }
         }
@@ -1677,7 +2170,12 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         let mut written = 0usize;
         let mut tracked: Vec<ProcKey> = Vec::new();
         for dk in &keys {
-            match self.add_proc_rule_by_inode(dk.dev as u32, dk.inode, 0 /*allow*/, 0 /*inherit*/) {
+            match self.add_proc_rule_by_inode(
+                dk.dev as u32,
+                dk.inode,
+                0, /*allow*/
+                0, /*inherit*/
+            ) {
                 Ok(_) => {
                     written += 1;
                     tracked.push(*dk);
@@ -1692,7 +2190,11 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             }
         }
         *self.active_proc_whitelist.lock().unwrap() = tracked;
-        log_info!("[EbpfBackend] 🛡️ 信任进程白名单: 解析 {} 条, 写入 proc_rules {} 条", keys.len(), written);
+        log_info!(
+            "[EbpfBackend] 🛡️ 信任进程白名单: 解析 {} 条, 写入 proc_rules {} 条",
+            keys.len(),
+            written
+        );
     }
 
     /// 信任进程搜索目录：$PATH + 常见系统目录（去重）。
@@ -1707,9 +2209,16 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             }
         }
         for d in [
-            "/sbin", "/usr/sbin", "/bin", "/usr/bin",
-            "/usr/local/sbin", "/usr/local/bin",
-            "/usr/lib/systemd", "/lib/systemd", "/usr/lib", "/lib",
+            "/sbin",
+            "/usr/sbin",
+            "/bin",
+            "/usr/bin",
+            "/usr/local/sbin",
+            "/usr/local/bin",
+            "/usr/lib/systemd",
+            "/lib/systemd",
+            "/usr/lib",
+            "/lib",
         ] {
             let d = d.to_string();
             if !dirs.contains(&d) {
@@ -1753,19 +2262,31 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
     fn write_dir_policy_bpf(&self, key: DirKey, policy: DirPolicy) {
         let mut loader = match self.loader.lock() {
             Ok(l) => l,
-            Err(e) => { warn!("[EbpfBackend] DPI lock error: {}", e); return; }
+            Err(e) => {
+                warn!("[EbpfBackend] DPI lock error: {}", e);
+                return;
+            }
         };
         let bpf = match loader.file_bpf_mut() {
             Some(b) => b,
-            None => { warn!("[EbpfBackend] DPI: file_bpf not loaded"); return; }
+            None => {
+                warn!("[EbpfBackend] DPI: file_bpf not loaded");
+                return;
+            }
         };
         let map_data = match bpf.map_mut("dir_policies") {
             Some(m) => m,
-            None => { warn!("[EbpfBackend] DPI: dir_policies map unavailable"); return; }
+            None => {
+                warn!("[EbpfBackend] DPI: dir_policies map unavailable");
+                return;
+            }
         };
         let mut dir_policies = match AyaHashMap::<_, DirKey, DirPolicy>::try_from(map_data) {
             Ok(m) => m,
-            Err(e) => { warn!("[EbpfBackend] DPI: try_from failed: {}", e); return; }
+            Err(e) => {
+                warn!("[EbpfBackend] DPI: try_from failed: {}", e);
+                return;
+            }
         };
         match dir_policies.insert(key, policy, 0) {
             Ok(_) => {
@@ -1788,10 +2309,17 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
 
         let patterns = dpi_parser::parse_patterns(&pat_text);
         let rules = dpi_parser::parse_rules(&rule_text);
-        info!("[EbpfBackend] DPI commit: {} patterns, {} rules parsed", patterns.len(), rules.len());
+        info!(
+            "[EbpfBackend] DPI commit: {} patterns, {} rules parsed",
+            patterns.len(),
+            rules.len()
+        );
 
         let entries = dpi_parser::match_patterns_to_rules(&patterns, &rules);
-        info!("[EbpfBackend] DPI commit: {} dir_policy entries resolved", entries.len());
+        info!(
+            "[EbpfBackend] DPI commit: {} dir_policy entries resolved",
+            entries.len()
+        );
 
         for entry in &entries {
             self.write_dir_policy_bpf(entry.key, entry.policy);
@@ -1803,17 +2331,23 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
     fn remove_proc_rule_by_hash(&self, hash: &str) -> anyhow::Result<()> {
         let entries: Vec<(u64, u64)> = {
             let md5_map = self.md5_map.read().unwrap();
-            md5_map.get(hash)
+            md5_map
+                .get(hash)
                 .map(|es| es.iter().map(|e| (e.dev, e.inode)).collect())
                 .unwrap_or_default()
         };
         {
             let mut loader = self.loader.lock().unwrap();
-            let bpf = loader.proc_bpf_mut().ok_or_else(|| anyhow::anyhow!("Proc agent not loaded"))?;
+            let bpf = loader
+                .proc_bpf_mut()
+                .ok_or_else(|| anyhow::anyhow!("Proc agent not loaded"))?;
             let mut proc_rules: AyaHashMap<_, ProcKey, ProcRuleVal> =
                 AyaHashMap::try_from(bpf.map_mut("proc_rules").unwrap())?;
             for (dev, inode) in &entries {
-                let _ = proc_rules.remove(&ProcKey { dev: *dev as u32, inode: *inode });
+                let _ = proc_rules.remove(&ProcKey {
+                    dev: *dev as u32,
+                    inode: *inode,
+                });
             }
         }
         let mut inodes: Vec<u64> = entries.iter().map(|(_, inode)| *inode).collect();
@@ -1843,7 +2377,10 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             let guard = match self.pending_rules.lock() {
                 Ok(g) => g,
                 Err(e) => {
-                    log::error!("[EbpfBackend] ❌ pending_rules mutex poisoned! recovering... err={}", e);
+                    log::error!(
+                        "[EbpfBackend] ❌ pending_rules mutex poisoned! recovering... err={}",
+                        e
+                    );
                     e.into_inner()
                 }
             };
@@ -1852,11 +2389,23 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         let (pending_len, cache_white_len, cache_black_len) = {
             let pr = match self.pending_rules.lock() {
                 Ok(g) => g,
-                Err(e) => { log::error!("[EbpfBackend] ❌ pending_rules mutex poisoned (len) err={}", e); e.into_inner() }
+                Err(e) => {
+                    log::error!(
+                        "[EbpfBackend] ❌ pending_rules mutex poisoned (len) err={}",
+                        e
+                    );
+                    e.into_inner()
+                }
             };
             let pc = match self.process_cache.lock() {
                 Ok(g) => g,
-                Err(e) => { log::error!("[EbpfBackend] ❌ process_cache mutex poisoned (len) err={}", e); e.into_inner() }
+                Err(e) => {
+                    log::error!(
+                        "[EbpfBackend] ❌ process_cache mutex poisoned (len) err={}",
+                        e
+                    );
+                    e.into_inner()
+                }
             };
             (pr.len(), pc.0.len(), pc.1.len())
         };
@@ -1870,7 +2419,10 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                 let cache = match self.process_cache.lock() {
                     Ok(g) => g,
                     Err(e) => {
-                        log::error!("[EbpfBackend] ❌ process_cache mutex poisoned! recovering... err={}", e);
+                        log::error!(
+                            "[EbpfBackend] ❌ process_cache mutex poisoned! recovering... err={}",
+                            e
+                        );
                         e.into_inner()
                     }
                 };
@@ -1915,7 +2467,13 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         if action == 0 {
             if let Some(rec) = self.overlay_index_lookup(inode) {
                 if rec.md5 == hash {
-                    let _ = self.add_proc_rule_ino_by_inode(inode, action, mode, rec.size, rec.prefix_hash);
+                    let _ = self.add_proc_rule_ino_by_inode(
+                        inode,
+                        action,
+                        mode,
+                        rec.size,
+                        rec.prefix_hash,
+                    );
                 }
             }
         }
@@ -1929,32 +2487,59 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                 if !Self::md5_entry_valid(&entry) {
                     continue; // 过期映射，跳过
                 }
-                if let Err(err) = self.add_proc_rule_by_inode(entry.dev as u32, entry.inode, action, mode) {
-                    log::warn!("[EbpfBackend] 批量补写 proc_rules 失败: dev={} inode={} err={}", entry.dev, entry.inode, err);
+                if let Err(err) =
+                    self.add_proc_rule_by_inode(entry.dev as u32, entry.inode, action, mode)
+                {
+                    log::warn!(
+                        "[EbpfBackend] 批量补写 proc_rules 失败: dev={} inode={} err={}",
+                        entry.dev,
+                        entry.inode,
+                        err
+                    );
                 } else {
                     written += 1;
                 }
             }
             if written > 0 {
-                log::info!("[EbpfBackend] 🔎 同 MD5 批量补写 {} 条 proc_rules (hash={})", written, &hash[..8.min(hash.len())]);
+                log::info!(
+                    "[EbpfBackend] 🔎 同 MD5 批量补写 {} 条 proc_rules (hash={})",
+                    written,
+                    &hash[..8.min(hash.len())]
+                );
             }
         }
         {
             let mut pr = match self.pending_rules.lock() {
                 Ok(g) => g,
-                Err(e) => { log::error!("[EbpfBackend] ❌ pending_rules mutex poisoned (remove) err={}", e); e.into_inner() }
+                Err(e) => {
+                    log::error!(
+                        "[EbpfBackend] ❌ pending_rules mutex poisoned (remove) err={}",
+                        e
+                    );
+                    e.into_inner()
+                }
             };
             pr.remove(hash);
         }
         {
             let mut ar = match self.applied_rules.lock() {
                 Ok(g) => g,
-                Err(e) => { log::error!("[EbpfBackend] ❌ applied_rules mutex poisoned (insert) err={}", e); e.into_inner() }
+                Err(e) => {
+                    log::error!(
+                        "[EbpfBackend] ❌ applied_rules mutex poisoned (insert) err={}",
+                        e
+                    );
+                    e.into_inner()
+                }
             };
             ar.insert(hash.to_string(), action);
         }
 
-        let kind = if action == 0 { "白名单" } else { "黑名单" };
+        let kind = if action == 0 {
+            "白名单"
+        } else {
+            "黑名单"
+        };
         log::info!("[EbpfBackend] ✅ 不明进程命中{}，即时补写 proc_rules: dev={} inode={} path={} action={}",
             kind, dev, inode, path, action);
         Some(action)
@@ -1965,21 +2550,30 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
     fn replay_pending_rules(&self) {
         let mut pending = match self.pending_rules.lock() {
             Ok(g) => g,
-            Err(e) => { log::error!("[EbpfBackend] ❌ pending_rules mutex poisoned (replay), recovering"); e.into_inner() }
+            Err(e) => {
+                log::error!("[EbpfBackend] ❌ pending_rules mutex poisoned (replay), recovering");
+                e.into_inner()
+            }
         };
         let md5_map = match self.md5_map.read() {
             Ok(g) => g,
-            Err(e) => { log::error!("[EbpfBackend] ❌ md5_map mutex poisoned (replay), recovering"); e.into_inner() }
+            Err(e) => {
+                log::error!("[EbpfBackend] ❌ md5_map mutex poisoned (replay), recovering");
+                e.into_inner()
+            }
         };
         let mode = if self.proc_protect { 2u8 } else { 1u8 };
 
         // 1. 处理 pending_rules（之前 md5_map 里没有的 MD5）
         let mut replayed = 0;
-        let to_remove: Vec<String> = pending.iter()
+        let to_remove: Vec<String> = pending
+            .iter()
             .filter_map(|(hash, action)| {
                 if let Some(entries) = md5_map.get(hash.as_str()) {
-                    let valid: Vec<&Md5Entry> =
-                        entries.iter().filter(|e| Self::md5_entry_valid(e)).collect();
+                    let valid: Vec<&Md5Entry> = entries
+                        .iter()
+                        .filter(|e| Self::md5_entry_valid(e))
+                        .collect();
                     if valid.is_empty() {
                         return None; // 仅有过期映射，继续等待扫描/反查
                     }
@@ -1988,17 +2582,27 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                         if *action == 0 {
                             if let Some(rec) = self.overlay_index_lookup(e.inode) {
                                 if rec.md5 == *hash {
-                                    let _ = self.add_proc_rule_ino_by_inode(e.inode, *action, mode, rec.size, rec.prefix_hash);
+                                    let _ = self.add_proc_rule_ino_by_inode(
+                                        e.inode,
+                                        *action,
+                                        mode,
+                                        rec.size,
+                                        rec.prefix_hash,
+                                    );
                                 }
                             }
                         }
                     }
                     replayed += 1;
                     Some(hash.clone())
-                } else { None }
+                } else {
+                    None
+                }
             })
             .collect();
-        for h in &to_remove { pending.remove(h); }
+        for h in &to_remove {
+            pending.remove(h);
+        }
 
         // 2. 扫描 applied_rules：同一 MD5 新增的 (dev,inode) 也要补写 BPF
         //    场景：规则下发时 md5_map 只有部分映射，后续扫描/运行时发现同一二进制的新身份
@@ -2006,7 +2610,12 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         {
             let applied = match self.applied_rules.lock() {
                 Ok(g) => g,
-                Err(e) => { log::error!("[EbpfBackend] ❌ applied_rules mutex poisoned (replay), recovering"); e.into_inner() }
+                Err(e) => {
+                    log::error!(
+                        "[EbpfBackend] ❌ applied_rules mutex poisoned (replay), recovering"
+                    );
+                    e.into_inner()
+                }
             };
             for (hash, &action) in applied.iter() {
                 if let Some(entries) = md5_map.get(hash.as_str()) {
@@ -2014,12 +2623,21 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                         if !Self::md5_entry_valid(e) {
                             continue;
                         }
-                        if self.add_proc_rule_by_inode(e.dev as u32, e.inode, action, mode).is_ok() {
+                        if self
+                            .add_proc_rule_by_inode(e.dev as u32, e.inode, action, mode)
+                            .is_ok()
+                        {
                             patched += 1;
                             if action == 0 {
                                 if let Some(rec) = self.overlay_index_lookup(e.inode) {
                                     if rec.md5 == *hash {
-                                        let _ = self.add_proc_rule_ino_by_inode(e.inode, action, mode, rec.size, rec.prefix_hash);
+                                        let _ = self.add_proc_rule_ino_by_inode(
+                                            e.inode,
+                                            action,
+                                            mode,
+                                            rec.size,
+                                            rec.prefix_hash,
+                                        );
                                     }
                                 }
                             }
@@ -2103,11 +2721,20 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             let mtime = if is_container {
                 0
             } else {
-                meta.modified().ok()
+                meta.modified()
+                    .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs()).unwrap_or(0)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
             };
-            recs.push((key, InodeMd5Rec { md5: hash, mtime, path: store_path }));
+            recs.push((
+                key,
+                InodeMd5Rec {
+                    md5: hash,
+                    mtime,
+                    path: store_path,
+                },
+            ));
         }
         let mut added = 0usize;
         {
@@ -2119,7 +2746,10 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                 }
             }
         }
-        info!("[EbpfBackend] 枚举运行进程，预填 inode_md5_map {} 条", added);
+        info!(
+            "[EbpfBackend] 枚举运行进程，预填 inode_md5_map {} 条",
+            added
+        );
         Ok(added)
     }
 
@@ -2129,13 +2759,20 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         // 阻塞进程事件路径上的 inode_md5_map 查表。
         let mut md5_entries: Vec<(String, Md5Entry)> = Vec::new();
         let mut inode_recs: Vec<((u64, u64), InodeMd5Rec)> = Vec::new();
+        let mut overlay_index_recs: Vec<(u64, OverlayInodeRec)> = Vec::new();
         let mut path_cache_entries: Vec<(String, (String, u64))> = Vec::new();
         let mut count = 0usize;
         for dir in dirs {
-            let walker = if recursive { walkdir::WalkDir::new(dir) } else { walkdir::WalkDir::new(dir).max_depth(1) };
+            let walker = if recursive {
+                walkdir::WalkDir::new(dir)
+            } else {
+                walkdir::WalkDir::new(dir).max_depth(1)
+            };
             for entry in walker.into_iter().filter_map(|e| e.ok()) {
                 let path = entry.path();
-                if !path.is_file() { continue; }
+                if !path.is_file() {
+                    continue;
+                }
                 let path_str = path.to_string_lossy().to_string();
                 let data = match std::fs::read(path) {
                     Ok(d) => d,
@@ -2150,14 +2787,45 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                     continue;
                 }
                 let hash = hex::encode(md5::compute(&data).0);
-                let mtime = meta.modified().ok()
+                let mtime = meta
+                    .modified()
+                    .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d: std::time::Duration| d.as_secs())
                     .unwrap_or(0);
                 let key = (meta.dev(), meta.ino());
                 path_cache_entries.push((path_str.clone(), (hash.clone(), mtime)));
-                md5_entries.push((hash.clone(), Md5Entry { inode: key.1, dev: key.0, path: path_str.clone(), mtime }));
-                inode_recs.push((key, InodeMd5Rec { md5: hash, mtime, path: path_str }));
+                md5_entries.push((
+                    hash.clone(),
+                    Md5Entry {
+                        inode: key.1,
+                        dev: key.0,
+                        path: path_str.clone(),
+                        mtime,
+                    },
+                ));
+                // 宿主机可执行文件也纳入 overlay inode 索引：
+                // runc 1.2.x 的 runc-dmz 会把宿主机二进制通过 overlayfs 重新 exec，
+                // 此时事件 dev 变成 overlay 匿名设备号，只有底层 inode 保持不变。
+                overlay_index_recs.push((
+                    key.1,
+                    OverlayInodeRec {
+                        md5: hash.clone(),
+                        path: path_str.clone(),
+                        underlying_dev: key.0,
+                        size: data.len() as u64,
+                        prefix_hash: types::prefix_hash16(&data),
+                        is_container: false,
+                    },
+                ));
+                inode_recs.push((
+                    key,
+                    InodeMd5Rec {
+                        md5: hash,
+                        mtime,
+                        path: path_str,
+                    },
+                ));
                 count += 1;
             }
         }
@@ -2165,7 +2833,9 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         {
             let mut map = self.md5_map.write().unwrap();
             for (hash, entry) in &md5_entries {
-                map.entry(hash.clone()).or_insert_with(Vec::new).push(entry.clone());
+                map.entry(hash.clone())
+                    .or_insert_with(Vec::new)
+                    .push(entry.clone());
             }
             let mut imap = self.inode_md5_map.write().unwrap();
             for (key, rec) in inode_recs {
@@ -2176,8 +2846,15 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                 path_cache.insert(p, v);
             }
         }
-        info!("[EbpfBackend] Scanned {} executables, {} unique MD5s, {} unique inodes",
-            count, self.md5_map.read().unwrap().len(), self.inode_md5_map.read().unwrap().len());
+        for (inode, rec) in overlay_index_recs {
+            self.overlay_index_insert(inode, rec);
+        }
+        info!(
+            "[EbpfBackend] Scanned {} executables, {} unique MD5s, {} unique inodes",
+            count,
+            self.md5_map.read().unwrap().len(),
+            self.inode_md5_map.read().unwrap().len()
+        );
         self.replay_pending_rules();
         Ok(count)
     }
@@ -2193,12 +2870,15 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
 
         let mut map = self.md5_map.write().unwrap();
         let mut path_cache = self.path_hash_cache.write().unwrap();
+        let mut overlay_index_recs: Vec<(u64, OverlayInodeRec)> = Vec::new();
         let mut count = 0usize;
         for (hash, path) in entries {
             if !path.starts_with('/') {
                 continue; // 相对路径无法可靠重建，跳过
             }
-            let Ok(data) = std::fs::read(&path) else { continue; };
+            let Ok(data) = std::fs::read(&path) else {
+                continue;
+            };
             if data.len() < 4 || &data[..4] != b"\x7fELF" {
                 continue; // 非 ELF，跳过
             }
@@ -2207,24 +2887,56 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                 continue; // 文件内容已变化，跳过避免误放行
             }
             use std::os::unix::fs::MetadataExt;
-            let Ok(md) = std::fs::metadata(&path) else { continue; };
-            let mtime = md.modified()
+            let Ok(md) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let mtime = md
+                .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d: std::time::Duration| d.as_secs())
                 .unwrap_or(0);
             path_cache.insert(path.clone(), (hash.clone(), mtime));
-            map.entry(hash.clone()).or_insert_with(Vec::new)
-                .push(Md5Entry { inode: md.ino(), dev: md.dev(), path: path.clone(), mtime });
-            self.inode_md5_map.write().unwrap()
-                .insert((md.dev(), md.ino()), InodeMd5Rec { md5: hash, mtime, path });
+            map.entry(hash.clone())
+                .or_insert_with(Vec::new)
+                .push(Md5Entry {
+                    inode: md.ino(),
+                    dev: md.dev(),
+                    path: path.clone(),
+                    mtime,
+                });
+            overlay_index_recs.push((
+                md.ino(),
+                OverlayInodeRec {
+                    md5: hash.clone(),
+                    path: path.clone(),
+                    underlying_dev: md.dev(),
+                    size: data.len() as u64,
+                    prefix_hash: types::prefix_hash16(&data),
+                    is_container: false,
+                },
+            ));
+            self.inode_md5_map.write().unwrap().insert(
+                (md.dev(), md.ino()),
+                InodeMd5Rec {
+                    md5: hash,
+                    mtime,
+                    path,
+                },
+            );
             count += 1;
         }
         drop(map); // 释放写锁，让 replay_pending_rules 可以获取读锁
         drop(path_cache);
+        for (inode, rec) in overlay_index_recs {
+            self.overlay_index_insert(inode, rec);
+        }
 
         if count > 0 {
-            info!("[EbpfBackend] 从 DB 加载 {} 条非扫描目录可执行文件到 md5_map", count);
+            info!(
+                "[EbpfBackend] 从 DB 加载 {} 条非扫描目录可执行文件到 md5_map",
+                count
+            );
             self.replay_pending_rules();
         }
         Ok(count)
@@ -2235,7 +2947,9 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
     pub fn maybe_rescan_container_overlays(&self) {
         use std::sync::atomic::Ordering;
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let last = self.last_overlay_rescan.load(Ordering::Relaxed);
         if now.saturating_sub(last) < 300 {
             return; // 5 分钟内已扫过，跳过
@@ -2253,9 +2967,15 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
     fn path_is_mountpoint(path: &str) -> bool {
         use std::os::unix::fs::MetadataExt;
         let p = std::path::Path::new(path);
-        let Ok(meta) = std::fs::metadata(p) else { return false; };
-        let Some(parent) = p.parent() else { return false; };
-        let Ok(pmeta) = std::fs::metadata(parent) else { return false; };
+        let Ok(meta) = std::fs::metadata(p) else {
+            return false;
+        };
+        let Some(parent) = p.parent() else {
+            return false;
+        };
+        let Ok(pmeta) = std::fs::metadata(parent) else {
+            return false;
+        };
         meta.dev() != pmeta.dev()
     }
 
@@ -2277,13 +2997,23 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         let s = std::fs::read_to_string(path).ok()?;
         for line in s.lines() {
             let line = line.trim();
-            if line.starts_with('#') { continue; }
-            let Some(rest) = line.strip_prefix(key) else { continue; };
+            if line.starts_with('#') {
+                continue;
+            }
+            let Some(rest) = line.strip_prefix(key) else {
+                continue;
+            };
             let rest = rest.trim_start();
-            let Some(rest) = rest.strip_prefix('=') else { continue; };
+            let Some(rest) = rest.strip_prefix('=') else {
+                continue;
+            };
             let rest = rest.trim_start();
-            let Some(quote) = rest.chars().next() else { continue; };
-            if quote != '"' && quote != '\'' { continue; }
+            let Some(quote) = rest.chars().next() else {
+                continue;
+            };
+            if quote != '"' && quote != '\'' {
+                continue;
+            }
             let rest = &rest[quote.len_utf8()..];
             return rest.split(quote).next().map(|v| v.to_string());
         }
@@ -2291,12 +3021,21 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
     }
 
     fn push_containerd_roots(roots: &mut Vec<String>, base: &str) {
-        roots.push(format!("{}/io.containerd.snapshot.v1.overlayfs/snapshots", base));
+        roots.push(format!(
+            "{}/io.containerd.snapshot.v1.overlayfs/snapshots",
+            base
+        ));
         if let Ok(entries) = std::fs::read_dir(base) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.contains("snapshot") && name.ends_with("overlayfs") {
-                    roots.push(entry.path().join("snapshots").to_string_lossy().into_owned());
+                    roots.push(
+                        entry
+                            .path()
+                            .join("snapshots")
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
                 }
             }
         }
@@ -2325,7 +3064,8 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                 Self::push_containerd_roots(&mut roots, &base);
             }
         }
-        if let Some(gr) = Self::read_toml_string_field("/etc/containers/storage.conf", "graphroot") {
+        if let Some(gr) = Self::read_toml_string_field("/etc/containers/storage.conf", "graphroot")
+        {
             roots.push(format!("{}/overlay", gr));
         }
         roots.sort();
@@ -2336,11 +3076,15 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
     fn discover_container_scan_dirs() -> Vec<(String, Arc<std::os::fd::OwnedFd>, bool)> {
         let mut candidates: Vec<(String, bool)> = Vec::new();
         for root in Self::container_scan_roots() {
-            let Ok(entries) = std::fs::read_dir(&root) else { continue; };
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 for name in ["diff", "merged", "fs"] {
                     let p = entry.path().join(name);
-                    if !p.is_dir() { continue; }
+                    if !p.is_dir() {
+                        continue;
+                    }
                     let s = p.to_string_lossy().into_owned();
                     // diff 恒为底层；merged 恒为运行中 overlay 挂载；
                     // fs 需区分 containerd committed（层）与 active（挂载）。
@@ -2380,12 +3124,27 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             log::debug!("[EbpfBackend] 未发现容器 overlay 目录，跳过容器扫描");
             return Ok(0);
         }
-        log::debug!("[EbpfBackend] 发现 {} 个容器 rootfs/层目录，开始扫描", scan_dirs.len());
+        log::debug!(
+            "[EbpfBackend] 发现 {} 个容器 rootfs/层目录，开始扫描",
+            scan_dirs.len()
+        );
         for (i, (d, _, is_ov)) in scan_dirs.iter().enumerate() {
-            log::debug!("[EbpfBackend]   容器[{}]: {} (overlay_mount={})", i, d, is_ov);
+            log::debug!(
+                "[EbpfBackend]   容器[{}]: {} (overlay_mount={})",
+                i,
+                d,
+                is_ov
+            );
         }
 
-        let std_subdirs: &[&str] = &["bin", "sbin", "usr/bin", "usr/sbin", "usr/local/bin", "usr/local/sbin"];
+        let std_subdirs: &[&str] = &[
+            "bin",
+            "sbin",
+            "usr/bin",
+            "usr/sbin",
+            "usr/local/bin",
+            "usr/local/sbin",
+        ];
 
         let mut md5_entries: Vec<(String, Md5Entry)> = Vec::new();
         let mut inode_recs: Vec<((u64, u64), InodeMd5Rec)> = Vec::new();
@@ -2400,7 +3159,8 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             let dir_mtime = if *is_overlay_mount {
                 0
             } else {
-                std::fs::metadata(root_dir).ok()
+                std::fs::metadata(root_dir)
+                    .ok()
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
@@ -2433,11 +3193,14 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                         .unwrap_or(&full_path_str)
                         .trim_start_matches('/');
 
-                    let Some(fd) = container_watch::open_file_in_root(root_fd.as_raw_fd(), rel) else {
+                    let Some(fd) = container_watch::open_file_in_root(root_fd.as_raw_fd(), rel)
+                    else {
                         continue;
                     };
                     let mut file = std::fs::File::from(fd);
-                    let Ok(meta) = file.metadata() else { continue; };
+                    let Ok(meta) = file.metadata() else {
+                        continue;
+                    };
                     if !meta.is_file() {
                         continue;
                     }
@@ -2472,20 +3235,35 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
                     }
 
                     let mtime = 0;
-                    md5_entries.push((hash.clone(), Md5Entry {
-                        inode: key.1, dev: key.0, path: container_path.clone(), mtime,
-                    }));
-                    inode_recs.push((key, InodeMd5Rec {
-                        md5: hash.clone(), mtime, path: container_path.clone(),
-                    }));
-                    if !*is_overlay_mount {
-                        overlay_index_recs.push((key.1, OverlayInodeRec {
+                    md5_entries.push((
+                        hash.clone(),
+                        Md5Entry {
+                            inode: key.1,
+                            dev: key.0,
+                            path: container_path.clone(),
+                            mtime,
+                        },
+                    ));
+                    inode_recs.push((
+                        key,
+                        InodeMd5Rec {
                             md5: hash.clone(),
-                            path: container_path,
-                            underlying_dev: key.0,
-                            size,
-                            prefix_hash,
-                        }));
+                            mtime,
+                            path: container_path.clone(),
+                        },
+                    ));
+                    if !*is_overlay_mount {
+                        overlay_index_recs.push((
+                            key.1,
+                            OverlayInodeRec {
+                                md5: hash.clone(),
+                                path: container_path,
+                                underlying_dev: key.0,
+                                size,
+                                prefix_hash,
+                                is_container: true,
+                            },
+                        ));
                     }
                     path_cache_entries.push((full_path_str, (hash, mtime)));
                     count += 1;
@@ -2500,7 +3278,10 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             let mut map = self.md5_map.write().unwrap();
             for (hash, entry) in &md5_entries {
                 let list = map.entry(hash.clone()).or_insert_with(Vec::new);
-                if !list.iter().any(|e| e.dev == entry.dev && e.inode == entry.inode) {
+                if !list
+                    .iter()
+                    .any(|e| e.dev == entry.dev && e.inode == entry.inode)
+                {
                     list.push(entry.clone());
                 }
             }
@@ -2531,7 +3312,6 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         Ok(count)
     }
 
-
     /// 扫描容器层 + 运行中 merged（完整扫描）
     pub fn scan_container_overlays(&self) -> anyhow::Result<usize> {
         self.scan_container_overlays_impl(true)
@@ -2555,15 +3335,28 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
             n_type,
             n_level: 3,
             n_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
             rename_dir: None,
-            notice_remark: Some(format!("自保保护: pid={} uid={} op=0x{:02X}", pid, uid, op_type)),
+            notice_remark: Some(format!(
+                "自保保护: pid={} uid={} op=0x{:02X}",
+                pid, uid, op_type
+            )),
             exception_process: Some(comm.to_string()),
-            peripheral_name: None, peripheral_remark: None, peripheral_eid: None,
+            peripheral_name: None,
+            peripheral_remark: None,
+            peripheral_eid: None,
             p_param: Some(path.to_string()),
         };
-        log::warn!("[EbpfBackend] 🛡️ 自保目录命中: path={} comm={} pid={} op_type=0x{:02X} n_type={}",
-            path, comm, pid, op_type, n_type);
+        log::warn!(
+            "[EbpfBackend] 🛡️ 自保目录命中: path={} comm={} pid={} op_type=0x{:02X} n_type={}",
+            path,
+            comm,
+            pid,
+            op_type,
+            n_type
+        );
         reporter::broadcast_audit_log(&log);
         reporter::send_to_http_upload(&log);
     }
@@ -2571,9 +3364,11 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
     /// 自保专用目录保护（与 DPI dir_policies 完全独立）。
     fn write_self_protect_dirs(&self, enabled: bool) -> Result<(), String> {
         let mut loader = self.loader.lock().map_err(|e| e.to_string())?;
-        let bpf = loader.file_bpf_mut()
+        let bpf = loader
+            .file_bpf_mut()
             .ok_or_else(|| "file_agent not loaded".to_string())?;
-        let map_data = bpf.map_mut("self_protect_dirs")
+        let map_data = bpf
+            .map_mut("self_protect_dirs")
             .ok_or_else(|| "self_protect_dirs map unavailable".to_string())?;
         let mut map = AyaHashMap::<_, DirKey, SelfProtectRule>::try_from(map_data)
             .map_err(|e| e.to_string())?;
@@ -2581,14 +3376,22 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
         for (path, whole_dir, prefixes) in SELF_PROTECT_DIRS {
             let key = match dpi_parser::resolve_dir_to_key(path) {
                 Some(k) => k,
-                None => { warn!("[EbpfBackend] 自保目录不存在，跳过: {}", path); continue; }
+                None => {
+                    warn!("[EbpfBackend] 自保目录不存在，跳过: {}", path);
+                    continue;
+                }
             };
             if enabled {
-                let rule = if *whole_dir { SelfProtectRule::whole_dir() }
-                           else { SelfProtectRule::with_prefixes(prefixes) };
+                let rule = if *whole_dir {
+                    SelfProtectRule::whole_dir()
+                } else {
+                    SelfProtectRule::with_prefixes(prefixes)
+                };
                 map.insert(key, rule, 0).map_err(|e| e.to_string())?;
-                info!("[EbpfBackend] 🛡️ 自保目录保护: {} dev={} inode={} whole_dir={}",
-                    path, key.dev, key.inode, whole_dir);
+                info!(
+                    "[EbpfBackend] 🛡️ 自保目录保护: {} dev={} inode={} whole_dir={}",
+                    path, key.dev, key.inode, whole_dir
+                );
             } else {
                 let _ = map.remove(&key);
                 info!("[EbpfBackend] 自保目录保护移除: {}", path);
@@ -2601,8 +3404,12 @@ fn report_process_event(&self, event: &UnifiedEvent, path: &str, comm: &str, n_t
 // ── SecurityBackend impl ──
 
 impl SecurityBackend for EbpfBackend {
-    fn is_active(&self) -> bool { self.file_loaded || self.proc_loaded || self.net_loaded }
-    fn name(&self) -> &str { "ebpf" }
+    fn is_active(&self) -> bool {
+        self.file_loaded || self.proc_loaded || self.net_loaded
+    }
+    fn name(&self) -> &str {
+        "ebpf"
+    }
 
     // 进程
     fn add_md5_rules(&self, data: &str) -> Result<(), String> {
@@ -2616,26 +3423,39 @@ impl SecurityBackend for EbpfBackend {
 
         for raw in data.lines() {
             let line = raw.trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
 
             // 删除: "del 0 {hash}" / "del 1 {hash}"
             if let Some(stripped) = line.strip_prefix("del ") {
                 let mut parts = stripped.split_whitespace();
                 let which = parts.next(); // "0"=白, "1"=黑
-                let Some(h) = parts.next() else { continue; };
+                let Some(h) = parts.next() else {
+                    continue;
+                };
                 let _ = self.remove_proc_rule_by_hash(h);
                 self.pending_rules.lock().unwrap().remove(h);
                 self.applied_rules.lock().unwrap().remove(h);
                 let mut cache = self.process_cache.lock().unwrap();
-                if which == Some("0") { cache.0.retain(|x| x != h); }
-                else { cache.1.retain(|x| x != h); }
+                if which == Some("0") {
+                    cache.0.retain(|x| x != h);
+                } else {
+                    cache.1.retain(|x| x != h);
+                }
                 continue;
             }
 
             // 新增/覆盖: "{hash}=0" (白) / "{hash}=1" (黑)
-            let Some(idx) = line.find('=') else { continue; };
+            let Some(idx) = line.find('=') else {
+                continue;
+            };
             let hash = &line[..idx];
-            let action = if line[idx + 1..].starts_with('0') { 0u8 } else { 1u8 };
+            let action = if line[idx + 1..].starts_with('0') {
+                0u8
+            } else {
+                1u8
+            };
 
             // 1) md5_map 已有映射：直接翻译为 (dev,inode) 写 BPF。
             // 2) md5_map 没有：先用持久化的 hash→path 反查文件，校验 MD5 后补全身份再写 BPF，
@@ -2648,7 +3468,10 @@ impl SecurityBackend for EbpfBackend {
                 if let Some(entry) = self.resolve_identity_from_cache(hash) {
                     log::info!(
                         "[EbpfBackend] 🎯 规则下发前反查命中: hash={} dev={} inode={} path={}",
-                        &hash[..8.min(hash.len())], entry.dev, entry.inode, entry.path
+                        &hash[..8.min(hash.len())],
+                        entry.dev,
+                        entry.inode,
+                        entry.path
                     );
                     entries.push(entry);
                 }
@@ -2662,33 +3485,59 @@ impl SecurityBackend for EbpfBackend {
                     if action == 0 {
                         if let Some(rec) = self.overlay_index_lookup(e.inode) {
                             if rec.md5 == hash
-                                && self.add_proc_rule_ino_by_inode(e.inode, action, mode, rec.size, rec.prefix_hash).is_ok() {
+                                && self
+                                    .add_proc_rule_ino_by_inode(
+                                        e.inode,
+                                        action,
+                                        mode,
+                                        rec.size,
+                                        rec.prefix_hash,
+                                    )
+                                    .is_ok()
+                            {
                                 ino_written += 1;
                             }
                         }
                     }
                 }
                 if ino_written > 0 {
-                    log::info!("[EbpfBackend] 🎯 hash={} 同步写入 {} 条 overlay ino allow",
-                        &hash[..8.min(hash.len())], ino_written);
+                    log::info!(
+                        "[EbpfBackend] 🎯 hash={} 同步写入 {} 条 overlay ino allow",
+                        &hash[..8.min(hash.len())],
+                        ino_written
+                    );
                 }
-                self.applied_rules.lock().unwrap().insert(hash.to_string(), action);
+                self.applied_rules
+                    .lock()
+                    .unwrap()
+                    .insert(hash.to_string(), action);
                 applied += 1;
             } else {
-                self.pending_rules.lock().unwrap().insert(hash.to_string(), action);
+                self.pending_rules
+                    .lock()
+                    .unwrap()
+                    .insert(hash.to_string(), action);
                 pending += 1;
             }
 
             // 同步 process_cache（追加，不整体覆盖；同一 hash 不重复入列）
             let mut cache = self.process_cache.lock().unwrap();
-            let list = if action == 0 { &mut cache.0 } else { &mut cache.1 };
+            let list = if action == 0 {
+                &mut cache.0
+            } else {
+                &mut cache.1
+            };
             if !list.iter().any(|x| x == hash) {
                 list.push(hash.to_string());
             }
             drop(cache);
         }
 
-        log::info!("[EbpfBackend] add_md5_rules: 已下发 {} 条, 待扫描/反查未命中 {} 条", applied, pending);
+        log::info!(
+            "[EbpfBackend] add_md5_rules: 已下发 {} 条, 待扫描/反查未命中 {} 条",
+            applied,
+            pending
+        );
         // 有规则真正写入 proc_rules（在线 push 且 md5_map 已就绪）→ 首次加载完成，开启进程检测
         if applied > 0 {
             self.enable_proc_detection();
@@ -2714,12 +3563,23 @@ impl SecurityBackend for EbpfBackend {
         self.process_cache.lock().unwrap().1.clone()
     }
 
-    fn query_process_rule(&self, path: &str, dev: u64, inode: u64) -> Result<common::backend::ProcRuleQueryResult, String> {
-        let mut result = common::backend::ProcRuleQueryResult { action: -1, ..Default::default() };
+    fn query_process_rule(
+        &self,
+        path: &str,
+        dev: u64,
+        inode: u64,
+    ) -> Result<common::backend::ProcRuleQueryResult, String> {
+        let mut result = common::backend::ProcRuleQueryResult {
+            action: -1,
+            ..Default::default()
+        };
 
         // 1. 确定 (dev, inode)：显式 dev/inode 优先，否则从 path 解析（相对路径先 canonicalize）
         let key = if dev != 0 || inode != 0 {
-            ProcKey { dev: dev as u32, inode }
+            ProcKey {
+                dev: dev as u32,
+                inode,
+            }
         } else {
             let resolved = std::fs::canonicalize(path)
                 .map(|p| p.to_string_lossy().to_string())
@@ -2741,18 +3601,32 @@ impl SecurityBackend for EbpfBackend {
 
         // 2. 查 proc_rules map（key=(dev,inode)，value.action: 0=allow/白, 1=deny/黑）
         let mut loader = self.loader.lock().map_err(|e| e.to_string())?;
-        let bpf = loader.proc_bpf_mut().ok_or_else(|| "Proc agent not loaded".to_string())?;
-        let map_data = bpf.map_mut("proc_rules").ok_or_else(|| "proc_rules map not found".to_string())?;
-        let proc_rules = AyaHashMap::<_, ProcKey, ProcRuleVal>::try_from(map_data)
-            .map_err(|e| e.to_string())?;
+        let bpf = loader
+            .proc_bpf_mut()
+            .ok_or_else(|| "Proc agent not loaded".to_string())?;
+        let map_data = bpf
+            .map_mut("proc_rules")
+            .ok_or_else(|| "proc_rules map not found".to_string())?;
+        let proc_rules =
+            AyaHashMap::<_, ProcKey, ProcRuleVal>::try_from(map_data).map_err(|e| e.to_string())?;
         let (k_dev, k_ino) = (key.dev, key.inode);
         match proc_rules.get(&key, 0) {
             Ok(val) => {
                 result.found = true;
                 result.action = val.action() as i32;
                 result.mode = val.mode() as i32;
-                let kind = if val.action() == 0 { "白名单(allow)" } else { "黑名单(deny)" };
-                result.message = format!("命中 {} dev={} inode={} mode={}", kind, k_dev, k_ino, val.mode());
+                let kind = if val.action() == 0 {
+                    "白名单(allow)"
+                } else {
+                    "黑名单(deny)"
+                };
+                result.message = format!(
+                    "命中 {} dev={} inode={} mode={}",
+                    kind,
+                    k_dev,
+                    k_ino,
+                    val.mode()
+                );
             }
             Err(aya::maps::MapError::KeyNotFound) => {
                 result.message = format!("未命中 proc_rules dev={} inode={}", k_dev, k_ino);
@@ -2764,7 +3638,8 @@ impl SecurityBackend for EbpfBackend {
 
     fn lookup_hash_paths(&self, hash: &str) -> Vec<String> {
         let md5_map = self.md5_map.read().unwrap();
-        md5_map.get(hash)
+        md5_map
+            .get(hash)
             .map(|entries| entries.iter().map(|e| e.path.clone()).collect())
             .unwrap_or_default()
     }
@@ -2783,13 +3658,33 @@ impl SecurityBackend for EbpfBackend {
     // 网络
     fn write_tcp_force_ecn(&self, enable: bool) -> Result<(), String> {
         let mut loader = self.loader.lock().unwrap();
-        let bpf = loader.net_bpf_mut().ok_or_else(|| "Net agent not loaded".to_string())?;
+        let bpf = loader
+            .net_bpf_mut()
+            .ok_or_else(|| "Net agent not loaded".to_string())?;
         let mut pkt_mod_rules: AyaHashMap<_, PktModKey, PktModValue> =
-            AyaHashMap::try_from(bpf.map_mut("pkt_mod_rules").unwrap()).map_err(|e| format!("{}", e))?;
+            AyaHashMap::try_from(bpf.map_mut("pkt_mod_rules").unwrap())
+                .map_err(|e| format!("{}", e))?;
 
-        let key = PktModKey { protocol: 6, direction: 2, padding: [0;2], dst_ip: 0, src_port: 0, dst_port: 0 };
+        let key = PktModKey {
+            protocol: 6,
+            direction: 2,
+            padding: [0; 2],
+            dst_ip: 0,
+            src_port: 0,
+            dst_port: 0,
+        };
         if enable {
-            pkt_mod_rules.insert(key, PktModValue { tcp_flags_enable: 1, tcp_set_ecn_echo: 1, ..Default::default() }, 0).map_err(|e| e.to_string())?;
+            pkt_mod_rules
+                .insert(
+                    key,
+                    PktModValue {
+                        tcp_flags_enable: 1,
+                        tcp_set_ecn_echo: 1,
+                        ..Default::default()
+                    },
+                    0,
+                )
+                .map_err(|e| e.to_string())?;
             info!("[EbpfBackend] ECN-Echo ON");
         } else {
             let _ = pkt_mod_rules.remove(&key);
@@ -2868,7 +3763,9 @@ impl SecurityBackend for EbpfBackend {
         info!("[EbpfBackend] write_netblock_switch={}", on as u8);
         self.apply_saddr_blocks()
     }
-    fn write_defense_switch(&self, _rule_type: &str, _value: &str) -> Result<(), String> { Ok(()) }
+    fn write_defense_switch(&self, _rule_type: &str, _value: &str) -> Result<(), String> {
+        Ok(())
+    }
 
     // DPI — parse pattern/rule text strings, resolve directories to (dev,inode),
     // and write DirPolicy entries into the file_agent's dir_policies BPF map.
@@ -2897,9 +3794,18 @@ impl SecurityBackend for EbpfBackend {
         Ok(())
     }
 
-    fn write_process_dpi_patterns(&self, data: &str, clear: bool, build: bool) -> Result<(), String> {
-        log_info!("[EbpfBackend] write_process_dpi_patterns: clear={} build={} data_len={}",
-            clear, build, data.len());
+    fn write_process_dpi_patterns(
+        &self,
+        data: &str,
+        clear: bool,
+        build: bool,
+    ) -> Result<(), String> {
+        log_info!(
+            "[EbpfBackend] write_process_dpi_patterns: clear={} build={} data_len={}",
+            clear,
+            build,
+            data.len()
+        );
         if clear {
             self.proc_pat_buffer.lock().unwrap().clear();
             self.clear_proc_whitelist_bpf();
@@ -2929,16 +3835,27 @@ impl SecurityBackend for EbpfBackend {
     }
 
     // ── 运行时开关同步到 BPF maps ──
-    fn sync_switches(&self, file_switch: bool, proc_switch: bool,
-                     file_protect: bool, proc_protect: bool) -> Result<(), String> {
+    fn sync_switches(
+        &self,
+        file_switch: bool,
+        proc_switch: bool,
+        file_protect: bool,
+        proc_protect: bool,
+    ) -> Result<(), String> {
         self.sync_runtime_switches(file_switch, proc_switch, file_protect, proc_protect);
         Ok(())
     }
 
     // 其他
-    fn emit_docker_event(&self, _kind: u8, _flag: u8, _pid: i32) -> Result<(), String> { Ok(()) }
-    fn clear_docker_rt(&self) -> Result<(), String> { Ok(()) }
-    fn write_business_ports(&self, _ports: &[u16]) -> Result<(), String> { Ok(()) }
+    fn emit_docker_event(&self, _kind: u8, _flag: u8, _pid: i32) -> Result<(), String> {
+        Ok(())
+    }
+    fn clear_docker_rt(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn write_business_ports(&self, _ports: &[u16]) -> Result<(), String> {
+        Ok(())
+    }
     /// 自保开关：防 kill（protected_pids）+ 自保目录保护（self_protect_dirs）。
     /// 自保目录保护走专用 self_protect_dirs map，与 DPI dir_policies 完全独立，
     /// 不依赖 file_switch，也不依赖 token/GLOBAL_PATTERN_MGR。
@@ -2951,11 +3868,17 @@ impl SecurityBackend for EbpfBackend {
                 if enabled {
                     ModularLoader::add_protected_pid(bpf, agent_pid)
                         .map_err(|e| format!("protected_pids add failed: {}", e))?;
-                    info!("[EbpfBackend] 🛡️ 自保防 kill 已启用: agent PID {} 已加入保护列表", agent_pid);
+                    info!(
+                        "[EbpfBackend] 🛡️ 自保防 kill 已启用: agent PID {} 已加入保护列表",
+                        agent_pid
+                    );
                 } else {
                     ModularLoader::remove_protected_pid(bpf, agent_pid)
                         .map_err(|e| format!("protected_pids remove failed: {}", e))?;
-                    info!("[EbpfBackend] 自保防 kill 已禁用: agent PID {} 已移出保护列表", agent_pid);
+                    info!(
+                        "[EbpfBackend] 自保防 kill 已禁用: agent PID {} 已移出保护列表",
+                        agent_pid
+                    );
                 }
             }
         }

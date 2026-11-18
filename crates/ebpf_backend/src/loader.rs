@@ -39,13 +39,20 @@ impl ModularLoader {
         Ok(())
     }
 
-    pub fn load_proc_agent(&mut self, path: &str, proc_rules_max_entries: u32) -> anyhow::Result<()> {
+    pub fn load_proc_agent(
+        &mut self,
+        path: &str,
+        proc_rules_max_entries: u32,
+    ) -> anyhow::Result<()> {
         info!("[EbpfBackend] 📦 解析 ELF: proc_agent.bpf.o");
         let mut loader = BpfLoader::new();
         if proc_rules_max_entries > 0 {
             loader.set_max_entries("proc_rules", proc_rules_max_entries);
             loader.set_max_entries("proc_rules_ino", proc_rules_max_entries);
-            info!("[EbpfBackend]   proc_rules max_entries = {}", proc_rules_max_entries);
+            info!(
+                "[EbpfBackend]   proc_rules max_entries = {}",
+                proc_rules_max_entries
+            );
         }
         let bpf = loader.load_file(path)?;
         for (name, _prog) in bpf.programs() {
@@ -195,7 +202,10 @@ impl ModularLoader {
             // clsact qdisc 无法建立而失败（内核返回 ENOENT）——与 cgroup connect4
             // 一样降级为警告，不阻断 XDP/进程/文件功能。
             if let Some(prog) = bpf.program_mut("tc_packet_filter") {
-                info!("[EbpfBackend] 🔌 加载 TC egress: tc_packet_filter on {}...", interface);
+                info!(
+                    "[EbpfBackend] 🔌 加载 TC egress: tc_packet_filter on {}...",
+                    interface
+                );
                 let tc_result = (|| -> anyhow::Result<SchedClassifierLinkId> {
                     let _ = std::process::Command::new("tc")
                         .args(["qdisc", "add", "dev", interface, "clsact"])
@@ -207,9 +217,15 @@ impl ModularLoader {
                 match tc_result {
                     Ok(link_id) => {
                         self.tc_attached = Some(("tc_packet_filter".to_string(), link_id));
-                        info!("[EbpfBackend] ✅ TC Egress attached: tc_packet_filter -> {}", interface);
+                        info!(
+                            "[EbpfBackend] ✅ TC Egress attached: tc_packet_filter -> {}",
+                            interface
+                        );
                     }
-                    Err(e) => warn!("[EbpfBackend] ⚠ TC Egress 挂载失败（非致命，XDP 仍生效）: {}", e),
+                    Err(e) => warn!(
+                        "[EbpfBackend] ⚠ TC Egress 挂载失败（非致命，XDP 仍生效）: {}",
+                        e
+                    ),
                 }
             } else {
                 warn!("[EbpfBackend] ⚠ 未找到程序: tc_packet_filter");
@@ -229,7 +245,10 @@ impl ModularLoader {
                 warn!("[EbpfBackend] ⚠ 系统非 cgroup v2，跳过 Cgroup connect4 挂载（cgroup v1 不支持此钩子）");
                 return Ok(());
             };
-            info!("[EbpfBackend] 🔌 加载 Cgroup connect4 (cgroup_path={})...", cgroup_path);
+            info!(
+                "[EbpfBackend] 🔌 加载 Cgroup connect4 (cgroup_path={})...",
+                cgroup_path
+            );
             match (|| -> anyhow::Result<()> {
                 let cgroup_fd = std::fs::File::open(cgroup_path)?;
                 let program: &mut aya::programs::CgroupSockAddr = prog.try_into()?;
@@ -238,7 +257,10 @@ impl ModularLoader {
                 Ok(())
             })() {
                 Ok(()) => info!("[EbpfBackend] ✅ Cgroup connect4 attached"),
-                Err(e) => warn!("[EbpfBackend] ⚠ Cgroup connect4 挂载失败（非致命，XDP/TC 仍生效）: {}", e),
+                Err(e) => warn!(
+                    "[EbpfBackend] ⚠ Cgroup connect4 挂载失败（非致命，XDP/TC 仍生效）: {}",
+                    e
+                ),
             }
         } else {
             warn!("[EbpfBackend] ⚠ 未找到程序: enforce_connect4");
@@ -306,13 +328,20 @@ impl ModularLoader {
     pub fn set_global_mode(bpf: &mut Bpf, feature_idx: u32, protect: bool) -> anyhow::Result<()> {
         let map = match bpf.map_mut("global_modes") {
             Some(m) => m,
-            None => { info!("[EbpfBackend] global_modes map 不存在，跳过"); return Ok(()); }
+            None => {
+                info!("[EbpfBackend] global_modes map 不存在，跳过");
+                return Ok(());
+            }
         };
         let mut arr: Array<_, u8> = Array::try_from(map)?;
         let val: u8 = if protect { 2 } else { 1 }; // 1=MONITOR, 2=PROTECT
         arr.set(feature_idx, val, 0)?;
-        info!("[EbpfBackend] ✅ global_modes[{}] = {} ({})", feature_idx, val,
-            if protect { "PROTECT" } else { "MONITOR" });
+        info!(
+            "[EbpfBackend] ✅ global_modes[{}] = {} ({})",
+            feature_idx,
+            val,
+            if protect { "PROTECT" } else { "MONITOR" }
+        );
         Ok(())
     }
 
@@ -320,11 +349,17 @@ impl ModularLoader {
     pub fn set_agent_pid(bpf: &mut Bpf, pid: u32) -> anyhow::Result<()> {
         let map = match bpf.map_mut("agent_pids") {
             Some(m) => m,
-            None => { info!("[EbpfBackend] agent_pids map 不存在，跳过"); return Ok(()); }
+            None => {
+                info!("[EbpfBackend] agent_pids map 不存在，跳过");
+                return Ok(());
+            }
         };
         let mut arr: Array<_, u32> = Array::try_from(map)?;
         arr.set(0, pid, 0)?;
-        info!("[EbpfBackend] ✅ agent_pids[0] = {} (agent PID 已写入，自保规则将放行本进程)", pid);
+        info!(
+            "[EbpfBackend] ✅ agent_pids[0] = {} (agent PID 已写入，自保规则将放行本进程)",
+            pid
+        );
         Ok(())
     }
 
@@ -334,14 +369,20 @@ impl ModularLoader {
         let map = match bpf.map_mut("feature_switches") {
             Some(m) => m,
             None => {
-                info!("[EbpfBackend] feature_switches map 不存在，跳过 enable({})", feature_idx);
+                info!(
+                    "[EbpfBackend] feature_switches map 不存在，跳过 enable({})",
+                    feature_idx
+                );
                 return Ok(());
             }
         };
         let mut arr: Array<_, u8> = Array::try_from(map)?;
         let val: u8 = if enabled { 1 } else { 0 };
         arr.set(feature_idx, val, 0)?;
-        info!("[EbpfBackend] ✅ feature_switches[{}] = {}", feature_idx, val);
+        info!(
+            "[EbpfBackend] ✅ feature_switches[{}] = {}",
+            feature_idx, val
+        );
         Ok(())
     }
 
@@ -351,7 +392,10 @@ impl ModularLoader {
         use aya::maps::HashMap;
         let map = match bpf.map_mut("protected_pids") {
             Some(m) => m,
-            None => { info!("[EbpfBackend] protected_pids map 不存在，跳过"); return Ok(()); }
+            None => {
+                info!("[EbpfBackend] protected_pids map 不存在，跳过");
+                return Ok(());
+            }
         };
         let mut hash: HashMap<_, u32, u8> = HashMap::try_from(map)?;
         let val: u8 = 1;
@@ -365,7 +409,10 @@ impl ModularLoader {
         use aya::maps::HashMap;
         let map = match bpf.map_mut("protected_pids") {
             Some(m) => m,
-            None => { info!("[EbpfBackend] protected_pids map 不存在，跳过"); return Ok(()); }
+            None => {
+                info!("[EbpfBackend] protected_pids map 不存在，跳过");
+                return Ok(());
+            }
         };
         let mut hash: HashMap<_, u32, u8> = HashMap::try_from(map)?;
         hash.remove(&pid)?;
