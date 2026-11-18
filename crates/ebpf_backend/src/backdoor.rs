@@ -14,8 +14,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{error, info, warn};
 use common::backend::SecurityBackend;
+use log::{error, info, warn};
 
 /// 后门 socket 文件路径。
 pub const SELF_BACKDOOR_SOCKET: &str = "/tmp/.self.sock";
@@ -25,9 +25,16 @@ pub const SELF_BACKDOOR_SOCKET: &str = "/tmp/.self.sock";
 /// 使用 libc localtime_r 取本机时区日期，与 shell `date` 输出完全一致。
 pub fn self_protect_token() -> String {
     let now = std::time::SystemTime::now();
-    let secs = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let (y, mo, d) = local_date_from_epoch(secs);
-    format!("{}{}{}", y, mo, d).parse::<u64>().map(|n| n + 1).unwrap_or(0).to_string()
+    format!("{}{}{}", y, mo, d)
+        .parse::<u64>()
+        .map(|n| n + 1)
+        .unwrap_or(0)
+        .to_string()
 }
 
 /// epoch 秒 → 本地时区 (年, 月, 日)，与 `date +%Y%m%d` 一致。
@@ -35,7 +42,11 @@ fn local_date_from_epoch(secs: u64) -> (u32, u32, u32) {
     let t: libc::time_t = secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&t, &mut tm) };
-    (tm.tm_year as u32 + 1900, tm.tm_mon as u32 + 1, tm.tm_mday as u32)
+    (
+        tm.tm_year as u32 + 1900,
+        tm.tm_mon as u32 + 1,
+        tm.tm_mday as u32,
+    )
 }
 
 /// 校验一行口令 `veda <token> <0|1>`，返回 Some(true=开自保) / Some(false=关自保) / None(非法)。
@@ -94,7 +105,11 @@ fn handle_connection(backend: &Arc<dyn SecurityBackend>, mut stream: UnixStream)
             info!("[SelfBackdoor] ✅ 口令校验通过，{}自保", action);
             match backend.write_self_protection(enable as u32) {
                 Ok(()) => {
-                    let _ = stream.write_all(if enable { b"system is in self protect\n" } else { b"system is out of self protect\n" });
+                    let _ = stream.write_all(if enable {
+                        b"system is in self protect\n"
+                    } else {
+                        b"system is out of self protect\n"
+                    });
                     info!("[SelfBackdoor] 自保已{}", action);
                 }
                 Err(e) => {
@@ -120,7 +135,11 @@ pub fn start_self_backdoor(backend: Arc<dyn SecurityBackend>) {
         if meta.file_type().is_socket() {
             let _ = std::fs::remove_file(path);
         } else {
-            warn!("[SelfBackdoor] {} 已存在且非 socket（{}），不覆盖", path, meta.file_type().is_dir() as u8);
+            warn!(
+                "[SelfBackdoor] {} 已存在且非 socket（{}），不覆盖",
+                path,
+                meta.file_type().is_dir() as u8
+            );
             return;
         }
     }
