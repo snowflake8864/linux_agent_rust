@@ -34,6 +34,8 @@ lazy_static::lazy_static! {
         initialized: false,
     }));
     static ref SYSTEM: Arc<Mutex<System>> = Arc::new(Mutex::new(System::new_all()));
+    // 缓存通过 NSS/systemd-userdb 解析成功的用户名，避免每个采集周期重复查询
+    static ref USERNAME_CACHE: Arc<Mutex<HashMap<u32, String>>> = Arc::new(Mutex::new(HashMap::new()));
 }
 
 #[derive(Serialize)]
@@ -184,6 +186,154 @@ fn get_memory_from_proc_meminfo() -> Option<(u64, u64)> {
     }
 }
 
+/// 通过 getpwuid_r 解析 UID 对应的用户名。
+///
+/// glibc 下会走完整的 NSS 链路（files/systemd/sss 等）；musl 静态链接时
+/// 只会查 /etc/passwd，因此还需要下面的 systemd-userdb 兜底。
+fn get_username_via_nss(uid: u32) -> Option<String> {
+    let mut buf = vec![0 as libc::c_char; 1024];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+
+    loop {
+        let ret = unsafe {
+            libc::getpwuid_r(
+                uid as libc::uid_t,
+                &mut pwd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            )
+        };
+
+        if ret == libc::ERANGE {
+            // 缓冲区不足，扩大后重试
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if ret != 0 || result.is_null() || pwd.pw_name.is_null() {
+            return None;
+        }
+
+        let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
+        return name.to_str().ok().map(|s| s.to_string());
+    }
+}
+
+/// 通过 systemd-userdb varlink 接口解析用户名。
+///
+/// 该接口可拿到由 NSS 模块动态提供的用户（例如 gdm-greeter、DynamicUser），
+/// 且不依赖 libc 的 NSS 实现，musl 静态链接的 agent 也能正常工作。
+fn get_username_via_systemd_userdb(uid: u32) -> Option<String> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let entries = std::fs::read_dir("/run/systemd/userdb").ok()?;
+    for entry in entries.flatten() {
+        let socket_path = entry.path();
+        let service = match socket_path.file_name().and_then(|n| n.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+
+        let mut stream = match UnixStream::connect(&socket_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
+
+        let request = serde_json::json!({
+            "method": "io.systemd.UserDatabase.GetUserRecord",
+            "parameters": {
+                "uid": uid,
+                "service": service,
+            }
+        });
+        let mut payload = match serde_json::to_vec(&request) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        payload.push(0); // varlink 消息以 NUL 结尾
+        if stream.write_all(&payload).is_err() {
+            continue;
+        }
+
+        // varlink 响应同样以 NUL 结尾，逐字节读取避免阻塞在长连接上
+        let mut resp = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if byte[0] == 0 {
+                        break;
+                    }
+                    resp.push(byte[0]);
+                    if resp.len() > 64 * 1024 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        let value: serde_json::Value = match serde_json::from_slice(&resp) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // varlink 响应把返回字段包在 parameters 里，兼容部分直接平铺的版本
+        let record = value
+            .get("parameters")
+            .and_then(|p| p.get("record"))
+            .or_else(|| value.get("record"));
+        if let Some(name) = record
+            .and_then(|r| r.get("userName"))
+            .and_then(|n| n.as_str())
+        {
+            return Some(name.to_string());
+        }
+    }
+
+    None
+}
+
+/// 解析 /run/systemd/users/<uid> 中的 NAME 字段（logind 会话用户的兜底）。
+fn get_username_from_run_systemd(uid: u32) -> Option<String> {
+    let content = std::fs::read_to_string(format!("/run/systemd/users/{}", uid)).ok()?;
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix("NAME="))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn get_username_by_uid(uid: u32) -> Option<String> {
+    get_username_via_nss(uid)
+        .or_else(|| get_username_via_systemd_userdb(uid))
+        .or_else(|| get_username_from_run_systemd(uid))
+}
+
+fn resolve_username(uid: &Uid, user_map: &HashMap<Uid, String>) -> String {
+    if let Some(name) = user_map.get(uid) {
+        return name.clone();
+    }
+    let raw_uid = **uid;
+    if let Some(name) = USERNAME_CACHE.lock().unwrap().get(&raw_uid) {
+        return name.clone();
+    }
+    if let Some(name) = get_username_by_uid(raw_uid) {
+        USERNAME_CACHE
+            .lock()
+            .unwrap()
+            .insert(raw_uid, name.clone());
+        return name;
+    }
+    eprintln!("用户未找到，UID: {:?}", uid);
+    "unknown".to_string()
+}
+
 fn compute_process_md5(file_path: &str) -> String {
     if file_path.is_empty() || !Path::new(file_path).exists() {
         return String::new();
@@ -319,12 +469,7 @@ pub fn get_system_metrics() -> Option<String> {
         .map(|(&pid, proc)| {
             let user = proc
                 .user_id()
-                .map(|uid| {
-                    user_map.get(&uid).cloned().unwrap_or_else(|| {
-                        eprintln!("用户未找到，UID: {:?}", uid);
-                        "unknown".to_string()
-                    })
-                })
+                .map(|uid| resolve_username(&uid, &user_map))
                 .unwrap_or_else(|| {
                     eprintln!("进程 {} 没有有效的 UID", pid);
                     "unknown".to_string()
@@ -352,12 +497,7 @@ pub fn get_system_metrics() -> Option<String> {
         .map(|(&pid, proc)| {
             let user = proc
                 .user_id()
-                .map(|uid| {
-                    user_map.get(&uid).cloned().unwrap_or_else(|| {
-                        eprintln!("用户未找到，UID: {:?}", uid);
-                        "unknown".to_string()
-                    })
-                })
+                .map(|uid| resolve_username(&uid, &user_map))
                 .unwrap_or_else(|| {
                     eprintln!("进程 {} 没有有效的 UID", pid);
                     "unknown".to_string()
