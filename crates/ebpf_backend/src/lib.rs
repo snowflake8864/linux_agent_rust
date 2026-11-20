@@ -1269,14 +1269,15 @@ impl EbpfBackend {
         // 不能直接等同容器（runc-dmz 就是宿主机进程 exec overlay 克隆文件）。
         is_container |= real_path.starts_with("/proc/");
         log::info!(
-            "[EbpfBackend] 📋 进程归属: pid={} cgid={} container={:?} md5={} real_path={}",
+            "[EbpfBackend] 📋 进程归属: pid={} cgid={} container={:?} md5={} real_path={} event_path={}",
             event.pid,
             event.cgid,
             container
                 .as_ref()
                 .map(|c| (c.runtime.as_str(), c.container_id.as_str())),
             md5_hash.as_deref().unwrap_or("(none)"),
-            real_path
+            real_path,
+            path
         );
         // 容器进程或 overlay 文件且 md5 未命中 → 按需补扫容器 overlay
         //（防止启动后新容器的可执行文件漏扫，也兼容 dev 变化的 overlay 克隆）。
@@ -1357,9 +1358,14 @@ impl EbpfBackend {
         // 真未知：正常上报，让服务器有机会评判
         // 容器进程路径格式：去掉 /proc/<pid>/root/ 前缀，加 ;container 后缀
         // /proc/<pid>/root/<path> 结构固定：第4个/之后就是容器内路径
+        // 宿主机进程优先用事件里的可执行路径（execve 实际路径），
+        // 这样 coreutils/busybox 这类硬链接多合一程序能显示真实命令名（ls/chmod/...），
+        // 而不是按 md5/inode 反查时随机命中的同 inode 别名。
         let display_path = if is_container {
             let clean = Self::strip_proc_root_prefix(&real_path);
             format!("{};container", clean)
+        } else if Self::event_path_matches(path, key) {
+            path.to_string()
         } else {
             real_path.clone()
         };
@@ -1434,6 +1440,20 @@ impl EbpfBackend {
             return format!("/proc/{}/{}", pid, &path["/proc/self/".len()..]);
         }
         path.to_string()
+    }
+
+    /// 事件里的路径是否可用来展示：必须是绝对路径、非 /proc 伪路径，
+    /// 且 stat 后的 (dev,inode) 与事件一致（防止 exec 后文件已被替换）。
+    /// 用于硬链接多合一程序（coreutils/busybox）：事件路径保留被调用的命令名。
+    fn event_path_matches(event_path: &str, key: (u64, u64)) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        if !event_path.starts_with('/') || event_path.starts_with("/proc/") {
+            return false;
+        }
+        match std::fs::metadata(event_path) {
+            Ok(meta) => meta.dev() == key.0 && meta.ino() == key.1,
+            Err(_) => false,
+        }
     }
 
     /// 从已知 MD5 记录里挑一个适合展示的路径，优先真实宿主路径。
