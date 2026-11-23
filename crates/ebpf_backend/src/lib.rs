@@ -3329,6 +3329,34 @@ impl EbpfBackend {
         }
     }
 
+    /// 收集 rootless 容器运行时（podman/containerd，uid!=0）的 storage 根目录。
+    /// 这类容器的 layer 位于用户 home（~/.local/share/containers/storage/overlay）
+    /// 或 /run/user/<uid>/containers/storage/overlay，而 /var/lib/... 只覆盖 rootful。
+    /// 漏扫这些路径会导致 rootless 容器的 overlay inode 永远进不了索引，
+    /// 保护模式下其 entrypoint 被当未知进程拦死。
+    fn push_rootless_container_roots(roots: &mut Vec<String>) {
+        let mut homes: Vec<String> = vec!["/root".into()];
+        if let Ok(entries) = std::fs::read_dir("/home") {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    homes.push(p.to_string_lossy().into_owned());
+                }
+            }
+        }
+        for home in homes {
+            roots.push(format!("{}/.local/share/containers/storage/overlay", home));
+        }
+        if let Ok(entries) = std::fs::read_dir("/run/user") {
+            for entry in entries.flatten() {
+                roots.push(format!(
+                    "{}/containers/storage/overlay",
+                    entry.path().to_string_lossy()
+                ));
+            }
+        }
+    }
+
     /// 收集常见容器运行时的层/rootfs 根目录，兼容自定义 data-root/graphroot。
     fn container_scan_roots() -> Vec<String> {
         let mut roots: Vec<String> = vec![
@@ -3339,6 +3367,7 @@ impl EbpfBackend {
             "/var/lib/rancher/rke2/agent/containerd/io.containerd.snapshot.v1.overlayfs/snapshots".into(),
             "/var/snap/microk8s/common/var/lib/containerd/io.containerd.snapshot.v1.overlayfs/snapshots".into(),
         ];
+        Self::push_rootless_container_roots(&mut roots);
         if let Some(dr) = Self::read_json_string_field("/etc/docker/daemon.json", "data-root") {
             roots.push(format!("{}/overlay2", dr));
         }
