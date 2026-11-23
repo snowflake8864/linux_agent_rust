@@ -6,6 +6,7 @@ use logging::{log_error, log_info};
 use std::fs;
 use std::fs::File;
 use std::io::{self, Write};
+use std::net::ToSocketAddrs;
 use std::process::Command;
 
 #[derive(Debug, Default, Clone)]
@@ -293,6 +294,51 @@ fn run_cmd_capture(cmd: &str, args: &[&str]) -> Result<String, String> {
 }
 
 impl NetInfoConfig {
+    /// 管理服务器 IPv4 列表（主机字节序 u32，与 `ip_str_to_u32` 表示一致）。
+    /// 优先 SERVER_IP；为空时从 SERVERIPPORT URL 提取 host；域名会尝试解析。
+    pub fn get_server_ipv4s(&self) -> Vec<u32> {
+        let mut hosts: Vec<String> = Vec::new();
+        let sip = self.server_ip.trim();
+        if !sip.is_empty() {
+            hosts.push(sip.to_string());
+        }
+        let url = self.server_ip_port.trim();
+        if !url.is_empty() {
+            let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+            let hostport = rest.split('/').next().unwrap_or("");
+            let host = match hostport.rsplit_once(':') {
+                Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h,
+                _ => hostport,
+            };
+            if !host.is_empty() {
+                hosts.push(host.to_string());
+            }
+        }
+
+        let port = if self.server_port == 0 {
+            443
+        } else {
+            self.server_port as u16
+        };
+        let mut out: Vec<u32> = Vec::new();
+        for h in hosts {
+            if let Ok(ip) = h.parse::<std::net::Ipv4Addr>() {
+                out.push(u32::from_be_bytes(ip.octets()));
+                continue;
+            }
+            if let Ok(addrs) = (h.as_str(), port).to_socket_addrs() {
+                for a in addrs {
+                    if let std::net::SocketAddr::V4(v4) = a {
+                        out.push(u32::from_be_bytes(v4.ip().octets()));
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// 获取主接口（基于 server_ip）
     fn get_main_interface(server_ip: &str) -> Result<String, String> {
         let out = run_cmd_capture("ip", &["route", "get", server_ip])
