@@ -233,13 +233,10 @@ impl ModularLoader {
         }
 
         // 对内/对外通信审计 kprobe（完全不依赖 cgroup，也不影响现有 connect4）。
-        // 只做只读观测：tcp_connect 记录发起进程，tcp_finish_connect 确认建立。
+        // 只做只读观测：tcp_connect 外发 SYN 即上报（对齐驱动 netdos_tcp_out）。
         // 挂载失败仅告警，不阻断 XDP/TC/cgroup 等既有网络功能。
         use aya::programs::KProbe;
-        for (prog_name, func) in [
-            ("netlog_tcp_connect", "tcp_connect"),
-            ("netlog_tcp_established", "tcp_finish_connect"),
-        ] {
+        for (prog_name, func) in [("netlog_tcp_connect", "tcp_connect")] {
             if let Some(prog) = bpf.program_mut(prog_name) {
                 info!("[EbpfBackend] 🔌 加载 kprobe: {}...", func);
                 let result = (|| -> anyhow::Result<()> {

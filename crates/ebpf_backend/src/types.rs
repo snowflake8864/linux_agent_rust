@@ -251,19 +251,19 @@ unsafe impl aya::Pod for PktEvent {}
 /// Size of net PktEvent in eBPF = 16 bytes
 pub const PKT_EVENT_SIZE: usize = 16;
 
-// --- 对内/对外通信事件（匹配 net_agent.bpf.c netlog_event, 36字节）---
-/// log_type: 1=对外通信（本机主动发起且收到响应）, 2=对内通信（外部连接本机业务端口）。
-/// IP/端口均为网络字节序（线上原始值）。
+// --- 对内/对外通信事件（匹配 net_agent.bpf.c netlog_event, 60字节）---
+/// log_type: 2=对外通信（本机主动发起外发 SYN）, 3=对内通信（外部连接本机业务端口）。
+/// family: 2=AF_INET, 10=AF_INET6。地址为网络字节序，IPv4 使用前 4 字节，其余补 0。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NetLogEvent {
     pub event_type: u8, // EVENT_NETLOG = 5
-    pub log_type: u8,   // 1=outer, 2=inner
+    pub log_type: u8,   // 2=outer, 3=inner
     pub protocol: u8,   // 6=TCP
-    pub _pad: u8,
-    pub pid: u32, // outer=发起进程 PID；inner=0
-    pub saddr: u32,
-    pub daddr: u32,
+    pub family: u8,     // 2=AF_INET, 10=AF_INET6
+    pub pid: u32,       // outer=发起进程 PID；inner=0
+    pub saddr: [u8; 16],
+    pub daddr: [u8; 16],
     pub sport: u16,
     pub dport: u16,
     pub comm: [u8; 16],
@@ -271,10 +271,19 @@ pub struct NetLogEvent {
 
 unsafe impl aya::Pod for NetLogEvent {}
 
-/// Size of NetLogEvent in eBPF = 36 bytes (4 + 4*3 + 2*2 + 16)
-pub const NETLOG_EVENT_SIZE: usize = 36;
+/// Size of NetLogEvent in eBPF = 60 bytes (4 + 4 + 16*2 + 2*2 + 16)
+pub const NETLOG_EVENT_SIZE: usize = 60;
 
 const _: () = assert!(std::mem::size_of::<NetLogEvent>() == NETLOG_EVENT_SIZE);
+
+/// IPv6 服务器 IP map 的 key（16 字节网络序地址）
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv6Key {
+    pub addr: [u8; 16],
+}
+
+unsafe impl aya::Pod for Ipv6Key {}
 
 pub const EVENT_NETLOG: u8 = 5;
 
