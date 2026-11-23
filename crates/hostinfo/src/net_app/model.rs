@@ -248,6 +248,20 @@ pub fn get_port_from_state(port: u16) -> Option<PortBusinessInfo> {
     NETAPP_STATE.get_port_info_from_state(port)
 }
 
+/// 当前业务端口集合（LISTEN + DNAT + docker），升序去重。
+/// 供 eBPF 后端下发 business_ports map，用于识别“对内通信”。
+pub fn get_business_ports() -> Vec<u16> {
+    match NETAPP_STATE.read() {
+        Ok(state) => {
+            let mut ports: Vec<u16> = state.port_map.keys().copied().collect();
+            ports.sort_unstable();
+            ports.dedup();
+            ports
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
 pub fn get_netapp_json() -> Result<String, serde_json::Error> {
     NETAPP_STATE.to_json_from_state()
 }

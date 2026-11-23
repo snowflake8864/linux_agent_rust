@@ -232,6 +232,34 @@ impl ModularLoader {
             }
         }
 
+        // 对内/对外通信审计 kprobe（完全不依赖 cgroup，也不影响现有 connect4）。
+        // 只做只读观测：tcp_connect 记录发起进程，tcp_finish_connect 确认建立。
+        // 挂载失败仅告警，不阻断 XDP/TC/cgroup 等既有网络功能。
+        use aya::programs::KProbe;
+        for (prog_name, func) in [
+            ("netlog_tcp_connect", "tcp_connect"),
+            ("netlog_tcp_established", "tcp_finish_connect"),
+        ] {
+            if let Some(prog) = bpf.program_mut(prog_name) {
+                info!("[EbpfBackend] 🔌 加载 kprobe: {}...", func);
+                let result = (|| -> anyhow::Result<()> {
+                    let kp: &mut KProbe = prog.try_into()?;
+                    kp.load()?;
+                    kp.attach(func, 0)?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => info!("[EbpfBackend] ✅ KProbe attached: {}", func),
+                    Err(e) => warn!(
+                        "[EbpfBackend] ⚠ kprobe {} 挂载失败（非致命，对内/对外通信审计不可用）: {}",
+                        func, e
+                    ),
+                }
+            } else {
+                warn!("[EbpfBackend] ⚠ 未找到程序: {}", prog_name);
+            }
+        }
+
         // Cgroup connect4 hook (本地连接拦截)
         // 注意: BPF_CGROUP_INET4_CONNECT 要求 cgroup v2 (unified hierarchy)。
         // 在 cgroup v1 或 hybrid 模式系统上，/sys/fs/cgroup 不是有效的 cgroup v2 fd，

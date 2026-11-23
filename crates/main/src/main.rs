@@ -152,6 +152,18 @@ async fn kysec_restore_after_upgrade() {
     let _ = fs::remove_file(KYSEC_PENDING_FILE);
 }
 
+/// 下发管理服务器 IP 到后端（eBPF 模式写入 BPF map，用于过滤对外通信日志）。
+/// 调用方需已持有/读取配置并传入 ips，避免在 cfg 锁内重复加锁造成死锁。
+fn apply_server_ip_filter(backend: &dyn SecurityBackend, ips: &[u32]) {
+    if ips.is_empty() {
+        return;
+    }
+    match backend.write_server_ips(ips) {
+        Ok(()) => log_info!("[startup] 对外通信日志过滤服务器 IP: {:?}", ips),
+        Err(e) => log_error!("[startup] 下发服务器 IP 过滤失败: {}", e),
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     ensure_single_instance(); 
@@ -227,6 +239,8 @@ async fn main() -> std::io::Result<()> {
     // ── 后端选择 ──
     {
         let mut cfg = NETINFO_CONFIG.lock().unwrap();
+        // 提前算好服务器 IP（此处置于 cfg 锁内，后续避免重复加锁死锁）
+        let server_ips = cfg.get_server_ipv4s();
         let backend_mode = cfg.backend_mode.clone();
         let admission_enabled = cfg.admission.enabled;
         let admission_mode = cfg.admission.mode;
@@ -280,6 +294,9 @@ async fn main() -> std::io::Result<()> {
                 init_dpi_writer();
                 pattern::process_pattern_rules_mgr::PROCESS_PATTERN_RULES_MGR.lock().init();
 
+                // kprobe 在 init() 内挂载；服务器 IP 过滤表必须在挂载前写好，
+                // 避免启动瞬间 agent 自身心跳被误报为“对外通信”。
+                apply_server_ip_filter(ebpf.as_ref(), &server_ips);
                 if let Err(e) = ebpf.init() {
                     log_error!("[eBPF] ❌ EbpfBackend 初始化失败: {}", e);
                     std::process::exit(1);
@@ -298,14 +315,20 @@ async fn main() -> std::io::Result<()> {
                 ebpf.start_file_event_reader();
                 // 启动网络事件 ring buffer reader（虚开端口/重定向命中 → 告警队列）
                 ebpf.start_net_event_reader();
+                // 启动对内/对外通信 ring buffer reader（netlog_events → syslog 队列）
+                ebpf.start_netlog_event_reader();
                 ebpf.start_container_scan_loop();
                 // 自保后门：Unix socket .self.sock，口令 `veda <YYYY+MD+1> 0` 关自保（复刻驱动 /proc/osec/self）
                 ebpf.start_self_backdoor();
-                // 虚开端口告警上报 worker：批量 POST /v1/upOpenPort（对齐驱动模式路径）
+                // 虚开端口/对内对外通信告警上报 worker：批量 POST（对齐驱动模式路径）
                 {
                     let bm = Arc::new(init.clone());
+                    let bm_netlog = bm.clone();
                     tokio::spawn(async move {
                         reporter::fake_port_audit::run_open_port_audit_worker(bm).await;
+                    });
+                    tokio::spawn(async move {
+                        reporter::net_log_audit::run_net_log_worker(bm_netlog).await;
                     });
                 }
 
@@ -386,6 +409,8 @@ async fn main() -> std::io::Result<()> {
                                     set_backend(ebpf.clone());
                                     init_dpi_writer();
                                     pattern::process_pattern_rules_mgr::PROCESS_PATTERN_RULES_MGR.lock().init();
+                                    // 过滤表先于 kprobe 挂载写入（同主 eBPF 分支）
+                                    apply_server_ip_filter(ebpf.as_ref(), &server_ips);
                                     if let Err(e) = ebpf.init() {
                                         log_error!("EbpfBackend fallback init 失败: {}", e);
                                         log_warn!("eBPF 初始化失败，以空后端模式继续运行");
@@ -400,14 +425,19 @@ async fn main() -> std::io::Result<()> {
                                         ebpf.start_proc_event_reader();
                                         ebpf.start_file_event_reader();
                                         ebpf.start_net_event_reader();
+                                        ebpf.start_netlog_event_reader();
                                         ebpf.start_container_scan_loop();
                                         // 自保后门：Unix socket .self.sock（复刻驱动 /proc/osec/self）
                                         ebpf.start_self_backdoor();
-                                        // 虚开端口告警上报 worker：批量 POST /v1/upOpenPort（对齐驱动模式路径）
+                                        // 虚开端口/对内对外通信告警上报 worker：批量 POST（对齐驱动模式路径）
                                         {
                                             let bm = Arc::new(init.clone());
+                                            let bm_netlog = bm.clone();
                                             tokio::spawn(async move {
                                                 reporter::fake_port_audit::run_open_port_audit_worker(bm).await;
+                                            });
+                                            tokio::spawn(async move {
+                                                reporter::net_log_audit::run_net_log_worker(bm_netlog).await;
                                             });
                                         }
 

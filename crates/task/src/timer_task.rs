@@ -161,9 +161,16 @@ impl TimerTask for BootManager {
                         update_netstat_info();
                         update_dnat_info();
                         update_docker_info();
-                        // business_ports 是驱动 /proc 接口，eBPF 后端不加载驱动，跳过
                         if common::backend::is_driver_backend() {
                             write_business_ports_to_proc();
+                        } else {
+                            // eBPF 模式：业务端口写入 BPF map，供 XDP 识别对内通信
+                            let ports = hostinfo::net_app::model::get_business_ports();
+                            if let Err(e) = common::backend::with_backend(|b| {
+                                b.write_business_ports(&ports)
+                            }) {
+                                log_error!("[timer] 下发业务端口失败: {}", e);
+                            }
                         }
 
                         // 热更新 /opt/osec/osec_backend.conf（日志级别等）：先看时间戳，再看内容

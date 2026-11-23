@@ -5,6 +5,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_tracing.h>
 
 #ifndef ETH_P_IP
 #define ETH_P_IP 0x0800
@@ -42,6 +43,8 @@ static __always_inline void csum_replace4(__u16 *csum, __u32 old_val, __u32 new_
 
 // Event types
 #define EVENT_NET 3
+// 对内/对外通信连接事件（type 与 pkt_event 区分，另用独立的 netlog_events ringbuf）
+#define EVENT_NETLOG 5
 
 // Event structure for ring buffer
 struct pkt_event {
@@ -53,6 +56,21 @@ struct pkt_event {
     __u32 dst_ip;
     __u16 src_port;
     __u16 dst_port;
+};
+
+// 对内/对外通信事件。IP/端口统一为网络字节序（用户层 from_be）。
+// log_type: 1=对外通信(本机主动发起且完成三次握手), 2=对内通信(外部连接本机业务端口)
+struct netlog_event {
+    __u8 type;        // EVENT_NETLOG
+    __u8 log_type;    // 1=outer, 2=inner
+    __u8 protocol;    // 6=TCP
+    __u8 padding;
+    __u32 pid;        // outer=发起进程 PID；inner=0（用户层按业务端口反查）
+    __u32 saddr;      // 源 IP（网络序）
+    __u32 daddr;      // 目的 IP（网络序）
+    __u16 sport;      // 源端口（网络序）
+    __u16 dport;      // 目的端口（网络序）
+    __u8 comm[16];    // outer=发起进程 comm；inner=全 0
 };
 
 // Block rules map
@@ -177,6 +195,51 @@ struct {
     __uint(max_entries, 256 * 1024);
 } pkt_events SEC(".maps");
 
+// ── 对内/对外通信审计 ──
+// 开关位：bit0=对内(syslog_inner_switch), bit1=对外(syslog_outer_switch)
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} netlog_switch SEC(".maps");
+
+// 本机业务端口表（来自 NETAPP_STATE: LISTEN + DNAT + docker），key 为主机字节序
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u16);
+    __type(value, __u8);
+} business_ports SEC(".maps");
+
+// 业务端口条数（0 时热路径短路，避免 HASH 查询）
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} business_ports_meta SEC(".maps");
+
+// 管理服务器 IP（主机字节序 u32）：对外通信日志中过滤，避免 agent 自身心跳刷屏
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 32);
+    __type(key, __u32);
+    __type(value, __u8);
+} server_ips SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} server_ips_meta SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);
+} netlog_events SEC(".maps");
+
 // 连接去重表：同一连接（原始四元组+协议）只向用户层上报一次。
 // LRU 自动淘汰旧连接，客户端端口复用后可再次上报，避免 HASH 表满后永久失效。
 struct conn_key {
@@ -194,6 +257,28 @@ struct {
     __type(key, struct conn_key);
     __type(value, __u8);
 } conn_seen SEC(".maps");
+
+// 对内通信连接去重：与 conn_seen 独立，避免与虚开端口告警互相吞并
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct conn_key);
+    __type(value, __u8);
+} netlog_seen SEC(".maps");
+
+// 对外通信两阶段关联：tcp_connect 记录发起进程，tcp_finish_connect 确认建立。
+// key 为原始四元组（网络序），避免依赖 socket cookie / cgroup。
+struct pending_conn {
+    __u32 pid;
+    __u8  comm[16];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct conn_key);
+    __type(value, struct pending_conn);
+} pending_conns SEC(".maps");
 
 // Debug counter array
 struct {
@@ -242,6 +327,55 @@ static __always_inline void report_vir_port_once(__u8 protocol, __u32 src_ip, __
                                                  __u16 src_port, __u16 dst_port) {
     if (mark_conn_first(protocol, src_ip, dst_ip, src_port, dst_port))
         send_network_event(protocol, src_ip, dst_ip, src_port, dst_port, 0x40);
+}
+
+// Helper: 上报对内/对外通信事件（log_type: 1=outer, 2=inner）
+static __always_inline void send_netlog_event(__u8 log_type, __u32 pid,
+                                              __u32 saddr, __u32 daddr,
+                                              __u16 sport, __u16 dport, __u8 *comm) {
+    struct netlog_event *e = bpf_ringbuf_reserve(&netlog_events, sizeof(*e), 0);
+    if (!e) return;
+    e->type = EVENT_NETLOG;
+    e->log_type = log_type;
+    e->protocol = IPPROTO_TCP;
+    e->padding = 0;
+    e->pid = pid;
+    e->saddr = saddr;
+    e->daddr = daddr;
+    e->sport = sport;
+    e->dport = dport;
+    __builtin_memset(e->comm, 0, sizeof(e->comm));
+    if (comm)
+        __builtin_memcpy(e->comm, comm, sizeof(e->comm));
+    bpf_ringbuf_submit(e, 0);
+}
+
+// Helper: 判断目的 IP 是否为管理服务器（入参为主机字节序）
+static __always_inline int is_server_ip_host(__u32 ip_host) {
+    __u32 mk = 0;
+    __u32 *cnt = bpf_map_lookup_elem(&server_ips_meta, &mk);
+    if (!cnt || *cnt == 0)
+        return 0;
+    __u8 *v = bpf_map_lookup_elem(&server_ips, &ip_host);
+    return v && *v;
+}
+
+// Helper: 对内通信按连接去重（只取首个 SYN）
+static __always_inline int mark_netlog_first(__u8 protocol, __u32 src_ip, __u32 dst_ip,
+                                             __u16 src_port, __u16 dst_port) {
+    struct conn_key ck;
+    __builtin_memset(&ck, 0, sizeof(ck));
+    ck.src_ip = src_ip;
+    ck.dst_ip = dst_ip;
+    ck.src_port = src_port;
+    ck.dst_port = dst_port;
+    ck.protocol = protocol;
+
+    if (bpf_map_lookup_elem(&netlog_seen, &ck))
+        return 0;
+    __u8 one = 1;
+    bpf_map_update_elem(&netlog_seen, &ck, &one, BPF_ANY);
+    return 1;
 }
 
 // Helper: find rule with wildcards (for XDP ingress)
@@ -390,6 +524,7 @@ int xdp_packet_filter(struct xdp_md *ctx) {
     if (c2) (*c2)++;
 
     __u16 src_port = 0, dst_port = 0;
+    __u8 tcp_is_syn = 0;
     void *l4_hdr = (void *)ip + (ip->ihl * 4);
 
     if (protocol == 6) {
@@ -398,15 +533,9 @@ int xdp_packet_filter(struct xdp_md *ctx) {
         src_port = tcp->source;
         dst_port = tcp->dest;
 
-        /* Debug: 打印所有入向 TCP SYN（连接发起包），用于确认包是否进入 XDP。
-         * generic XDP 在 tcpdump 挂点之前执行，抓包看不到原始进向包，只能靠这里。 */
-        {
-            __u8 flags_byte = *((__u8 *)tcp + 13);
-            if ((flags_byte & 0x12) == 0x02) { /* SYN 且无 ACK */
-                // [removed bpf_printk]
-                // [removed bpf_printk]
-            }
-        }
+        // 记录是否 SYN（无 ACK），供对内通信用；不改动任何转发逻辑
+        __u8 flags_byte = *((__u8 *)tcp + 13);
+        tcp_is_syn = ((flags_byte & 0x12) == 0x02);
 
         // Debug: count TCP SYN to dst_port 30002 (12917)
         if (dst_port == 12917) {
@@ -433,6 +562,28 @@ int xdp_packet_filter(struct xdp_md *ctx) {
         // [removed bpf_printk]
         send_network_event(protocol, src_ip, dst_ip, src_port, dst_port, 0x80);
         return XDP_DROP;
+    }
+
+    // 1a. 对内通信审计：外部 SYN 打向本机业务端口（LISTEN/DNAT/docker）时上报。
+    //     只读检查，成功与否都不改变后续转发/改写/拦截逻辑。
+    if (protocol == 6 && tcp_is_syn) {
+        __u32 lk = 0;
+        __u32 *sw = bpf_map_lookup_elem(&netlog_switch, &lk);
+        if (sw && (*sw & 1)) {
+            __u32 mk = 0;
+            __u32 *cnt = bpf_map_lookup_elem(&business_ports_meta, &mk);
+            if (cnt && *cnt > 0) {
+                __u16 hp = bpf_ntohs(dst_port);
+                __u8 *hit = bpf_map_lookup_elem(&business_ports, &hp);
+                if (hit) {
+                    if (mark_netlog_first(protocol, src_ip, dst_ip, src_port, dst_port)) {
+                        __u8 empty[16];
+                        __builtin_memset(empty, 0, sizeof(empty));
+                        send_netlog_event(2, 0, src_ip, dst_ip, src_port, dst_port, empty);
+                    }
+                }
+            }
+        }
     }
 
     // 2. Try find mod rule (Ingress = 1)，miss 时回退虚开端口区间表
@@ -856,4 +1007,87 @@ int enforce_connect4(struct bpf_sock_addr *ctx) {
     }
 
     return 1;
+}
+
+// ── 对外通信审计（kprobe，不挂 cgroup、不改连接）──
+// tcp_connect: 本机发起 connect、已选好源端口，记录发起进程；
+// tcp_finish_connect: 收到 SYN-ACK 进入 ESTABLISHED，确认“收到响应”后上报。
+#ifndef AF_INET
+#define AF_INET 2
+#endif
+
+static __always_inline int conn_key_from_sk(struct sock *sk, struct conn_key *ck) {
+    __builtin_memset(ck, 0, sizeof(*ck));
+    if (BPF_CORE_READ(sk, __sk_common.skc_family) != AF_INET)
+        return 0;
+    ck->src_ip = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
+    ck->dst_ip = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+    __u16 lport = BPF_CORE_READ(sk, __sk_common.skc_num);
+    ck->src_port = bpf_htons(lport);
+    ck->dst_port = BPF_CORE_READ(sk, __sk_common.skc_dport);
+    ck->protocol = IPPROTO_TCP;
+    return 1;
+}
+
+// 只统计“对外”，跳过本机回环
+static __always_inline int is_loopback_be(__u32 ip_be) {
+    return (bpf_ntohl(ip_be) >> 24) == 127;
+}
+
+SEC("kprobe/tcp_connect")
+int netlog_tcp_connect(struct pt_regs *ctx) {
+    __u32 zero = 0;
+    __u32 *sw = bpf_map_lookup_elem(&netlog_switch, &zero);
+    if (!sw || !(*sw & 2))
+        return 0;
+
+    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+    if (!sk)
+        return 0;
+
+    struct conn_key ck;
+    if (!conn_key_from_sk(sk, &ck))
+        return 0;
+    if (is_loopback_be(ck.src_ip) || is_loopback_be(ck.dst_ip))
+        return 0;
+    if (is_server_ip_host(bpf_ntohl(ck.dst_ip)))
+        return 0;
+
+    struct pending_conn pc;
+    __builtin_memset(&pc, 0, sizeof(pc));
+    pc.pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    bpf_get_current_comm(&pc.comm, sizeof(pc.comm));
+    bpf_map_update_elem(&pending_conns, &ck, &pc, BPF_ANY);
+    return 0;
+}
+
+SEC("kprobe/tcp_finish_connect")
+int netlog_tcp_established(struct pt_regs *ctx) {
+    __u32 zero = 0;
+    __u32 *sw = bpf_map_lookup_elem(&netlog_switch, &zero);
+    if (!sw || !(*sw & 2))
+        return 0;
+
+    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+    if (!sk)
+        return 0;
+
+    struct conn_key ck;
+    if (!conn_key_from_sk(sk, &ck))
+        return 0;
+
+    // 服务器 IP 可能在连接建立前才下发，这里再判一次并清掉 pending
+    if (is_server_ip_host(bpf_ntohl(ck.dst_ip))) {
+        bpf_map_delete_elem(&pending_conns, &ck);
+        return 0;
+    }
+
+    struct pending_conn *pc = bpf_map_lookup_elem(&pending_conns, &ck);
+    if (!pc)
+        return 0;
+
+    send_netlog_event(1, pc->pid, ck.src_ip, ck.dst_ip,
+                      ck.src_port, ck.dst_port, pc->comm);
+    bpf_map_delete_elem(&pending_conns, &ck);
+    return 0;
 }
