@@ -1075,7 +1075,9 @@ impl EbpfBackend {
             2
         }
         // OP_WRITE → modify
-        else {
+        else if op & OP_RENAME != 0 {
+            4
+        } else {
             3
         } // OP_READ → open (idx=3), and fallback
     }

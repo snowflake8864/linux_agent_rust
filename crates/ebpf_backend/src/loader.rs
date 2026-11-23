@@ -115,6 +115,16 @@ impl ModularLoader {
             warn!("[EbpfBackend] ⚠ 未找到程序: enforce_inode_unlink");
         }
 
+        if let Some(prog) = bpf.program_mut("enforce_inode_rename") {
+            info!("[EbpfBackend] 🔌 加载 LSM: inode_rename...");
+            let lsm: &mut Lsm = prog.try_into()?;
+            lsm.load("inode_rename", &btf)?;
+            lsm.attach()?;
+            info!("[EbpfBackend] ✅ LSM attached: inode_rename");
+        } else {
+            warn!("[EbpfBackend] ⚠ 未找到程序: enforce_inode_rename");
+        }
+
         if let Some(prog) = bpf.program_mut("enforce_vfs_mkdir") {
             info!("[EbpfBackend] 🔌 加载 kprobe: vfs_mkdir...");
             let kprobe: &mut KProbe = prog.try_into()?;

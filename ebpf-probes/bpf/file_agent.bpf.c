@@ -126,6 +126,13 @@ struct {
 #define OP_MODIFY  4
 #define OP_CREATE  8
 #define OP_DELETE  16
+#define OP_RENAME  32
+
+// include/linux/fs.h: set on file->f_mode by lookup_open() when this open
+// actually created the file. Stable across kernels (4.19-6.12: 1 << 20).
+#ifndef FMODE_CREATED
+#define FMODE_CREATED 0x100000
+#endif
 
 // ===== Helper Structures =====
 struct unified_event {
@@ -316,6 +323,22 @@ static __always_inline int check_exact_match(const char *filename, const struct 
     return match;
 }
 
+// Look up the parent dir policy for a rename source/destination and return it
+// only when the rule protects rename and the leaf name matches its filters.
+static __always_inline struct dir_policy *rename_lookup_policy(struct inode *dir, const char *filename) {
+    if (!dir) return 0;
+    struct dir_key key;
+    dev_t kdev = BPF_CORE_READ(dir, i_sb, s_dev);
+    key.dev = kernel_dev_to_user(kdev);
+    key.inode = BPF_CORE_READ(dir, i_ino);
+    struct dir_policy *policy = bpf_map_lookup_elem(&dir_policies, &key);
+    if (!policy) return 0;
+    if (!(policy->ops_mask & OP_RENAME)) return 0;
+    if (!check_exact_match(filename, policy)) return 0;
+    if (!check_suffix(filename, policy)) return 0;
+    return policy;
+}
+
 // ===== LSM Hooks =====
 
 SEC("lsm.s/file_open")
@@ -333,12 +356,6 @@ int BPF_PROG(enforce_file_open, struct file *file) {
     else if (acc_mode == O_RDWR) op_type = OP_READ | OP_WRITE;
     
     if (op_type == 0) return 0;
-
-    // Note: O_CREAT/O_TRUNC are NOT in f_flags (consumed by build_open_flags()
-    // in the VFS layer before security_file_open is called).
-    // CREATE detection is handled by the separate enforce_inode_create hook.
-    // We rely solely on O_ACCMODE (O_RDONLY/O_WRONLY/O_RDWR) to determine
-    // whether this open is a read, write, or read-write operation.
 
     struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
     if (!dentry) return 0;
@@ -379,6 +396,11 @@ int BPF_PROG(enforce_file_open, struct file *file) {
     struct dir_policy *policy = bpf_map_lookup_elem(&dir_policies, &key);
     if (!policy) return 0;
 
+    // Mirror the driver's file_audit_kernel() for touch/create: a real create
+    // (FMODE_CREATED) is FILE_CREATE and is matched against protect_rw bit4,
+    // i.e. OP_CREATE. Without that bit the driver does not alert either.
+    if (BPF_CORE_READ(file, f_mode) & FMODE_CREATED)
+        op_type = OP_CREATE;
     if (!(policy->ops_mask & op_type)) return 0;
     
     if (!check_exact_match(filename, policy)) return 0;
@@ -492,8 +514,11 @@ int BPF_PROG(enforce_inode_create, struct inode *dir, struct dentry *dentry, umo
         return -EPERM;
     }
 
-    bpf_printk("inode_create: MONITOR filename=%s", filename);
-    send_monitor_event(EVENT_FILE, filename, 0, OP_CREATE);
+    // A successful create via open() is always followed by
+    // security_file_open(), which reports it as CREATE via FMODE_CREATED.
+    // Avoid a duplicate CREATE here; only blocking is reported above.
+    // mkdir/mknod have no file_open follow-up and keep their own hooks.
+    bpf_printk("inode_create: MONITOR filename=%s (reported by file_open)", filename);
     return 0;
 }
 
@@ -542,6 +567,81 @@ int BPF_PROG(enforce_inode_unlink, struct inode *dir, struct dentry *dentry) {
     }
 
     send_monitor_event(EVENT_FILE, filename, 0, OP_DELETE);
+    return 0;
+}
+
+SEC("lsm.s/inode_rename")
+int BPF_PROG(enforce_inode_rename, struct inode *old_dir, struct dentry *old_dentry,
+             struct inode *new_dir, struct dentry *new_dentry) {
+    if (is_agent_process()) return 0;
+
+    __u32 zero = 0;
+    struct path_buffer *scratch = bpf_map_lookup_elem(&path_scratch, &zero);
+    if (!scratch) return 0;
+
+    char *filename = scratch->buf;
+
+    // Source: moving a protected file out of a protected dir / subtree.
+    __builtin_memset(filename, 0, 64);
+    bpf_probe_read_kernel_str(filename, 64, BPF_CORE_READ(old_dentry, d_name.name));
+    if (is_self_protect_violation(old_dentry, filename)) {
+        bpf_printk("inode_rename: SELF_PROTECT BLOCK src=%s", filename);
+        send_monitor_event(EVENT_SELF_PROTECT, filename, 1, OP_RENAME);
+        return -EPERM;
+    }
+
+    // Destination: moving a file into a protected dir / subtree.
+    __builtin_memset(filename, 0, 64);
+    bpf_probe_read_kernel_str(filename, 64, BPF_CORE_READ(new_dentry, d_name.name));
+    if (is_self_protect_violation(new_dentry, filename)) {
+        bpf_printk("inode_rename: SELF_PROTECT BLOCK dst=%s", filename);
+        send_monitor_event(EVENT_SELF_PROTECT, filename, 1, OP_RENAME);
+        return -EPERM;
+    }
+
+    if (!feature_enabled(FEATURE_FILE)) return 0;
+
+    int old_match = 0;
+    int new_match = 0;
+
+    // Source parent policy: deny here blocks moving the file away.
+    __builtin_memset(filename, 0, 64);
+    bpf_probe_read_kernel_str(filename, 64, BPF_CORE_READ(old_dentry, d_name.name));
+    struct dir_policy *policy = rename_lookup_policy(old_dir, filename);
+    if (policy) {
+        __u8 effective_mode = resolve_mode(policy->mode, FEATURE_FILE);
+        if (effective_mode == MODE_PROTECT && policy->action == ACTION_DENY) {
+            bpf_printk("inode_rename: BLOCK src=%s", filename);
+            send_monitor_event(EVENT_FILE, filename, 1, OP_RENAME);
+            return -EPERM;
+        }
+        old_match = 1;
+    }
+
+    // Destination parent policy: deny here blocks moving the file in.
+    __builtin_memset(filename, 0, 64);
+    bpf_probe_read_kernel_str(filename, 64, BPF_CORE_READ(new_dentry, d_name.name));
+    policy = rename_lookup_policy(new_dir, filename);
+    if (policy) {
+        __u8 effective_mode = resolve_mode(policy->mode, FEATURE_FILE);
+        if (effective_mode == MODE_PROTECT && policy->action == ACTION_DENY) {
+            bpf_printk("inode_rename: BLOCK dst=%s", filename);
+            send_monitor_event(EVENT_FILE, filename, 1, OP_RENAME);
+            return -EPERM;
+        }
+        new_match = 1;
+    }
+
+    if (old_match) {
+        __builtin_memset(filename, 0, 64);
+        bpf_probe_read_kernel_str(filename, 64, BPF_CORE_READ(old_dentry, d_name.name));
+        bpf_printk("inode_rename: MONITOR src=%s", filename);
+        send_monitor_event(EVENT_FILE, filename, 0, OP_RENAME);
+    } else if (new_match) {
+        bpf_printk("inode_rename: MONITOR dst=%s", filename);
+        send_monitor_event(EVENT_FILE, filename, 0, OP_RENAME);
+    }
+
     return 0;
 }
 

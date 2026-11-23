@@ -334,6 +334,7 @@ pub const OP_WRITE: u8 = 2;
 pub const OP_MODIFY: u8 = 4;
 pub const OP_CREATE: u8 = 8;
 pub const OP_DELETE: u8 = 16;
+pub const OP_RENAME: u8 = 32;
 
 // 文件事件 event_type（匹配 file_agent.bpf.c）
 pub const EVENT_FILE: u8 = 1;
