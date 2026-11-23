@@ -34,6 +34,24 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
+// Read the first kprobe argument portably across architectures.
+// On arm64 libbpf's PT_REGS_PARM1 relies on `struct user_pt_regs`, which is
+// missing when vmlinux.h was generated on x86_64. Read the register from the
+// arm64 pt_regs layout directly so a single vmlinux.h works on both arches.
+static __always_inline void *kprobe_parm1(struct pt_regs *ctx) {
+#if defined(__TARGET_ARCH_arm64)
+    struct arm64_user_pt_regs {
+        __u64 regs[31];
+        __u64 sp;
+        __u64 pc;
+        __u64 pstate;
+    };
+    return (void *)((struct arm64_user_pt_regs *)ctx)->regs[0];
+#else
+    return (void *)PT_REGS_PARM1(ctx);
+#endif
+}
+
 // Checksum replacement helpers
 static __always_inline void csum_replace2(__u16 *csum, __u16 old_val, __u16 new_val) {
     __u32 new_csum = *csum;
@@ -1163,7 +1181,7 @@ int netlog_tcp_connect(struct pt_regs *ctx) {
     if (!sw || !(*sw & 2))
         return 0;
 
-    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+    struct sock *sk = (struct sock *)kprobe_parm1(ctx);
     if (!sk)
         return 0;
 
