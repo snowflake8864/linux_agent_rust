@@ -177,6 +177,24 @@ struct {
     __uint(max_entries, 256 * 1024);
 } pkt_events SEC(".maps");
 
+// 连接去重表：同一连接（原始四元组+协议）只向用户层上报一次。
+// LRU 自动淘汰旧连接，客户端端口复用后可再次上报，避免 HASH 表满后永久失效。
+struct conn_key {
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 src_port;
+    __u16 dst_port;
+    __u8  protocol;
+    __u8  pad[3];
+} __attribute__((packed));
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct conn_key);
+    __type(value, __u8);
+} conn_seen SEC(".maps");
+
 // Debug counter array
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -199,6 +217,31 @@ static __always_inline void send_network_event(__u8 protocol, __u32 src_ip, __u3
         e->tcp_flags_set = flags;
         bpf_ringbuf_submit(e, 0);
     }
+}
+
+// Helper: 首次见到该连接返回 1（应上报），已上报过返回 0（跳过）
+static __always_inline int mark_conn_first(__u8 protocol, __u32 src_ip, __u32 dst_ip,
+                                           __u16 src_port, __u16 dst_port) {
+    struct conn_key ck;
+    __builtin_memset(&ck, 0, sizeof(ck));
+    ck.src_ip = src_ip;
+    ck.dst_ip = dst_ip;
+    ck.src_port = src_port;
+    ck.dst_port = dst_port;
+    ck.protocol = protocol;
+
+    if (bpf_map_lookup_elem(&conn_seen, &ck))
+        return 0;
+    __u8 one = 1;
+    bpf_map_update_elem(&conn_seen, &ck, &one, BPF_ANY);
+    return 1;
+}
+
+// Helper: 虚开端口告警按连接去重，同一连接只上报一次
+static __always_inline void report_vir_port_once(__u8 protocol, __u32 src_ip, __u32 dst_ip,
+                                                 __u16 src_port, __u16 dst_port) {
+    if (mark_conn_first(protocol, src_ip, dst_ip, src_port, dst_port))
+        send_network_event(protocol, src_ip, dst_ip, src_port, dst_port, 0x40);
 }
 
 // Helper: find rule with wildcards (for XDP ingress)
@@ -492,11 +535,12 @@ int xdp_packet_filter(struct xdp_md *ctx) {
             csum_replace4(&tcp->check, tcp->ack_seq, ack_val);
             tcp->ack_seq = ack_val;
 
-            send_network_event(protocol, src_ip, dst_ip, src_port, dst_port, 0x40);
+            report_vir_port_once(protocol, src_ip, dst_ip, src_port, dst_port);
             return XDP_TX;
         }
-        // 非 SYN 的 TCP 包：上报后丢弃，避免内核回 RST 暴露蜜罐
-        send_network_event(protocol, src_ip, dst_ip, src_port, dst_port, 0x40);
+        // 非 SYN 的 TCP 包：丢弃避免内核回 RST；按连接去重后仅首个包上报，
+        // 兼容纯 ACK/FIN 扫描（无 SYN）也能被发现，同一连接不重复告警。
+        report_vir_port_once(protocol, src_ip, dst_ip, src_port, dst_port);
         return XDP_DROP;
     }
 
@@ -635,7 +679,8 @@ int xdp_packet_filter(struct xdp_md *ctx) {
     __u64 *c6 = bpf_map_lookup_elem(&debug_stats, &k6);
     if (c6) (*c6)++;
 
-    send_network_event(protocol, src_ip, dst_ip, src_port, dst_port, 0x40);
+    // 同一连接只上报一次（首个包），避免数据包/重传导致重复告警
+    report_vir_port_once(protocol, src_ip, dst_ip, src_port, dst_port);
     return XDP_PASS;
 }
 

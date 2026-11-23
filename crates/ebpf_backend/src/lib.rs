@@ -1089,8 +1089,9 @@ impl EbpfBackend {
         let backend = self.clone();
         std::thread::spawn(move || {
             info!("[EbpfBackend] 网络事件 ringbuf reader 已启动");
-            // 同 (攻击IP, 虚开端口) 30 秒去重：抑制 SYN 重传造成的告警风暴
-            let mut last_seen: std::collections::HashMap<(u32, u16), std::time::Instant> =
+            // 连接级去重兜底：BPF 层已按连接只上报首个包，这里再按完整四元组
+            // 做短窗口去重，抑制 SYN 重传；不同连接（源端口不同）不会互相吞掉。
+            let mut last_seen: std::collections::HashMap<(u32, u16, u32, u16), std::time::Instant> =
                 std::collections::HashMap::new();
             loop {
                 let items = Self::drain_ringbuf(&rb);
@@ -1106,11 +1107,12 @@ impl EbpfBackend {
                     }
 
                     let attack_ip = u32::from_be(ev.src_ip);
+                    let attack_port = u16::from_be(ev.src_port);
                     let dest_ip = u32::from_be(ev.dst_ip);
                     let dport = u16::from_be(ev.dst_port);
 
-                    // 去重窗口
-                    let key = (attack_ip, dport);
+                    // 去重窗口（完整连接四元组）
+                    let key = (attack_ip, attack_port, dest_ip, dport);
                     let now = std::time::Instant::now();
                     if let Some(t) = last_seen.get(&key) {
                         if now.duration_since(*t) < std::time::Duration::from_secs(30) {
