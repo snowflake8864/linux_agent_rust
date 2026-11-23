@@ -10,6 +10,7 @@ pub mod dnslog_audit;
 pub mod self_protect;
 pub mod netlink_msg;
 pub mod net_service_log;
+pub mod net_log_audit;
 pub mod log_worker;
 pub use log_worker::{StartBashLog, StartAutoProcess};
 

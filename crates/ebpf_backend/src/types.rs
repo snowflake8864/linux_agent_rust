@@ -251,6 +251,33 @@ unsafe impl aya::Pod for PktEvent {}
 /// Size of net PktEvent in eBPF = 16 bytes
 pub const PKT_EVENT_SIZE: usize = 16;
 
+// --- 对内/对外通信事件（匹配 net_agent.bpf.c netlog_event, 36字节）---
+/// log_type: 1=对外通信（本机主动发起且收到响应）, 2=对内通信（外部连接本机业务端口）。
+/// IP/端口均为网络字节序（线上原始值）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NetLogEvent {
+    pub event_type: u8, // EVENT_NETLOG = 5
+    pub log_type: u8,   // 1=outer, 2=inner
+    pub protocol: u8,   // 6=TCP
+    pub _pad: u8,
+    pub pid: u32, // outer=发起进程 PID；inner=0
+    pub saddr: u32,
+    pub daddr: u32,
+    pub sport: u16,
+    pub dport: u16,
+    pub comm: [u8; 16],
+}
+
+unsafe impl aya::Pod for NetLogEvent {}
+
+/// Size of NetLogEvent in eBPF = 36 bytes (4 + 4*3 + 2*2 + 16)
+pub const NETLOG_EVENT_SIZE: usize = 36;
+
+const _: () = assert!(std::mem::size_of::<NetLogEvent>() == NETLOG_EVENT_SIZE);
+
+pub const EVENT_NETLOG: u8 = 5;
+
 // --- 虚开端口区间规则表 (匹配 net_agent.bpf.c vir_port_rule, 20字节) ---
 /// 一条规则一个 [start_port,end_port] 区间，XDP 线性比较命中（对齐驱动链表）
 #[repr(C)]

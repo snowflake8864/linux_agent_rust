@@ -6,7 +6,7 @@ use logging::log_info;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 pub mod backdoor;
@@ -89,6 +89,14 @@ pub struct EbpfBackend {
     file_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
     /// eBPF ring buffer 读取器（从 net_agent 的 pkt_events 读取虚开端口命中事件）
     net_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
+    /// eBPF ring buffer 读取器（从 net_agent 的 netlog_events 读取对内/对外通信事件）
+    netlog_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
+    /// 对内/对外通信开关位：bit0=对内(syslog_inner), bit1=对外(syslog_outer)
+    netlog_switch: AtomicU32,
+    /// 最近一次下发的业务端口表（避免重复刷新 BPF map）
+    last_business_ports: Mutex<Vec<u16>>,
+    /// 最近一次下发的管理服务器 IP（host 字节序），用于对外通信日志过滤
+    server_ips: Mutex<Vec<u32>>,
     /// path → (md5, mtime) 缓存（后台扫描填充 + 首次命中时补充）
     pub path_hash_cache: Arc<RwLock<std::collections::HashMap<String, (String, u64)>>>,
     /// DPI patterns buffer — accumulated until `build` triggers matching
@@ -461,6 +469,10 @@ impl EbpfBackend {
             proc_ringbuf: Arc::new(Mutex::new(None)),
             file_ringbuf: Arc::new(Mutex::new(None)),
             net_ringbuf: Arc::new(Mutex::new(None)),
+            netlog_ringbuf: Arc::new(Mutex::new(None)),
+            netlog_switch: AtomicU32::new(0),
+            last_business_ports: Mutex::new(Vec::new()),
+            server_ips: Mutex::new(Vec::new()),
             path_hash_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             dpi_pat_buffer: Arc::new(Mutex::new(String::new())),
             dpi_rule_buffer: Arc::new(Mutex::new(String::new())),
@@ -612,6 +624,87 @@ impl EbpfBackend {
         Ok(())
     }
 
+    /// 写对内/对外通信开关位到 BPF（bit0=inner, bit1=outer）
+    fn write_netlog_switch_map(bpf: &mut aya::Bpf, bits: u32) {
+        if let Some(map) = bpf.map_mut("netlog_switch") {
+            match AyaArray::<_, u32>::try_from(map) {
+                Ok(mut arr) => {
+                    if let Err(e) = arr.set(0u32, &bits, 0) {
+                        warn!("[EbpfBackend] netlog_switch 写入失败: {}", e);
+                    }
+                }
+                Err(e) => warn!("[EbpfBackend] netlog_switch 类型错误: {}", e),
+            }
+        } else {
+            warn!("[EbpfBackend] ⚠ net_agent 无 netlog_switch map，对内/对外开关无法生效");
+        }
+    }
+
+    /// 全量刷新业务端口表到 BPF（供 XDP 对内通信识别）
+    fn write_business_ports_map(bpf: &mut aya::Bpf, ports: &[u16]) {
+        if let Some(map) = bpf.map_mut("business_ports") {
+            match AyaHashMap::<_, u16, u8>::try_from(map) {
+                Ok(mut m) => {
+                    let existing: Vec<u16> = m.keys().filter_map(|k| k.ok()).collect();
+                    for k in existing {
+                        if !ports.contains(&k) {
+                            let _ = m.remove(&k);
+                        }
+                    }
+                    for &p in ports {
+                        if let Err(e) = m.insert(p, 1u8, 0) {
+                            warn!("[EbpfBackend] business_ports 插入 {} 失败: {}", p, e);
+                        }
+                    }
+                }
+                Err(e) => warn!("[EbpfBackend] business_ports 类型错误: {}", e),
+            }
+        } else {
+            warn!("[EbpfBackend] ⚠ net_agent 无 business_ports map，对内通信无法识别业务端口");
+        }
+
+        // 计数最后写：XDP 侧以此做热路径短路
+        if let Some(map) = bpf.map_mut("business_ports_meta") {
+            if let Ok(mut arr) = AyaArray::<_, u32>::try_from(map) {
+                if let Err(e) = arr.set(0u32, &(ports.len() as u32), 0) {
+                    warn!("[EbpfBackend] business_ports_meta 写入失败: {}", e);
+                }
+            }
+        }
+    }
+
+    /// 全量刷新管理服务器 IP 到 BPF（对外通信日志中过滤）
+    fn write_server_ips_map(bpf: &mut aya::Bpf, ips: &[u32]) {
+        if let Some(map) = bpf.map_mut("server_ips") {
+            match AyaHashMap::<_, u32, u8>::try_from(map) {
+                Ok(mut m) => {
+                    let existing: Vec<u32> = m.keys().filter_map(|k| k.ok()).collect();
+                    for k in existing {
+                        if !ips.contains(&k) {
+                            let _ = m.remove(&k);
+                        }
+                    }
+                    for &ip in ips {
+                        if let Err(e) = m.insert(ip, 1u8, 0) {
+                            warn!("[EbpfBackend] server_ips 插入 {:?} 失败: {}", ip, e);
+                        }
+                    }
+                }
+                Err(e) => warn!("[EbpfBackend] server_ips 类型错误: {}", e),
+            }
+        } else {
+            warn!("[EbpfBackend] ⚠ net_agent 无 server_ips map，对外通信无法过滤服务器 IP");
+        }
+
+        if let Some(map) = bpf.map_mut("server_ips_meta") {
+            if let Ok(mut arr) = AyaArray::<_, u32>::try_from(map) {
+                if let Err(e) = arr.set(0u32, &(ips.len() as u32), 0) {
+                    warn!("[EbpfBackend] server_ips_meta 写入失败: {}", e);
+                }
+            }
+        }
+    }
+
     pub fn init(&self) -> anyhow::Result<()> {
         info!("[EbpfBackend] ===== 开始挂载 eBPF 程序到内核 =====");
         let mut loader = self.loader.lock().unwrap();
@@ -689,6 +782,31 @@ impl EbpfBackend {
                     }
                 } else {
                     warn!("[EbpfBackend] ⚠ net_agent 无 pkt_events map，虚开端口不上报告警");
+                }
+
+                // 创建 netlog_events ringbuf reader（对内/对外通信事件 → syslog 上报）
+                if let Some(map) = bpf.take_map("netlog_events") {
+                    match RingBuf::try_from(map) {
+                        Ok(rb) => {
+                            *self.netlog_ringbuf.lock().unwrap() = Some(rb);
+                            info!("[EbpfBackend] ✅ Netlog event ringbuf reader 创建成功");
+                        }
+                        Err(e) => warn!("[EbpfBackend] ❌ 创建 netlog ringbuf reader 失败: {}", e),
+                    }
+                } else {
+                    warn!("[EbpfBackend] ⚠ net_agent 无 netlog_events map，对内/对外通信不上报");
+                }
+
+                // apply 可能在 init 之前已下发的开关/业务端口（init 完成后再写一次 BPF map）
+                let bits = self.netlog_switch.load(Ordering::SeqCst);
+                Self::write_netlog_switch_map(bpf, bits);
+                let ports = self.last_business_ports.lock().unwrap().clone();
+                if !ports.is_empty() {
+                    Self::write_business_ports_map(bpf, &ports);
+                }
+                let sips = self.server_ips.lock().unwrap().clone();
+                if !sips.is_empty() {
+                    Self::write_server_ips_map(bpf, &sips);
                 }
             }
             info!(
@@ -1176,6 +1294,84 @@ impl EbpfBackend {
                 }
                 if items.is_empty() {
                     std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        });
+    }
+
+    /// 启动对内/对外通信 ring buffer 读取器
+    /// net_agent 的 netlog_events → SysNetLog 队列 → reporter worker POST /v1/putsyslog
+    pub fn start_netlog_event_reader(self: &Arc<Self>) {
+        if !self.net_loaded {
+            return;
+        }
+        let rb = self.netlog_ringbuf.clone();
+        let backend = self.clone();
+        std::thread::spawn(move || {
+            info!("[EbpfBackend] 对内/对外通信 ringbuf reader 已启动");
+            loop {
+                let items = Self::drain_ringbuf(&rb);
+                for data in &items {
+                    if data.len() < NETLOG_EVENT_SIZE {
+                        continue;
+                    }
+                    let ev: NetLogEvent =
+                        unsafe { std::ptr::read_unaligned(data.as_ptr() as *const NetLogEvent) };
+                    if ev.event_type != EVENT_NETLOG || (ev.log_type != 1 && ev.log_type != 2) {
+                        continue;
+                    }
+
+                    let src_ip = u32::from_be(ev.saddr);
+                    let dst_ip = u32::from_be(ev.daddr);
+                    let sport = u16::from_be(ev.sport);
+                    let dport = u16::from_be(ev.dport);
+                    let comm = Self::bytes_to_string(&ev.comm);
+                    // 对外：与驱动一致，p_dir 用可执行文件路径、hash 用文件 MD5（comm 仅 16 字节，不够）
+                    let (p_dir, hash) = if ev.log_type == 1 && ev.pid > 0 {
+                        match std::fs::read_link(format!("/proc/{}/exe", ev.pid)) {
+                            Ok(path) => {
+                                let path = path.to_string_lossy().to_string();
+                                let md5 = backend.get_md5_cached(&path);
+                                (path, md5)
+                            }
+                            Err(_) => (comm.clone(), None),
+                        }
+                    } else {
+                        (comm.clone(), None)
+                    };
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i32;
+
+                    let log = reporter::SysNetLog {
+                        uid: None,
+                        p_id: ev.pid as i32,
+                        p_dir: Some(p_dir.clone()),
+                        res_ip: Some(Ipv4Addr::from(dst_ip).to_string()),
+                        rs_port: dport,
+                        proto: 6,
+                        time: now,
+                        log_type: ev.log_type as i32,
+                        hash,
+                        source_ip: Some(Ipv4Addr::from(src_ip).to_string()),
+                        source_port: sport,
+                    };
+                    info!(
+                        "[EbpfBackend] 通信事件: type={} pid={} {}:{} -> {}:{} p_dir={} hash={}",
+                        if ev.log_type == 2 { "对内" } else { "对外" },
+                        ev.pid,
+                        log.source_ip.as_deref().unwrap_or(""),
+                        sport,
+                        log.res_ip.as_deref().unwrap_or(""),
+                        dport,
+                        p_dir,
+                        log.hash.as_deref().unwrap_or("")
+                    );
+                    reporter::net_log_audit::push_net_log(log);
+                }
+                if items.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
                 }
             }
         });
@@ -3785,7 +3981,29 @@ impl SecurityBackend for EbpfBackend {
         info!("[EbpfBackend] write_netblock_switch={}", on as u8);
         self.apply_saddr_blocks()
     }
-    fn write_defense_switch(&self, _rule_type: &str, _value: &str) -> Result<(), String> {
+    fn write_defense_switch(&self, rule_type: &str, value: &str) -> Result<(), String> {
+        if rule_type.trim() != "defense_switch" {
+            return Ok(());
+        }
+        let v: u32 = value
+            .trim()
+            .parse()
+            .map_err(|e| format!("defense_switch 值非法 '{}': {}", value, e))?;
+        // 与驱动保持一致：bit10=对内(syslog_inner_switch), bit11=对外(syslog_outer_switch)
+        let inner = ((v >> 10) & 1) as u32;
+        let outer = ((v >> 11) & 1) as u32;
+        let bits = inner | (outer << 1);
+        self.netlog_switch.store(bits, Ordering::SeqCst);
+        {
+            let mut loader = self.loader.lock().unwrap();
+            if let Some(bpf) = loader.net_bpf_mut() {
+                Self::write_netlog_switch_map(bpf, bits);
+            }
+        }
+        info!(
+            "[EbpfBackend] write_defense_switch: inner={} outer={} (bits={})",
+            inner, outer, bits
+        );
         Ok(())
     }
 
@@ -3875,9 +4093,50 @@ impl SecurityBackend for EbpfBackend {
     fn clear_docker_rt(&self) -> Result<(), String> {
         Ok(())
     }
-    fn write_business_ports(&self, _ports: &[u16]) -> Result<(), String> {
+    fn write_business_ports(&self, ports: &[u16]) -> Result<(), String> {
+        {
+            let mut last = self.last_business_ports.lock().unwrap();
+            if last.as_slice() == ports {
+                return Ok(());
+            }
+            last.clear();
+            last.extend_from_slice(ports);
+        }
+        {
+            let mut loader = self.loader.lock().unwrap();
+            if let Some(bpf) = loader.net_bpf_mut() {
+                Self::write_business_ports_map(bpf, ports);
+            }
+        }
+        info!(
+            "[EbpfBackend] write_business_ports: {} 个业务端口已下发",
+            ports.len()
+        );
         Ok(())
     }
+
+    fn write_server_ips(&self, ips: &[u32]) -> Result<(), String> {
+        {
+            let mut last = self.server_ips.lock().unwrap();
+            if last.as_slice() == ips {
+                return Ok(());
+            }
+            last.clear();
+            last.extend_from_slice(ips);
+        }
+        {
+            let mut loader = self.loader.lock().unwrap();
+            if let Some(bpf) = loader.net_bpf_mut() {
+                Self::write_server_ips_map(bpf, ips);
+            }
+        }
+        info!(
+            "[EbpfBackend] write_server_ips: {} 个服务器 IP 已下发（对外日志过滤）",
+            ips.len()
+        );
+        Ok(())
+    }
+
     /// 自保开关：防 kill（protected_pids）+ 自保目录保护（self_protect_dirs）。
     /// 自保目录保护走专用 self_protect_dirs map，与 DPI dir_policies 完全独立，
     /// 不依赖 file_switch，也不依赖 token/GLOBAL_PATTERN_MGR。

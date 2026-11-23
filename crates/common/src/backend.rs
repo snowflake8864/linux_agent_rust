@@ -136,6 +136,10 @@ pub trait SecurityBackend: Send + Sync {
     fn emit_docker_event(&self, kind: u8, flag: u8, pid: i32) -> Result<(), String>;
     fn clear_docker_rt(&self) -> Result<(), String>;
     fn write_business_ports(&self, ports: &[u16]) -> Result<(), String>;
+    /// 下发需从“对外通信”日志中排除的服务器 IP（主机字节序 u32）。默认空操作。
+    fn write_server_ips(&self, _ips: &[u32]) -> Result<(), String> {
+        Ok(())
+    }
     fn write_self_protection(&self, num: u32) -> Result<(), String>;
 
     // ── 退出清理 ──
