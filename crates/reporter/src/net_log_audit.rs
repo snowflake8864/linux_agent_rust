@@ -1,8 +1,8 @@
 //! eBPF 模式下对内/对外通信日志的上报队列与 worker。
 //!
 //! 与驱动模式 `net_service_log.rs` 对齐：
-//! - 对内(log_type=2)：按业务端口反查业务进程，补全 pid/path/hash；
-//! - 对外(log_type=1)：pid/comm 由 BPF kprobe 在 connect 时采集；
+//! - 对内(log_type=3)：按业务端口反查业务进程，补全 pid/path/hash；
+//! - 对外(log_type=2)：pid/comm 由 BPF kprobe 在 connect 时采集；
 //! - 最终批量 POST `/v1/putsyslog`（不做 gRPC 广播，与驱动路径一致）。
 
 use std::collections::VecDeque;
@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use common::manager::boot::BootManager;
 use hostinfo::net_app::model::get_port_from_state;
-use logging::{log_error, log_info, log_warn};
+use logging::{log_error, log_warn};
 use net_client::core::NetClient;
 use process_mgr::get_md5_global;
 use tokio::time::Duration;
@@ -73,7 +73,7 @@ pub async fn run_net_log_worker(boot_manager: Arc<BootManager>) {
         }
 
         for log in logs.iter_mut() {
-            if log.log_type == 2 {
+            if log.log_type == 3 {
                 enrich_inner(log);
             }
         }
@@ -90,12 +90,25 @@ pub async fn run_net_log_worker(boot_manager: Arc<BootManager>) {
         let mut json_str = String::new();
         match build_batch_syslog_net_json(&logs, &mut json_str) {
             Ok(()) => {
+                /*
+                log_info!(
+                    "[netlog] 准备上报 {} 条, log_types={:?}, payload={}",
+                    logs.len(),
+                    log_types,
+                    json_str
+                );
+                */
                 let token = boot_manager.get_token().await;
                 match client
                     .post_data_async(&url, &json_str, Duration::from_secs(10), token.as_deref())
                     .await
                 {
-                    Ok(_) => log_info!("[netlog] 上报 {} 条通信日志成功", logs.len()),
+                    // Ok(_) => log_info!(
+                    //     "[netlog] 上报 {} 条通信日志成功, log_types={:?}",
+                    //     logs.len(),
+                    //     log_types
+                    // ),
+                    Ok(_) => {}
                     Err(err) => log_error!("[netlog] 上报 {} 条失败: {}", logs.len(), err),
                 }
             }

@@ -96,7 +96,7 @@ pub struct EbpfBackend {
     /// 最近一次下发的业务端口表（避免重复刷新 BPF map）
     last_business_ports: Mutex<Vec<u16>>,
     /// 最近一次下发的管理服务器 IP（host 字节序），用于对外通信日志过滤
-    server_ips: Mutex<Vec<u32>>,
+    server_ips: Mutex<Vec<std::net::IpAddr>>,
     /// path → (md5, mtime) 缓存（后台扫描填充 + 首次命中时补充）
     pub path_hash_cache: Arc<RwLock<std::collections::HashMap<String, (String, u64)>>>,
     /// DPI patterns buffer — accumulated until `build` triggers matching
@@ -673,18 +673,27 @@ impl EbpfBackend {
         }
     }
 
-    /// 全量刷新管理服务器 IP 到 BPF（对外通信日志中过滤）
-    fn write_server_ips_map(bpf: &mut aya::Bpf, ips: &[u32]) {
+    /// 全量刷新管理服务器 IP 到 BPF（对外通信日志中过滤，支持 IPv4/IPv6）
+    fn write_server_ips_map(bpf: &mut aya::Bpf, ips: &[std::net::IpAddr]) {
+        let mut v4: Vec<u32> = Vec::new();
+        let mut v6: Vec<Ipv6Key> = Vec::new();
+        for ip in ips {
+            match ip {
+                std::net::IpAddr::V4(a) => v4.push(u32::from_be_bytes(a.octets())),
+                std::net::IpAddr::V6(a) => v6.push(Ipv6Key { addr: a.octets() }),
+            }
+        }
+
         if let Some(map) = bpf.map_mut("server_ips") {
             match AyaHashMap::<_, u32, u8>::try_from(map) {
                 Ok(mut m) => {
                     let existing: Vec<u32> = m.keys().filter_map(|k| k.ok()).collect();
                     for k in existing {
-                        if !ips.contains(&k) {
+                        if !v4.contains(&k) {
                             let _ = m.remove(&k);
                         }
                     }
-                    for &ip in ips {
+                    for &ip in &v4 {
                         if let Err(e) = m.insert(ip, 1u8, 0) {
                             warn!("[EbpfBackend] server_ips 插入 {:?} 失败: {}", ip, e);
                         }
@@ -693,16 +702,65 @@ impl EbpfBackend {
                 Err(e) => warn!("[EbpfBackend] server_ips 类型错误: {}", e),
             }
         } else {
-            warn!("[EbpfBackend] ⚠ net_agent 无 server_ips map，对外通信无法过滤服务器 IP");
+            warn!("[EbpfBackend] ⚠ net_agent 无 server_ips map，IPv4 服务器 IP 无法过滤");
         }
-
         if let Some(map) = bpf.map_mut("server_ips_meta") {
             if let Ok(mut arr) = AyaArray::<_, u32>::try_from(map) {
-                if let Err(e) = arr.set(0u32, &(ips.len() as u32), 0) {
+                if let Err(e) = arr.set(0u32, &(v4.len() as u32), 0) {
                     warn!("[EbpfBackend] server_ips_meta 写入失败: {}", e);
                 }
             }
         }
+
+        if let Some(map) = bpf.map_mut("server_ips6") {
+            match AyaHashMap::<_, Ipv6Key, u8>::try_from(map) {
+                Ok(mut m) => {
+                    let existing: Vec<Ipv6Key> = m.keys().filter_map(|k| k.ok()).collect();
+                    for k in existing {
+                        if !v6.contains(&k) {
+                            let _ = m.remove(&k);
+                        }
+                    }
+                    for k in &v6 {
+                        if let Err(e) = m.insert(k, 1u8, 0) {
+                            warn!("[EbpfBackend] server_ips6 插入 {:?} 失败: {}", k.addr, e);
+                        }
+                    }
+                }
+                Err(e) => warn!("[EbpfBackend] server_ips6 类型错误: {}", e),
+            }
+        } else {
+            warn!("[EbpfBackend] ⚠ net_agent 无 server_ips6 map，IPv6 服务器 IP 无法过滤");
+        }
+        if let Some(map) = bpf.map_mut("server_ips6_meta") {
+            if let Ok(mut arr) = AyaArray::<_, u32>::try_from(map) {
+                if let Err(e) = arr.set(0u32, &(v6.len() as u32), 0) {
+                    warn!("[EbpfBackend] server_ips6_meta 写入失败: {}", e);
+                }
+            }
+        }
+
+        info!(
+            "[EbpfBackend] server_ips map 已刷新: IPv4={} IPv6={}",
+            v4.len(),
+            v6.len()
+        );
+    }
+
+    /// 追加一个服务器 IP（用于兼容 server_ipv4/server_ipv6 规则，保留已有集合）
+    fn add_server_ip(&self, ip: std::net::IpAddr) -> Result<(), String> {
+        let ips = {
+            let mut last = self.server_ips.lock().unwrap();
+            if !last.contains(&ip) {
+                last.push(ip);
+            }
+            last.clone()
+        };
+        let mut loader = self.loader.lock().unwrap();
+        if let Some(bpf) = loader.net_bpf_mut() {
+            Self::write_server_ips_map(bpf, &ips);
+        }
+        Ok(())
     }
 
     pub fn init(&self) -> anyhow::Result<()> {
@@ -971,6 +1029,15 @@ impl EbpfBackend {
     fn bytes_to_string(bytes: &[u8]) -> String {
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         String::from_utf8_lossy(&bytes[..end]).to_string()
+    }
+
+    /// 按 family 格式化 16 字节地址（IPv4 取前 4 字节）
+    fn format_ip(family: u8, bytes: &[u8; 16]) -> String {
+        if family == 2 {
+            Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]).to_string()
+        } else {
+            std::net::Ipv6Addr::from(*bytes).to_string()
+        }
     }
 
     /// 解析进程 ringbuf 事件
@@ -1317,17 +1384,17 @@ impl EbpfBackend {
                     }
                     let ev: NetLogEvent =
                         unsafe { std::ptr::read_unaligned(data.as_ptr() as *const NetLogEvent) };
-                    if ev.event_type != EVENT_NETLOG || (ev.log_type != 1 && ev.log_type != 2) {
+                    if ev.event_type != EVENT_NETLOG || (ev.log_type != 2 && ev.log_type != 3) {
                         continue;
                     }
 
-                    let src_ip = u32::from_be(ev.saddr);
-                    let dst_ip = u32::from_be(ev.daddr);
+                    let src_ip = Self::format_ip(ev.family, &ev.saddr);
+                    let dst_ip = Self::format_ip(ev.family, &ev.daddr);
                     let sport = u16::from_be(ev.sport);
                     let dport = u16::from_be(ev.dport);
                     let comm = Self::bytes_to_string(&ev.comm);
                     // 对外：与驱动一致，p_dir 用可执行文件路径、hash 用文件 MD5（comm 仅 16 字节，不够）
-                    let (p_dir, hash) = if ev.log_type == 1 && ev.pid > 0 {
+                    let (p_dir, hash) = if ev.log_type == 2 && ev.pid > 0 {
                         match std::fs::read_link(format!("/proc/{}/exe", ev.pid)) {
                             Ok(path) => {
                                 let path = path.to_string_lossy().to_string();
@@ -1348,18 +1415,20 @@ impl EbpfBackend {
                         uid: None,
                         p_id: ev.pid as i32,
                         p_dir: Some(p_dir.clone()),
-                        res_ip: Some(Ipv4Addr::from(dst_ip).to_string()),
+                        res_ip: Some(dst_ip.clone()),
                         rs_port: dport,
                         proto: 6,
                         time: now,
                         log_type: ev.log_type as i32,
                         hash,
-                        source_ip: Some(Ipv4Addr::from(src_ip).to_string()),
+                        source_ip: Some(src_ip.clone()),
                         source_port: sport,
                     };
+                    /*
                     info!(
-                        "[EbpfBackend] 通信事件: type={} pid={} {}:{} -> {}:{} p_dir={} hash={}",
-                        if ev.log_type == 2 { "对内" } else { "对外" },
+                        "[EbpfBackend] 通信事件: log_type={} ({}) pid={} {}:{} -> {}:{} p_dir={} hash={}",
+                        log.log_type,
+                        if ev.log_type == 3 { "对内" } else { "对外" },
                         ev.pid,
                         log.source_ip.as_deref().unwrap_or(""),
                         sport,
@@ -1368,6 +1437,7 @@ impl EbpfBackend {
                         p_dir,
                         log.hash.as_deref().unwrap_or("")
                     );
+                    */
                     reporter::net_log_audit::push_net_log(log);
                 }
                 if items.is_empty() {
@@ -3932,6 +4002,30 @@ impl SecurityBackend for EbpfBackend {
             if line.is_empty() {
                 continue;
             }
+            // 兼容驱动侧 server_ipv4/server_ipv6 规则形式（值为主机序 u32 / 点分或冒分地址）
+            if let Some(v) = line.strip_prefix("server_ipv4 ") {
+                match v.trim().parse::<u32>() {
+                    Ok(n) => {
+                        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(n));
+                        if let Err(e) = self.add_server_ip(ip) {
+                            result = Err(e);
+                        }
+                    }
+                    Err(e) => warn!("[EbpfBackend] server_ipv4 行解析失败 '{}': {}", line, e),
+                }
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("server_ipv6 ") {
+                match v.trim().parse::<std::net::IpAddr>() {
+                    Ok(ip) => {
+                        if let Err(e) = self.add_server_ip(ip) {
+                            result = Err(e);
+                        }
+                    }
+                    Err(e) => warn!("[EbpfBackend] server_ipv6 行解析失败 '{}': {}", line, e),
+                }
+                continue;
+            }
             if line.starts_with("VIR_OPEN_PORT ") {
                 match parse_vir_open_port_line(line) {
                     Some((index, total, rule)) => {
@@ -4115,7 +4209,7 @@ impl SecurityBackend for EbpfBackend {
         Ok(())
     }
 
-    fn write_server_ips(&self, ips: &[u32]) -> Result<(), String> {
+    fn write_server_ips(&self, ips: &[std::net::IpAddr]) -> Result<(), String> {
         {
             let mut last = self.server_ips.lock().unwrap();
             if last.as_slice() == ips {

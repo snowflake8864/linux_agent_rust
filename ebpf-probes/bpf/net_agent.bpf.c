@@ -10,11 +10,20 @@
 #ifndef ETH_P_IP
 #define ETH_P_IP 0x0800
 #endif
+#ifndef ETH_P_IPV6
+#define ETH_P_IPV6 0x86DD
+#endif
 #ifndef IPPROTO_TCP
 #define IPPROTO_TCP 6
 #endif
 #ifndef IPPROTO_UDP
 #define IPPROTO_UDP 17
+#endif
+#ifndef AF_INET
+#define AF_INET 2
+#endif
+#ifndef AF_INET6
+#define AF_INET6 10
 #endif
 
 // TC action codes
@@ -59,15 +68,16 @@ struct pkt_event {
 };
 
 // 对内/对外通信事件。IP/端口统一为网络字节序（用户层 from_be）。
-// log_type: 1=对外通信(本机主动发起且完成三次握手), 2=对内通信(外部连接本机业务端口)
+// log_type: 2=对外通信(本机主动发起外发 SYN), 3=对内通信(外部连接本机业务端口)
+// family: 2=AF_INET, 10=AF_INET6；IPv4 地址放前 4 字节，其余补 0。
 struct netlog_event {
     __u8 type;        // EVENT_NETLOG
-    __u8 log_type;    // 1=outer, 2=inner
+    __u8 log_type;    // 2=outer, 3=inner
     __u8 protocol;    // 6=TCP
-    __u8 padding;
+    __u8 family;      // 2=AF_INET, 10=AF_INET6
     __u32 pid;        // outer=发起进程 PID；inner=0（用户层按业务端口反查）
-    __u32 saddr;      // 源 IP（网络序）
-    __u32 daddr;      // 目的 IP（网络序）
+    __u8 saddr[16];   // 源 IP（网络序）
+    __u8 daddr[16];   // 目的 IP（网络序）
     __u16 sport;      // 源端口（网络序）
     __u16 dport;      // 目的端口（网络序）
     __u8 comm[16];    // outer=发起进程 comm；inner=全 0
@@ -235,6 +245,25 @@ struct {
     __type(value, __u32);
 } server_ips_meta SEC(".maps");
 
+// 管理服务器 IPv6（16 字节网络序）
+struct in6_key {
+    __u8 addr[16];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 32);
+    __type(key, struct in6_key);
+    __type(value, __u8);
+} server_ips6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} server_ips6_meta SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 256 * 1024);
@@ -243,12 +272,13 @@ struct {
 // 连接去重表：同一连接（原始四元组+协议）只向用户层上报一次。
 // LRU 自动淘汰旧连接，客户端端口复用后可再次上报，避免 HASH 表满后永久失效。
 struct conn_key {
-    __u32 src_ip;
-    __u32 dst_ip;
+    __u8  saddr[16];   // IPv4 用前 4 字节，其余补 0
+    __u8  daddr[16];
     __u16 src_port;
     __u16 dst_port;
     __u8  protocol;
-    __u8  pad[3];
+    __u8  family;      // 2=AF_INET, 10=AF_INET6
+    __u8  pad[2];
 } __attribute__((packed));
 
 struct {
@@ -266,19 +296,30 @@ struct {
     __type(value, __u8);
 } netlog_seen SEC(".maps");
 
-// 对外通信两阶段关联：tcp_connect 记录发起进程，tcp_finish_connect 确认建立。
-// key 为原始四元组（网络序），避免依赖 socket cookie / cgroup。
-struct pending_conn {
-    __u32 pid;
-    __u8  comm[16];
-};
 
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
-    __type(key, struct conn_key);
-    __type(value, struct pending_conn);
-} pending_conns SEC(".maps");
+static __always_inline void conn_key_from_v4(struct conn_key *ck, __u8 protocol,
+                                             __u32 src_ip, __u32 dst_ip,
+                                             __u16 src_port, __u16 dst_port) {
+    __builtin_memset(ck, 0, sizeof(*ck));
+    __builtin_memcpy(ck->saddr, &src_ip, 4);
+    __builtin_memcpy(ck->daddr, &dst_ip, 4);
+    ck->src_port = src_port;
+    ck->dst_port = dst_port;
+    ck->protocol = protocol;
+    ck->family = AF_INET;
+}
+
+static __always_inline void conn_key_from_addr(struct conn_key *ck, __u8 family,
+                                               const __u8 *saddr, const __u8 *daddr,
+                                               __u16 src_port, __u16 dst_port) {
+    __builtin_memset(ck, 0, sizeof(*ck));
+    __builtin_memcpy(ck->saddr, saddr, 16);
+    __builtin_memcpy(ck->daddr, daddr, 16);
+    ck->src_port = src_port;
+    ck->dst_port = dst_port;
+    ck->protocol = IPPROTO_TCP;
+    ck->family = family;
+}
 
 // Debug counter array
 struct {
@@ -308,12 +349,7 @@ static __always_inline void send_network_event(__u8 protocol, __u32 src_ip, __u3
 static __always_inline int mark_conn_first(__u8 protocol, __u32 src_ip, __u32 dst_ip,
                                            __u16 src_port, __u16 dst_port) {
     struct conn_key ck;
-    __builtin_memset(&ck, 0, sizeof(ck));
-    ck.src_ip = src_ip;
-    ck.dst_ip = dst_ip;
-    ck.src_port = src_port;
-    ck.dst_port = dst_port;
-    ck.protocol = protocol;
+    conn_key_from_v4(&ck, protocol, src_ip, dst_ip, src_port, dst_port);
 
     if (bpf_map_lookup_elem(&conn_seen, &ck))
         return 0;
@@ -329,19 +365,19 @@ static __always_inline void report_vir_port_once(__u8 protocol, __u32 src_ip, __
         send_network_event(protocol, src_ip, dst_ip, src_port, dst_port, 0x40);
 }
 
-// Helper: 上报对内/对外通信事件（log_type: 1=outer, 2=inner）
-static __always_inline void send_netlog_event(__u8 log_type, __u32 pid,
-                                              __u32 saddr, __u32 daddr,
+// Helper: 上报对内/对外通信事件（log_type: 2=outer, 3=inner）
+static __always_inline void send_netlog_event(__u8 log_type, __u32 pid, __u8 family,
+                                              const __u8 *saddr, const __u8 *daddr,
                                               __u16 sport, __u16 dport, __u8 *comm) {
     struct netlog_event *e = bpf_ringbuf_reserve(&netlog_events, sizeof(*e), 0);
     if (!e) return;
     e->type = EVENT_NETLOG;
     e->log_type = log_type;
     e->protocol = IPPROTO_TCP;
-    e->padding = 0;
+    e->family = family;
     e->pid = pid;
-    e->saddr = saddr;
-    e->daddr = daddr;
+    __builtin_memcpy(e->saddr, saddr, 16);
+    __builtin_memcpy(e->daddr, daddr, 16);
     e->sport = sport;
     e->dport = dport;
     __builtin_memset(e->comm, 0, sizeof(e->comm));
@@ -360,16 +396,32 @@ static __always_inline int is_server_ip_host(__u32 ip_host) {
     return v && *v;
 }
 
+// Helper: 按 family 判断目的地址是否为管理服务器（IPv4/IPv6）
+static __always_inline int is_server_ip(__u8 family, const __u8 *addr) {
+    if (family == AF_INET) {
+        __u32 ip;
+        __builtin_memcpy(&ip, addr, 4);
+        return is_server_ip_host(bpf_ntohl(ip));
+    }
+    if (family == AF_INET6) {
+        __u32 mk = 0;
+        __u32 *cnt = bpf_map_lookup_elem(&server_ips6_meta, &mk);
+        if (!cnt || *cnt == 0)
+            return 0;
+        struct in6_key k;
+        __builtin_memcpy(k.addr, addr, 16);
+        __u8 *v = bpf_map_lookup_elem(&server_ips6, &k);
+        return v && *v;
+    }
+    return 0;
+}
+
 // Helper: 对内通信按连接去重（只取首个 SYN）
-static __always_inline int mark_netlog_first(__u8 protocol, __u32 src_ip, __u32 dst_ip,
+static __always_inline int mark_netlog_first(__u8 family, const __u8 *saddr,
+                                             const __u8 *daddr,
                                              __u16 src_port, __u16 dst_port) {
     struct conn_key ck;
-    __builtin_memset(&ck, 0, sizeof(ck));
-    ck.src_ip = src_ip;
-    ck.dst_ip = dst_ip;
-    ck.src_port = src_port;
-    ck.dst_port = dst_port;
-    ck.protocol = protocol;
+    conn_key_from_addr(&ck, family, saddr, daddr, src_port, dst_port);
 
     if (bpf_map_lookup_elem(&netlog_seen, &ck))
         return 0;
@@ -485,6 +537,42 @@ int xdp_packet_filter(struct xdp_md *ctx) {
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
+
+    // IPv6 对内通信审计：只读识别 TCP SYN 到业务端口；不改变现有 IPv6 透传行为。
+    // 说明：仅处理无扩展头或 nexthdr 直接为 TCP 的报文（覆盖绝大多数 TCP/IPv6 流量）。
+    if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+        struct ipv6hdr *ip6 = (void *)(eth + 1);
+        if ((void *)(ip6 + 1) > data_end) return XDP_PASS;
+        if (ip6->nexthdr == IPPROTO_TCP) {
+            struct tcphdr *tcp6 = (void *)(ip6 + 1);
+            if ((void *)(tcp6 + 1) > data_end) return XDP_PASS;
+            __u8 flags6 = *((__u8 *)tcp6 + 13);
+            if ((flags6 & 0x12) == 0x02) {
+                __u32 lk = 0;
+                __u32 *sw = bpf_map_lookup_elem(&netlog_switch, &lk);
+                if (sw && (*sw & 1)) {
+                    __u32 mk = 0;
+                    __u32 *cnt = bpf_map_lookup_elem(&business_ports_meta, &mk);
+                    if (cnt && *cnt > 0) {
+                        __u16 hp = bpf_ntohs(tcp6->dest);
+                        __u8 *hit = bpf_map_lookup_elem(&business_ports, &hp);
+                        if (hit) {
+                            __u8 s[16], d[16], empty[16];
+                            __builtin_memcpy(s, &ip6->saddr, 16);
+                            __builtin_memcpy(d, &ip6->daddr, 16);
+                            if (mark_netlog_first(AF_INET6, s, d, tcp6->source, tcp6->dest)) {
+                                __builtin_memset(empty, 0, sizeof(empty));
+                                send_netlog_event(3, 0, AF_INET6, s, d,
+                                                  tcp6->source, tcp6->dest, empty);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return XDP_PASS;
+    }
+
     if (eth->h_proto != bpf_htons(ETH_P_IP)) return XDP_PASS;
 
     struct iphdr *ip = (void *)eth + sizeof(*eth);
@@ -576,10 +664,14 @@ int xdp_packet_filter(struct xdp_md *ctx) {
                 __u16 hp = bpf_ntohs(dst_port);
                 __u8 *hit = bpf_map_lookup_elem(&business_ports, &hp);
                 if (hit) {
-                    if (mark_netlog_first(protocol, src_ip, dst_ip, src_port, dst_port)) {
-                        __u8 empty[16];
+                    __u8 s[16], d[16], empty[16];
+                    __builtin_memset(s, 0, sizeof(s));
+                    __builtin_memset(d, 0, sizeof(d));
+                    __builtin_memcpy(s, &src_ip, 4);
+                    __builtin_memcpy(d, &dst_ip, 4);
+                    if (mark_netlog_first(AF_INET, s, d, src_port, dst_port)) {
                         __builtin_memset(empty, 0, sizeof(empty));
-                        send_netlog_event(2, 0, src_ip, dst_ip, src_port, dst_port, empty);
+                        send_netlog_event(3, 0, AF_INET, s, d, src_port, dst_port, empty);
                     }
                 }
             }
@@ -1010,18 +1102,28 @@ int enforce_connect4(struct bpf_sock_addr *ctx) {
 }
 
 // ── 对外通信审计（kprobe，不挂 cgroup、不改连接）──
-// tcp_connect: 本机发起 connect、已选好源端口，记录发起进程；
-// tcp_finish_connect: 收到 SYN-ACK 进入 ESTABLISHED，确认“收到响应”后上报。
-#ifndef AF_INET
-#define AF_INET 2
-#endif
+// tcp_connect: 本机发起 connect、已选好源端口，外发 SYN 即上报（对齐驱动 netdos_tcp_out）。
 
 static __always_inline int conn_key_from_sk(struct sock *sk, struct conn_key *ck) {
     __builtin_memset(ck, 0, sizeof(*ck));
-    if (BPF_CORE_READ(sk, __sk_common.skc_family) != AF_INET)
+    __u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+    if (family != AF_INET && family != AF_INET6)
         return 0;
-    ck->src_ip = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
-    ck->dst_ip = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+    ck->family = family;
+
+    if (family == AF_INET) {
+        __u32 s = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
+        __u32 d = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+        __builtin_memcpy(ck->saddr, &s, 4);
+        __builtin_memcpy(ck->daddr, &d, 4);
+    } else {
+        struct in6_addr v6;
+        BPF_CORE_READ_INTO(&v6, sk, __sk_common.skc_v6_rcv_saddr);
+        __builtin_memcpy(ck->saddr, &v6, 16);
+        BPF_CORE_READ_INTO(&v6, sk, __sk_common.skc_v6_daddr);
+        __builtin_memcpy(ck->daddr, &v6, 16);
+    }
+
     __u16 lport = BPF_CORE_READ(sk, __sk_common.skc_num);
     ck->src_port = bpf_htons(lport);
     ck->dst_port = BPF_CORE_READ(sk, __sk_common.skc_dport);
@@ -1029,9 +1131,29 @@ static __always_inline int conn_key_from_sk(struct sock *sk, struct conn_key *ck
     return 1;
 }
 
-// 只统计“对外”，跳过本机回环
+// 只统计“对外”，跳过本机回环（IPv4 127/8、IPv6 ::1）
 static __always_inline int is_loopback_be(__u32 ip_be) {
     return (bpf_ntohl(ip_be) >> 24) == 127;
+}
+
+static __always_inline int is_loopback_v6(const __u8 *a) {
+#pragma unroll
+    for (int i = 0; i < 15; i++) {
+        if (a[i] != 0)
+            return 0;
+    }
+    return a[15] == 1;
+}
+
+static __always_inline int is_loopback_addr(__u8 family, const __u8 *a) {
+    if (family == AF_INET) {
+        __u32 ip;
+        __builtin_memcpy(&ip, a, 4);
+        return is_loopback_be(ip);
+    }
+    if (family == AF_INET6)
+        return is_loopback_v6(a);
+    return 0;
 }
 
 SEC("kprobe/tcp_connect")
@@ -1048,46 +1170,18 @@ int netlog_tcp_connect(struct pt_regs *ctx) {
     struct conn_key ck;
     if (!conn_key_from_sk(sk, &ck))
         return 0;
-    if (is_loopback_be(ck.src_ip) || is_loopback_be(ck.dst_ip))
+    if (is_loopback_addr(ck.family, ck.saddr) || is_loopback_addr(ck.family, ck.daddr))
         return 0;
-    if (is_server_ip_host(bpf_ntohl(ck.dst_ip)))
-        return 0;
-
-    struct pending_conn pc;
-    __builtin_memset(&pc, 0, sizeof(pc));
-    pc.pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-    bpf_get_current_comm(&pc.comm, sizeof(pc.comm));
-    bpf_map_update_elem(&pending_conns, &ck, &pc, BPF_ANY);
-    return 0;
-}
-
-SEC("kprobe/tcp_finish_connect")
-int netlog_tcp_established(struct pt_regs *ctx) {
-    __u32 zero = 0;
-    __u32 *sw = bpf_map_lookup_elem(&netlog_switch, &zero);
-    if (!sw || !(*sw & 2))
+    if (is_server_ip(ck.family, ck.daddr))
         return 0;
 
-    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
-    if (!sk)
-        return 0;
+    __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    __u8 comm[16];
+    __builtin_memset(comm, 0, sizeof(comm));
+    bpf_get_current_comm(comm, sizeof(comm));
 
-    struct conn_key ck;
-    if (!conn_key_from_sk(sk, &ck))
-        return 0;
-
-    // 服务器 IP 可能在连接建立前才下发，这里再判一次并清掉 pending
-    if (is_server_ip_host(bpf_ntohl(ck.dst_ip))) {
-        bpf_map_delete_elem(&pending_conns, &ck);
-        return 0;
-    }
-
-    struct pending_conn *pc = bpf_map_lookup_elem(&pending_conns, &ck);
-    if (!pc)
-        return 0;
-
-    send_netlog_event(1, pc->pid, ck.src_ip, ck.dst_ip,
-                      ck.src_port, ck.dst_port, pc->comm);
-    bpf_map_delete_elem(&pending_conns, &ck);
+    // 与驱动 netdos_tcp_out 一致：外发 SYN 即上报，不等待 SYN-ACK
+    send_netlog_event(2, pid, ck.family, ck.saddr, ck.daddr,
+                      ck.src_port, ck.dst_port, comm);
     return 0;
 }
