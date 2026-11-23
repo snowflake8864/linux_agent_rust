@@ -8,6 +8,7 @@ use kernel_module::{LoadKernelDriver, unload_driver, ensure_kernel_hold, DriverB
 use ebpf_backend::{EbpfBackend, capability::EbpfCapability};
 use common::backend::{SecurityBackend, NoopBackend, set_backend, init_dpi_writer};
 use common::manager::boot::BootManager;
+use std::net::IpAddr;
 use reporter::{AuditLogInfo, AuditProcess, StartBashLog, StartAutoProcess};
 use tokio::sync::mpsc;
 use logging::{log_info, CustomLogger, log_error, log_warn};
@@ -22,7 +23,6 @@ use docker::StartDockerMonitor;
 use virus_scan_grpc::StartVirusScanGrpcService;
 use std::fs;
 use std::path::Path;
-use std::net::IpAddr;
 use std::time::Duration;
 
 
@@ -153,9 +153,10 @@ async fn kysec_restore_after_upgrade() {
     let _ = fs::remove_file(KYSEC_PENDING_FILE);
 }
 
-/// 下发管理服务器 IP 到后端（eBPF 模式写入 BPF map，用于过滤对外通信日志）。
+/// eBPF 模式下发管理服务器 IP（写入 server_ips/server_ips6 BPF map）。
+/// driver 模式的 netlink 0x703 在启动段保持原逻辑，不经过此函数。
 /// 调用方需已持有/读取配置并传入 ips，避免在 cfg 锁内重复加锁造成死锁。
-fn apply_server_ip_filter(backend: &dyn SecurityBackend, ips: &[u32]) {
+fn apply_server_ip_filter(backend: &dyn SecurityBackend, ips: &[std::net::IpAddr]) {
     if ips.is_empty() {
         return;
     }
@@ -255,7 +256,7 @@ async fn main() -> std::io::Result<()> {
     {
         let mut cfg = NETINFO_CONFIG.lock().unwrap();
         // 提前算好服务器 IP（此处置于 cfg 锁内，后续避免重复加锁死锁）
-        let server_ips = cfg.get_server_ipv4s();
+        let server_ips = cfg.get_server_ips();
         let backend_mode = cfg.backend_mode.clone();
         let admission_enabled = cfg.admission.enabled;
         let admission_mode = cfg.admission.mode;

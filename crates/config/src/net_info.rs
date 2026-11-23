@@ -294,9 +294,9 @@ fn run_cmd_capture(cmd: &str, args: &[&str]) -> Result<String, String> {
 }
 
 impl NetInfoConfig {
-    /// 管理服务器 IPv4 列表（主机字节序 u32，与 `ip_str_to_u32` 表示一致）。
+    /// 管理服务器 IP 列表（IPv4/IPv6，去重）。
     /// 优先 SERVER_IP；为空时从 SERVERIPPORT URL 提取 host；域名会尝试解析。
-    pub fn get_server_ipv4s(&self) -> Vec<u32> {
+    pub fn get_server_ips(&self) -> Vec<std::net::IpAddr> {
         let mut hosts: Vec<String> = Vec::new();
         let sip = self.server_ip.trim();
         if !sip.is_empty() {
@@ -306,9 +306,13 @@ impl NetInfoConfig {
         if !url.is_empty() {
             let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
             let hostport = rest.split('/').next().unwrap_or("");
-            let host = match hostport.rsplit_once(':') {
-                Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h,
-                _ => hostport,
+            let host = if let Some(inner) = hostport.strip_prefix('[') {
+                inner.split(']').next().unwrap_or("")
+            } else {
+                match hostport.rsplit_once(':') {
+                    Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h,
+                    _ => hostport,
+                }
             };
             if !host.is_empty() {
                 hosts.push(host.to_string());
@@ -320,17 +324,15 @@ impl NetInfoConfig {
         } else {
             self.server_port as u16
         };
-        let mut out: Vec<u32> = Vec::new();
+        let mut out: Vec<std::net::IpAddr> = Vec::new();
         for h in hosts {
-            if let Ok(ip) = h.parse::<std::net::Ipv4Addr>() {
-                out.push(u32::from_be_bytes(ip.octets()));
+            if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+                out.push(ip);
                 continue;
             }
             if let Ok(addrs) = (h.as_str(), port).to_socket_addrs() {
                 for a in addrs {
-                    if let std::net::SocketAddr::V4(v4) = a {
-                        out.push(u32::from_be_bytes(v4.ip().octets()));
-                    }
+                    out.push(a.ip());
                 }
             }
         }
