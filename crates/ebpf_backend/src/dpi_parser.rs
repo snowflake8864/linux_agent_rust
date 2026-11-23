@@ -39,6 +39,7 @@ use super::types::{DirKey, DirPolicy};
 use super::OP_CREATE;
 use super::OP_DELETE;
 use super::OP_READ;
+use super::OP_RENAME;
 use super::OP_WRITE;
 
 // ── Parsed intermediate representations ──
@@ -333,7 +334,7 @@ fn collect_suffixes_for_dir(
 ///   bit0 = read, bit1 = write, bit2 = delete, bit3 = rename, bit4 = create
 ///
 /// eBPF `ops_mask` (from file_agent.bpf.c):
-///   OP_READ(1) | OP_WRITE(2) | OP_MODIFY(4) | OP_CREATE(8) | OP_DELETE(16)
+///   OP_READ(1) | OP_WRITE(2) | OP_MODIFY(4) | OP_CREATE(8) | OP_DELETE(16) | OP_RENAME(32)
 fn compute_ops_mask(rule: &ParsedRule, _pattern: &ParsedPattern) -> u8 {
     let rw = rule.protect_rw;
 
@@ -343,19 +344,19 @@ fn compute_ops_mask(rule: &ParsedRule, _pattern: &ParsedPattern) -> u8 {
     // rule_type=0 (global trust) → all operations (for allow listing)
 
     if rule.rule_type == 1 || rule.rule_type == 3 {
-        // Extortion / self-protection: block create, write, delete
-        return OP_CREATE | OP_WRITE | OP_DELETE;
+        // Extortion / self-protection: block create, write, delete, rename
+        return OP_CREATE | OP_WRITE | OP_DELETE | OP_RENAME;
     }
 
     if rule.rule_type == 0 {
         // Global trust dir: trust all operations (allow)
-        return OP_READ | OP_WRITE | OP_CREATE | OP_DELETE;
+        return OP_READ | OP_WRITE | OP_CREATE | OP_DELETE | OP_RENAME;
     }
 
     // rule_type == 2 (tamper): map protect_rw bits
     if rw == 0 {
         // inherit — default to all ops
-        return OP_READ | OP_WRITE | OP_CREATE | OP_DELETE;
+        return OP_READ | OP_WRITE | OP_CREATE | OP_DELETE | OP_RENAME;
     }
 
     let mut mask: u8 = 0;
@@ -369,8 +370,8 @@ fn compute_ops_mask(rule: &ParsedRule, _pattern: &ParsedPattern) -> u8 {
         mask |= OP_DELETE;
     } // bit2: delete
     if rw & 8 != 0 {
-        mask |= OP_WRITE;
-    } // bit3: rename → write
+        mask |= OP_RENAME;
+    } // bit3: rename
     if rw & 16 != 0 {
         mask |= OP_CREATE;
     } // bit4: create
@@ -503,7 +504,7 @@ mod tests {
         };
         let pat = ParsedPattern::default();
         let mask = compute_ops_mask(&rule, &pat);
-        assert_eq!(mask, OP_READ | OP_WRITE | OP_DELETE | OP_CREATE);
+        assert_eq!(mask, OP_READ | OP_WRITE | OP_DELETE | OP_CREATE | OP_RENAME);
     }
 
     #[test]
@@ -514,7 +515,7 @@ mod tests {
         };
         let pat = ParsedPattern::default();
         let mask = compute_ops_mask(&rule, &pat);
-        assert_eq!(mask, OP_CREATE | OP_WRITE | OP_DELETE);
+        assert_eq!(mask, OP_CREATE | OP_WRITE | OP_DELETE | OP_RENAME);
     }
 
     #[test]
