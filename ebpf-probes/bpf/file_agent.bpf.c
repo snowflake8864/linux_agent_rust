@@ -678,11 +678,6 @@ int BPF_PROG(enforce_inode_create, struct inode *dir, struct dentry *dentry, umo
         return -EPERM;
     }
 
-    {
-        int er = extort_check(scratch, dentry, filename, 0, OP_CREATE, parent_dev, parent_ino);
-        if (er) return er;
-    }
-
     if (!feature_enabled(FEATURE_FILE)) {
         return 0;
     }
