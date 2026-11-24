@@ -2694,6 +2694,40 @@ impl EbpfBackend {
         }
     }
 
+    /// 把 path 的所有祖先目录（含父目录）按 (dev,inode) 缓存。
+    fn cache_path_ancestors(&self, path: &str) {
+        use std::os::linux::fs::MetadataExt;
+        let mut cur = std::path::Path::new(path).parent();
+        while let Some(dir) = cur {
+            if let Ok(md) = std::fs::metadata(dir) {
+                if md.is_dir() {
+                    let p = dir.to_string_lossy().into_owned();
+                    self.cache_dir_path(md.st_dev(), md.st_ino(), &p);
+                }
+            }
+            cur = dir.parent();
+        }
+    }
+
+    /// 从 start 路径开始向上找 inode 匹配的祖先目录；顺手缓存沿途目录。
+    fn path_ancestor_with_inode(&self, start: &str, dev: u64, inode: u64) -> Option<String> {
+        use std::os::linux::fs::MetadataExt;
+        let mut cur = Some(std::path::PathBuf::from(start));
+        while let Some(p) = cur {
+            if let Ok(md) = std::fs::metadata(&p) {
+                if md.is_dir() {
+                    let ps = p.to_string_lossy().into_owned();
+                    self.cache_dir_path(md.st_dev(), md.st_ino(), &ps);
+                    if md.st_dev() == dev && md.st_ino() == inode {
+                        return Some(ps);
+                    }
+                }
+            }
+            cur = p.parent().map(|x| x.to_path_buf());
+        }
+        None
+    }
+
     /// 事件路径补全：file_open 已带全路径；其他钩子只带叶子名，
     /// 用父目录 (dev,inode) 查缓存，缺失时尝试 /proc/<pid>/cwd 和 fd。
     fn resolve_event_full_path(&self, event: &FileEvent, leaf: &str) -> String {
@@ -2702,6 +2736,9 @@ impl EbpfBackend {
                 let parent = if pos == 0 { "/" } else { &leaf[..pos] };
                 self.cache_dir_path(event.parent_dev as u64, event.parent_ino, parent);
             }
+            // 应用层补全增强：把全路径事件经过的所有祖先目录都缓存起来，
+            // 后续同目录/祖先目录的 delete/rename 只有叶子名时也能拼出全路径。
+            self.cache_path_ancestors(leaf);
             return leaf.to_string();
         }
         if event.parent_ino != 0 {
@@ -2732,24 +2769,17 @@ impl EbpfBackend {
         }
         let cwd = format!("/proc/{}/cwd", pid);
         if let Ok(p) = std::fs::read_link(&cwd) {
-            if let Ok(md) = std::fs::metadata(&p) {
-                if md.st_dev() == dev && md.st_ino() == inode {
-                    let p = p.to_string_lossy().into_owned();
-                    self.cache_dir_path(dev, inode, &p);
-                    return Some(p);
-                }
+            if let Some(hit) = self.path_ancestor_with_inode(&p.to_string_lossy(), dev, inode) {
+                return Some(hit);
             }
         }
+        // cwd 不匹配时，再试进程打开的目录 fd；同样支持从 fd 目标向上找父目录。
         let fd_dir = format!("/proc/{}/fd", pid);
         let rd = std::fs::read_dir(fd_dir).ok()?;
         for entry in rd.flatten() {
             if let Ok(p) = std::fs::read_link(entry.path()) {
-                if let Ok(md) = std::fs::metadata(&p) {
-                    if md.is_dir() && md.st_dev() == dev && md.st_ino() == inode {
-                        let p = p.to_string_lossy().into_owned();
-                        self.cache_dir_path(dev, inode, &p);
-                        return Some(p);
-                    }
+                if let Some(hit) = self.path_ancestor_with_inode(&p.to_string_lossy(), dev, inode) {
+                    return Some(hit);
                 }
             }
         }
