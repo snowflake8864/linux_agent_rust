@@ -128,7 +128,8 @@ pub trait SecurityBackend: Send + Sync {
     // ── 运行时开关同步 ──
     /// eBPF模式：将file/proc的switch和protect写入BPF maps；driver模式：空操作
     fn sync_switches(&self, _file_switch: bool, _proc_switch: bool,
-                     _file_protect: bool, _proc_protect: bool) -> Result<(), String> {
+                     _file_protect: bool, _proc_protect: bool,
+                     _extortion_switch: bool, _extortion_protect: bool) -> Result<(), String> {
         Ok(())
     }
 

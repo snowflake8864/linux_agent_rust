@@ -33,7 +33,7 @@
 //! | 2    | tamper           | DENY        |
 //! | 3    | self-protection  | DENY        |
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::types::{DirKey, DirPolicy};
 use super::OP_CREATE;
@@ -90,6 +90,8 @@ pub struct ParsedRule {
 #[derive(Debug, Clone)]
 pub struct ResolvedDirPolicy {
     pub key: DirKey,
+    /// 策略配置的目录路径（用于 is_extend/recursive 时在用户态预展开子目录）
+    pub path: String,
     pub policy: DirPolicy,
 }
 
@@ -245,6 +247,7 @@ pub fn match_patterns_to_rules(
                 dk,
                 ResolvedDirPolicy {
                     key: dir_key,
+                    path: key.to_string(),
                     policy: DirPolicy {
                         ops_mask,
                         action,
@@ -326,6 +329,149 @@ fn collect_suffixes_for_dir(
     }
 
     (filter_type, suffix_count, suffixes)
+}
+
+// ── 勒索防护（lesuo / exiport）解析 ──
+
+/// 一条全局文件后缀勒索规则。
+#[derive(Debug, Clone, Default)]
+pub struct ParsedExtortRule {
+    /// 去掉前导 '.' 的后缀，例如 "docx"
+    pub suffix: String,
+    /// TPNC 引用的信任进程规则号（type=1 rule 的 tpnc）
+    pub rule_id: Option<u32>,
+}
+
+/// 目录型勒索规则（驱动 action=0 include dir）：该目录及子目录下的操作都要告警。
+#[derive(Debug, Clone, Default)]
+pub struct ParsedExtortDirRule {
+    pub path: String,
+    pub rule_id: Option<u32>,
+}
+
+/// 解析目录型勒索规则（rule type=1 + action=0，pattern key 为目录路径）。
+pub fn parse_extort_dir_rules(
+    patterns: &[ParsedPattern],
+    rules: &[ParsedRule],
+) -> Vec<ParsedExtortDirRule> {
+    let pat_by_name: HashMap<&str, &ParsedPattern> =
+        patterns.iter().map(|p| (p.name.as_str(), p)).collect();
+    let mut out: Vec<ParsedExtortDirRule> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for rule in rules {
+        if rule.rule_type != 1 || rule.action != 0 {
+            continue;
+        }
+        let Some(primary) = rule.pattern_refs.first() else {
+            continue;
+        };
+        let Some(pat) = pat_by_name.get(primary.as_str()) else {
+            continue;
+        };
+        let key = pat.key.trim();
+        if key.is_empty() || key.starts_with('.') || !key.starts_with('/') {
+            continue;
+        }
+        if !seen.insert(key.to_string()) {
+            continue;
+        }
+        out.push(ParsedExtortDirRule {
+            path: key.to_string(),
+            rule_id: rule.tpnc.as_deref().and_then(|v| v.parse().ok()),
+        });
+    }
+    out
+}
+
+/// 勒索信任进程条目（来自 true_process_rt：`hash,rule_id,99`）。
+#[derive(Debug, Clone, Default)]
+pub struct ParsedTrueProcess {
+    pub hash: String,
+    pub rule_id: u32,
+    pub rule_type: u32,
+}
+
+/// 从 DPI pattern/rule 文本中解析勒索后缀规则。
+///
+/// 驱动语义：rule type=1(lesuo) + action=3(include file) + pattern key 以 '.'
+/// 开头，例如 `name=exiportInfo_0,key=.docx,offset=-5`。这些规则是全局后缀，
+/// 不能落到按目录 inode 索引的 dir_policies 中，单独解析给 extort_rules map。
+pub fn parse_extort_rules(
+    patterns: &[ParsedPattern],
+    rules: &[ParsedRule],
+) -> Vec<ParsedExtortRule> {
+    let pat_by_name: HashMap<&str, &ParsedPattern> =
+        patterns.iter().map(|p| (p.name.as_str(), p)).collect();
+
+    let mut out: Vec<ParsedExtortRule> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for rule in rules {
+        if rule.rule_type != 1 || rule.action != 3 {
+            continue;
+        }
+        let Some(primary) = rule.pattern_refs.first() else {
+            continue;
+        };
+        let Some(pat) = pat_by_name.get(primary.as_str()) else {
+            continue;
+        };
+        let key = pat.key.trim();
+        if !key.starts_with('.') || key.len() < 2 {
+            continue;
+        }
+        let mut suffix = &key[1..];
+        // 容错：策略里 file_suffix 本身带 '.' 时避免出现 "..docx"
+        while let Some(stripped) = suffix.strip_prefix('.') {
+            suffix = stripped;
+        }
+        if suffix.is_empty() || suffix.len() > super::types::MAX_EXTORT_SUFFIX {
+            continue;
+        }
+        if !seen.insert(suffix.to_string()) {
+            continue;
+        }
+        out.push(ParsedExtortRule {
+            suffix: suffix.to_string(),
+            rule_id: rule.tpnc.as_deref().and_then(|v| v.parse().ok()),
+        });
+        if out.len() >= super::types::MAX_EXTORT_RULES as usize {
+            break;
+        }
+    }
+    out
+}
+
+/// 解析 true_process_rt 文本：每行 `hash,rule_id,rule_type`。
+pub fn parse_true_processes(text: &str) -> Vec<ParsedTrueProcess> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut it = line.split(',');
+        let (Some(hash), Some(rule_id), Some(rule_type)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let hash = hash.trim();
+        if hash.is_empty() {
+            continue;
+        }
+        let Ok(rule_id) = rule_id.trim().parse::<u32>() else {
+            continue;
+        };
+        let Ok(rule_type) = rule_type.trim().parse::<u32>() else {
+            continue;
+        };
+        out.push(ParsedTrueProcess {
+            hash: hash.to_string(),
+            rule_id,
+            rule_type,
+        });
+    }
+    out
 }
 
 /// Map `protect_rw` bitmask from rule to eBPF `ops_mask` bitmask.
@@ -516,6 +662,33 @@ mod tests {
         let pat = ParsedPattern::default();
         let mask = compute_ops_mask(&rule, &pat);
         assert_eq!(mask, OP_CREATE | OP_WRITE | OP_DELETE | OP_RENAME);
+    }
+
+    #[test]
+    fn test_parse_extort_suffix_rules() {
+        let pats = parse_patterns(
+            "name=exiportInfo_0,key=.docx,offset=-5\nname=exiportInfo_1,key=.pdf,offset=-4\n",
+        );
+        let rules = parse_rules(
+            "target=exiportInfo_0,pattern=exiportInfo_0,action=3,TPNC=1,type=1\n             target=exiportInfo_1,pattern=exiportInfo_1,action=3,type=1\n",
+        );
+        let out = parse_extort_rules(&pats, &rules);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].suffix, "docx");
+        assert_eq!(out[0].rule_id, Some(1));
+        assert_eq!(out[1].suffix, "pdf");
+        assert_eq!(out[1].rule_id, None);
+    }
+
+    #[test]
+    fn test_parse_true_processes() {
+        let out = parse_true_processes(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,1,99\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,2,88\n",
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].rule_id, 1);
+        assert_eq!(out[0].rule_type, 99);
+        assert_eq!(out[1].rule_type, 88);
     }
 
     #[test]

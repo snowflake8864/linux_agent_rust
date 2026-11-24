@@ -305,7 +305,7 @@ pub struct VirPortBpfRule {
 
 unsafe impl aya::Pod for VirPortBpfRule {}
 
-// --- 文件事件 ring buffer (匹配 file_agent.bpf.c unified_event, 92字节) ---
+// --- 文件事件 ring buffer (匹配 file_agent.bpf.c unified_event, 304字节) ---
 /// File event from eBPF file_agent ringbuf.
 /// Layout must match the C struct in file_agent.bpf.c exactly.
 #[repr(C)]
@@ -317,14 +317,20 @@ pub struct FileEvent {
     pub _pad: u8,       // alignment to 32bit
     pub pid: u32,
     pub uid: u32,
+    pub parent_dev: u32, // 父目录 dev（用户态编码）
+    pub _pad2: u32,
+    pub parent_ino: u64, // 父目录 inode
+    pub exe_dev: u32,    // 当前进程可执行文件 dev
+    pub _pad3: u32,
+    pub exe_ino: u64,    // 当前进程可执行文件 inode
     pub comm: [u8; 16],
-    pub path: [u8; 64],
+    pub path: [u8; 256],
 }
 
 unsafe impl aya::Pod for FileEvent {}
 
-/// Size of FileEvent in eBPF = 92 bytes (1+1+1+1 + 4+4 + 16 + 64)
-pub const FILE_EVENT_SIZE: usize = 92;
+/// Size of FileEvent in eBPF = 320 bytes
+pub const FILE_EVENT_SIZE: usize = 320;
 
 const _: () = assert!(std::mem::size_of::<FileEvent>() == FILE_EVENT_SIZE);
 
@@ -339,6 +345,7 @@ pub const OP_RENAME: u8 = 32;
 // 文件事件 event_type（匹配 file_agent.bpf.c）
 pub const EVENT_FILE: u8 = 1;
 pub const EVENT_SELF_PROTECT: u8 = 4;
+pub const EVENT_EXTORT: u8 = 5;
 
 impl Default for PktModValue {
     fn default() -> Self {
@@ -376,3 +383,22 @@ mod prefix_hash_tests {
         assert_eq!(prefix_hash16(&bytes), 615731795747517251);
     }
 }
+
+// --- 勒索防护（exiport/lesuo，与 file_agent.bpf.c 保持一致） ---
+pub const MAX_EXTORT_RULES: u32 = 32;
+pub const MAX_EXTORT_SUFFIX: usize = 16;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ExtortSuffixKey(pub [u8; MAX_EXTORT_SUFFIX]);
+
+unsafe impl aya::Pod for ExtortSuffixKey {}
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct ExtortProcKey {
+    pub dev: u32,
+    pub inode: u64,
+}
+
+unsafe impl aya::Pod for ExtortProcKey {}

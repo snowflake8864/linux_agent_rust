@@ -248,11 +248,15 @@ async fn main() -> std::io::Result<()> {
         let admission_switch = cfg.admission_switch;
         // .o 加载由 [EBPF] 段独立控制，服务器 SWITCH/PROTECT 只控制运行时行为
         let proc_enabled = cfg.ebpf_proc_agent;
-        let file_enabled = cfg.ebpf_file_agent;
+        // 勒索防护复用 file_agent 的 LSM 钩子；即使 EBPF_FILE_AGENT=0，
+        // 只要 EXTORTION_SWITCH=1 也必须加载 file_agent，否则勒索规则无法生效。
+        let file_enabled = cfg.ebpf_file_agent || cfg.extortion_switch || cfg.extortion_protect;
         let net_enabled = cfg.ebpf_net_agent;
+        let extortion_switch = cfg.extortion_switch;
+        let extortion_protect = cfg.extortion_protect;
         log_info!("[eBPF] 模块加载: proc={}, file={}, net={}", proc_enabled, file_enabled, net_enabled);
-        log_info!("[eBPF] 运行时开关: proc_switch={}, file_switch={} | 模式: proc_protect={}, file_protect={}",
-            cfg.proc_switch, cfg.file_switch, cfg.proc_protect, cfg.file_protect);
+        log_info!("[eBPF] 运行时开关: proc_switch={}, file_switch={}, extortion_switch={} | 模式: proc_protect={}, file_protect={}, extortion_protect={}",
+            cfg.proc_switch, cfg.file_switch, extortion_switch, cfg.proc_protect, cfg.file_protect, extortion_protect);
 
         log_info!("后端模式: {}", backend_mode);
 
@@ -280,6 +284,7 @@ async fn main() -> std::io::Result<()> {
                     "/opt/osec/bpf",
                     file_enabled, cfg.file_switch, cfg.file_protect,
                     proc_enabled, cfg.proc_switch, cfg.proc_protect,
+                    extortion_switch, extortion_protect,
                     net_enabled,
                     &cfg.ifcfg, "xdp",
                     cfg.ebpf_proc_rules_max_entries,
@@ -400,6 +405,7 @@ async fn main() -> std::io::Result<()> {
                                 "/opt/osec/bpf",
                                 file_enabled, cfg.file_switch, cfg.file_protect,
                                 proc_enabled, cfg.proc_switch, cfg.proc_protect,
+                                extortion_switch, extortion_protect,
                                 net_enabled,
                                 &cfg.ifcfg, "xdp",
                                 cfg.ebpf_proc_rules_max_entries,

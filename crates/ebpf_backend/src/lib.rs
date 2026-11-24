@@ -107,6 +107,17 @@ pub struct EbpfBackend {
     dpi_tp_buffer: Arc<Mutex<String>>,
     /// Active dir_policies keys for clear operations
     active_dir_keys: Arc<Mutex<Vec<DirKey>>>,
+    /// 勒索后缀 extort_suffixes map 中已写入的 keys（clear 用）
+    active_extort_suffix_keys: Arc<Mutex<Vec<ExtortSuffixKey>>>,
+    /// 目录型勒索 extort_dirs map 中已写入的 keys（clear 用）
+    active_extort_dir_keys: Arc<Mutex<Vec<DirKey>>>,
+    /// 勒索信任进程 extort_trusted map 中已写入的 keys（clear 用）
+    active_extort_trust: Arc<Mutex<Vec<ExtortProcKey>>>,
+    /// 勒索策略中 hash → 允许的规则索引位图（后续发现该可执行文件时补写 extort_trusted）
+    extort_trust_hashes: Arc<Mutex<std::collections::HashMap<String, u32>>>,
+    /// 目录 (dev,inode) → 全路径缓存：用于 delete/rename 事件在用户态补全全路径，
+    /// 由策略目录预展开、file_open 全路径事件、/proc/<pid>/cwd 逐步填充。
+    dir_path_cache: Arc<RwLock<std::collections::HashMap<(u64, u64), String>>>,
     /// 进程信任白名单 patterns buffer — 累积到 build 时解析为 (dev,inode)
     proc_pat_buffer: Arc<Mutex<String>>,
     /// 已下发的进程信任白名单 proc_rules keys（用于 clear 时按 (dev,inode) 移除）
@@ -374,6 +385,8 @@ impl EbpfBackend {
         proc_enabled: bool,
         proc_switch: bool,
         proc_protect: bool,
+        extortion_switch: bool,
+        extortion_protect: bool,
         net_enabled: bool,
         interface: &str,
         engine: &str,
@@ -385,8 +398,8 @@ impl EbpfBackend {
         let mut net_loaded = false;
 
         info!("[EbpfBackend] ===== 开始加载 eBPF 模块 =====");
-        info!("[EbpfBackend] .o加载: file={}, proc={}, net={} | switch: file={}, proc={} | protect: file={}, proc={}",
-            file_enabled, proc_enabled, net_enabled, file_switch, proc_switch, file_protect, proc_protect);
+        info!("[EbpfBackend] .o加载: file={}, proc={}, net={} | switch: file={}, proc={}, extort={} | protect: file={}, proc={}, extort={}",
+            file_enabled, proc_enabled, net_enabled, file_switch, proc_switch, extortion_switch, file_protect, proc_protect, extortion_protect);
 
         if file_enabled {
             let path = format!("{}/file_agent.bpf.o", bpf_dir);
@@ -446,7 +459,7 @@ impl EbpfBackend {
             container_watch::ContainerWatcher::disabled()
         };
 
-        Ok(Self {
+        let backend = Self {
             loader: Arc::new(Mutex::new(loader)),
             file_loaded,
             proc_loaded,
@@ -478,6 +491,11 @@ impl EbpfBackend {
             dpi_rule_buffer: Arc::new(Mutex::new(String::new())),
             dpi_tp_buffer: Arc::new(Mutex::new(String::new())),
             active_dir_keys: Arc::new(Mutex::new(Vec::new())),
+            active_extort_suffix_keys: Arc::new(Mutex::new(Vec::new())),
+            active_extort_dir_keys: Arc::new(Mutex::new(Vec::new())),
+            active_extort_trust: Arc::new(Mutex::new(Vec::new())),
+            extort_trust_hashes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            dir_path_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             proc_pat_buffer: Arc::new(Mutex::new(String::new())),
             active_proc_whitelist: Arc::new(Mutex::new(Vec::new())),
             vir_port_state: Arc::new(Mutex::new(VirPortState::default())),
@@ -487,7 +505,10 @@ impl EbpfBackend {
             netblock_enabled: AtomicBool::new(false),
             last_overlay_rescan: std::sync::atomic::AtomicU64::new(0),
             container_watcher,
-        })
+        };
+        // 勒索防护开关/模式独立于 file_switch/file_protect。
+        backend.set_extort_switches(extortion_switch, extortion_protect);
+        Ok(backend)
     }
 
     /// 将缓存的 VIR_OPEN_PORT 规则集刷入 net_agent 的 vir_port_rules 区间表。
@@ -947,6 +968,34 @@ impl EbpfBackend {
         self.refresh_all_proc_rules(proc_protect);
     }
 
+    /// 写入勒索防护开关/模式：extort_switches[0]=enable, [1]=protect。
+    /// 对应驱动 defense_switch 的 bit7(EXTORTION_SWITCH) / bit4(EXTORTION_PROTECT)。
+    fn set_extort_switches(&self, enabled: bool, protect: bool) {
+        if !self.file_loaded {
+            return;
+        }
+        let mut loader = match self.loader.lock() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let bpf = match loader.file_bpf_mut() {
+            Some(b) => b,
+            None => return,
+        };
+        let map = match bpf.map_mut("extort_switches") {
+            Some(m) => m,
+            None => return,
+        };
+        if let Ok(mut arr) = AyaArray::<_, u8>::try_from(map) {
+            let _ = arr.set(0u32, &(enabled as u8), 0);
+            let _ = arr.set(1u32, &(protect as u8), 0);
+            info!(
+                "[EbpfBackend] 勒索防护开关: enabled={} protect={}",
+                enabled, protect
+            );
+        }
+    }
+
     /// 用新 mode 重写所有已下发的 proc_rules BPF 条目
     fn refresh_all_proc_rules(&self, protect: bool) {
         let mode: u8 = if protect { 2 } else { 1 };
@@ -1210,6 +1259,7 @@ impl EbpfBackend {
                 let items = Self::drain_ringbuf(&rb);
                 for data in &items {
                     if let Some((event, path, comm)) = Self::parse_file_event(data) {
+                        let path = backend.resolve_event_full_path(event, &path);
                         if event.event_type == EVENT_SELF_PROTECT {
                             backend.report_self_protect_event(
                                 &path,
@@ -1217,6 +1267,28 @@ impl EbpfBackend {
                                 event.pid,
                                 event.uid,
                                 event.op_type,
+                            );
+                            continue;
+                        }
+                        let proc_md5 = backend.resolve_event_proc_md5(event);
+                        if event.event_type == EVENT_EXTORT {
+                            // 对齐驱动 LESOU：protect→3201/n_level=3，monitor→3202/n_level=2
+                            let blocked = event.blocked == 1;
+                            let n_type = if blocked { 3201 } else { 3202 };
+                            let action = if blocked { "拦截" } else { "监控" };
+                            log::info!(
+                                "[EbpfBackend] 勒索防护命中: path={} comm={} pid={} blocked={}",
+                                path, comm, event.pid, blocked
+                            );
+                            backend.report_file_event(
+                                &path,
+                                &comm,
+                                n_type,
+                                action,
+                                event.pid,
+                                event.op_type,
+                                "EXTORT",
+                                proc_md5.as_deref(),
                             );
                             continue;
                         }
@@ -1242,6 +1314,7 @@ impl EbpfBackend {
                                 event.pid,
                                 event.op_type,
                                 op_name,
+                                proc_md5.as_deref(),
                             );
                         } else {
                             log::info!("[EbpfBackend] 👀 文件监控: path={} comm={} pid={} op_type=0x{:02X}→{} n_type={}",
@@ -1254,6 +1327,7 @@ impl EbpfBackend {
                                 event.pid,
                                 event.op_type,
                                 op_name,
+                                proc_md5.as_deref(),
                             );
                         }
                     }
@@ -2175,6 +2249,22 @@ impl EbpfBackend {
         if inserted {
             local_store::md5_inode_cache::persist_if_enabled(hash, path);
         }
+
+        // 勒索策略下发时尚未发现该信任进程：现在拿到 (dev,inode) 后即时补写。
+        let extort_mask = self
+            .extort_trust_hashes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(hash).copied());
+        if let Some(mask) = extort_mask {
+            self.write_extort_trust_bpf(
+                ExtortProcKey {
+                    dev: dev as u32,
+                    inode,
+                },
+                mask,
+            );
+        }
     }
 
     /// 规则下发时若 md5_map 尚无该 hash，尝试用持久化的 hash→path 反查文件：
@@ -2224,8 +2314,15 @@ impl EbpfBackend {
         pid: u32,
         op_type: u8,
         op_name: &str,
+        proc_md5: Option<&str>,
     ) {
-        let md5_hash = self.get_md5_cached(path);
+        // 文件/勒索告警的 identifier 使用“操作进程”的 MD5（对齐驱动），
+        // 不是被操作文件本身的 MD5。
+        let md5_hash = proc_md5.map(|s| s.to_string());
+        log::info!(
+            "[EbpfBackend] 文件告警: n_type={} path={} comm={} proc_md5={:?}",
+            n_type, path, comm, md5_hash
+        );
         let log = reporter::AuditLogInfo {
             file_path: Some(path.to_string()),
             md5: md5_hash,
@@ -2588,6 +2685,453 @@ impl EbpfBackend {
         }
     }
 
+    fn cache_dir_path(&self, dev: u64, inode: u64, path: &str) {
+        if inode == 0 || path.is_empty() {
+            return;
+        }
+        if let Ok(mut m) = self.dir_path_cache.write() {
+            m.insert((dev, inode), path.to_string());
+        }
+    }
+
+    /// 事件路径补全：file_open 已带全路径；其他钩子只带叶子名，
+    /// 用父目录 (dev,inode) 查缓存，缺失时尝试 /proc/<pid>/cwd 和 fd。
+    fn resolve_event_full_path(&self, event: &FileEvent, leaf: &str) -> String {
+        if leaf.starts_with('/') {
+            if let Some(pos) = leaf.rfind('/') {
+                let parent = if pos == 0 { "/" } else { &leaf[..pos] };
+                self.cache_dir_path(event.parent_dev as u64, event.parent_ino, parent);
+            }
+            return leaf.to_string();
+        }
+        if event.parent_ino != 0 {
+            let key = (event.parent_dev as u64, event.parent_ino);
+            if let Some(p) = self.dir_path_cache.read().ok().and_then(|m| m.get(&key).cloned()) {
+                return Self::join_path(&p, leaf);
+            }
+            if let Some(p) = self.resolve_parent_path_via_proc(event.pid, key.0, key.1) {
+                return Self::join_path(&p, leaf);
+            }
+        }
+        leaf.to_string()
+    }
+
+    fn join_path(parent: &str, leaf: &str) -> String {
+        if parent.is_empty() || parent == "/" {
+            format!("/{}", leaf.trim_start_matches('/'))
+        } else {
+            format!("{}/{}", parent.trim_end_matches('/'), leaf.trim_start_matches('/'))
+        }
+    }
+
+    /// 用事件 pid 的 cwd/fd 反查父目录路径（仅缓存缺失时执行，且只在告警路径上）。
+    fn resolve_parent_path_via_proc(&self, pid: u32, dev: u64, inode: u64) -> Option<String> {
+        use std::os::linux::fs::MetadataExt;
+        if pid == 0 {
+            return None;
+        }
+        let cwd = format!("/proc/{}/cwd", pid);
+        if let Ok(p) = std::fs::read_link(&cwd) {
+            if let Ok(md) = std::fs::metadata(&p) {
+                if md.st_dev() == dev && md.st_ino() == inode {
+                    let p = p.to_string_lossy().into_owned();
+                    self.cache_dir_path(dev, inode, &p);
+                    return Some(p);
+                }
+            }
+        }
+        let fd_dir = format!("/proc/{}/fd", pid);
+        let rd = std::fs::read_dir(fd_dir).ok()?;
+        for entry in rd.flatten() {
+            if let Ok(p) = std::fs::read_link(entry.path()) {
+                if let Ok(md) = std::fs::metadata(&p) {
+                    if md.is_dir() && md.st_dev() == dev && md.st_ino() == inode {
+                        let p = p.to_string_lossy().into_owned();
+                        self.cache_dir_path(dev, inode, &p);
+                        return Some(p);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 文件事件上报使用“操作进程”的 MD5（不是被操作文件的 MD5）。
+    fn resolve_event_proc_md5(&self, event: &FileEvent) -> Option<String> {
+        if event.exe_ino != 0 {
+            if let Ok(map) = self.inode_md5_map.read() {
+                if let Some(rec) = map.get(&(event.exe_dev as u64, event.exe_ino)) {
+                    return Some(rec.md5.clone());
+                }
+            }
+        }
+        if event.pid > 0 {
+            if let Ok(p) = std::fs::read_link(format!("/proc/{}/exe", event.pid)) {
+                let mut path = p.to_string_lossy().into_owned();
+                if let Some(stripped) = path.strip_suffix(" (deleted)") {
+                    path = stripped.to_string();
+                }
+                if let Some(h) = self.get_md5_cached(&path) {
+                    return Some(h);
+                }
+            }
+        }
+        None
+    }
+
+    /// is_extend=1（recursive）策略：用户态递归遍历已存在的子目录，
+    /// 把同一个 dir_policy 写到每个子目录 inode 上。
+    /// 这样 BPF 只需要查直接父目录，避免 verifier 里做祖先链循环。
+    fn expand_recursive_dir_policy(&self, root: &str, policy: DirPolicy, budget: &mut usize) {
+        use std::os::linux::fs::MetadataExt;
+
+        let mut stack: Vec<String> = vec![root.to_string()];
+        while let Some(dir) = stack.pop() {
+            if *budget == 0 {
+                warn!(
+                    "[EbpfBackend] 递归策略展开达到上限，剩余子目录未展开: root={}",
+                    root
+                );
+                return;
+            }
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            for entry in rd.flatten() {
+                if *budget == 0 {
+                    break;
+                }
+                let path = entry.path();
+                // 不跟随符号链接，避免目录环
+                let md = match std::fs::symlink_metadata(&path) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if !md.file_type().is_dir() {
+                    continue;
+                }
+                let key = DirKey {
+                    dev: md.st_dev(),
+                    inode: md.st_ino(),
+                };
+                self.write_dir_policy_bpf(key, policy);
+                *budget -= 1;
+                if let Some(p) = path.to_str() {
+                    self.cache_dir_path(key.dev, key.inode, p);
+                    stack.push(p.to_string());
+                }
+            }
+        }
+    }
+
+    // ── 勒索防护（extort / lesuo）→ extort_rules + extort_trusted ──
+
+    /// 清空 extort 后缀表与信任进程表（保留 enable/protect 开关）。
+    fn clear_extort_policy_bpf(&self) {
+        self.extort_trust_hashes.lock().unwrap().clear();
+
+        let suffix_keys = std::mem::take(&mut *self.active_extort_suffix_keys.lock().unwrap());
+        let dir_keys = std::mem::take(&mut *self.active_extort_dir_keys.lock().unwrap());
+        let trust_keys = std::mem::take(&mut *self.active_extort_trust.lock().unwrap());
+        let mut loader = match self.loader.lock() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let bpf = match loader.file_bpf_mut() {
+            Some(b) => b,
+            None => return,
+        };
+        if !suffix_keys.is_empty() {
+            if let Some(map) = bpf.map_mut("extort_suffixes") {
+                if let Ok(mut suffixes) =
+                    AyaHashMap::<_, ExtortSuffixKey, u32>::try_from(map)
+                {
+                    for key in &suffix_keys {
+                        let _ = suffixes.remove(key);
+                    }
+                }
+            }
+        }
+        if !dir_keys.is_empty() {
+            if let Some(map) = bpf.map_mut("extort_dirs") {
+                if let Ok(mut dirs) = AyaHashMap::<_, DirKey, u32>::try_from(map) {
+                    for key in &dir_keys {
+                        let _ = dirs.remove(key);
+                    }
+                }
+            }
+        }
+        if !trust_keys.is_empty() {
+            if let Some(map) = bpf.map_mut("extort_trusted") {
+                if let Ok(mut trusted) =
+                    AyaHashMap::<_, ExtortProcKey, u32>::try_from(map)
+                {
+                    for key in &trust_keys {
+                        let _ = trusted.remove(key);
+                    }
+                }
+            }
+        }
+    }
+
+    fn write_extort_suffix_bpf(&self, index: u32, suffix: &str) {
+        let bytes = suffix.as_bytes();
+        if bytes.is_empty() || bytes.len() > MAX_EXTORT_SUFFIX {
+            warn!("[EbpfBackend] 勒索后缀非法，跳过: {:?}", suffix);
+            return;
+        }
+        let mut key = ExtortSuffixKey([0u8; MAX_EXTORT_SUFFIX]);
+        key.0[..bytes.len()].copy_from_slice(bytes);
+
+        let mut loader = match self.loader.lock() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let bpf = match loader.file_bpf_mut() {
+            Some(b) => b,
+            None => return,
+        };
+        let map = match bpf.map_mut("extort_suffixes") {
+            Some(m) => m,
+            None => return,
+        };
+        let mut suffixes = match AyaHashMap::<_, ExtortSuffixKey, u32>::try_from(map) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("[EbpfBackend] extort_suffixes map 不可用: {}", e);
+                return;
+            }
+        };
+        if suffixes.insert(key, index, 0).is_ok() {
+            self.active_extort_suffix_keys.lock().unwrap().push(key);
+        }
+    }
+
+    fn write_extort_dir_bpf(&self, key: DirKey, index: u32) {
+        let mut loader = match self.loader.lock() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let bpf = match loader.file_bpf_mut() {
+            Some(b) => b,
+            None => return,
+        };
+        let map = match bpf.map_mut("extort_dirs") {
+            Some(m) => m,
+            None => return,
+        };
+        let mut dirs = match AyaHashMap::<_, DirKey, u32>::try_from(map) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("[EbpfBackend] extort_dirs map 不可用: {}", e);
+                return;
+            }
+        };
+        if dirs.insert(key, index, 0).is_ok() {
+            self.active_extort_dir_keys.lock().unwrap().push(key);
+        }
+    }
+
+    /// 目录型勒索：把规则目录及其已存在子目录写入 extort_dirs（O(1) 父目录查找）。
+    fn expand_extort_dir(&self, root: &str, index: u32, budget: &mut usize) {
+        use std::os::linux::fs::MetadataExt;
+        let md = match std::fs::metadata(root) {
+            Ok(m) if m.is_dir() => m,
+            _ => return,
+        };
+        let root_key = DirKey {
+            dev: md.st_dev(),
+            inode: md.st_ino(),
+        };
+        self.write_extort_dir_bpf(root_key, index);
+        self.cache_dir_path(root_key.dev, root_key.inode, root);
+        *budget = budget.saturating_sub(1);
+
+        let mut stack: Vec<String> = vec![root.to_string()];
+        while let Some(dir) = stack.pop() {
+            if *budget == 0 {
+                warn!(
+                    "[EbpfBackend] 目录型勒索规则展开达到上限: root={}",
+                    root
+                );
+                return;
+            }
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            for entry in rd.flatten() {
+                if *budget == 0 {
+                    break;
+                }
+                let path = entry.path();
+                let md = match std::fs::symlink_metadata(&path) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if !md.file_type().is_dir() {
+                    continue;
+                }
+                let key = DirKey {
+                    dev: md.st_dev(),
+                    inode: md.st_ino(),
+                };
+                self.write_extort_dir_bpf(key, index);
+                *budget -= 1;
+                if let Some(p) = path.to_str() {
+                    self.cache_dir_path(key.dev, key.inode, p);
+                    stack.push(p.to_string());
+                }
+            }
+        }
+    }
+
+    fn write_extort_trust_bpf(&self, key: ExtortProcKey, mask: u32) {
+        let mut loader = match self.loader.lock() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let bpf = match loader.file_bpf_mut() {
+            Some(b) => b,
+            None => return,
+        };
+        let map = match bpf.map_mut("extort_trusted") {
+            Some(m) => m,
+            None => return,
+        };
+        let mut trusted = match AyaHashMap::<_, ExtortProcKey, u32>::try_from(map) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("[EbpfBackend] extort_trusted map 不可用: {}", e);
+                return;
+            }
+        };
+        if trusted.insert(key, mask, 0).is_ok() {
+            self.active_extort_trust.lock().unwrap().push(key);
+            let dev = key.dev;
+            let inode = key.inode;
+            info!(
+                "[EbpfBackend] 勒索信任进程: dev={} inode={} mask=0x{:x}",
+                dev, inode, mask
+            );
+        }
+    }
+
+    /// 应用勒索策略：写全局后缀表 + 目录表，并把 TPNC 的 MD5 翻译成 (dev,inode) 写信任表。
+    fn commit_extort_bpf(
+        &self,
+        rules: &[dpi_parser::ParsedExtortRule],
+        dir_rules: &[dpi_parser::ParsedExtortDirRule],
+        true_processes: &[dpi_parser::ParsedTrueProcess],
+    ) {
+        self.clear_extort_policy_bpf();
+
+        if rules.is_empty() && dir_rules.is_empty() {
+            info!("[EbpfBackend] 勒索防护: 无后缀/目录规则");
+            return;
+        }
+
+        let mut rule_id_to_idx: std::collections::HashMap<u32, u32> =
+            std::collections::HashMap::new();
+        for (i, rule) in rules.iter().enumerate() {
+            self.write_extort_suffix_bpf(i as u32, &rule.suffix);
+            if let Some(rid) = rule.rule_id {
+                rule_id_to_idx.insert(rid, i as u32);
+            }
+        }
+
+        // 目录规则的位号接在后缀规则之后，整体不超过 32 位信任位图。
+        let mut dir_budget = MAX_EXTORT_RULES as usize - rules.len().min(MAX_EXTORT_RULES as usize);
+        let mut expand_budget = 900usize;
+        let mut dir_written = 0usize;
+        for (i, rule) in dir_rules.iter().enumerate() {
+            if dir_budget == 0 {
+                break;
+            }
+            let idx = rules.len() as u32 + i as u32;
+            if idx >= MAX_EXTORT_RULES {
+                break;
+            }
+            self.expand_extort_dir(&rule.path, idx, &mut expand_budget);
+            if let Some(rid) = rule.rule_id {
+                rule_id_to_idx.insert(rid, idx);
+            }
+            dir_written += 1;
+            dir_budget = dir_budget.saturating_sub(1);
+        }
+
+        // TPNC：hash → 允许的规则索引位图（仅 rule_type=99 为勒索信任进程）。
+        let mut desired: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        for tp in true_processes {
+            if tp.rule_type != 99 {
+                continue;
+            }
+            if let Some(&idx) = rule_id_to_idx.get(&tp.rule_id) {
+                *desired.entry(tp.hash.clone()).or_insert(0) |= 1u32 << idx;
+            }
+        }
+
+        if desired.is_empty() {
+            info!(
+                "[EbpfBackend] 勒索防护: {} 条后缀规则, {} 条目录规则，无信任进程",
+                rules.len(), dir_written
+            );
+            self.extort_trust_hashes.lock().unwrap().clear();
+            return;
+        }
+
+        // 先尝试用现有 md5_map / 持久化缓存把 hash 翻译成 (dev,inode)。
+        let mut pending: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        for (hash, mask) in &desired {
+            let mut resolved = false;
+            if let Some(entries) = self.md5_entries(hash) {
+                for e in entries {
+                    if !Self::md5_entry_valid(&e) {
+                        continue;
+                    }
+                    self.write_extort_trust_bpf(
+                        ExtortProcKey {
+                            dev: e.dev as u32,
+                            inode: e.inode,
+                        },
+                        *mask,
+                    );
+                    resolved = true;
+                }
+            }
+            if !resolved {
+                if let Some(e) = self.resolve_identity_from_cache(hash) {
+                    self.write_extort_trust_bpf(
+                        ExtortProcKey {
+                            dev: e.dev as u32,
+                            inode: e.inode,
+                        },
+                        *mask,
+                    );
+                    resolved = true;
+                }
+            }
+            if !resolved {
+                pending.insert(hash.clone(), *mask);
+            }
+        }
+
+        let resolved_n = desired.len() - pending.len();
+        info!(
+            "[EbpfBackend] 勒索防护: {} 条后缀规则, {} 条目录规则, {} 个信任进程, 已解析 {} 个, 待发现 {} 个",
+            rules.len(),
+            dir_written,
+            desired.len(),
+            resolved_n,
+            pending.len()
+        );
+        // 未解析的保留下来，进程后续被发现时在 record_process_identity 补写。
+        *self.extort_trust_hashes.lock().unwrap() = pending;
+    }
+
     /// Parse accumulated patterns+rules, match them, resolve directories,
     /// and write DirPolicy entries to the BPF map.
     fn commit_dpi_to_bpf(&self) -> Result<(), String> {
@@ -2611,9 +3155,32 @@ impl EbpfBackend {
             entries.len()
         );
 
+        // dir_policies max_entries=1024，预留空间给递归展开，避免写满。
+        let mut expand_budget = 900usize.saturating_sub(entries.len());
+        let mut expanded = 0usize;
         for entry in &entries {
             self.write_dir_policy_bpf(entry.key, entry.policy);
+            self.cache_dir_path(entry.key.dev, entry.key.inode, &entry.path);
+            if entry.policy.recursive != 0 && !entry.path.is_empty() {
+                let before = expand_budget;
+                self.expand_recursive_dir_policy(&entry.path, entry.policy, &mut expand_budget);
+                expanded += before - expand_budget;
+            }
         }
+        if expanded > 0 {
+            info!(
+                "[EbpfBackend] DPI commit: 递归策略预展开 {} 个子目录",
+                expanded
+            );
+        }
+
+        // 勒索防护：全局后缀规则 + TPNC 信任进程（与 dir_policies 独立）。
+        let extort_rules = dpi_parser::parse_extort_rules(&patterns, &rules);
+        let extort_dir_rules = dpi_parser::parse_extort_dir_rules(&patterns, &rules);
+        let tp_text = self.dpi_tp_buffer.lock().unwrap().clone();
+        let true_processes = dpi_parser::parse_true_processes(&tp_text);
+        self.commit_extort_bpf(&extort_rules, &extort_dir_rules, &true_processes);
+
         Ok(())
     }
 
@@ -4139,6 +4706,7 @@ impl SecurityBackend for EbpfBackend {
             self.dpi_pat_buffer.lock().unwrap().clear();
             self.dpi_rule_buffer.lock().unwrap().clear();
             self.clear_dir_policies_bpf();
+            self.clear_extort_policy_bpf();
         }
         if !data.is_empty() {
             self.dpi_pat_buffer.lock().unwrap().push_str(data);
@@ -4206,8 +4774,11 @@ impl SecurityBackend for EbpfBackend {
         proc_switch: bool,
         file_protect: bool,
         proc_protect: bool,
+        extortion_switch: bool,
+        extortion_protect: bool,
     ) -> Result<(), String> {
         self.sync_runtime_switches(file_switch, proc_switch, file_protect, proc_protect);
+        self.set_extort_switches(extortion_switch, extortion_protect);
         Ok(())
     }
 
