@@ -205,6 +205,7 @@ struct unified_event {
     __u64 exe_ino;      // 当前进程可执行文件 inode（用于上报进程 MD5）
     char comm[16];
     char path[256];
+    char cmdline[256];  // 当前进程 argv（NUL 分隔），事件发生时由 BPF 拷贝
 };
 
 // ===== Helper Functions =====
@@ -250,6 +251,20 @@ static __noinline void send_monitor_event_impl(__u8 type, const char *path, __u8
                 e->exe_dev = (__u32)kernel_dev_to_user(exe_kdev);
                 e->exe_ino = BPF_CORE_READ(exe_inode, i_ino);
             }
+        }
+    }
+
+    __builtin_memset(e->cmdline, 0, sizeof(e->cmdline));
+    if (task) {
+        unsigned long arg_start = BPF_CORE_READ(task, mm, arg_start);
+        unsigned long arg_end = BPF_CORE_READ(task, mm, arg_end);
+        if (arg_start && arg_end > arg_start) {
+            unsigned long avail = arg_end - arg_start;
+            __u32 len = (__u32)sizeof(e->cmdline) - 1;
+            if (avail < (unsigned long)(sizeof(e->cmdline) - 1)) {
+                len = (__u32)avail;
+            }
+            bpf_probe_read_user(e->cmdline, len, (void *)arg_start);
         }
     }
 

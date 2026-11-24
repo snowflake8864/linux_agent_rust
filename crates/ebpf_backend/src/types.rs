@@ -325,12 +325,13 @@ pub struct FileEvent {
     pub exe_ino: u64,    // 当前进程可执行文件 inode
     pub comm: [u8; 16],
     pub path: [u8; 256],
+    pub cmdline: [u8; 256],
 }
 
 unsafe impl aya::Pod for FileEvent {}
 
 /// Size of FileEvent in eBPF = 320 bytes
-pub const FILE_EVENT_SIZE: usize = 320;
+pub const FILE_EVENT_SIZE: usize = 576;
 
 const _: () = assert!(std::mem::size_of::<FileEvent>() == FILE_EVENT_SIZE);
 
