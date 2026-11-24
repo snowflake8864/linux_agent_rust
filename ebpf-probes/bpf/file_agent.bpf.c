@@ -278,16 +278,12 @@ static __noinline void send_monitor_event_impl(__u8 type, const char *path, __u8
     }
 
     __builtin_memset(e->cmdline, 0, sizeof(e->cmdline));
+    // e->cwd 保持清零：内核 6.4+ 的 bpf_d_path 要求 trusted 指针，而
+    // bpf_get_current_task_btf()->fs 在 verifier 中是 untrusted_ptr_fs_struct，
+    // 直接传入会被拒绝（aarch64 + 6.8 内核即此情况）。cwd 由用户态回退到
+    // /proc/<pid>/cwd 解析，见 ebpf_backend::resolve_path_via_cmdline。
     __builtin_memset(e->cwd, 0, sizeof(e->cwd));
     if (task) {
-        struct task_struct *btf_task = bpf_get_current_task_btf();
-        if (btf_task) {
-            struct fs_struct *fs = btf_task->fs;
-            if (fs) {
-                long cwd_len = bpf_d_path(&fs->pwd, e->cwd, sizeof(e->cwd));
-                if (cwd_len <= 0) e->cwd[0] = '\0';
-            }
-        }
         unsigned long arg_start = BPF_CORE_READ(task, mm, arg_start);
         unsigned long arg_end = BPF_CORE_READ(task, mm, arg_end);
         if (arg_start && arg_end > arg_start) {
@@ -609,6 +605,15 @@ static __always_inline int extort_suffix_match(const char *filename, __u32 *matc
     return 1;
 }
 
+// 统一 LSM 返回值：显式分支返回常量，避免 clang 把 `cond ? -EPERM : 0`
+// 优化成 `r6 = -r6`。后者在部分内核/clang 组合下会让 verifier 认为 R0
+// 是 unknown scalar，从而报 "At program exit the register R0 has unknown
+// scalar value should have been in [-4095, 0]"。
+static __noinline int deny_ret(int block) {
+    if (block) return -EPERM;
+    return 0;
+}
+
 // 勒索防护检查：命中受保护后缀且当前进程不受信任时，
 // protect 模式返回 -EPERM，monitor 模式只上报。目录本身不参与后缀匹配。
 static __noinline int extort_check_impl(struct path_buffer *scratch, struct dentry *dentry,
@@ -654,7 +659,7 @@ static __noinline int extort_check_impl(struct path_buffer *scratch, struct dent
     __u8 protect = extort_protect_mode();
     send_monitor_event(scratch, EVENT_EXTORT, fullpath ? fullpath : filename,
                        protect ? 1 : 0, op_type, parent_dev, parent_ino);
-    return protect ? -EPERM : 0;
+    return deny_ret(protect);
 }
 
 static __always_inline int extort_check(struct path_buffer *scratch, struct dentry *dentry,
@@ -769,7 +774,7 @@ int BPF_PROG(enforce_file_open, struct file *file) {
                 int fblock = (fmode == MODE_PROTECT && fp->action == ACTION_DENY);
                 send_monitor_event(scratch, EVENT_FILE, fullpath ? fullpath : filename,
                                    fblock, op_type, parent_dev, parent_ino);
-                return fblock ? -EPERM : 0;
+                return deny_ret(fblock);
             }
         }
     }
@@ -915,7 +920,7 @@ int BPF_PROG(enforce_inode_unlink, struct inode *dir, struct dentry *dentry) {
             __u8 fmode = resolve_mode(fp->mode, FEATURE_FILE);
             int fblock = (fmode == MODE_PROTECT && fp->action == ACTION_DENY);
             send_monitor_event(scratch, EVENT_FILE, filename, fblock, OP_DELETE, parent_dev, parent_ino);
-            return fblock ? -EPERM : 0;
+            return deny_ret(fblock);
         }
     }
 
@@ -996,7 +1001,7 @@ int BPF_PROG(enforce_inode_rename, struct inode *old_dir, struct dentry *old_den
             __builtin_memset(filename, 0, 64);
             bpf_probe_read_kernel_str(filename, 64, BPF_CORE_READ(old_dentry, d_name.name));
             send_monitor_event(scratch, EVENT_FILE, filename, fblock, OP_RENAME, old_pdev, old_pino);
-            return fblock ? -EPERM : 0;
+            return deny_ret(fblock);
         }
     }
     // 具体文件策略：目标文件 inode（覆盖已有文件时）
@@ -1013,7 +1018,7 @@ int BPF_PROG(enforce_inode_rename, struct inode *old_dir, struct dentry *old_den
             __builtin_memset(filename, 0, 64);
             bpf_probe_read_kernel_str(filename, 64, BPF_CORE_READ(new_dentry, d_name.name));
             send_monitor_event(scratch, EVENT_FILE, filename, fblock, OP_RENAME, new_pdev, new_pino);
-            return fblock ? -EPERM : 0;
+            return deny_ret(fblock);
         }
     }
 
