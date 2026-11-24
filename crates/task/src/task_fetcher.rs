@@ -291,11 +291,15 @@ pub fn apply_config_diff(old: &NetInfoConfig, new: &NetInfoConfig) -> Result<(),
     // ── eBPF 运行时开关同步：无条件写入 BPF maps，确保与 ini 一致 ──
     // 即使 old==new，BPF maps 也可能因重启/初始化导致状态不同步
     log_info!(
-        "apply_config_diff: sync eBPF switches file(sw={},prot={}) proc(sw={},prot={})",
-        new.file_switch, new.file_protect, new.proc_switch, new.proc_protect
+        "apply_config_diff: sync eBPF switches file(sw={},prot={}) proc(sw={},prot={}) extort(sw={},prot={})",
+        new.file_switch, new.file_protect, new.proc_switch, new.proc_protect,
+        new.extortion_switch, new.extortion_protect
     );
     common::backend::with_backend(|b| {
-        b.sync_switches(new.file_switch, new.proc_switch, new.file_protect, new.proc_protect)
+        b.sync_switches(
+            new.file_switch, new.proc_switch, new.file_protect, new.proc_protect,
+            new.extortion_switch, new.extortion_protect,
+        )
     })?;
 
     Ok(())
@@ -986,11 +990,15 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
 
     // ── eBPF 运行时开关同步：始终调用，driver 模式 no-op，eBPF 模式写 BPF maps ──
     log_info!(
-        "[task_fetcher] sync_switches file(sw={},prot={}) proc(sw={},prot={})",
-        new.file_switch, new.file_protect, new.proc_switch, new.proc_protect
+        "[task_fetcher] sync_switches file(sw={},prot={}) proc(sw={},prot={}) extort(sw={},prot={})",
+        new.file_switch, new.file_protect, new.proc_switch, new.proc_protect,
+        new.extortion_switch, new.extortion_protect
     );
     common::backend::with_backend(|b| {
-        b.sync_switches(new.file_switch, new.proc_switch, new.file_protect, new.proc_protect)
+        b.sync_switches(
+            new.file_switch, new.proc_switch, new.file_protect, new.proc_protect,
+            new.extortion_switch, new.extortion_protect,
+        )
     })?;
 
     Ok(())

@@ -451,6 +451,7 @@ impl PatternRulesMgr {
     pub fn clear_exiport_dir(&mut self) {
         self.exiport_dir_patterns.clear();
         self.exiport_dir_rules.clear();
+        self.exiport_true_process.clear();
         self.set_pattern_rules();
     } 
 
