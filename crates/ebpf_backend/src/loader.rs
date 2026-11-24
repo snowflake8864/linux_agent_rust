@@ -125,6 +125,36 @@ impl ModularLoader {
             warn!("[EbpfBackend] ⚠ 未找到程序: enforce_inode_rename");
         }
 
+        if let Some(prog) = bpf.program_mut("enforce_extort_inode_rename") {
+            info!("[EbpfBackend] 🔌 加载 LSM: inode_rename (extort)...");
+            let lsm: &mut Lsm = prog.try_into()?;
+            lsm.load("inode_rename", &btf)?;
+            lsm.attach()?;
+            info!("[EbpfBackend] ✅ LSM attached: inode_rename (extort)");
+        } else {
+            warn!("[EbpfBackend] ⚠ 未找到程序: enforce_extort_inode_rename");
+        }
+
+        if let Some(prog) = bpf.program_mut("enforce_inode_rmdir") {
+            info!("[EbpfBackend] 🔌 加载 LSM: inode_rmdir...");
+            let lsm: &mut Lsm = prog.try_into()?;
+            lsm.load("inode_rmdir", &btf)?;
+            lsm.attach()?;
+            info!("[EbpfBackend] ✅ LSM attached: inode_rmdir");
+        } else {
+            warn!("[EbpfBackend] ⚠ 未找到程序: enforce_inode_rmdir");
+        }
+
+        if let Some(prog) = bpf.program_mut("enforce_inode_mkdir") {
+            info!("[EbpfBackend] 🔌 加载 LSM: inode_mkdir...");
+            let lsm: &mut Lsm = prog.try_into()?;
+            lsm.load("inode_mkdir", &btf)?;
+            lsm.attach()?;
+            info!("[EbpfBackend] ✅ LSM attached: inode_mkdir");
+        } else {
+            warn!("[EbpfBackend] ⚠ 未找到程序: enforce_inode_mkdir");
+        }
+
         if let Some(prog) = bpf.program_mut("enforce_vfs_mkdir") {
             info!("[EbpfBackend] 🔌 加载 kprobe: vfs_mkdir...");
             let kprobe: &mut KProbe = prog.try_into()?;

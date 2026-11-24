@@ -196,6 +196,11 @@ pub fn match_patterns_to_rules(
         if rule.pattern_refs.is_empty() {
             continue;
         }
+        // 勒索规则（type=1）由 parse_extort_rules / parse_extort_dir_rules 处理，
+        // 不能落到 dir_policies/file_policies，否则目录型勒索会被误当成防篡改。
+        if rule.rule_type == 1 {
+            continue;
+        }
 
         // The first pattern_ref IS the directory pattern
         let primary_name = rule.pattern_refs.first().unwrap().as_str();
@@ -219,6 +224,13 @@ pub fn match_patterns_to_rules(
         let ops_mask = compute_ops_mask(rule, pattern);
         let action = compute_action(rule);
         let recursive: u8 = if pattern.is_not_extend { 0 } else { 1 };
+        let trust_rule: u8 = rule
+            .tpnc
+            .as_deref()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v >= 1 && *v <= 64)
+            .map(|v| v as u8)
+            .unwrap_or(0);
 
         // Collect suffixes from this rule's chain and related sub-rules
         let (filter_type, suffix_count, suffixes) =
@@ -232,6 +244,9 @@ pub fn match_patterns_to_rules(
             }
             // OR ops (union of all operation restrictions)
             existing.policy.ops_mask |= ops_mask;
+            if existing.policy.trust_rule == 0 && trust_rule != 0 {
+                existing.policy.trust_rule = trust_rule;
+            }
             // Merge suffixes
             if filter_type != 0 {
                 existing.policy.filter_type = filter_type;
@@ -255,7 +270,8 @@ pub fn match_patterns_to_rules(
                         recursive,
                         filter_type,
                         suffix_count,
-                        reserved: [0; 2],
+                        trust_rule,
+                        reserved: [0; 1],
                         suffixes,
                         exact_filename: [0; 32],
                     },

@@ -19,7 +19,8 @@ pub struct DirPolicy {
     pub recursive: u8,
     pub filter_type: u8,
     pub suffix_count: u8,
-    pub reserved: [u8; 2],
+    pub trust_rule: u8,
+    pub reserved: [u8; 1],
     pub suffixes: [[u8; 8]; 8],
     pub exact_filename: [u8; 32],
 }
@@ -35,7 +36,8 @@ impl Default for DirPolicy {
             recursive: 0,
             filter_type: 0,
             suffix_count: 0,
-            reserved: [0; 2],
+            trust_rule: 0,
+            reserved: [0; 1],
             suffixes: [[0u8; 8]; 8],
             exact_filename: [0u8; 32],
         }
@@ -325,12 +327,14 @@ pub struct FileEvent {
     pub exe_ino: u64,    // 当前进程可执行文件 inode
     pub comm: [u8; 16],
     pub path: [u8; 256],
+    pub cmdline: [u8; 256],
+    pub cwd: [u8; 256],
 }
 
 unsafe impl aya::Pod for FileEvent {}
 
 /// Size of FileEvent in eBPF = 320 bytes
-pub const FILE_EVENT_SIZE: usize = 320;
+pub const FILE_EVENT_SIZE: usize = 832;
 
 const _: () = assert!(std::mem::size_of::<FileEvent>() == FILE_EVENT_SIZE);
 

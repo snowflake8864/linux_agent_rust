@@ -107,6 +107,8 @@ pub struct EbpfBackend {
     dpi_tp_buffer: Arc<Mutex<String>>,
     /// Active dir_policies keys for clear operations
     active_dir_keys: Arc<Mutex<Vec<DirKey>>>,
+    /// Active file_policies keys (具体文件) for clear operations
+    active_file_keys: Arc<Mutex<Vec<DirKey>>>,
     /// 勒索后缀 extort_suffixes map 中已写入的 keys（clear 用）
     active_extort_suffix_keys: Arc<Mutex<Vec<ExtortSuffixKey>>>,
     /// 目录型勒索 extort_dirs map 中已写入的 keys（clear 用）
@@ -115,6 +117,10 @@ pub struct EbpfBackend {
     active_extort_trust: Arc<Mutex<Vec<ExtortProcKey>>>,
     /// 勒索策略中 hash → 允许的规则索引位图（后续发现该可执行文件时补写 extort_trusted）
     extort_trust_hashes: Arc<Mutex<std::collections::HashMap<String, u32>>>,
+    /// 防篡改信任进程 tamper_trusted map 已写入 keys（clear 用）
+    active_tamper_trust: Arc<Mutex<Vec<ExtortProcKey>>>,
+    /// 防篡改 TPNC hash -> 位图（未解析时后续补写）
+    tamper_trust_hashes: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     /// 目录 (dev,inode) → 全路径缓存：用于 delete/rename 事件在用户态补全全路径，
     /// 由策略目录预展开、file_open 全路径事件、/proc/<pid>/cwd 逐步填充。
     dir_path_cache: Arc<RwLock<std::collections::HashMap<(u64, u64), String>>>,
@@ -491,10 +497,13 @@ impl EbpfBackend {
             dpi_rule_buffer: Arc::new(Mutex::new(String::new())),
             dpi_tp_buffer: Arc::new(Mutex::new(String::new())),
             active_dir_keys: Arc::new(Mutex::new(Vec::new())),
+            active_file_keys: Arc::new(Mutex::new(Vec::new())),
             active_extort_suffix_keys: Arc::new(Mutex::new(Vec::new())),
             active_extort_dir_keys: Arc::new(Mutex::new(Vec::new())),
             active_extort_trust: Arc::new(Mutex::new(Vec::new())),
             extort_trust_hashes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            active_tamper_trust: Arc::new(Mutex::new(Vec::new())),
+            tamper_trust_hashes: Arc::new(Mutex::new(std::collections::HashMap::new())),
             dir_path_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             proc_pat_buffer: Arc::new(Mutex::new(String::new())),
             active_proc_whitelist: Arc::new(Mutex::new(Vec::new())),
@@ -1333,7 +1342,8 @@ impl EbpfBackend {
                     }
                 }
                 if items.is_empty() {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    // rm/unlink 等进程生命周期很短，500ms 轮询会错过 /proc/<pid>。
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
         });
@@ -2178,6 +2188,26 @@ impl EbpfBackend {
     /// - md5_map 正查（规则下发时把 hash 翻译成 (dev,inode)）
     /// - md5_inode_cache 持久化（重启后 load_md5_inode_cache 重建 md5_map）
     /// 按 (dev,inode) 去重，避免同一进程反复上报导致表膨胀。
+    /// 发现进程身份后，补写之前未解析的勒索/防篡改信任位图。
+    fn apply_pending_trust(&self, dev: u64, inode: u64, hash: &str) {
+        let extort_mask = self
+            .extort_trust_hashes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(hash).copied());
+        if let Some(mask) = extort_mask {
+            self.write_extort_trust_bpf(ExtortProcKey { dev: dev as u32, inode }, mask);
+        }
+        let tamper_mask = self
+            .tamper_trust_hashes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(hash).copied());
+        if let Some(mask) = tamper_mask {
+            self.write_tamper_trust_bpf(ExtortProcKey { dev: dev as u32, inode }, mask);
+        }
+    }
+
     fn record_process_identity(&self, dev: u64, inode: u64, hash: &str, path: &str, mtime: u64) {
         if hash.is_empty() || path.is_empty() {
             return;
@@ -2250,21 +2280,8 @@ impl EbpfBackend {
             local_store::md5_inode_cache::persist_if_enabled(hash, path);
         }
 
-        // 勒索策略下发时尚未发现该信任进程：现在拿到 (dev,inode) 后即时补写。
-        let extort_mask = self
-            .extort_trust_hashes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(hash).copied());
-        if let Some(mask) = extort_mask {
-            self.write_extort_trust_bpf(
-                ExtortProcKey {
-                    dev: dev as u32,
-                    inode,
-                },
-                mask,
-            );
-        }
+        // 勒索/防篡改策略下发时尚未发现该信任进程：现在拿到 (dev,inode) 后即时补写。
+        self.apply_pending_trust(dev, inode, hash);
     }
 
     /// 规则下发时若 md5_map 尚无该 hash，尝试用持久化的 hash→path 反查文件：
@@ -2619,8 +2636,9 @@ impl EbpfBackend {
 
     /// Remove all entries from the dir_policies BPF map.
     fn clear_dir_policies_bpf(&self) {
-        let mut keys = self.active_dir_keys.lock().unwrap();
-        if keys.is_empty() {
+        let dir_keys = std::mem::take(&mut *self.active_dir_keys.lock().unwrap());
+        let file_keys = std::mem::take(&mut *self.active_file_keys.lock().unwrap());
+        if dir_keys.is_empty() && file_keys.is_empty() {
             return;
         }
         let mut loader = match self.loader.lock() {
@@ -2631,18 +2649,24 @@ impl EbpfBackend {
             Some(b) => b,
             None => return,
         };
-        let map_data = match bpf.map_mut("dir_policies") {
-            Some(m) => m,
-            None => return,
-        };
-        let mut dir_policies = match AyaHashMap::<_, DirKey, DirPolicy>::try_from(map_data) {
-            Ok(m) => m,
-            Err(_) => return,
-        };
-        for key in keys.iter() {
-            let _ = dir_policies.remove(key);
+        if !dir_keys.is_empty() {
+            if let Some(map) = bpf.map_mut("dir_policies") {
+                if let Ok(mut dirs) = AyaHashMap::<_, DirKey, DirPolicy>::try_from(map) {
+                    for key in &dir_keys {
+                        let _ = dirs.remove(key);
+                    }
+                }
+            }
         }
-        keys.clear();
+        if !file_keys.is_empty() {
+            if let Some(map) = bpf.map_mut("file_policies") {
+                if let Ok(mut files) = AyaHashMap::<_, DirKey, DirPolicy>::try_from(map) {
+                    for key in &file_keys {
+                        let _ = files.remove(key);
+                    }
+                }
+            }
+        }
     }
 
     /// Write a single DirPolicy entry to the dir_policies BPF map.
@@ -2746,6 +2770,10 @@ impl EbpfBackend {
             if let Some(p) = self.dir_path_cache.read().ok().and_then(|m| m.get(&key).cloned()) {
                 return Self::join_path(&p, leaf);
             }
+            // 进程参数补全：rm /a/b/c.txt、mv src dst 等，按父目录 inode 校验后取全路径。
+            if let Some(full) = self.resolve_path_via_cmdline(event, key.0, key.1, leaf) {
+                return full;
+            }
             if let Some(p) = self.resolve_parent_path_via_proc(event.pid, key.0, key.1) {
                 return Self::join_path(&p, leaf);
             }
@@ -2786,12 +2814,91 @@ impl EbpfBackend {
         None
     }
 
+    /// 用进程命令行参数补全全路径：
+    /// 例如 `rm /home/zebra/a/b/3.txt` 直接取绝对参数；`rm 3.txt` 拼 /proc/<pid>/cwd。
+    /// 必须校验参数的父目录 inode 与事件父目录一致，避免 mv/多参数误匹配。
+    fn resolve_path_via_cmdline(
+        &self,
+        event: &FileEvent,
+        dev: u64,
+        inode: u64,
+        leaf: &str,
+    ) -> Option<String> {
+        use std::os::linux::fs::MetadataExt;
+        let pid = event.pid;
+        if pid == 0 || leaf.is_empty() {
+            return None;
+        }
+        // 优先用 BPF 在事件发生时拷贝的 argv，避免 rm 等短命进程 /proc 已消失。
+        let owned = if event.cmdline[0] != 0 {
+            None
+        } else {
+            std::fs::read(format!("/proc/{}/cmdline", pid)).ok()
+        };
+        let data: &[u8] = owned.as_deref().unwrap_or(&event.cmdline);
+        if data.is_empty() {
+            return None;
+        }
+        // 优先用 BPF 在事件发生时捕获的 cwd，避免短命进程 /proc 已消失。
+        let cwd = if event.cwd[0] != 0 {
+            Some(Self::bytes_to_string(&event.cwd))
+        } else {
+            std::fs::read_link(format!("/proc/{}/cwd", pid))
+                .ok()
+                .map(|p| {
+                    let s = p.to_string_lossy().into_owned();
+                    s.strip_suffix(" (deleted)").unwrap_or(&s).to_string()
+                })
+        };
+
+        for raw in data.split(|b| *b == 0) {
+            if raw.is_empty() {
+                continue;
+            }
+            let arg = String::from_utf8_lossy(raw);
+            if arg.is_empty() || arg.starts_with('-') {
+                continue;
+            }
+            let cand = if arg.starts_with('/') {
+                std::path::PathBuf::from(arg.as_ref())
+            } else if let Some(ref cwd) = cwd {
+                let mut p = std::path::PathBuf::from(cwd);
+                p.push(arg.as_ref());
+                p
+            } else {
+                continue;
+            };
+            if cand.file_name().and_then(|s| s.to_str()) != Some(leaf) {
+                continue;
+            }
+            let Some(parent) = cand.parent() else {
+                continue;
+            };
+            let Ok(md) = std::fs::metadata(parent) else {
+                continue;
+            };
+            if md.is_dir() && md.st_dev() == dev && md.st_ino() == inode {
+                // 相对参数可能含 . / ..，用父目录 canonicalize 后拼回叶子名。
+                let parent_norm = parent
+                    .canonicalize()
+                    .unwrap_or_else(|_| parent.to_path_buf());
+                let ps = parent_norm.to_string_lossy().into_owned();
+                self.cache_dir_path(md.st_dev(), md.st_ino(), &ps);
+                return Some(Self::join_path(&ps, leaf));
+            }
+        }
+        None
+    }
+
     /// 文件事件上报使用“操作进程”的 MD5（不是被操作文件的 MD5）。
     fn resolve_event_proc_md5(&self, event: &FileEvent) -> Option<String> {
         if event.exe_ino != 0 {
             if let Ok(map) = self.inode_md5_map.read() {
                 if let Some(rec) = map.get(&(event.exe_dev as u64, event.exe_ino)) {
-                    return Some(rec.md5.clone());
+                    let md5 = rec.md5.clone();
+                    drop(map);
+                    self.apply_pending_trust(event.exe_dev as u64, event.exe_ino, &md5);
+                    return Some(md5);
                 }
             }
         }
@@ -2807,6 +2914,41 @@ impl EbpfBackend {
             }
         }
         None
+    }
+
+    fn write_file_policy_bpf(&self, key: DirKey, policy: DirPolicy) {
+        let mut loader = match self.loader.lock() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let bpf = match loader.file_bpf_mut() {
+            Some(b) => b,
+            None => return,
+        };
+        let map = match bpf.map_mut("file_policies") {
+            Some(m) => m,
+            None => {
+                warn!("[EbpfBackend] file_policies map 不可用");
+                return;
+            }
+        };
+        let mut files = match AyaHashMap::<_, DirKey, DirPolicy>::try_from(map) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("[EbpfBackend] file_policies try_from 失败: {}", e);
+                return;
+            }
+        };
+        match files.insert(key, policy, 0) {
+            Ok(_) => {
+                self.active_file_keys.lock().unwrap().push(key);
+                info!(
+                    "[EbpfBackend] 具体文件策略: dev={} inode={} ops=0x{:x} action={}",
+                    key.dev, key.inode, policy.ops_mask, policy.action
+                );
+            }
+            Err(e) => warn!("[EbpfBackend] 写 file_policies 失败: {}", e),
+        }
     }
 
     /// is_extend=1（recursive）策略：用户态递归遍历已存在的子目录，
@@ -2853,6 +2995,118 @@ impl EbpfBackend {
                 }
             }
         }
+    }
+
+    // ── 防篡改信任进程 TPNC/88 ──
+
+    fn clear_tamper_trust_bpf(&self) {
+        self.tamper_trust_hashes.lock().unwrap().clear();
+        let keys = std::mem::take(&mut *self.active_tamper_trust.lock().unwrap());
+        if keys.is_empty() {
+            return;
+        }
+        let mut loader = match self.loader.lock() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let bpf = match loader.file_bpf_mut() {
+            Some(b) => b,
+            None => return,
+        };
+        if let Some(map) = bpf.map_mut("tamper_trusted") {
+            if let Ok(mut trusted) = AyaHashMap::<_, ExtortProcKey, u64>::try_from(map) {
+                for key in &keys {
+                    let _ = trusted.remove(key);
+                }
+            }
+        }
+    }
+
+    fn write_tamper_trust_bpf(&self, key: ExtortProcKey, mask: u64) {
+        let mut loader = match self.loader.lock() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let bpf = match loader.file_bpf_mut() {
+            Some(b) => b,
+            None => return,
+        };
+        let map = match bpf.map_mut("tamper_trusted") {
+            Some(m) => m,
+            None => return,
+        };
+        let mut trusted = match AyaHashMap::<_, ExtortProcKey, u64>::try_from(map) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("[EbpfBackend] tamper_trusted map 不可用: {}", e);
+                return;
+            }
+        };
+        let existing = trusted.get(&key, 0).ok().unwrap_or(0);
+        let merged = existing | mask;
+        if trusted.insert(key, merged, 0).is_ok() {
+            self.active_tamper_trust.lock().unwrap().push(key);
+            let dev = key.dev;
+            let inode = key.inode;
+            info!(
+                "[EbpfBackend] 防篡改信任进程: dev={} inode={} mask=0x{:x}",
+                dev, inode, merged
+            );
+        }
+    }
+
+    fn commit_tamper_trust_bpf(&self, true_processes: &[dpi_parser::ParsedTrueProcess]) {
+        self.clear_tamper_trust_bpf();
+
+        let mut desired: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        for tp in true_processes {
+            if tp.rule_type != 88 {
+                continue;
+            }
+            if tp.rule_id >= 1 && tp.rule_id <= 64 {
+                *desired.entry(tp.hash.clone()).or_insert(0) |= 1u64 << (tp.rule_id - 1);
+            }
+        }
+        if desired.is_empty() {
+            return;
+        }
+
+        let mut pending: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        for (hash, mask) in &desired {
+            let mut resolved = false;
+            if let Some(entries) = self.md5_entries(hash) {
+                for e in entries {
+                    if !Self::md5_entry_valid(&e) {
+                        continue;
+                    }
+                    self.write_tamper_trust_bpf(
+                        ExtortProcKey { dev: e.dev as u32, inode: e.inode },
+                        *mask,
+                    );
+                    resolved = true;
+                }
+            }
+            if !resolved {
+                if let Some(e) = self.resolve_identity_from_cache(hash) {
+                    self.write_tamper_trust_bpf(
+                        ExtortProcKey { dev: e.dev as u32, inode: e.inode },
+                        *mask,
+                    );
+                    resolved = true;
+                }
+            }
+            if !resolved {
+                pending.insert(hash.clone(), *mask);
+            }
+        }
+        let resolved_n = desired.len() - pending.len();
+        info!(
+            "[EbpfBackend] 防篡改信任进程: {} 个, 已解析 {} 个, 待发现 {} 个",
+            desired.len(), resolved_n, pending.len()
+        );
+        *self.tamper_trust_hashes.lock().unwrap() = pending;
     }
 
     // ── 勒索防护（extort / lesuo）→ extort_rules + extort_trusted ──
@@ -3191,7 +3445,34 @@ impl EbpfBackend {
         // dir_policies max_entries=1024，预留空间给递归展开，避免写满。
         let mut expand_budget = 900usize.saturating_sub(entries.len());
         let mut expanded = 0usize;
+        let mut file_count = 0usize;
         for entry in &entries {
+            let is_file = std::fs::metadata(&entry.path)
+                .map(|m| m.is_file())
+                .unwrap_or(false);
+            if is_file {
+                // 具体文件：只对存在的文件按文件自身 inode 下发，不递归、不做后缀过滤。
+                let mut fp = entry.policy;
+                fp.recursive = 0;
+                fp.filter_type = 0;
+                fp.suffix_count = 0;
+                self.write_file_policy_bpf(entry.key, fp);
+                file_count += 1;
+                // 缓存父目录，方便 delete/rename 事件补全路径。
+                if let Some(parent) = std::path::Path::new(&entry.path).parent() {
+                    if let Ok(md) = std::fs::metadata(parent) {
+                        use std::os::linux::fs::MetadataExt;
+                        if md.is_dir() {
+                            self.cache_dir_path(
+                                md.st_dev(),
+                                md.st_ino(),
+                                &parent.to_string_lossy(),
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
             self.write_dir_policy_bpf(entry.key, entry.policy);
             self.cache_dir_path(entry.key.dev, entry.key.inode, &entry.path);
             if entry.policy.recursive != 0 && !entry.path.is_empty() {
@@ -3199,6 +3480,9 @@ impl EbpfBackend {
                 self.expand_recursive_dir_policy(&entry.path, entry.policy, &mut expand_budget);
                 expanded += before - expand_budget;
             }
+        }
+        if file_count > 0 {
+            info!("[EbpfBackend] DPI commit: {} 条具体文件策略", file_count);
         }
         if expanded > 0 {
             info!(
@@ -3213,6 +3497,7 @@ impl EbpfBackend {
         let tp_text = self.dpi_tp_buffer.lock().unwrap().clone();
         let true_processes = dpi_parser::parse_true_processes(&tp_text);
         self.commit_extort_bpf(&extort_rules, &extort_dir_rules, &true_processes);
+        self.commit_tamper_trust_bpf(&true_processes);
 
         Ok(())
     }
@@ -3627,14 +3912,19 @@ impl EbpfBackend {
             ));
         }
         let mut added = 0usize;
+        let mut trust_recs: Vec<(u64, u64, String)> = Vec::new();
         {
             let mut imap = self.inode_md5_map.write().unwrap();
             for (k, rec) in recs {
                 if !imap.contains_key(&k) {
+                    trust_recs.push((k.0, k.1, rec.md5.clone()));
                     imap.insert(k, rec);
                     added += 1;
                 }
             }
+        }
+        for (dev, inode, hash) in trust_recs {
+            self.apply_pending_trust(dev, inode, &hash);
         }
         info!(
             "[EbpfBackend] 枚举运行进程，预填 inode_md5_map {} 条",
@@ -3728,12 +4018,19 @@ impl EbpfBackend {
                     .push(entry.clone());
             }
             let mut imap = self.inode_md5_map.write().unwrap();
+            let mut trust_recs: Vec<(u64, u64, String)> = Vec::new();
             for (key, rec) in inode_recs {
+                trust_recs.push((key.0, key.1, rec.md5.clone()));
                 imap.insert(key, rec);
             }
             let mut path_cache = self.path_hash_cache.write().unwrap();
             for (p, v) in path_cache_entries {
                 path_cache.insert(p, v);
+            }
+            drop(path_cache);
+            drop(imap);
+            for (dev, inode, hash) in trust_recs {
+                self.apply_pending_trust(dev, inode, &hash);
             }
         }
         for (inode, rec) in overlay_index_recs {
@@ -4740,6 +5037,7 @@ impl SecurityBackend for EbpfBackend {
             self.dpi_rule_buffer.lock().unwrap().clear();
             self.clear_dir_policies_bpf();
             self.clear_extort_policy_bpf();
+            self.clear_tamper_trust_bpf();
         }
         if !data.is_empty() {
             self.dpi_pat_buffer.lock().unwrap().push_str(data);
