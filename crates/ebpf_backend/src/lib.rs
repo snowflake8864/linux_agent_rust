@@ -1333,7 +1333,8 @@ impl EbpfBackend {
                     }
                 }
                 if items.is_empty() {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    // rm/unlink 等进程生命周期很短，500ms 轮询会错过 /proc/<pid>。
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
         });
@@ -2746,6 +2747,10 @@ impl EbpfBackend {
             if let Some(p) = self.dir_path_cache.read().ok().and_then(|m| m.get(&key).cloned()) {
                 return Self::join_path(&p, leaf);
             }
+            // 进程参数补全：rm /a/b/c.txt、mv src dst 等，按父目录 inode 校验后取全路径。
+            if let Some(full) = self.resolve_path_via_cmdline(event, key.0, key.1, leaf) {
+                return full;
+            }
             if let Some(p) = self.resolve_parent_path_via_proc(event.pid, key.0, key.1) {
                 return Self::join_path(&p, leaf);
             }
@@ -2781,6 +2786,73 @@ impl EbpfBackend {
                 if let Some(hit) = self.path_ancestor_with_inode(&p.to_string_lossy(), dev, inode) {
                     return Some(hit);
                 }
+            }
+        }
+        None
+    }
+
+    /// 用进程命令行参数补全全路径：
+    /// 例如 `rm /home/zebra/a/b/3.txt` 直接取绝对参数；`rm 3.txt` 拼 /proc/<pid>/cwd。
+    /// 必须校验参数的父目录 inode 与事件父目录一致，避免 mv/多参数误匹配。
+    fn resolve_path_via_cmdline(
+        &self,
+        event: &FileEvent,
+        dev: u64,
+        inode: u64,
+        leaf: &str,
+    ) -> Option<String> {
+        use std::os::linux::fs::MetadataExt;
+        let pid = event.pid;
+        if pid == 0 || leaf.is_empty() {
+            return None;
+        }
+        // 优先用 BPF 在事件发生时拷贝的 argv，避免 rm 等短命进程 /proc 已消失。
+        let owned = if event.cmdline[0] != 0 {
+            None
+        } else {
+            std::fs::read(format!("/proc/{}/cmdline", pid)).ok()
+        };
+        let data: &[u8] = owned.as_deref().unwrap_or(&event.cmdline);
+        if data.is_empty() {
+            return None;
+        }
+        let cwd = std::fs::read_link(format!("/proc/{}/cwd", pid))
+            .ok()
+            .map(|p| {
+                let s = p.to_string_lossy().into_owned();
+                s.strip_suffix(" (deleted)").unwrap_or(&s).to_string()
+            });
+
+        for raw in data.split(|b| *b == 0) {
+            if raw.is_empty() {
+                continue;
+            }
+            let arg = String::from_utf8_lossy(raw);
+            if arg.is_empty() || arg.starts_with('-') {
+                continue;
+            }
+            let cand = if arg.starts_with('/') {
+                std::path::PathBuf::from(arg.as_ref())
+            } else if let Some(ref cwd) = cwd {
+                let mut p = std::path::PathBuf::from(cwd);
+                p.push(arg.as_ref());
+                p
+            } else {
+                continue;
+            };
+            if cand.file_name().and_then(|s| s.to_str()) != Some(leaf) {
+                continue;
+            }
+            let Some(parent) = cand.parent() else {
+                continue;
+            };
+            let Ok(md) = std::fs::metadata(parent) else {
+                continue;
+            };
+            if md.is_dir() && md.st_dev() == dev && md.st_ino() == inode {
+                let ps = parent.to_string_lossy().into_owned();
+                self.cache_dir_path(md.st_dev(), md.st_ino(), &ps);
+                return Some(cand.to_string_lossy().into_owned());
             }
         }
         None
