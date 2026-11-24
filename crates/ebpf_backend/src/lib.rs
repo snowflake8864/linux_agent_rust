@@ -3007,13 +3007,16 @@ impl EbpfBackend {
                 return;
             }
         };
-        if trusted.insert(key, mask, 0).is_ok() {
+        // 同一 (dev,inode) 可能来自多个 trusted hash：合并 mask，避免后写覆盖前写。
+        let existing = trusted.get(&key, 0).ok().unwrap_or(0);
+        let merged = existing | mask;
+        if trusted.insert(key, merged, 0).is_ok() {
             self.active_extort_trust.lock().unwrap().push(key);
             let dev = key.dev;
             let inode = key.inode;
             info!(
                 "[EbpfBackend] 勒索信任进程: dev={} inode={} mask=0x{:x}",
-                dev, inode, mask
+                dev, inode, merged
             );
         }
     }
