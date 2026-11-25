@@ -347,6 +347,36 @@ struct {
     __type(value, __u64);
 } debug_stats SEC(".maps");
 
+// 重定向转发：用 FIB 查下一跳 L2 地址，改写二层头后从入口网卡 XDP_TX 发出。
+// 背景：generic XDP 模式下 XDP_PASS 依赖内核 re-route，SNAT 源 IP 为本机地址时
+// 改写后的包无法送达重定向目标（目的 MAC 仍是本机），必须显式改写 L2 并 TX。
+// 查路由失败时回退 XDP_PASS，交内核兜底，避免比现状更差。
+// src_ip/src_port/dst_ip/dst_port 均为改写后的网络字节序值。
+static __always_inline int xdp_fib_tx(struct xdp_md *ctx, void *eth,
+                                      __u8 protocol,
+                                      __u32 src_ip, __u16 src_port,
+                                      __u32 dst_ip, __u16 dst_port) {
+    struct bpf_fib_lookup fib;
+    struct ethhdr *eh = (struct ethhdr *)eth;
+    __builtin_memset(&fib, 0, sizeof(fib));
+    fib.family      = AF_INET;
+    fib.l4_protocol = protocol;
+    fib.sport       = src_port;
+    fib.dport       = dst_port;
+    fib.ifindex     = ctx->ingress_ifindex;  // generic XDP 下显式给设备，避免 -ENODEV
+    // 不设 ipv4_src：SNAT 后源 IP 是本机地址，XDP ingress 下内核会因 martian
+    // 源地址拒绝常规 FIB 查询。用 DIRECT 标志直接按目的查邻居表。
+    fib.ipv4_dst    = dst_ip;
+
+    long ret = bpf_fib_lookup(ctx, &fib, sizeof(fib), BPF_FIB_LOOKUP_DIRECT);
+    if (ret != BPF_FIB_LKUP_RET_SUCCESS)
+        return XDP_PASS;
+
+    __builtin_memcpy(eh->h_source, fib.smac, 6);
+    __builtin_memcpy(eh->h_dest, fib.dmac, 6);
+    return XDP_TX;
+}
+
 // Helper: send network event
 static __always_inline void send_network_event(__u8 protocol, __u32 src_ip, __u32 dst_ip, 
                                                 __u16 src_port, __u16 dst_port, __u8 flags) {
@@ -748,7 +778,10 @@ int xdp_packet_filter(struct xdp_md *ctx) {
             ip->saddr = r_val->local_ip;
             csum_replace4(&ip->check, dst_ip, r_val->client_ip);
             ip->daddr = r_val->client_ip;
-            return XDP_PASS;
+            // 反向回包同样需要改写 L2 并 TX，否则目的 MAC 仍是本机，回包发不出去
+            return xdp_fib_tx(ctx, eth, protocol,
+                              r_val->local_ip, r_val->local_port,
+                              r_val->client_ip, r_val->client_port);
         }
         return XDP_PASS;
     }
@@ -935,14 +968,16 @@ int xdp_packet_filter(struct xdp_md *ctx) {
         ip->saddr = new_src_ip;
     }
 
-    // Debug: count forwarded (XDP_PASS)
+    // Debug: count forwarded
     __u32 k6 = 6;
     __u64 *c6 = bpf_map_lookup_elem(&debug_stats, &k6);
     if (c6) (*c6)++;
 
     // 同一连接只上报一次（首个包），避免数据包/重传导致重复告警
     report_vir_port_once(protocol, src_ip, dst_ip, src_port, dst_port);
-    return XDP_PASS;
+    // 显式改写 L2 并从入口网卡 TX 发出：generic XDP 下不能靠 XDP_PASS 交内核转发
+    return xdp_fib_tx(ctx, eth, protocol,
+                      new_src_ip, src_port, target_ip, target_port);
 }
 
 // TC classifier for egress (return traffic)
