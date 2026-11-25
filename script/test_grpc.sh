@@ -3,7 +3,8 @@
 # gRPC 接口测试脚本 — 可手动选择要测试的接口
 # 用法:
 #   ./test_grpc.sh              # 交互式菜单选择
-#   ./test_grpc.sh <编号>        # 直接测试指定接口 (1-35, s1-s9, vf, vr)
+#   ./test_grpc.sh <编号>        # 直接测试指定接口 (1-34, 35/bpf, s1-s9, vf, vr)
+#   ./test_grpc.sh bpf           # 查看 BPF 层真实策略（按分类清晰展示）
 #   ./test_grpc.sh all           # 测试全部只读接口 (1-34)
 #   ./test_grpc.sh write         # 测试写接口（需离线模式）
 #   ./test_grpc.sh stream        # 测试流式接口 (17, 18, s1-s6, vf, vr)
@@ -144,6 +145,11 @@ show_test_help() {
                echo "    返回: token(字符串), is_valid(true=有效/false=未获取到)"
                echo "    无参数，始终可用（在线/离线均可调用）"
                echo "    用法: $0 34" ;;
+        35|bpf) echo -e "${CYAN}[35/bpf] BPF策略总览${NC} — 直接读取内核 BPF map"
+               echo "    分类展示: 开关/模式、进程规则、文件防篡改、自保护、勒索防护、网络管控"
+               echo "    将 action/mode/ops/IP/端口翻译为中文，避免只看十六进制"
+               echo "    依赖: bpftool + python3 + root/CAP_BPF"
+               echo "    用法: $0 bpf  或  $0 35" ;;
         s1)    echo -e "${CYAN}[s1] VirusScan流${NC} — 病毒扫描双向流 (StreamControl)"
                echo "    双向流式接口，客户端发送扫描指令，服务端返回扫描结果"
                echo "    用法: $0 s1" ;;
@@ -241,7 +247,7 @@ show_test_help() {
               echo -e "    ${GREEN}执行模式:${NC} w17 {\"backup_id\":\"root_snap_6_20260626_155713\"} → 实际删除指定快照" ;;
 
         *)     echo -e "${RED}未知测试编号: $tid${NC}"
-                echo "有效范围: 1-33, s1-s9, vf, vr, w1-w17"
+                echo "有效范围: 1-35, bpf, s1-s9, vf, vr, w1-w17"
                echo "输入 ? 查看完整菜单，输入 <编号> ? 查看单项说明" ;;
     esac
     echo ""
@@ -362,6 +368,411 @@ print_result() {
     echo -e "=============================================="
     echo -e "  结果: ${GREEN}${pass} 通过${NC} / ${RED}${fail} 失败${NC}"
     echo -e "=============================================="
+}
+
+# ── BPF 层策略查看 ──────────────────────────────────────────────────────
+# 说明: gRPC 只能查“用户态策略 JSON”和单条进程规则；真正的策略在内核 BPF map 中。
+#       本功能用 bpftool 读取真实 map，并按业务语义翻译成中文输出。
+show_bpf_policies() {
+    echo ""
+    echo -e "${CYAN}===== BPF 层策略总览 =====${NC}"
+
+    local mode_json effective mode iface
+    mode_json=$(grpc_call_raw backend.proto backend.BackendService GetBackendMode '{}' 2>/dev/null)
+    if [ -n "$mode_json" ]; then
+        effective=$(printf '%s' "$mode_json" | grep -oE '"effective"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]+)".*/\1/')
+        mode=$(printf '%s' "$mode_json" | grep -oE '"mode"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]+)".*/\1/')
+        iface=$(printf '%s' "$mode_json" | grep -oE '"interface"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]+)".*/\1/')
+        echo -e "  后端: 配置=${mode:-未知} 生效=${effective:-未知} 网口=${iface:-无}"
+        case "$effective" in
+            ebpf|ebpf-fallback) ;;
+            *) echo -e "  ${YELLOW}注意: 当前不是 eBPF 后端，以下展示的是内核中仍存在的 BPF map${NC}" ;;
+        esac
+    else
+        echo -e "  ${YELLOW}注意: 未取到后端状态（gRPC 不可达或 BackendService 未注册）${NC}"
+    fi
+
+    if [ "$(id -u)" != "0" ]; then
+        echo -e "  ${YELLOW}注意: 非 root 可能无法读取 BPF map，需要 CAP_BPF/CAP_SYS_ADMIN${NC}"
+    fi
+    if ! command -v bpftool >/dev/null 2>&1; then
+        echo -e "  ${RED}错误: 未找到 bpftool，无法读取 BPF map${NC}"
+        return 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo -e "  ${RED}错误: 未找到 python3，无法格式化 BPF map${NC}"
+        return 1
+    fi
+
+    BPFTOOL="$(command -v bpftool)" \
+    BPF_VIEW_MAX_ROWS="${BPF_VIEW_MAX_ROWS:-200}" \
+    python3 - <<'PY'
+import ipaddress
+import json
+import os
+import struct
+import subprocess
+
+BPFTool = os.environ.get("BPFTOOL", "bpftool")
+MAX_ROWS = int(os.environ.get("BPF_VIEW_MAX_ROWS", "200"))
+
+WATCH = [
+    ("运行状态 / 开关", ["feature_switches", "global_modes", "extort_switches",
+                     "netlog_switch", "vir_port_meta", "saddr_block_meta",
+                     "business_ports_meta", "server_ips_meta", "server_ips6_meta",
+                     "file_name_policy_count"]),
+    ("进程管控", ["proc_rules", "proc_rules_ino", "proc_patterns",
+                "agent_pids", "protected_pids"]),
+    ("文件防篡改 / 自保护", ["dir_policies", "file_policies", "file_name_policies",
+                        "tamper_trusted", "self_protect_dirs"]),
+    ("勒索防护", ["extort_suffixes", "extort_dirs", "extort_trusted"]),
+    ("网络管控", ["block_rules", "pkt_mod_rules", "vir_port_rules",
+                "saddr_block_rules", "business_ports", "server_ips", "server_ips6"]),
+]
+ALL_NAMES = set(n for _, names in WATCH for n in names)
+SHORT_TO_FULL = {n[:15]: n for n in ALL_NAMES}
+
+ACTION = {0: "白/允许", 1: "黑/拒绝"}
+MODE = {0: "继承", 1: "监控", 2: "保护"}
+FILTER = {0: "无", 1: "后缀包含", 2: "后缀排除"}
+OPS_BITS = [(1, "读"), (2, "写"), (4, "改"), (8, "建"), (16, "删"), (32, "改名"), (64, "执行")]
+PROTO = {0: "ANY", 6: "TCP", 17: "UDP"}
+DIR = {0: "双向", 1: "入", 2: "出"}
+
+
+def run_bpf(args):
+    try:
+        p = subprocess.run([BPFTool] + args, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, text=True, timeout=10)
+    except Exception as exc:
+        return None, str(exc)
+    if p.returncode != 0:
+        return None, (p.stderr or p.stdout or "bpftool 执行失败").strip()
+    try:
+        return json.loads(p.stdout), None
+    except Exception as exc:
+        return None, "JSON 解析失败: %s" % exc
+
+
+def scalar(x, default=0):
+    if isinstance(x, bool):
+        return int(x)
+    if isinstance(x, int):
+        return x
+    if isinstance(x, str):
+        try:
+            return int(x, 0)
+        except ValueError:
+            return default
+    if isinstance(x, dict):
+        for key in ("value", "key", "data"):
+            if key in x:
+                return scalar(x[key], default)
+    if isinstance(x, list) and x:
+        return scalar(x[0], default)
+    return default
+
+
+def as_bytes(x):
+    if isinstance(x, (bytes, bytearray)):
+        return bytes(x)
+    if isinstance(x, list):
+        out = bytearray()
+        for i in x:
+            if isinstance(i, int):
+                out.append(i & 0xFF)
+            else:
+                try:
+                    out.append(int(str(i), 0) & 0xFF)
+                except ValueError:
+                    pass
+        return bytes(out)
+    if isinstance(x, str):
+        try:
+            return bytes.fromhex(x.replace("0x", "").replace(":", "").replace(" ", ""))
+        except ValueError:
+            return b""
+    return scalar(x).to_bytes(4, "little", signed=False)
+
+
+def gv(d, buf, name, off, fmt):
+    if isinstance(d, dict):
+        for key in (name, name.lstrip("_")):
+            if key in d:
+                return scalar(d[key])
+    size = struct.calcsize(fmt)
+    return struct.unpack_from(fmt, buf, off)[0] if len(buf) >= off + size else 0
+
+
+def gb(d, buf, name, off, size):
+    if isinstance(d, dict) and name in d:
+        val = d[name]
+        if isinstance(val, str):
+            return val.encode("utf-8")
+        return as_bytes(val)
+    return buf[off:off + size]
+
+
+def cstr(buf):
+    return buf.split(b"\0", 1)[0].decode("utf-8", "replace")
+
+
+def ip_host(n):
+    try:
+        return str(ipaddress.IPv4Address(n & 0xFFFFFFFF))
+    except ValueError:
+        return str(n)
+
+
+def ip_net(n):
+    try:
+        return str(ipaddress.IPv4Address(struct.pack("<I", n & 0xFFFFFFFF)))
+    except ValueError:
+        return str(n)
+
+
+def ops_str(mask):
+    return "|".join(name for bit, name in OPS_BITS if mask & bit) or "-"
+
+
+def dir_policy(vd, vb):
+    ops = gv(vd, vb, "ops_mask", 0, "<B")
+    action = gv(vd, vb, "action", 1, "<B")
+    mode = gv(vd, vb, "mode", 2, "<B")
+    recur = gv(vd, vb, "recursive", 3, "<B")
+    ftype = gv(vd, vb, "filter_type", 4, "<B")
+    scnt = min(gv(vd, vb, "suffix_count", 5, "<B"), 8)
+    trust = gv(vd, vb, "trust_rule", 6, "<B") if len(vb) >= 104 else 0
+    sb = gb(vd, vb, "suffixes", 8, 64)
+    suffixes = ",".join(cstr(sb[i * 8:(i + 1) * 8]) for i in range(scnt)) or "-"
+    exact = cstr(gb(vd, vb, "exact_filename", 72, 32)) if len(vb) >= 104 else "-"
+    return {
+        "ops": ops_str(ops), "action": ACTION.get(action, str(action)),
+        "mode": MODE.get(mode, str(mode)), "recur": "是" if recur else "否",
+        "filter": FILTER.get(ftype, str(ftype)), "trust": trust,
+        "suffixes": suffixes, "exact": exact,
+    }
+
+
+def decode(name, k, v):
+    kd = k if isinstance(k, dict) else {}
+    vd = v if isinstance(v, dict) else {}
+    kb, vb = as_bytes(k), as_bytes(v)
+
+    if name == "feature_switches":
+        idx = scalar(k)
+        label = {0: "file_agent", 1: "proc_agent", 2: "net_agent"}.get(idx, str(idx))
+        return ["索引", "模块", "状态"], [idx, label, "启用" if scalar(v) else "关闭"]
+    if name == "global_modes":
+        idx = scalar(k)
+        label = {0: "file_agent", 1: "proc_agent", 2: "net_agent"}.get(idx, str(idx))
+        val = scalar(v)
+        return ["索引", "模块", "模式"], [idx, label, "保护" if val else "监控"]
+    if name == "extort_switches":
+        idx = scalar(k)
+        label = {0: "勒索开关", 1: "拦截模式"}.get(idx, str(idx))
+        val = scalar(v)
+        return ["索引", "含义", "状态"], [idx, label, "开启" if val else "关闭"]
+    if name == "netlog_switch":
+        val = scalar(v)
+        return ["位", "含义", "状态"], [
+            "0/1", "对内通信/对外通信",
+            ("对内:%s 对外:%s" % ("开" if val & 1 else "关", "开" if val & 2 else "关")),
+        ]
+    if name.endswith("_meta") or name == "file_name_policy_count":
+        return ["项", "生效条数"], [name, scalar(v)]
+
+    if name == "proc_rules":
+        dev = gv(kd, kb, "dev", 0, "<I")
+        ino = gv(kd, kb, "inode", 4, "<Q")
+        am = gv(vd, vb, "action_mode", 0, "<B")
+        return ["dev", "inode", "动作", "模式"], [
+            dev, ino, ACTION.get(am & 1, str(am & 1)), MODE.get((am >> 1) & 3, str((am >> 1) & 3)),
+        ]
+    if name == "proc_rules_ino":
+        ino = gv(kd, kb, "inode", 0, "<Q") if kb else scalar(k)
+        am = gv(vd, vb, "action_mode", 0, "<B")
+        size = gv(vd, vb, "size", 4, "<I")
+        ph = gv(vd, vb, "prefix_hash", 8, "<Q")
+        return ["inode", "动作", "模式", "文件大小", "前缀指纹"], [
+            ino, ACTION.get(am & 1, str(am & 1)), MODE.get((am >> 1) & 3, str((am >> 1) & 3)), size, ph,
+        ]
+    if name == "proc_patterns":
+        pat = cstr(gb(kd, kb, "pattern", 0, 32))
+        act = gv(vd, vb, "action", 0, "<B")
+        mode = gv(vd, vb, "mode", 1, "<B")
+        return ["模式串", "动作", "模式"], [pat or "-", ACTION.get(act, str(act)), MODE.get(mode, str(mode))]
+    if name in ("agent_pids", "protected_pids"):
+        return ["PID", "状态"], [scalar(k), "允许/受保护" if scalar(v) else "无"]
+
+    if name in ("dir_policies", "file_policies"):
+        dev = gv(kd, kb, "dev", 0, "<Q")
+        ino = gv(kd, kb, "inode", 8, "<Q")
+        p = dir_policy(vd, vb)
+        return ["dev", "inode", "操作", "动作", "模式", "递归", "过滤", "后缀", "精确文件名"], [
+            dev, ino, p["ops"], p["action"], p["mode"], p["recur"], p["filter"], p["suffixes"], p["exact"],
+        ]
+    if name == "file_name_policies":
+        dev = gv(kd, kb, "dir_dev", 0, "<Q")
+        ino = gv(kd, kb, "dir_ino", 8, "<Q")
+        fname = cstr(gb(kd, kb, "name", 16, 256))
+        p = dir_policy(vd, vb)
+        return ["父目录dev", "父目录inode", "文件名", "操作", "动作", "模式"], [
+            dev, ino, fname or "-", p["ops"], p["action"], p["mode"],
+        ]
+    if name == "self_protect_dirs":
+        dev = gv(kd, kb, "dev", 0, "<Q")
+        ino = gv(kd, kb, "inode", 8, "<Q")
+        whole = gv(vd, vb, "whole_dir", 0, "<B")
+        cnt = min(gv(vd, vb, "prefix_count", 1, "<B"), 2)
+        pb = gb(vd, vb, "prefixes", 2, 32)
+        pref = ",".join(cstr(pb[i * 16:(i + 1) * 16]) for i in range(cnt)) or "-"
+        return ["dev", "inode", "范围", "文件名前缀"], [
+            dev, ino, "整个目录" if whole else "按前缀", pref,
+        ]
+    if name == "tamper_trusted":
+        dev = gv(kd, kb, "dev", 0, "<I")
+        ino = gv(kd, kb, "inode", 4, "<Q")
+        return ["dev", "inode", "信任规则位图"], [dev, ino, scalar(v)]
+
+    if name == "extort_suffixes":
+        suf = cstr(gb(kd, kb, "suffix", 0, 16)) or cstr(gb(kd, kb, "addr", 0, 16)) or cstr(kb[:16])
+        return ["后缀", "规则索引"], [suf or "-", scalar(v)]
+    if name == "extort_dirs":
+        dev = gv(kd, kb, "dev", 0, "<Q")
+        ino = gv(kd, kb, "inode", 8, "<Q")
+        return ["dev", "inode", "规则索引"], [dev, ino, scalar(v)]
+    if name == "extort_trusted":
+        dev = gv(kd, kb, "dev", 0, "<I")
+        ino = gv(kd, kb, "inode", 4, "<Q")
+        return ["dev", "inode", "允许规则位图"], [dev, ino, scalar(v)]
+
+    if name == "block_rules":
+        return ["端口", "状态"], [scalar(k), "阻断" if scalar(v) else "放行"]
+    if name == "saddr_block_rules":
+        return ["源IP", "状态"], [ip_net(scalar(k)), "阻断" if scalar(v) else "放行"]
+    if name == "business_ports":
+        return ["业务端口", "状态"], [scalar(k), "有效" if scalar(v) else "无效"]
+    if name == "server_ips":
+        return ["服务器IP", "状态"], [ip_host(scalar(k)), "过滤" if scalar(v) else "无效"]
+    if name == "server_ips6":
+        addr = gb(kd, kb, "addr", 0, 16)
+        try:
+            text = str(ipaddress.IPv6Address(addr))
+        except ValueError:
+            text = addr.hex()
+        return ["服务器IPv6", "状态"], [text, "过滤" if scalar(v) else "无效"]
+    if name == "vir_port_rules":
+        proto = gv(vd, vb, "protocol", 0, "<B")
+        keep = gv(vd, vb, "keep_port", 1, "<B")
+        start = gv(vd, vb, "start_port", 2, "<H")
+        end = gv(vd, vb, "end_port", 4, "<H")
+        redir = gv(vd, vb, "redirect_port", 6, "<H")
+        dst = gv(vd, vb, "dst_ip", 8, "<I")
+        ndst = gv(vd, vb, "new_dst_ip", 12, "<I")
+        alarm = gv(vd, vb, "addr_type", 16, "<B")
+        rule = "端口 %d-%d" % (start, end) if start else "未使用"
+        if redir:
+            rule += " -> %d" % redir
+        if ndst:
+            rule += " -> %s" % ip_net(ndst)
+        return ["索引", "协议", "规则", "目的地址", "保持原端口", "告警级"], [
+            scalar(k), PROTO.get(proto, str(proto)), rule,
+            ip_net(dst) if dst else "任意", "是" if keep else "否", alarm,
+        ]
+    if name == "pkt_mod_rules":
+        proto = gv(kd, kb, "protocol", 0, "<B")
+        direc = gv(kd, kb, "direction", 1, "<B")
+        dst = gv(kd, kb, "dst_ip", 4, "<I")
+        sport = gv(kd, kb, "src_port", 8, "<H")
+        dport = gv(kd, kb, "dst_port", 10, "<H")
+        ecn = gv(vd, vb, "tcp_set_ecn_echo", 1, "<B")
+        cwr = gv(vd, vb, "tcp_set_cwr", 2, "<B")
+        pmod = gv(vd, vb, "port_mod_enable", 8, "<B")
+        nsp = gv(vd, vb, "new_src_port", 9, "<H")
+        ndp = gv(vd, vb, "new_dst_port", 11, "<H")
+        imod = gv(vd, vb, "ip_mod_enable", 12, "<B")
+        nip = gv(vd, vb, "new_dst_ip", 17, "<I")
+        allow = gv(vd, vb, "allowed_ip", 21, "<I")
+        mask = gv(vd, vb, "allowed_mask", 25, "<I")
+        match = "%s:%d -> %s:%d" % (ip_net(dst), dport, "*", sport)
+        mods = []
+        if ecn:
+            mods.append("ECN-Echo")
+        if cwr:
+            mods.append("CWR")
+        if pmod:
+            mods.append("端口改写 %d/%d" % (nsp, ndp))
+        if imod:
+            mods.append("IP改写 %s" % ip_net(nip))
+        if allow or mask:
+            mods.append("允许 %s/%s" % (ip_host(allow), ip_host(mask)))
+        return ["协议/方向", "匹配", "改写动作"], [
+            "%s/%s" % (PROTO.get(proto, str(proto)), DIR.get(direc, str(direc))),
+            match, ",".join(mods) or "仅告警/零改写",
+        ]
+
+    return ["字段", "值"], [str(k) if not isinstance(k, (dict, list)) else json.dumps(k),
+                           str(v) if not isinstance(v, (dict, list)) else json.dumps(v)]
+
+
+def print_entries(name, entries):
+    if not entries:
+        print("    (空表)")
+        return
+    header, _ = decode(name, entries[0].get("key"), entries[0].get("value"))
+    rows = []
+    for item in entries[:MAX_ROWS]:
+        _, row = decode(name, item.get("key"), item.get("value"))
+        rows.append([str(x) for x in row])
+    widths = [max([len(header[i])] + [len(r[i]) for r in rows]) for i in range(len(header))]
+    fmt = "    " + "  ".join(("%%-%ds" % w) for w in widths)
+    print(fmt % tuple(header))
+    print("    " + "  ".join("-" * w for w in widths))
+    for row in rows:
+        print(fmt % tuple(row))
+    if len(entries) > MAX_ROWS:
+        print("    ... 仅显示前 %d 条，共 %d 条（可调 BPF_VIEW_MAX_ROWS）" % (MAX_ROWS, len(entries)))
+
+
+maps, err = run_bpf(["-j", "map", "list"])
+if err:
+    print("  %s" % err)
+    print("  需要 CAP_BPF/CAP_SYS_ADMIN；尝试 sudo 运行本脚本。")
+else:
+    if not isinstance(maps, list):
+        maps = maps.get("maps", []) if isinstance(maps, dict) else []
+    related = []
+    for m in maps:
+        raw = m.get("name", "") or ""
+        full = SHORT_TO_FULL.get(raw[:15])
+        if full:
+            item = dict(m)
+            item["name_full"] = full
+            item["name_raw"] = raw
+            related.append(item)
+    print("  内核中匹配到 %d 个相关 BPF map" % len(related))
+    for category, names in WATCH:
+        group = [m for m in related if m.get("name_full") in names]
+        if not group:
+            continue
+        print("\n  == %s ==" % category)
+        for m in group:
+            name = m.get("name_full", "?")
+            raw = m.get("name_raw", name)
+            shown = "" if raw == name else " (内核名=%s)" % raw
+            mid = m.get("id", "?")
+            mtype = m.get("type", "?")
+            maxe = m.get("max_entries", "?")
+            print("\n  [%s]%s id=%s type=%s max_entries=%s" % (name, shown, mid, mtype, maxe))
+            dumped, dump_err = run_bpf(["-j", "map", "dump", "id", str(mid)])
+            if dump_err:
+                print("    读取失败: %s" % dump_err)
+                continue
+            if isinstance(dumped, dict):
+                dumped = dumped.get("values", [])
+            print_entries(name, dumped or [])
+PY
 }
 
 # ── 只读接口测试 (1-33) ─────────────────────────────────────────────────
@@ -861,6 +1272,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}  32) ProcRuleQuery(进程白/黑名单表查询)                      ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  33) PortKnock(单包敲门SPA中继)                              ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  34) GetToken(获取认证Token)                                 ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  35) BPF策略总览(真实map,需root)  bpf=同35                   ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  s1) VirusScan流(StreamControl)                              ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  s2) 扫描Ping   s3) 停止   s4) 暂停   s5) 恢复   s6) 处置   ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  s7) 隔离区(未还原)  s8) 隔离区(全部)  s9) 隔离区(按病毒名) ${CYAN}║${NC}"
@@ -1014,6 +1426,7 @@ case "${1:-menu}" in
                 25) test_25 ;; 26) test_26 ;;
                 27) test_27 ;; 28) test_28 ;; 28b) test_28b ;;
                 29) test_29 ;; 30) test_30 ;; 31) test_31 ;; 32) test_32 ;; 33) test_33 ;; 34) test_34 ;;
+                35|bpf) show_bpf_policies ;;
                 s1) test_s1 ;; s2) test_s2 ;; s3) test_s3 ;; s4) test_s4 ;; s5) test_s5 ;; s6) test_s6 ;;
                 s7) test_s7 ;; s8) test_s8 ;; s9) test_s9 ;;
                 vf) test_virus_full_flow ;;
@@ -1028,7 +1441,7 @@ case "${1:-menu}" in
                 w9)  test_w9  ;; w10) test_w10 ;; w11) test_w11 ;; w12) test_w12 ;;
                 w13) test_w13 ;; w14) test_w14 ;; w15) test_w15 ;; w16) test_w16 ;; w17) test_w17 ;;
                 all)
-                    echo -e "\n${GREEN}── 测试全部只读接口 (1-33) ──${NC}"
+                    echo -e "\n${GREEN}── 测试全部只读接口 (1-34) ──${NC}"
                     run_all_readonly
                     print_result
                     ;;
@@ -1090,6 +1503,7 @@ case "${1:-menu}" in
                     echo "  32) ProcRuleQuery(进程白/黑名单表查询)"
                     echo "  33) PortKnock(单包敲门SPA中继)"
                     echo "  34) GetToken(获取认证Token)"
+                    echo "  35) BPF策略总览(真实map)  bpf) 同 35"
                     echo "  s1) VirusScan流(启动)  s2) Ping  s3) 停止  s4) 暂停  s5) 恢复  s6) 处置"
                     echo "  s7) 隔离区(未还原)  s8) 隔离区(全部)  s9) 隔离区(按病毒名)"
                     echo "  vf) 病毒扫描完整流程(启动→暂停→恢复→停止)  vr) 病毒扫描递归完整性"
@@ -1112,7 +1526,8 @@ case "${1:-menu}" in
                     echo "  w15) PeripheralDefenseMode  w16) TriggerLocalUpdate  w17) DeleteBackup"
                     echo ""
                     echo -e "${CYAN}── 快捷命令 ──${NC}"
-                    echo "  all    测试全部只读 (1-33)"
+                    echo "  all    测试全部只读 (1-34)"
+                    echo "  bpf    查看 BPF 层真实策略 (同 35，需 root)"
                     echo "  write  测试全部写 (w1-w17, 需离线模式)"
                     echo "  stream 测试全部流式 (17, 18, s1-s6, vf, vr)"
                     echo "  full   测试全部 (读写+流)"
@@ -1193,7 +1608,8 @@ case "${1:-menu}" in
         echo "  menu            同无参数"
         echo ""
         echo "  交互菜单内可用命令:"
-        echo "    1-33, s1-s9    测试指定只读/流式接口"
+        echo "    1-34, s1-s9    测试指定只读/流式接口"
+        echo "    35 / bpf       查看 BPF 层真实策略（需 root + bpftool）"
         echo "    vf, vr          病毒扫描完整流程 / 递归完整性"
         echo "    03b,14b/14c/14d,23b  filter_status 过滤测试"
         echo "    w1-w17          测试指定写接口"
@@ -1214,7 +1630,8 @@ case "${1:-menu}" in
         echo "  $0 vf            病毒扫描完整流程（启动→暂停→恢复→停止）"
         echo "  $0 vr            病毒扫描递归完整性（多级子目录）"
         echo "  $0 w8            直接测试 CreateBackup"
-        echo "  $0 all           测试全部只读接口 (1-33)"
+        echo "  $0 bpf           查看 BPF 层策略（分类清晰展示，需 root）"
+        echo "  $0 all           测试全部只读接口 (1-34)"
         echo "  $0 write         测试全部写接口 (w1-w17)"
         echo "  $0 stream        测试流式接口 (17, 18, s1-s6, vf, vr)"
         echo "  $0 full          测试全部接口（读写+流）"
@@ -1247,6 +1664,8 @@ case "${1:-menu}" in
     s9) test_s9; print_result ;;
     vf) test_virus_full_flow; print_result ;;
     vr) test_virus_recursion; print_result ;;
+    34) test_34; print_result ;;
+    35|bpf) show_bpf_policies ;;
     32) if [ -n "$2" ]; then
             grpc_call "进程规则查询(自定义)" proc_diag.proto proc_diag.ProcDiagService QueryProcessRule "$2"
         else
@@ -1271,11 +1690,11 @@ case "${1:-menu}" in
             else
                 "test_$arg"
             fi
-        elif [[ "$arg" =~ ^[0-9]+$ ]] && [ "$arg" -ge 1 ] && [ "$arg" -le 33 ]; then
+        elif [[ "$arg" =~ ^[0-9]+$ ]] && [ "$arg" -ge 1 ] && [ "$arg" -le 35 ]; then
             "test_$(printf '%02d' "$arg")"
         else
             echo "无效参数: $1"
-            echo "用法: $0 [?|help|all|write|stream|full|listen|<1-33>|s1-s9|vf|vr|w1-w17|menu]"
+            echo "用法: $0 [?|help|all|write|stream|full|listen|<1-35>|bpf|s1-s9|vf|vr|w1-w17|menu]"
             echo "试试: $0 ?  查看完整帮助"
             exit 1
         fi

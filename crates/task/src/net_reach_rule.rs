@@ -143,7 +143,7 @@ pub async fn run_outreach_detection(
         .collect()
         .await;
 
-    log_info!("Outreach detection: {} succeeded", logs.len());
+    //log_info!("Outreach detection: {} succeeded", logs.len());
     Ok(OutreachDetect { data_list: logs })
 }
 pub fn build_outreach_detect_list_json(logs: &[DomainLog]) -> Result<String, String> {

@@ -1288,10 +1288,12 @@ impl EbpfBackend {
                             let blocked = event.blocked == 1;
                             let n_type = if blocked { 3201 } else { 3202 };
                             let action = if blocked { "拦截" } else { "监控" };
+                            /*
                             log::info!(
                                 "[EbpfBackend] 勒索防护命中: path={} comm={} pid={} blocked={}",
                                 path, comm, event.pid, blocked
                             );
+                            */
                             backend.report_file_event(
                                 &path,
                                 &comm,
@@ -2339,10 +2341,11 @@ impl EbpfBackend {
         // 文件/勒索告警的 identifier 使用“操作进程”的 MD5（对齐驱动），
         // 不是被操作文件本身的 MD5。
         let md5_hash = proc_md5.map(|s| s.to_string());
+        /*
         log::info!(
             "[EbpfBackend] 文件告警: n_type={} path={} comm={} proc_md5={:?}",
             n_type, path, comm, md5_hash
-        );
+        );*/
         let log = reporter::AuditLogInfo {
             file_path: Some(path.to_string()),
             md5: md5_hash,
