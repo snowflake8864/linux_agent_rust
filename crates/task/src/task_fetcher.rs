@@ -75,7 +75,6 @@ pub struct TaskFetcher {
     prev_defense_switch: Option<u32>,
     prev_open_port_switch: bool,
     prev_file_switch: bool,
-    prev_extortion_switch:bool,
     prev_proc_switch:bool,
     prev_syslog_process_switch:bool,
     prev_dynamic_switch:bool,
@@ -214,16 +213,6 @@ pub fn apply_config_diff(old: &NetInfoConfig, new: &NetInfoConfig) -> Result<(),
             if let Some(mgr) = GLOBAL_PATTERN_MGR.get() {
                 let mut pattern_mgr = mgr.lock().map_err(|e| e.to_string())?;
                 pattern_mgr.clear_protect_dir();
-            }
-        }
-    }
-
-    // ── 勒索保护关闭 → 清理勒索目录 ──
-    if new.extortion_protect != old.extortion_protect {
-        if !new.extortion_protect {
-            if let Some(mgr) = GLOBAL_PATTERN_MGR.get() {
-                let mut pattern_mgr = mgr.lock().map_err(|e| e.to_string())?;
-                pattern_mgr.clear_exiport_dir();
             }
         }
     }
@@ -587,7 +576,6 @@ impl TaskFetcher {
             prev_defense_switch: None,
             prev_open_port_switch: false,
             prev_file_switch:false,
-            prev_extortion_switch:false,
             prev_proc_switch:false,
             prev_syslog_process_switch:false,
             prev_dynamic_switch:false,
@@ -935,15 +923,6 @@ fn apply_config_diff(&mut self, _old: &NetInfoConfig, new: &NetInfoConfig) -> Re
             pattern_mgr.clear_protect_dir();
         }
         self.prev_file_switch = new.file_switch;
-    }
-
-    // ── 勒索保护关闭 → 清理勒索目录 ──
-    if new.extortion_protect != self.prev_extortion_switch {
-        if !new.extortion_protect {
-            let mut pattern_mgr = self.pattern_mgr.lock().map_err(|e| e.to_string())?;
-            pattern_mgr.clear_exiport_dir();
-        }
-        self.prev_extortion_switch = new.extortion_protect;
     }
 
     // ── 进程日志开关（netlink 0x702，匹配 v2.0） ──
