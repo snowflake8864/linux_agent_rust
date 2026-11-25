@@ -109,6 +109,8 @@ pub struct EbpfBackend {
     active_dir_keys: Arc<Mutex<Vec<DirKey>>>,
     /// Active file_policies keys (具体文件) for clear operations
     active_file_keys: Arc<Mutex<Vec<DirKey>>>,
+    /// Active file_name_policies keys (父目录+文件名兜底) for clear operations
+    active_file_name_keys: Arc<Mutex<Vec<FileNameKey>>>,
     /// 勒索后缀 extort_suffixes map 中已写入的 keys（clear 用）
     active_extort_suffix_keys: Arc<Mutex<Vec<ExtortSuffixKey>>>,
     /// 目录型勒索 extort_dirs map 中已写入的 keys（clear 用）
@@ -498,6 +500,7 @@ impl EbpfBackend {
             dpi_tp_buffer: Arc::new(Mutex::new(String::new())),
             active_dir_keys: Arc::new(Mutex::new(Vec::new())),
             active_file_keys: Arc::new(Mutex::new(Vec::new())),
+            active_file_name_keys: Arc::new(Mutex::new(Vec::new())),
             active_extort_suffix_keys: Arc::new(Mutex::new(Vec::new())),
             active_extort_dir_keys: Arc::new(Mutex::new(Vec::new())),
             active_extort_trust: Arc::new(Mutex::new(Vec::new())),
@@ -2638,7 +2641,8 @@ impl EbpfBackend {
     fn clear_dir_policies_bpf(&self) {
         let dir_keys = std::mem::take(&mut *self.active_dir_keys.lock().unwrap());
         let file_keys = std::mem::take(&mut *self.active_file_keys.lock().unwrap());
-        if dir_keys.is_empty() && file_keys.is_empty() {
+        let file_name_keys = std::mem::take(&mut *self.active_file_name_keys.lock().unwrap());
+        if dir_keys.is_empty() && file_keys.is_empty() && file_name_keys.is_empty() {
             return;
         }
         let mut loader = match self.loader.lock() {
@@ -2665,6 +2669,20 @@ impl EbpfBackend {
                         let _ = files.remove(key);
                     }
                 }
+            }
+        }
+        if !file_name_keys.is_empty() {
+            if let Some(map) = bpf.map_mut("file_name_policies") {
+                if let Ok(mut files) = AyaHashMap::<_, FileNameKey, DirPolicy>::try_from(map) {
+                    for key in &file_name_keys {
+                        let _ = files.remove(key);
+                    }
+                }
+            }
+        }
+        if let Some(map) = bpf.map_mut("file_name_policy_count") {
+            if let Ok(mut count) = AyaArray::<_, u32>::try_from(map) {
+                let _ = count.set(0u32, &0u32, 0);
             }
         }
     }
@@ -2948,6 +2966,65 @@ impl EbpfBackend {
                 );
             }
             Err(e) => warn!("[EbpfBackend] 写 file_policies 失败: {}", e),
+        }
+    }
+
+    /// 写“父目录 + 文件名”兜底策略，覆盖文件删除后同名重建的场景。
+    fn write_file_name_policy_bpf(&self, key: FileNameKey, policy: DirPolicy) {
+        let mut loader = match self.loader.lock() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let bpf = match loader.file_bpf_mut() {
+            Some(b) => b,
+            None => {
+                warn!("[EbpfBackend] file_name_policies map 不可用");
+                return;
+            }
+        };
+        let map = match bpf.map_mut("file_name_policies") {
+            Some(m) => m,
+            None => {
+                warn!("[EbpfBackend] file_name_policies map 不可用");
+                return;
+            }
+        };
+        let mut files = match AyaHashMap::<_, FileNameKey, DirPolicy>::try_from(map) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("[EbpfBackend] file_name_policies try_from 失败: {}", e);
+                return;
+            }
+        };
+        let name = String::from_utf8_lossy(&key.name)
+            .trim_end_matches('\0')
+            .to_string();
+        match files.insert(key, policy, 0) {
+            Ok(_) => {
+                self.active_file_name_keys.lock().unwrap().push(key);
+                info!(
+                    "[EbpfBackend] 文件路径策略: dir_dev={} dir_inode={} name={} ops=0x{:x}",
+                    key.dir_dev, key.dir_ino, name, policy.ops_mask
+                );
+            }
+            Err(e) => warn!("[EbpfBackend] 写 file_name_policies 失败: {}", e),
+        }
+    }
+
+    fn update_file_name_policy_count(&self) {
+        let count = self.active_file_name_keys.lock().unwrap().len() as u32;
+        let mut loader = match self.loader.lock() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let bpf = match loader.file_bpf_mut() {
+            Some(b) => b,
+            None => return,
+        };
+        if let Some(map) = bpf.map_mut("file_name_policy_count") {
+            if let Ok(mut arr) = AyaArray::<_, u32>::try_from(map) {
+                let _ = arr.set(0u32, &count, 0);
+            }
         }
     }
 
@@ -3463,6 +3540,19 @@ impl EbpfBackend {
                     if let Ok(md) = std::fs::metadata(parent) {
                         use std::os::linux::fs::MetadataExt;
                         if md.is_dir() {
+                            if let Some(file_name) =
+                                std::path::Path::new(&entry.path).file_name().and_then(|n| n.to_str())
+                            {
+                                match FileNameKey::new(md.st_dev(), md.st_ino(), file_name) {
+                                    Some(name_key) => {
+                                        self.write_file_name_policy_bpf(name_key, fp)
+                                    }
+                                    None => warn!(
+                                        "[EbpfBackend] 文件名过长，跳过路径策略: {}",
+                                        entry.path
+                                    ),
+                                }
+                            }
                             self.cache_dir_path(
                                 md.st_dev(),
                                 md.st_ino(),
@@ -3490,6 +3580,7 @@ impl EbpfBackend {
                 expanded
             );
         }
+        self.update_file_name_policy_count();
 
         // 勒索防护：全局后缀规则 + TPNC 信任进程（与 dir_policies 独立）。
         let extort_rules = dpi_parser::parse_extort_rules(&patterns, &rules);

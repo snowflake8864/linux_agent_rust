@@ -33,10 +33,18 @@ struct event_meta {
     __u64 parent_ino;
 };
 
+#define FILE_NAME_MAX 256
+struct file_name_key {
+    __u64 dir_dev;
+    __u64 dir_ino;
+    char name[FILE_NAME_MAX];
+};
+
 struct path_buffer {
     char buf[256];
     char full[256];
     struct event_meta meta;
+    struct file_name_key name_key;
 };
 
 struct {
@@ -78,6 +86,24 @@ struct {
     __type(key, struct dir_key);
     __type(value, struct dir_policy);
 } file_policies SEC(".maps");
+
+// 具体文件策略的“父目录 + 文件名”兜底：文件删除后同名重建时 inode 会变，
+// 通过该表仍能命中。key 以父目录 (dev,inode) + 完整文件名定位。
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct file_name_key);
+    __type(value, struct dir_policy);
+} file_name_policies SEC(".maps");
+
+// file_name_policies 是否有有效条目，避免没有具体文件策略时做无意义的
+// 文件名读取和 hash 查询。
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} file_name_policy_count SEC(".maps");
 
 // 防篡改信任进程：key 为进程 exe (dev,inode)，value 为 TPNC 规则号位图。
 struct tamper_proc_key {
@@ -519,6 +545,29 @@ static __always_inline int check_exact_match(const char *filename, const struct 
     return match;
 }
 
+// 具体文件策略的“父目录 + 文件名”兜底查询：
+// 文件被删除后同名重建时 inode 变化，inode 表会漏掉，这里按路径名重新命中。
+static __always_inline int file_name_policies_enabled(void) {
+    __u32 key = 0;
+    __u32 *v = bpf_map_lookup_elem(&file_name_policy_count, &key);
+    return v && *v;
+}
+
+static __noinline struct dir_policy *lookup_file_name_policy(
+    struct path_buffer *scratch, struct dentry *dentry,
+    __u32 parent_dev, __u64 parent_ino) {
+    if (!file_name_policies_enabled()) return 0;
+
+    struct file_name_key *key = &scratch->name_key;
+    key->dir_dev = (__u64)parent_dev;
+    key->dir_ino = parent_ino;
+    __builtin_memset(key->name, 0, sizeof(key->name));
+    const unsigned char *name_ptr = BPF_CORE_READ(dentry, d_name.name);
+    bpf_probe_read_kernel_str(key->name, sizeof(key->name), name_ptr);
+
+    return bpf_map_lookup_elem(&file_name_policies, key);
+}
+
 // ===== 勒索防护 helpers =====
 
 static __always_inline int extort_enabled(void) {
@@ -614,12 +663,21 @@ static __noinline int deny_ret(int block) {
     return 0;
 }
 
+// 仅在确认命中规则、需要上报时才生成全路径，避免每次 file_open 都走 bpf_d_path。
+static __noinline int fill_full_path(struct path_buffer *scratch, struct file *file) {
+    if (!file) return 0;
+    if (scratch->meta.has_full) return 1;
+    long plen = bpf_d_path(&file->f_path, scratch->full, sizeof(scratch->full));
+    if (plen <= 0) return 0;
+    scratch->meta.has_full = 1;
+    return 1;
+}
+
 // 勒索防护检查：命中受保护后缀且当前进程不受信任时，
 // protect 模式返回 -EPERM，monitor 模式只上报。目录本身不参与后缀匹配。
 static __noinline int extort_check_impl(struct path_buffer *scratch, struct dentry *dentry,
-                                       __u8 op_type) {
+                                       struct file *file, __u8 op_type) {
     const char *filename = scratch->buf;
-    const char *fullpath = scratch->meta.has_full ? scratch->full : 0;
     __u32 parent_dev = scratch->meta.parent_dev;
     __u64 parent_ino = scratch->meta.parent_ino;
 
@@ -656,6 +714,8 @@ static __noinline int extort_check_impl(struct path_buffer *scratch, struct dent
     if (!matched) return 0;
     if (is_extort_trusted(idx)) return 0;
 
+    fill_full_path(scratch, file);
+    const char *fullpath = scratch->meta.has_full ? scratch->full : 0;
     __u8 protect = extort_protect_mode();
     send_monitor_event(scratch, EVENT_EXTORT, fullpath ? fullpath : filename,
                        protect ? 1 : 0, op_type, parent_dev, parent_ino);
@@ -663,12 +723,12 @@ static __noinline int extort_check_impl(struct path_buffer *scratch, struct dent
 }
 
 static __always_inline int extort_check(struct path_buffer *scratch, struct dentry *dentry,
-                                       const char *filename, const char *fullpath, __u8 op_type,
+                                       struct file *file, __u8 op_type,
                                        __u32 parent_dev, __u64 parent_ino) {
     scratch->meta.parent_dev = parent_dev;
     scratch->meta.parent_ino = parent_ino;
-    scratch->meta.has_full = fullpath ? 1 : 0;
-    return extort_check_impl(scratch, dentry, op_type);
+    scratch->meta.has_full = 0;
+    return extort_check_impl(scratch, dentry, file, op_type);
 }
 
 // Look up the dir policy for a rename source/destination and return it
@@ -729,11 +789,6 @@ int BPF_PROG(enforce_file_open, struct file *file) {
     const unsigned char *name_ptr = BPF_CORE_READ(dentry, d_name.name);
     bpf_probe_read_kernel_str(filename, 64, name_ptr);
 
-    // 命中后再生成全路径；bpf_d_path 失败时回退到叶子名。
-    char *fullpath = scratch->full;
-    long plen = bpf_d_path(&file->f_path, fullpath, sizeof(scratch->full));
-    if (plen <= 0) fullpath = 0;
-
     // ★ 自保专用检查：写操作命中自保目录则拦截（独立于 file_switch）
     if (op_type & OP_WRITE) {
         if (is_self_protect_violation(dentry, filename)) {
@@ -745,7 +800,7 @@ int BPF_PROG(enforce_file_open, struct file *file) {
 
     // 勒索防护独立于 file_switch，由 EXTORTION_SWITCH / EXTORTION_PROTECT 控制。
     {
-        int er = extort_check(scratch, dentry, filename, fullpath, op_type, parent_dev, parent_ino);
+        int er = extort_check(scratch, dentry, file, op_type, parent_dev, parent_ino);
         if (er) return er;
     }
 
@@ -766,13 +821,18 @@ int BPF_PROG(enforce_file_open, struct file *file) {
         fk.dev = kernel_dev_to_user(fkdev);
         fk.inode = BPF_CORE_READ(file_inode, i_ino);
         struct dir_policy *fp = bpf_map_lookup_elem(&file_policies, &fk);
+        if (!fp && (BPF_CORE_READ(file_inode, i_mode) & S_IFMT) != S_IFDIR) {
+            fp = lookup_file_name_policy(scratch, dentry, parent_dev, parent_ino);
+        }
         if (fp && (fp->ops_mask & op_type)) {
             if (is_tamper_trusted(fp)) {
                 // 具体文件策略的可信进程：跳过该策略，继续看父目录策略。
             } else {
                 __u8 fmode = resolve_mode(fp->mode, FEATURE_FILE);
                 int fblock = (fmode == MODE_PROTECT && fp->action == ACTION_DENY);
-                send_monitor_event(scratch, EVENT_FILE, fullpath ? fullpath : filename,
+                fill_full_path(scratch, file);
+                const char *event_path = scratch->meta.has_full ? scratch->full : filename;
+                send_monitor_event(scratch, EVENT_FILE, event_path,
                                    fblock, op_type, parent_dev, parent_ino);
                 return deny_ret(fblock);
             }
@@ -791,14 +851,17 @@ int BPF_PROG(enforce_file_open, struct file *file) {
     __u8 effective_mode = resolve_mode(policy->mode, FEATURE_FILE);
     // bpf_printk("file_open: effective_mode=%u action=%u op_type=%u", effective_mode, policy->action, op_type);
 
+    fill_full_path(scratch, file);
+    const char *event_path = scratch->meta.has_full ? scratch->full : filename;
+
     if (effective_mode == MODE_PROTECT && policy->action == ACTION_DENY) {
         // bpf_printk("file_open: BLOCK filename=%s op_type=%u", filename, op_type);
-        send_monitor_event(scratch, EVENT_FILE, fullpath ? fullpath : filename, 1, op_type, parent_dev, parent_ino);
+        send_monitor_event(scratch, EVENT_FILE, event_path, 1, op_type, parent_dev, parent_ino);
         return -EPERM;
     }
 
     // bpf_printk("file_open: MONITOR filename=%s op_type=%u", filename, op_type);
-    send_monitor_event(scratch, EVENT_FILE, fullpath ? fullpath : filename, 0, op_type, parent_dev, parent_ino);
+    send_monitor_event(scratch, EVENT_FILE, event_path, 0, op_type, parent_dev, parent_ino);
     return 0;
 }
 
@@ -832,6 +895,22 @@ int BPF_PROG(enforce_inode_create, struct inode *dir, struct dentry *dentry, umo
 
     if (!feature_enabled(FEATURE_FILE)) {
         return 0;
+    }
+
+    // 具体文件策略：删除后同名重建时 inode 已变化，按父目录 + 文件名兜底。
+    // monitor 模式不在 create 重复发事件，交给后续 file_open 上报。
+    if ((mode & S_IFMT) != S_IFDIR) {
+        struct dir_policy *file_policy =
+            lookup_file_name_policy(scratch, dentry, parent_dev, parent_ino);
+        if (file_policy && (file_policy->ops_mask & OP_CREATE) &&
+            !is_tamper_trusted(file_policy)) {
+            __u8 file_mode = resolve_mode(file_policy->mode, FEATURE_FILE);
+            if (file_mode == MODE_PROTECT && file_policy->action == ACTION_DENY) {
+                send_monitor_event_nocwd(scratch, EVENT_FILE, filename, 1, OP_CREATE,
+                                         parent_dev, parent_ino);
+                return -EPERM;
+            }
+        }
     }
 
     struct dir_key parent_key;
@@ -901,7 +980,7 @@ int BPF_PROG(enforce_inode_unlink, struct inode *dir, struct dentry *dentry) {
     }
 
     {
-        int er = extort_check(scratch, dentry, filename, 0, OP_DELETE, parent_dev, parent_ino);
+        int er = extort_check(scratch, dentry, 0, OP_DELETE, parent_dev, parent_ino);
         if (er) return er;
     }
 
@@ -915,6 +994,9 @@ int BPF_PROG(enforce_inode_unlink, struct inode *dir, struct dentry *dentry) {
         fk.dev = kernel_dev_to_user(fkdev);
         fk.inode = BPF_CORE_READ(target, i_ino);
         struct dir_policy *fp = bpf_map_lookup_elem(&file_policies, &fk);
+        if (!fp && (BPF_CORE_READ(target, i_mode) & S_IFMT) != S_IFDIR) {
+            fp = lookup_file_name_policy(scratch, dentry, parent_dev, parent_ino);
+        }
         if (fp && (fp->ops_mask & OP_DELETE)) {
             if (is_tamper_trusted(fp)) return 0;
             __u8 fmode = resolve_mode(fp->mode, FEATURE_FILE);
@@ -995,6 +1077,9 @@ int BPF_PROG(enforce_inode_rename, struct inode *old_dir, struct dentry *old_den
         fk.dev = kernel_dev_to_user(fkdev);
         fk.inode = BPF_CORE_READ(old_target, i_ino);
         struct dir_policy *fp = bpf_map_lookup_elem(&file_policies, &fk);
+        if (!fp && (BPF_CORE_READ(old_target, i_mode) & S_IFMT) != S_IFDIR) {
+            fp = lookup_file_name_policy(scratch, old_dentry, old_pdev, old_pino);
+        }
         if (fp && (fp->ops_mask & OP_RENAME) && !is_tamper_trusted(fp)) {
             __u8 fmode = resolve_mode(fp->mode, FEATURE_FILE);
             int fblock = (fmode == MODE_PROTECT && fp->action == ACTION_DENY);
@@ -1006,20 +1091,25 @@ int BPF_PROG(enforce_inode_rename, struct inode *old_dir, struct dentry *old_den
     }
     // 具体文件策略：目标文件 inode（覆盖已有文件时）
     struct inode *new_target = BPF_CORE_READ(new_dentry, d_inode);
+    struct dir_policy *new_fp = 0;
     if (new_target) {
         struct dir_key fk;
         dev_t fkdev = BPF_CORE_READ(new_target, i_sb, s_dev);
         fk.dev = kernel_dev_to_user(fkdev);
         fk.inode = BPF_CORE_READ(new_target, i_ino);
-        struct dir_policy *fp = bpf_map_lookup_elem(&file_policies, &fk);
-        if (fp && (fp->ops_mask & OP_RENAME) && !is_tamper_trusted(fp)) {
-            __u8 fmode = resolve_mode(fp->mode, FEATURE_FILE);
-            int fblock = (fmode == MODE_PROTECT && fp->action == ACTION_DENY);
-            __builtin_memset(filename, 0, 64);
-            bpf_probe_read_kernel_str(filename, 64, BPF_CORE_READ(new_dentry, d_name.name));
-            send_monitor_event(scratch, EVENT_FILE, filename, fblock, OP_RENAME, new_pdev, new_pino);
-            return deny_ret(fblock);
-        }
+        new_fp = bpf_map_lookup_elem(&file_policies, &fk);
+    }
+    // 目标路径不存在时也要覆盖：如 mv a.txt /protected/name.txt。
+    if (!new_fp && old_target && (BPF_CORE_READ(old_target, i_mode) & S_IFMT) != S_IFDIR) {
+        new_fp = lookup_file_name_policy(scratch, new_dentry, new_pdev, new_pino);
+    }
+    if (new_fp && (new_fp->ops_mask & OP_RENAME) && !is_tamper_trusted(new_fp)) {
+        __u8 fmode = resolve_mode(new_fp->mode, FEATURE_FILE);
+        int fblock = (fmode == MODE_PROTECT && new_fp->action == ACTION_DENY);
+        __builtin_memset(filename, 0, 64);
+        bpf_probe_read_kernel_str(filename, 64, BPF_CORE_READ(new_dentry, d_name.name));
+        send_monitor_event(scratch, EVENT_FILE, filename, fblock, OP_RENAME, new_pdev, new_pino);
+        return deny_ret(fblock);
     }
 
     int old_match = 0;
@@ -1156,12 +1246,12 @@ int BPF_PROG(enforce_extort_inode_rename, struct inode *old_dir, struct dentry *
 
     __builtin_memset(filename, 0, 64);
     bpf_probe_read_kernel_str(filename, 64, BPF_CORE_READ(old_dentry, d_name.name));
-    int er = extort_check(scratch, old_dentry, filename, 0, OP_RENAME, old_pdev, old_pino);
+    int er = extort_check(scratch, old_dentry, 0, OP_RENAME, old_pdev, old_pino);
     if (er) return er;
 
     __builtin_memset(filename, 0, 64);
     bpf_probe_read_kernel_str(filename, 64, BPF_CORE_READ(new_dentry, d_name.name));
-    er = extort_check(scratch, new_dentry, filename, 0, OP_RENAME, new_pdev, new_pino);
+    er = extort_check(scratch, new_dentry, 0, OP_RENAME, new_pdev, new_pino);
     if (er) return er;
     return 0;
 }
@@ -1187,7 +1277,7 @@ int BPF_PROG(enforce_inode_rmdir, struct inode *dir, struct dentry *dentry) {
         return -EPERM;
     }
 
-    int er = extort_check(scratch, dentry, filename, 0, OP_DELETE, parent_dev, parent_ino);
+    int er = extort_check(scratch, dentry, 0, OP_DELETE, parent_dev, parent_ino);
     if (er) return er;
 
     if (!feature_enabled(FEATURE_FILE)) return 0;
