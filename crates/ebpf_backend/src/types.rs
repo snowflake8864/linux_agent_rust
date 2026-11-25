@@ -10,6 +10,38 @@ pub struct DirKey {
 
 unsafe impl aya::Pod for DirKey {}
 
+/// 具体文件策略的“父目录 + 文件名”键，用于删除后同名重建时仍能命中。
+/// 与 file_agent.bpf.c 的 struct file_name_key 保持一致。
+pub const FILE_NAME_MAX: usize = 256;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FileNameKey {
+    pub dir_dev: u64,
+    pub dir_ino: u64,
+    pub name: [u8; FILE_NAME_MAX],
+}
+
+unsafe impl aya::Pod for FileNameKey {}
+
+const _: () = assert!(std::mem::size_of::<FileNameKey>() == 16 + FILE_NAME_MAX);
+
+impl FileNameKey {
+    pub fn new(dir_dev: u64, dir_ino: u64, name: &str) -> Option<Self> {
+        let bytes = name.as_bytes();
+        if bytes.is_empty() || bytes.len() >= FILE_NAME_MAX {
+            return None;
+        }
+        let mut buf = [0u8; FILE_NAME_MAX];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        Some(Self {
+            dir_dev,
+            dir_ino,
+            name: buf,
+        })
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct DirPolicy {
