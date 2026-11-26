@@ -224,7 +224,7 @@ pub fn broadcast_ssh_log(log: &crate::SyslogSshLog) {
         r#type: 0, level: if log.status == 0 { 1 } else { 2 },
         timestamp: log.time as u64,
         file_path: String::new(),
-        process_name: format!("ssh:{}", log.username),
+        process_name: format!("{}:{}", log.login_type, log.username),
         md5: String::new(),
         remark: format!("IP:{} type:{}", log.ip, log.login_type),
         peripheral_name: String::new(), peripheral_eid: String::new(),
