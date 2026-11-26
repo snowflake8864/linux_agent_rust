@@ -710,14 +710,18 @@ fn parse_ftp_line(line: &str, now: DateTime<Local>) -> Option<SyslogSshLog> {
     let lower = line.to_ascii_lowercase();
     let is_ftp = lower.contains("vsftpd")
         || lower.contains("proftpd")
-        || (lower.contains("[pid") && (lower.contains("ok login") || lower.contains("login failed")));
+        || (lower.contains("[pid")
+            && (lower.contains("ok login")
+                || lower.contains("fail login")
+                || lower.contains("login failed")));
     if !is_ftp {
         return None;
     }
     let success = lower.contains("ok login")
         || lower.contains("login successful")
         || lower.contains("session opened for user");
-    let failed = lower.contains("login failed")
+    let failed = lower.contains("fail login")
+        || lower.contains("login failed")
         || lower.contains("login incorrect")
         || lower.contains("authentication failure");
     if success == failed {
@@ -759,14 +763,25 @@ fn parse_ftp_line(line: &str, now: DateTime<Local>) -> Option<SyslogSshLog> {
         .iter()
         .filter_map(|word| {
             let candidate = word.strip_prefix("rhost=").unwrap_or(word);
-            let candidate = candidate.strip_prefix("::ffff:").unwrap_or(candidate);
-            let trimmed = candidate.trim_matches(|c: char| {
+            // vsftpd 的格式是 Client "::ffff:1.2.3.4"，先去引号再去 ::ffff: 前缀。
+            let candidate = candidate.trim_matches(|c: char| {
                 !c.is_ascii_alphanumeric() && c != '.' && c != ':'
             });
-            trimmed.split('[').next().unwrap_or(trimmed).parse::<IpAddr>().ok()
+            let candidate = candidate.strip_prefix("::ffff:").unwrap_or(candidate);
+            let candidate = candidate.split('[').next().unwrap_or(candidate);
+            let addr = candidate.parse::<IpAddr>().ok()?;
+            // IPv4-mapped IPv6 归一成 IPv4，避免 IP 字段变成 ::ffff:1.2.3.4。
+            let addr = match addr {
+                IpAddr::V6(v6) => v6.to_ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+                other => other,
+            };
+            if addr.is_unspecified() {
+                None
+            } else {
+                Some(addr.to_string())
+            }
         })
-        .find(|addr| !addr.is_unspecified())?
-        .to_string();
+        .next()?;
 
     build_login_log(
         &ip,
@@ -1072,6 +1087,22 @@ mod tests {
         // 无外部 IP 的独立日志同样跳过。
         let standalone = "Mon Nov 26 09:20:00 2026 [pid 2] [alice] OK Login";
         assert!(parse_ftp_line(standalone, fixed_now()).is_none());
+    }
+
+    #[test]
+    fn parses_real_vsftpd_log_format() {
+        let success = "Thu Nov 26 10:40:36 2026 [pid 127468] [zebra] OK LOGIN: Client \"::ffff:192.168.4.8\"";
+        let log = parse_ftp_line(success, fixed_now()).unwrap();
+        assert_eq!(log.username, "zebra");
+        assert_eq!(log.ip, "192.168.4.8");
+        assert_eq!(log.login_type, "FTP");
+        assert_eq!(log.status, 1);
+
+        let failed = "Thu Nov 26 10:31:58 2026 [pid 126861] [ftp_test_bad] FAIL LOGIN: Client \"::ffff:1.2.3.4\"";
+        let log = parse_ftp_line(failed, fixed_now()).unwrap();
+        assert_eq!(log.username, "ftp_test_bad");
+        assert_eq!(log.ip, "1.2.3.4");
+        assert_eq!(log.status, 0);
     }
 
     #[test]
