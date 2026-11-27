@@ -99,6 +99,8 @@ pub struct NetInfoConfig {
     pub ebpf_file_agent: bool,
     pub ebpf_proc_agent: bool,
     pub ebpf_net_agent: bool,
+    /// eBPF DNS 审计模块开关：控制是否加载 dns_agent.bpf.o（[EBPF] DNS_AGENT）
+    pub ebpf_dns_agent: bool,
     // eBPF proc_rules map 最大条目数（默认 131072）
     pub ebpf_proc_rules_max_entries: u32,
 }
@@ -819,6 +821,9 @@ impl NetInfoConfig {
         if let Some(value) = ini.get("EBPF", "NET_AGENT") {
             config.ebpf_net_agent = matches!(value.trim(), "1");
         }
+        if let Some(value) = ini.get("EBPF", "DNS_AGENT") {
+            config.ebpf_dns_agent = matches!(value.trim(), "1");
+        }
         // [EBPF] proc_rules map 条目数上限，默认 131072（128K）
         if let Some(value) = ini.get("EBPF", "PROC_RULES_MAX_ENTRIES") {
             if let Ok(n) = value.trim().parse::<u32>() {
@@ -1019,6 +1024,7 @@ impl NetInfoConfig {
         writeln!(file, "FILE_AGENT={}", self.ebpf_file_agent as u8)?;
         writeln!(file, "PROC_AGENT={}", self.ebpf_proc_agent as u8)?;
         writeln!(file, "NET_AGENT={}", self.ebpf_net_agent as u8)?;
+        writeln!(file, "DNS_AGENT={}", self.ebpf_dns_agent as u8)?;
         writeln!(file, "PROC_RULES_MAX_ENTRIES={}", self.ebpf_proc_rules_max_entries)?;
 
         // [SQLITE_DB] 段 — SQLite 基础设施开关

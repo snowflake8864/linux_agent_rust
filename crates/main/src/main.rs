@@ -286,6 +286,7 @@ async fn main() -> std::io::Result<()> {
                     proc_enabled, cfg.proc_switch, cfg.proc_protect,
                     extortion_switch, extortion_protect,
                     net_enabled,
+                    cfg.ebpf_dns_agent,
                     &cfg.ifcfg, "xdp",
                     cfg.ebpf_proc_rules_max_entries,
                 ).unwrap_or_else(|e| {
@@ -323,6 +324,7 @@ async fn main() -> std::io::Result<()> {
                 ebpf.start_net_event_reader();
                 // 启动对内/对外通信 ring buffer reader（netlog_events → syslog 队列）
                 ebpf.start_netlog_event_reader();
+                ebpf.start_dns_event_reader();
                 ebpf.start_container_scan_loop();
                 // 自保后门：Unix socket .self.sock，口令 `veda <YYYY+MD+1> 0` 关自保（复刻驱动 /proc/osec/self）
                 ebpf.start_self_backdoor();
@@ -407,6 +409,7 @@ async fn main() -> std::io::Result<()> {
                                 proc_enabled, cfg.proc_switch, cfg.proc_protect,
                                 extortion_switch, extortion_protect,
                                 net_enabled,
+                                cfg.ebpf_dns_agent,
                                 &cfg.ifcfg, "xdp",
                                 cfg.ebpf_proc_rules_max_entries,
                             ) {
@@ -433,6 +436,7 @@ async fn main() -> std::io::Result<()> {
                                         ebpf.start_file_event_reader();
                                         ebpf.start_net_event_reader();
                                         ebpf.start_netlog_event_reader();
+                ebpf.start_dns_event_reader();
                                         ebpf.start_container_scan_loop();
                                         // 自保后门：Unix socket .self.sock（复刻驱动 /proc/osec/self）
                                         ebpf.start_self_backdoor();

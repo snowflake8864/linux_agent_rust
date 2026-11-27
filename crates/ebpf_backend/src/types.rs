@@ -310,6 +310,27 @@ pub const NETLOG_EVENT_SIZE: usize = 60;
 
 const _: () = assert!(std::mem::size_of::<NetLogEvent>() == NETLOG_EVENT_SIZE);
 
+// --- DNS 审计事件（匹配 dns_agent.bpf.c dns_event, 72 字节）---
+/// DNS 响应解析结果：域名 + 解析出的 IPv4 地址（网络序，每个 4 字节）。
+/// 进程信息由用户态留空；family=2(AF_INET)。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct DnsEvent {
+    pub event_type: u8, // EVENT_DNS = 6
+    pub family: u8,     // 2=AF_INET
+    pub ip_cnt: u8,     // 0~12
+    pub _pad: u8,
+    pub domain: [u8; 64],
+    pub ips: [u8; 4],
+}
+
+unsafe impl aya::Pod for DnsEvent {}
+
+pub const DNS_EVENT_SIZE: usize = 72;
+pub const EVENT_DNS: u8 = 6;
+
+const _: () = assert!(std::mem::size_of::<DnsEvent>() == DNS_EVENT_SIZE);
+
 /// IPv6 服务器 IP map 的 key（16 字节网络序地址）
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

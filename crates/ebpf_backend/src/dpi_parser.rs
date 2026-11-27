@@ -95,6 +95,15 @@ pub struct ResolvedDirPolicy {
     pub policy: DirPolicy,
 }
 
+/// 全局信任目录（type=0 / TDir_rule）解析结果。
+#[derive(Debug, Clone)]
+pub struct ResolvedTrustedDir {
+    pub key: DirKey,
+    pub path: String,
+    /// 1=信任整个子树（is_extend=1），0=只信任直接位于该目录的对象
+    pub whole_dir: u8,
+}
+
 // ── Parsing helpers ──
 
 /// Parse a single comma-separated "key=value" pattern line.
@@ -198,7 +207,10 @@ pub fn match_patterns_to_rules(
         }
         // 勒索规则（type=1）由 parse_extort_rules / parse_extort_dir_rules 处理，
         // 不能落到 dir_policies/file_policies，否则目录型勒索会被误当成防篡改。
-        if rule.rule_type == 1 {
+        // 全局信任目录（type=0，TDir_rule）表示信任/放通，也不应变成防篡改目录策略，
+        // 否则像内置默认信任目录 /opt/osec/log 会被当成普通 dir_policy，
+        // 读取其中的日志反而触发监控告警（n_type=3004）。
+        if rule.rule_type == 1 || rule.rule_type == 0 {
             continue;
         }
 
@@ -281,6 +293,42 @@ pub fn match_patterns_to_rules(
     }
 
     by_key.into_values().collect()
+}
+
+/// 解析全局信任目录规则（type=0 / `target=TDir_rule`）。
+///
+/// 信任目录与防篡改/勒索规则语义相反：命中时完全跳过管控、不产生告警。
+/// `isnot_extend=1` 表示只信任目录本身（whole_dir=0），否则信任整个子树。
+pub fn parse_trusted_dirs(
+    patterns: &[ParsedPattern],
+    rules: &[ParsedRule],
+) -> Vec<ResolvedTrustedDir> {
+    let pat_by_name: HashMap<&str, &ParsedPattern> =
+        patterns.iter().map(|p| (p.name.as_str(), p)).collect();
+
+    let mut out = Vec::new();
+    for rule in rules {
+        if rule.rule_type != 0 || rule.pattern_refs.is_empty() {
+            continue;
+        }
+        let primary_name = rule.pattern_refs.first().unwrap().as_str();
+        let Some(pattern) = pat_by_name.get(primary_name) else {
+            continue;
+        };
+        let path = pattern.key.trim();
+        if path.is_empty() || path.starts_with('.') {
+            continue;
+        }
+        let Some(key) = resolve_dir_to_key(path) else {
+            continue;
+        };
+        out.push(ResolvedTrustedDir {
+            key,
+            path: path.to_string(),
+            whole_dir: if pattern.is_not_extend { 0 } else { 1 },
+        });
+    }
+    out
 }
 
 /// Collect suffix patterns linked to a directory rule via chained rules.
@@ -655,6 +703,35 @@ mod tests {
         let line = "target=TDir_rule,type=0,pattern=trueDir_0";
         let r = parse_rule_line(line).unwrap();
         assert_eq!(r.rule_type, 0);
+    }
+
+    #[test]
+    fn test_parse_trusted_dirs() {
+        let pats = parse_patterns(
+            "name=trueDir_0,key=/tmp,isnot_extend=1,pkt_len=-1,case_offset=1\n\
+             name=trueDir_1,key=/var,case_offset=1\n",
+        );
+        let rules = parse_rules(
+            "target=TDir_rule,type=0,pattern=trueDir_0\n\
+             target=TDir_rule,type=0,pattern=trueDir_1\n\
+             target=ProtectDir_0,pattern=ProtectDir_0,action=3,type=2\n",
+        );
+        let out = parse_trusted_dirs(&pats, &rules);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].path, "/tmp");
+        assert_eq!(out[0].whole_dir, 0);
+        assert_eq!(out[1].path, "/var");
+        assert_eq!(out[1].whole_dir, 1);
+    }
+
+    #[test]
+    fn test_global_trust_dir_not_written_as_dir_policy() {
+        // 信任目录(type=0)表示放通，不能被解析成 dir_policies，
+        // 否则信任目录里的文件读取会被当成防篡改监控产生告警。
+        // 用 /tmp 保证目录一定存在，避免 resolve_dir_to_key 失败导致假通过。
+        let pats = parse_patterns("name=trueDir_0,key=/tmp,isnot_extend=1,pkt_len=-1,case_offset=1\n");
+        let rules = parse_rules("target=TDir_rule,type=0,pattern=trueDir_0\n");
+        assert!(match_patterns_to_rules(&pats, &rules).is_empty());
     }
 
     #[test]
