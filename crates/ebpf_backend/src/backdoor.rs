@@ -21,8 +21,10 @@ use log::{error, info, warn};
 pub const SELF_BACKDOOR_SOCKET: &str = "/tmp/.self.sock";
 
 /// 按驱动模式口径计算当日口令 token：`YYYY` + `M`(去前导0) + `D`(去前导0)，再 +1。
-/// 例如 2026-09-09 → "2026"+"9"+"9" = 202699，+1 = 2026100。
-/// 使用 libc localtime_r 取本机时区日期，与 shell `date` 输出完全一致。
+/// 例如 2026-09-09 → "2026"+"9"+"9" = 202699，+1 = 202700。
+///
+/// 日期换算不再每次请求都调 libc::localtime_r（要读 /etc/localtime、可能拿时区锁），
+/// 改为"本地偏移按天缓存 + 纯算术换算"：localtime_r 一天最多触发一次。
 pub fn self_protect_token() -> String {
     let now = std::time::SystemTime::now();
     let secs = now
@@ -37,16 +39,50 @@ pub fn self_protect_token() -> String {
         .to_string()
 }
 
+/// 本地时区相对 UTC 的秒偏移，按 UTC 日缓存（DST 跨日后自动重新取一次）。
+fn local_utc_offset_secs(secs: u64) -> i64 {
+    static CACHE: std::sync::Mutex<(i64, i64)> = std::sync::Mutex::new((i64::MIN, 0));
+    let utc_day = (secs / 86_400) as i64;
+    let mut guard = match CACHE.lock() {
+        Ok(g) => g,
+        // 曾在这个锁里 panic 过：复用内部值，别让后门从此永久算不出 token
+        Err(e) => e.into_inner(),
+    };
+    if guard.0 == utc_day {
+        return guard.1;
+    }
+    let offset = unsafe {
+        let t: libc::time_t = secs as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            // 取时区失败时退回 UTC，至少 token 是可计算的确定值，而不是垃圾数据
+            0
+        } else {
+            tm.tm_gmtoff as i64
+        }
+    };
+    *guard = (utc_day, offset);
+    offset
+}
+
 /// epoch 秒 → 本地时区 (年, 月, 日)，与 `date +%Y%m%d` 一致。
 fn local_date_from_epoch(secs: u64) -> (u32, u32, u32) {
-    let t: libc::time_t = secs as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&t, &mut tm) };
-    (
-        tm.tm_year as u32 + 1900,
-        tm.tm_mon as u32 + 1,
-        tm.tm_mday as u32,
-    )
+    let local = secs as i64 + local_utc_offset_secs(secs);
+    civil_from_days(local.div_euclid(86_400))
+}
+
+/// 自 1970-01-01 起的天数 → (年, 月, 日)。纯算术，无锁、无分配、无系统调用。
+fn civil_from_days(days: i64) -> (u32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y } as u32, m, d)
 }
 
 /// 校验一行口令 `veda <token> <0|1>`，返回 Some(true=开自保) / Some(false=关自保) / None(非法)。
@@ -89,9 +125,28 @@ fn read_line(stream: &mut UnixStream) -> Option<String> {
 }
 
 /// 处理一个连接：读口令，校验通过则执行关/开自保。
+///
+/// 处理线程 panic 只会结束这一个线程、进程照常运行，日志里往往只剩第一行，
+/// 现场无法定位（见 2026-11-26 分析）。这里兜住 panic，并保证各阶段都留痕。
 fn handle_connection(backend: &Arc<dyn SecurityBackend>, mut stream: UnixStream) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle_connection_inner(backend, &mut stream)
+    }));
+    if let Err(payload) = result {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<非字符串 panic payload>".to_string());
+        error!("[SelfBackdoor] ❌ 处理线程 panic: {}", msg);
+        let _ = stream.write_all(b"internal error\n");
+    }
+}
+
+/// 后门实际处理逻辑：每个阶段各打一条日志，出问题时不会只剩"收到口令请求"。
+fn handle_connection_inner(backend: &Arc<dyn SecurityBackend>, stream: &mut UnixStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let line = match read_line(&mut stream) {
+    let line = match read_line(stream) {
         Some(l) => l,
         None => {
             let _ = stream.write_all(b"no data\n");
@@ -156,6 +211,9 @@ pub fn start_self_backdoor(backend: Arc<dyn SecurityBackend>) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
+    // 预计算当日口令 token：把时区换算（localtime_r）的首次调用放在启动阶段，
+    // 而不是放在处理口令的请求线程里，避免"请求线程第一次算 token 就炸"的静默失败。
+    let _ = std::panic::catch_unwind(self_protect_token);
     //info!("[SelfBackdoor] 🛡️ 自保后门已启动: {} （操作: echo \"veda ... 0\" | nc -U {}）", path, path);
     std::thread::spawn(move || {
         for conn in listener.incoming() {
@@ -173,4 +231,30 @@ pub fn start_self_backdoor(backend: Arc<dyn SecurityBackend>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(20_454), (2026, 1, 1));
+        // 2026-11-27：与 `date +%Y%m%d` 对齐
+        assert_eq!(civil_from_days(20_784), (2026, 11, 27));
+    }
+
+    #[test]
+    fn token_format_matches_driver() {
+        // 与 install.sh 的 $(date +%Y)$(date +%m|sed s/^0//)$(date +%d|sed s/^0//)+1 对齐：
+        // 2026-09-09 -> "2026"+"9"+"9" = 202699 -> +1 = 202700
+        let (y, mo, d) = civil_from_days(20_705);
+        assert_eq!((y, mo, d), (2026, 9, 9));
+        let token = format!("{}{}{}", y, mo, d)
+            .parse::<u64>()
+            .map(|n| n + 1)
+            .unwrap();
+        assert_eq!(token, 202_700);
+    }
 }
