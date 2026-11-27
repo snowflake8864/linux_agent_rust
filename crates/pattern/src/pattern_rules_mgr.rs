@@ -87,9 +87,10 @@ pub struct PatternRulesMgr {
 impl PatternRulesMgr {
     pub fn new() -> Self {
 
-        let default_global_trust_dirs = vec![
-            GlobalTrustDir { dir: "/opt/osec/log".to_string(), typ: 0, is_extend: 0 },
-        ];
+        // 不再内置 /opt/osec/log：该目录的读操作本来就不需要信任放行，
+        // 写操作已由 /opt/osec 自保目录管控（agent 自身经 agent_pids 豁免）。
+        // 保留空列表以维持 default_trust_dirs() 接口不变。
+        let default_global_trust_dirs: Vec<GlobalTrustDir> = Vec::new();
         PatternRulesMgr {
             const_file_patterns: String::new(),
             const_file_rules: String::new(),

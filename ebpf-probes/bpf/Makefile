@@ -34,7 +34,7 @@ CFLAGS := -target bpf -D$(ARCH_DEFINE) -I. -O2 -g -c
 BPF_OUT_DIR ?= ../../bpf_arch/$(ARCH_DIR)
 
 # Source files - modular version
-SOURCES := common_maps.bpf.c file_agent.bpf.c proc_agent.bpf.c net_agent.bpf.c
+SOURCES := common_maps.bpf.c file_agent.bpf.c proc_agent.bpf.c net_agent.bpf.c dns_agent.bpf.c
 OBJECTS := $(addprefix $(BPF_OUT_DIR)/, $(SOURCES:.c=.o))
 
 .PHONY: all clean help
@@ -58,6 +58,11 @@ $(BPF_OUT_DIR)/proc_agent.bpf.o: proc_agent.bpf.c vmlinux.h
 	$(CLANG) $(CFLAGS) $< -o $@
 
 $(BPF_OUT_DIR)/net_agent.bpf.o: net_agent.bpf.c vmlinux.h
+	@mkdir -p $(BPF_OUT_DIR)
+	@echo "Building BPF: $< -> $@"
+	$(CLANG) $(CFLAGS) $< -o $@
+
+$(BPF_OUT_DIR)/dns_agent.bpf.o: dns_agent.bpf.c vmlinux.h
 	@mkdir -p $(BPF_OUT_DIR)
 	@echo "Building BPF: $< -> $@"
 	$(CLANG) $(CFLAGS) $< -o $@

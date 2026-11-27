@@ -15,8 +15,8 @@ use net_client::core::NetClient;
 use process_mgr::get_md5_global;
 use tokio::time::Duration;
 
-use crate::build_json::build_batch_syslog_net_json;
-use crate::SysNetLog;
+use crate::build_json::{build_batch_syslog_net_json, build_dns_log_json};
+use crate::{DnsLog, SysNetLog};
 
 /// 全局对内/对外通信日志队列：eBPF 后端直接 push，worker 批量 POST。
 pub static NET_LOG_QUEUE: OnceLock<StdMutex<VecDeque<SysNetLog>>> = OnceLock::new();
@@ -35,6 +35,29 @@ pub fn push_net_log(log: SysNetLog) {
 
 fn drain_net_logs() -> Vec<SysNetLog> {
     let q = NET_LOG_QUEUE.get_or_init(|| StdMutex::new(VecDeque::new()));
+    match q.lock() {
+        Ok(mut g) => g.drain(..).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// eBPF DNS 审计日志队列：dns_agent ringbuf reader 直接 push，worker 批量 POST。
+pub static DNS_LOG_QUEUE: OnceLock<StdMutex<VecDeque<DnsLog>>> = OnceLock::new();
+
+/// eBPF 后端的同步接口：推入一条 DNS 审计日志（队列上限 1000 条防洪）。
+pub fn push_dns_log(log: DnsLog) {
+    let q = DNS_LOG_QUEUE.get_or_init(|| StdMutex::new(VecDeque::new()));
+    if let Ok(mut g) = q.lock() {
+        if g.len() >= 1000 {
+            g.pop_front();
+            log_warn!("[dnslog] 队列满，丢弃最旧条目");
+        }
+        g.push_back(log);
+    }
+}
+
+fn drain_dns_logs() -> Vec<DnsLog> {
+    let q = DNS_LOG_QUEUE.get_or_init(|| StdMutex::new(VecDeque::new()));
     match q.lock() {
         Ok(mut g) => g.drain(..).collect(),
         Err(_) => Vec::new(),
@@ -68,14 +91,9 @@ pub async fn run_net_log_worker(boot_manager: Arc<BootManager>) {
     loop {
         interval.tick().await;
         let mut logs = drain_net_logs();
-        if logs.is_empty() {
+        let dns_logs = drain_dns_logs();
+        if logs.is_empty() && dns_logs.is_empty() {
             continue;
-        }
-
-        for log in logs.iter_mut() {
-            if log.log_type == 3 {
-                enrich_inner(log);
-            }
         }
 
         let base_url = boot_manager.get_base_url();
@@ -87,32 +105,44 @@ pub async fn run_net_log_worker(boot_manager: Arc<BootManager>) {
             }
         };
         let url = format!("{}/v1/putsyslog", base_url);
-        let mut json_str = String::new();
-        match build_batch_syslog_net_json(&logs, &mut json_str) {
-            Ok(()) => {
-                /*
-                log_info!(
-                    "[netlog] 准备上报 {} 条, log_types={:?}, payload={}",
-                    logs.len(),
-                    log_types,
-                    json_str
-                );
-                */
-                let token = boot_manager.get_token().await;
-                match client
-                    .post_data_async(&url, &json_str, Duration::from_secs(10), token.as_deref())
-                    .await
-                {
-                    // Ok(_) => log_info!(
-                    //     "[netlog] 上报 {} 条通信日志成功, log_types={:?}",
-                    //     logs.len(),
-                    //     log_types
-                    // ),
-                    Ok(_) => {}
-                    Err(err) => log_error!("[netlog] 上报 {} 条失败: {}", logs.len(), err),
+
+        if !logs.is_empty() {
+            for log in logs.iter_mut() {
+                if log.log_type == 3 {
+                    enrich_inner(log);
                 }
             }
-            Err(e) => log_error!("[netlog] 构建 JSON 失败: {}", e),
+            let mut json_str = String::new();
+            match build_batch_syslog_net_json(&logs, &mut json_str) {
+                Ok(()) => {
+                    let token = boot_manager.get_token().await;
+                    match client
+                        .post_data_async(&url, &json_str, Duration::from_secs(10), token.as_deref())
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(err) => log_error!("[netlog] 上报 {} 条失败: {}", logs.len(), err),
+                    }
+                }
+                Err(e) => log_error!("[netlog] 构建 JSON 失败: {}", e),
+            }
+        }
+
+        // DNS 审计日志：独立 JSON，同样 POST /v1/putsyslog
+        if !dns_logs.is_empty() {
+            let mut dns_json = String::new();
+            match build_dns_log_json(&dns_logs, &mut dns_json) {
+                Ok(()) => {
+                    let token = boot_manager.get_token().await;
+                    if let Err(err) = client
+                        .post_data_async(&url, &dns_json, Duration::from_secs(10), token.as_deref())
+                        .await
+                    {
+                        log_error!("[dnslog] 上报 {} 条失败: {}", dns_logs.len(), err);
+                    }
+                }
+                Err(e) => log_error!("[dnslog] 构建 JSON 失败: {}", e),
+            }
         }
     }
 }

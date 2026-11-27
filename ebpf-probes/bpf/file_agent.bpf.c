@@ -79,6 +79,24 @@ struct {
     __type(value, struct dir_policy);
 } dir_policies SEC(".maps");
 
+// 全局信任目录（TDir_rule/type=0）：key 为目录 (dev,inode)，
+// value=1 表示信任整个子树，value=0 只信任直接位于该目录的对象。
+// 命中时优先于防篡改/勒索/自保规则直接放行（不告警、不拦截）。
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 512);
+    __type(key, struct dir_key);
+    __type(value, __u8);
+} trusted_dirs SEC(".maps");
+
+// 信任目录条目数：为 0 时跳过整条检查链，避免热路径上的 hash miss 开销。
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} trusted_dir_count SEC(".maps");
+
 // 具体文件防篡改策略：key 为文件自身 (dev,inode)，value 与 dir_policy 相同。
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -458,6 +476,41 @@ static __always_inline int is_self_protect_violation(struct dentry *dentry, cons
     return 0;
 }
 
+// 全局信任目录判定：从 dentry 的父目录向上有界遍历（最多 8 层）。
+// i==0 为直接父目录，命中即信任；更上层目录只有 value=whole_dir 时才信任。
+static __noinline int is_trusted_path(struct dentry *dentry) {
+    if (!dentry) return 0;
+    __u32 zero = 0;
+    __u32 *count = bpf_map_lookup_elem(&trusted_dir_count, &zero);
+    if (!count || *count == 0) return 0;
+    struct dentry *cur = BPF_CORE_READ(dentry, d_parent);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (!cur) break;
+        struct inode *inode = BPF_CORE_READ(cur, d_inode);
+        if (inode) {
+            struct dir_key key;
+            dev_t kdev = BPF_CORE_READ(inode, i_sb, s_dev);
+            key.dev = kernel_dev_to_user(kdev);
+            key.inode = BPF_CORE_READ(inode, i_ino);
+            __u8 *whole_dir = bpf_map_lookup_elem(&trusted_dirs, &key);
+            if (whole_dir && (*whole_dir || i == 0)) return 1;
+        }
+        cur = BPF_CORE_READ(cur, d_parent);
+    }
+    return 0;
+}
+
+// 当前进程的可执行文件是否位于信任目录下（用于进程维度的信任）。
+static __always_inline int is_current_exe_trusted(void) {
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (!task) return 0;
+    struct file *exe = BPF_CORE_READ(task, mm, exe_file);
+    if (!exe) return 0;
+    struct dentry *dentry = BPF_CORE_READ(exe, f_path.dentry);
+    return is_trusted_path(dentry);
+}
+
 static __always_inline __u8 resolve_mode(__u8 rule_mode, __u32 feature_idx) {
     // rule_mode: 0=use global, 1=monitor, 2=protect
     // Returns: MODE_MONITOR (1) or MODE_PROTECT (2)
@@ -585,6 +638,8 @@ static __always_inline int extort_protect_mode(void) {
 // 当前进程可执行文件是否在勒索信任进程表中，且允许 rule_idx 这个后缀规则。
 static __always_inline int is_extort_trusted(__u32 rule_idx) {
     if (rule_idx >= MAX_EXTORT_RULES) return 0;
+    // 信任目录下的进程：对所有勒索规则都视为信任进程。
+    if (is_current_exe_trusted()) return 1;
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     if (!task) return 0;
     struct file *exe = BPF_CORE_READ(task, mm, exe_file);
@@ -604,7 +659,10 @@ static __always_inline int is_extort_trusted(__u32 rule_idx) {
 
 // 防篡改信任进程：当前 exe 的 TPNC 位图是否包含该策略的 trust_rule。
 static __always_inline int is_tamper_trusted(const struct dir_policy *policy) {
-    if (!policy || policy->trust_rule == 0 || policy->trust_rule > 64) return 0;
+    if (!policy) return 0;
+    // 信任目录下的进程：对任何防篡改策略都视为信任进程（优先于 TPNC 位图）。
+    if (is_current_exe_trusted()) return 1;
+    if (policy->trust_rule == 0 || policy->trust_rule > 64) return 0;
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     if (!task) return 0;
     struct file *exe = BPF_CORE_READ(task, mm, exe_file);
@@ -677,6 +735,9 @@ static __noinline int fill_full_path(struct path_buffer *scratch, struct file *f
 // protect 模式返回 -EPERM，monitor 模式只上报。目录本身不参与后缀匹配。
 static __noinline int extort_check_impl(struct path_buffer *scratch, struct dentry *dentry,
                                        struct file *file, __u8 op_type) {
+    // 全局信任目录优先：勒索检查完全跳过。
+    if (is_trusted_path(dentry)) return 0;
+
     const char *filename = scratch->buf;
     __u32 parent_dev = scratch->meta.parent_dev;
     __u64 parent_ino = scratch->meta.parent_ino;
@@ -767,6 +828,9 @@ int BPF_PROG(enforce_file_open, struct file *file) {
 
     struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
     if (!dentry) return 0;
+
+    // 全局信任目录优先：不告警、不拦截。
+    if (is_trusted_path(dentry)) return 0;
 
     struct dentry *parent = BPF_CORE_READ(dentry, d_parent);
     if (!parent) return 0;
@@ -870,6 +934,7 @@ int BPF_PROG(enforce_inode_create, struct inode *dir, struct dentry *dentry, umo
     if (is_agent_process()) {
         return 0;
     }
+    if (is_trusted_path(dentry)) return 0;
 
     __u32 zero = 0;
     struct path_buffer *scratch = bpf_map_lookup_elem(&path_scratch, &zero);
@@ -959,6 +1024,7 @@ int BPF_PROG(enforce_inode_create, struct inode *dir, struct dentry *dentry, umo
 SEC("lsm.s/inode_unlink")
 int BPF_PROG(enforce_inode_unlink, struct inode *dir, struct dentry *dentry) {
     if (is_agent_process()) return 0;
+    if (is_trusted_path(dentry)) return 0;
 
     __u32 zero = 0;
     struct path_buffer *scratch = bpf_map_lookup_elem(&path_scratch, &zero);
@@ -1037,6 +1103,8 @@ SEC("lsm.s/inode_rename")
 int BPF_PROG(enforce_inode_rename, struct inode *old_dir, struct dentry *old_dentry,
              struct inode *new_dir, struct dentry *new_dentry) {
     if (is_agent_process()) return 0;
+    // 源或目标任一在信任目录下都放行。
+    if (is_trusted_path(old_dentry) || is_trusted_path(new_dentry)) return 0;
 
     __u32 zero = 0;
     struct path_buffer *scratch = bpf_map_lookup_elem(&path_scratch, &zero);
@@ -1161,6 +1229,7 @@ int BPF_PROG(enforce_inode_mkdir, struct inode *dir, struct dentry *dentry, umod
     if (is_agent_process()) {
         return 0;
     }
+    if (is_trusted_path(dentry)) return 0;
 
     __u32 zero = 0;
     struct path_buffer *scratch = bpf_map_lookup_elem(&path_scratch, &zero);
@@ -1233,6 +1302,8 @@ SEC("lsm.s/extort_inode_rename")
 int BPF_PROG(enforce_extort_inode_rename, struct inode *old_dir, struct dentry *old_dentry,
              struct inode *new_dir, struct dentry *new_dentry) {
     if (is_agent_process()) return 0;
+    // 源或目标任一在信任目录下都放行。
+    if (is_trusted_path(old_dentry) || is_trusted_path(new_dentry)) return 0;
 
     __u32 zero = 0;
     struct path_buffer *scratch = bpf_map_lookup_elem(&path_scratch, &zero);
@@ -1260,6 +1331,7 @@ int BPF_PROG(enforce_extort_inode_rename, struct inode *old_dir, struct dentry *
 SEC("lsm.s/inode_rmdir")
 int BPF_PROG(enforce_inode_rmdir, struct inode *dir, struct dentry *dentry) {
     if (is_agent_process()) return 0;
+    if (is_trusted_path(dentry)) return 0;
 
     __u32 zero = 0;
     struct path_buffer *scratch = bpf_map_lookup_elem(&path_scratch, &zero);

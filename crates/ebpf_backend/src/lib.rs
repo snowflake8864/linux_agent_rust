@@ -54,6 +54,7 @@ pub struct EbpfBackend {
     file_loaded: bool,
     proc_loaded: bool,
     net_loaded: bool,
+    dns_loaded: bool,
     /// 功能开关 (对应 *_SWITCH 配置)
     file_switch: bool,
     proc_switch: AtomicBool,
@@ -91,6 +92,8 @@ pub struct EbpfBackend {
     net_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
     /// eBPF ring buffer 读取器（从 net_agent 的 netlog_events 读取对内/对外通信事件）
     netlog_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
+    /// DNS 审计 ringbuf（dns_agent.bpf.o 的 dns_events）
+    dns_ringbuf: Arc<Mutex<Option<RingBuf<aya::maps::MapData>>>>,
     /// 对内/对外通信开关位：bit0=对内(syslog_inner), bit1=对外(syslog_outer)
     netlog_switch: AtomicU32,
     /// 最近一次下发的业务端口表（避免重复刷新 BPF map）
@@ -111,6 +114,8 @@ pub struct EbpfBackend {
     active_file_keys: Arc<Mutex<Vec<DirKey>>>,
     /// Active file_name_policies keys (父目录+文件名兜底) for clear operations
     active_file_name_keys: Arc<Mutex<Vec<FileNameKey>>>,
+    /// 全局信任目录 trusted_dirs 已写入 keys（file/proc 两个 BPF 对象各一份，clear 用）
+    active_trusted_dir_keys: Arc<Mutex<Vec<DirKey>>>,
     /// 勒索后缀 extort_suffixes map 中已写入的 keys（clear 用）
     active_extort_suffix_keys: Arc<Mutex<Vec<ExtortSuffixKey>>>,
     /// 目录型勒索 extort_dirs map 中已写入的 keys（clear 用）
@@ -396,6 +401,7 @@ impl EbpfBackend {
         extortion_switch: bool,
         extortion_protect: bool,
         net_enabled: bool,
+        dns_switch: bool,
         interface: &str,
         engine: &str,
         proc_rules_max_entries: u32,
@@ -454,9 +460,26 @@ impl EbpfBackend {
             info!("[EbpfBackend] NET_AGENT=0，跳过 net agent");
         }
 
+        // DNS 审计独立模块：DNS_AGENT=1 且 NET_AGENT=1 时加载 dns_agent.bpf.o。
+        // 加载失败不致命（降级为无 DNS 日志），不影响主网络功能。
+        let mut dns_loaded = false;
+        if net_enabled && dns_switch {
+            let path = format!("{}/dns_agent.bpf.o", bpf_dir);
+            if Path::new(&path).exists() {
+                info!("[EbpfBackend] 找到 dns_agent.bpf.o，开始加载...");
+                loader.load_dns_agent(&path)?;
+                dns_loaded = true;
+                info!("[EbpfBackend] ✅ dns_agent.bpf.o 加载成功");
+            } else {
+                warn!("[EbpfBackend] ❌ {} 不存在，跳过 DNS agent", path);
+            }
+        } else {
+            info!("[EbpfBackend] DNS_AGENT=0 或 NET_AGENT=0，跳过 DNS agent");
+        }
+
         info!(
-            "[EbpfBackend] ===== ELF 解析完成: file={}, proc={}, net={} =====",
-            file_loaded, proc_loaded, net_loaded
+            "[EbpfBackend] ===== ELF 解析完成: file={}, proc={}, net={}, dns={} =====",
+            file_loaded, proc_loaded, net_loaded, dns_loaded
         );
 
         // 容器收集仅在 eBPF 模式、且启用进程模块时启动；驱动模式不会走到这里。
@@ -472,6 +495,7 @@ impl EbpfBackend {
             file_loaded,
             proc_loaded,
             net_loaded,
+            dns_loaded,
             file_switch,
             proc_switch: AtomicBool::new(proc_switch),
             proc_detection_enabled: AtomicBool::new(false),
@@ -491,6 +515,7 @@ impl EbpfBackend {
             file_ringbuf: Arc::new(Mutex::new(None)),
             net_ringbuf: Arc::new(Mutex::new(None)),
             netlog_ringbuf: Arc::new(Mutex::new(None)),
+            dns_ringbuf: Arc::new(Mutex::new(None)),
             netlog_switch: AtomicU32::new(0),
             last_business_ports: Mutex::new(Vec::new()),
             server_ips: Mutex::new(Vec::new()),
@@ -501,6 +526,7 @@ impl EbpfBackend {
             active_dir_keys: Arc::new(Mutex::new(Vec::new())),
             active_file_keys: Arc::new(Mutex::new(Vec::new())),
             active_file_name_keys: Arc::new(Mutex::new(Vec::new())),
+            active_trusted_dir_keys: Arc::new(Mutex::new(Vec::new())),
             active_extort_suffix_keys: Arc::new(Mutex::new(Vec::new())),
             active_extort_dir_keys: Arc::new(Mutex::new(Vec::new())),
             active_extort_trust: Arc::new(Mutex::new(Vec::new())),
@@ -859,6 +885,10 @@ impl EbpfBackend {
             // 端口重定向依赖：accept_local（SNAT 后本机源地址不被判 martian）+ ip_forward
             *self.net_sysctl_state.lock().unwrap() = Some(apply_net_sysctls(&self.interface));
             loader.attach_net_programs(&self.interface, &self.engine)?;
+            // DNS 审计 tc ingress（独立对象，挂载失败仅告警）
+            if self.dns_loaded {
+                loader.attach_dns_program(&self.interface);
+            }
             // 启用 net feature switch (index 2) — net_agent 可能没有 feature_switches map，容错
             if let Some(bpf) = loader.net_bpf_mut() {
                 ModularLoader::enable_feature(bpf, 2, true)?;
@@ -898,6 +928,28 @@ impl EbpfBackend {
                 let sips = self.server_ips.lock().unwrap().clone();
                 if !sips.is_empty() {
                     Self::write_server_ips_map(bpf, &sips);
+                }
+            }
+
+            // DNS 审计：从独立对象取 ringbuf 并写入开关（DNS_AGENT=1 时）
+            if self.dns_loaded {
+                if let Some(bpf) = loader.dns_bpf_mut() {
+                    if let Some(map) = bpf.take_map("dns_events") {
+                        match RingBuf::try_from(map) {
+                            Ok(rb) => {
+                                *self.dns_ringbuf.lock().unwrap() = Some(rb);
+                                info!("[EbpfBackend] ✅ DNS event ringbuf reader 创建成功");
+                            }
+                            Err(e) => warn!("[EbpfBackend] ❌ 创建 DNS ringbuf reader 失败: {}", e),
+                        }
+                    } else {
+                        warn!("[EbpfBackend] ⚠ dns_agent 无 dns_events map，DNS 审计不上报");
+                    }
+                    if let Some(map) = bpf.map_mut("dns_switch") {
+                        if let Ok(mut arr) = AyaArray::<_, u32>::try_from(map) {
+                            let _ = arr.set(0u32, &1u32, 0);
+                        }
+                    }
                 }
             }
             info!(
@@ -1090,6 +1142,28 @@ impl EbpfBackend {
     fn bytes_to_string(bytes: &[u8]) -> String {
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         String::from_utf8_lossy(&bytes[..end]).to_string()
+    }
+
+    /// DNS question name 的原始 label 字节（[len][label]...[0]）转点分域名。
+    fn decode_dns_name(raw: &[u8; 64]) -> String {
+        let mut out = String::new();
+        let mut i = 0usize;
+        while i < raw.len() {
+            let len = raw[i] as usize;
+            i += 1;
+            if len == 0 {
+                break;
+            }
+            if len > 63 || i + len > raw.len() {
+                break;
+            }
+            if !out.is_empty() {
+                out.push('.');
+            }
+            out.push_str(&String::from_utf8_lossy(&raw[i..i + len]));
+            i += len;
+        }
+        out
     }
 
     /// 按 family 格式化 16 字节地址（IPv4 取前 4 字节）
@@ -1528,6 +1602,75 @@ impl EbpfBackend {
                     );
                     */
                     reporter::net_log_audit::push_net_log(log);
+                }
+                if items.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        });
+    }
+
+    /// 启动 DNS 审计 ringbuf 读取器
+    /// dns_agent 的 dns_events → DnsLog 队列 → reporter worker POST /v1/putsyslog
+    pub fn start_dns_event_reader(self: &Arc<Self>) {
+        if !self.dns_loaded {
+            return;
+        }
+        let rb = self.dns_ringbuf.clone();
+        std::thread::spawn(move || {
+            info!("[EbpfBackend] DNS 审计 ringbuf reader 已启动");
+            loop {
+                let items = Self::drain_ringbuf(&rb);
+                // 每个 A 记录一条事件；同批次同域名合并成一条日志。
+                let mut aggregated: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for data in &items {
+                    if data.len() < DNS_EVENT_SIZE || data[0] != EVENT_DNS {
+                        continue;
+                    }
+                    let ev: DnsEvent =
+                        unsafe { std::ptr::read_unaligned(data.as_ptr() as *const DnsEvent) };
+                    let domain = Self::decode_dns_name(&ev.domain);
+                    // 过滤反向 DNS 查询（与驱动 dnslog_audit.rs 一致）
+                    if domain.is_empty()
+                        || domain.contains(".in-addr.arpa")
+                        || domain.contains(".ip6.arpa")
+                    {
+                        continue;
+                    }
+                    let cnt = (ev.ip_cnt as usize).min(12);
+                    if cnt == 0 {
+                        continue;
+                    }
+                    let b = &ev.ips[0..4];
+                    let ip = format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]);
+                    aggregated.entry(domain).or_default().push(ip);
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i32;
+                for (domain, ips) in aggregated {
+                    let mut res_ip = String::new();
+                    for ip in ips {
+                        res_ip.push_str(&ip);
+                        res_ip.push(';');
+                    }
+                    let log = reporter::DnsLog {
+                        uid: None,
+                        p_id: 0,
+                        p_dir: None,
+                        domain_name: Some(domain.clone()),
+                        res_ip: Some(res_ip.clone()),
+                        time: now,
+                        log_type: 1,
+                        hash: None,
+                    };
+                    info!(
+                        "[EbpfBackend] DNS 审计: domain={} res_ip={}",
+                        domain, res_ip
+                    );
+                    reporter::net_log_audit::push_dns_log(log);
                 }
                 if items.is_empty() {
                     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -2687,6 +2830,103 @@ impl EbpfBackend {
         }
     }
 
+    /// 清空全局信任目录表。file_agent / proc_agent 是两个独立 BPF 对象，
+    /// trusted_dirs 各有一份，需要都清理。
+    fn clear_trusted_dirs_bpf(&self) {
+        let keys = std::mem::take(&mut *self.active_trusted_dir_keys.lock().unwrap());
+        if keys.is_empty() {
+            return;
+        }
+        let mut loader = match self.loader.lock() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        if let Some(bpf) = loader.file_bpf_mut() {
+            if let Some(map) = bpf.map_mut("trusted_dirs") {
+                if let Ok(mut trusted) = AyaHashMap::<_, DirKey, u8>::try_from(map) {
+                    for key in &keys {
+                        let _ = trusted.remove(key);
+                    }
+                }
+            }
+        }
+        if let Some(bpf) = loader.proc_bpf_mut() {
+            if let Some(map) = bpf.map_mut("trusted_dirs") {
+                if let Ok(mut trusted) = AyaHashMap::<_, DirKey, u8>::try_from(map) {
+                    for key in &keys {
+                        let _ = trusted.remove(key);
+                    }
+                }
+            }
+        }
+        self.set_trusted_dir_count(&mut loader, 0);
+    }
+
+    /// 同步 trusted_dir_count：BPF 侧据此在空表时短路遍历。
+    fn set_trusted_dir_count(&self, loader: &mut crate::loader::ModularLoader, count: u32) {
+        if let Some(bpf) = loader.file_bpf_mut() {
+            if let Some(map) = bpf.map_mut("trusted_dir_count") {
+                if let Ok(mut arr) = AyaArray::<_, u32>::try_from(map) {
+                    let _ = arr.set(0, &count, 0);
+                }
+            }
+        }
+        if let Some(bpf) = loader.proc_bpf_mut() {
+            if let Some(map) = bpf.map_mut("trusted_dir_count") {
+                if let Ok(mut arr) = AyaArray::<_, u32>::try_from(map) {
+                    let _ = arr.set(0, &count, 0);
+                }
+            }
+        }
+    }
+
+    fn write_trusted_dir_to_bpf(bpf: &mut aya::Bpf, key: DirKey, whole_dir: u8) -> Result<(), String> {
+        let map = bpf
+            .map_mut("trusted_dirs")
+            .ok_or_else(|| "trusted_dirs map unavailable".to_string())?;
+        let mut trusted = AyaHashMap::<_, DirKey, u8>::try_from(map).map_err(|e| e.to_string())?;
+        trusted.insert(key, whole_dir, 0).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// 写入一条全局信任目录（whole_dir=1 表示信任整个子树）。
+    /// 两个 BPF 对象各写一份，并追踪 key 供 clear 使用。
+    fn write_trusted_dir_bpf(&self, key: DirKey, whole_dir: u8) {
+        {
+            let mut loader = match self.loader.lock() {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!("[EbpfBackend] trusted_dirs lock error: {}", e);
+                    return;
+                }
+            };
+            if let Some(bpf) = loader.file_bpf_mut() {
+                if let Err(e) = Self::write_trusted_dir_to_bpf(bpf, key, whole_dir) {
+                    warn!("[EbpfBackend] 写 trusted_dirs(file) 失败: {}", e);
+                    return;
+                }
+            }
+            if let Some(bpf) = loader.proc_bpf_mut() {
+                if let Err(e) = Self::write_trusted_dir_to_bpf(bpf, key, whole_dir) {
+                    warn!("[EbpfBackend] 写 trusted_dirs(proc) 失败: {}", e);
+                    return;
+                }
+            }
+        }
+        let count = {
+            let mut keys = self.active_trusted_dir_keys.lock().unwrap();
+            keys.push(key);
+            keys.len() as u32
+        };
+        if let Ok(mut loader) = self.loader.lock() {
+            self.set_trusted_dir_count(&mut loader, count);
+        }
+        info!(
+            "[EbpfBackend] 全局信任目录: dev={} inode={} whole_dir={}",
+            key.dev, key.inode, whole_dir
+        );
+    }
+
     /// Write a single DirPolicy entry to the dir_policies BPF map.
     fn write_dir_policy_bpf(&self, key: DirKey, policy: DirPolicy) {
         let mut loader = match self.loader.lock() {
@@ -3065,6 +3305,51 @@ impl EbpfBackend {
                     inode: md.st_ino(),
                 };
                 self.write_dir_policy_bpf(key, policy);
+                *budget -= 1;
+                if let Some(p) = path.to_str() {
+                    self.cache_dir_path(key.dev, key.inode, p);
+                    stack.push(p.to_string());
+                }
+            }
+        }
+    }
+
+    /// 把全局信任目录 root 的子目录按 (dev,inode) 预展开写入 trusted_dirs。
+    /// 与 BPF 侧 8 层向上遍历配合，覆盖任意深度的子目录。
+    fn expand_trusted_dir_policy(&self, root: &str, whole_dir: u8, budget: &mut usize) {
+        use std::os::linux::fs::MetadataExt;
+
+        let mut stack: Vec<String> = vec![root.to_string()];
+        while let Some(dir) = stack.pop() {
+            if *budget == 0 {
+                warn!(
+                    "[EbpfBackend] 信任目录展开达到上限，root={}",
+                    root
+                );
+                return;
+            }
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            for entry in rd.flatten() {
+                if *budget == 0 {
+                    break;
+                }
+                let path = entry.path();
+                // 不跟随符号链接，避免目录环。
+                let md = match std::fs::symlink_metadata(&path) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if !md.file_type().is_dir() {
+                    continue;
+                }
+                let key = DirKey {
+                    dev: md.st_dev(),
+                    inode: md.st_ino(),
+                };
+                self.write_trusted_dir_bpf(key, whole_dir);
                 *budget -= 1;
                 if let Some(p) = path.to_str() {
                     self.cache_dir_path(key.dev, key.inode, p);
@@ -3581,6 +3866,25 @@ impl EbpfBackend {
             );
         }
         self.update_file_name_policy_count();
+
+        // 全局信任目录（type=0 / TDir_rule）：独立于 dir_policies 下发，
+        // 命中时 BPF 侧直接放行，不产生文件/进程告警。
+        let trusted_dirs = dpi_parser::parse_trusted_dirs(&patterns, &rules);
+        let mut trusted_budget = 400usize;
+        for entry in &trusted_dirs {
+            self.write_trusted_dir_bpf(entry.key, entry.whole_dir);
+            self.cache_dir_path(entry.key.dev, entry.key.inode, &entry.path);
+            if entry.whole_dir != 0 {
+                self.expand_trusted_dir_policy(&entry.path, entry.whole_dir, &mut trusted_budget);
+            }
+        }
+        if !trusted_dirs.is_empty() {
+            info!(
+                "[EbpfBackend] DPI commit: {} 条全局信任目录（含 {} 个展开子目录）",
+                trusted_dirs.len(),
+                400usize.saturating_sub(trusted_budget)
+            );
+        }
 
         // 勒索防护：全局后缀规则 + TPNC 信任进程（与 dir_policies 独立）。
         let extort_rules = dpi_parser::parse_extort_rules(&patterns, &rules);
@@ -5127,6 +5431,7 @@ impl SecurityBackend for EbpfBackend {
             self.dpi_pat_buffer.lock().unwrap().clear();
             self.dpi_rule_buffer.lock().unwrap().clear();
             self.clear_dir_policies_bpf();
+            self.clear_trusted_dirs_bpf();
             self.clear_extort_policy_bpf();
             self.clear_tamper_trust_bpf();
         }
