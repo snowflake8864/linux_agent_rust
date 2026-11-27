@@ -10,6 +10,10 @@ pub struct ModularLoader {
     pub file_bpf: Option<Bpf>,
     pub proc_bpf: Option<Bpf>,
     pub net_bpf: Option<Bpf>,
+    /// DNS 审计独立 BPF 对象（tc ingress）
+    pub dns_bpf: Option<Bpf>,
+    /// DNS tc ingress link id — 退出时精确 detach
+    dns_tc_attached: Option<SchedClassifierLinkId>,
     /// 已挂载的 XDP (程序名, link_id) — 退出时精确 detach
     xdp_attached: Option<(String, XdpLinkId)>,
     /// 已挂载的 TC egress (程序名, link_id) — 退出时精确 detach。
@@ -23,6 +27,8 @@ impl ModularLoader {
             file_bpf: None,
             proc_bpf: None,
             net_bpf: None,
+            dns_bpf: None,
+            dns_tc_attached: None,
             xdp_attached: None,
             tc_attached: None,
         }
@@ -70,6 +76,44 @@ impl ModularLoader {
         }
         self.net_bpf = Some(bpf);
         Ok(())
+    }
+
+    pub fn load_dns_agent(&mut self, path: &str) -> anyhow::Result<()> {
+        info!("[EbpfBackend] 📦 解析 ELF: dns_agent.bpf.o");
+        let bpf = BpfLoader::new().load_file(path)?;
+        for (name, _prog) in bpf.programs() {
+            info!("[EbpfBackend]   发现程序: {}", name);
+        }
+        self.dns_bpf = Some(bpf);
+        Ok(())
+    }
+
+    /// 挂载 DNS 审计 tc ingress 程序。clsact qdisc 与 net_agent 的 tc egress 共用；
+    /// 挂载失败仅告警，不影响主网络功能。
+    pub fn attach_dns_program(&mut self, interface: &str) {
+        let Some(bpf) = self.dns_bpf.as_mut() else {
+            warn!("[EbpfBackend] ⚠ DNS agent 未加载，跳过 dns tc ingress");
+            return;
+        };
+        let Some(prog) = bpf.program_mut("dns_tc_ingress") else {
+            warn!("[EbpfBackend] ⚠ 未找到程序: dns_tc_ingress");
+            return;
+        };
+        let result = (|| -> anyhow::Result<SchedClassifierLinkId> {
+            let _ = std::process::Command::new("tc")
+                .args(["qdisc", "add", "dev", interface, "clsact"])
+                .output();
+            let tc: &mut SchedClassifier = prog.try_into()?;
+            tc.load()?;
+            Ok(tc.attach(interface, TcAttachType::Ingress)?)
+        })();
+        match result {
+            Ok(link_id) => {
+                self.dns_tc_attached = Some(link_id);
+                info!("[EbpfBackend] ✅ DNS tc ingress attached -> {}", interface);
+            }
+            Err(e) => warn!("[EbpfBackend] ⚠ DNS tc ingress 挂载失败（非致命）: {}", e),
+        }
     }
 
     /// 挂载文件管控 eBPF 程序 (LSM hooks)
@@ -338,6 +382,10 @@ impl ModularLoader {
         self.file_bpf.as_mut()
     }
 
+    pub fn dns_bpf_mut(&mut self) -> Option<&mut Bpf> {
+        self.dns_bpf.as_mut()
+    }
+
     /// 退出时卸载网络管控 eBPF（XDP/TC）。
     ///
     /// 为什么必须显式卸载：
@@ -347,6 +395,20 @@ impl ModularLoader {
     ///
     /// LSM/kprobe/cgroup connect4 为 bpf_link 挂载，内核随进程退出自动回收，无需处理。
     pub fn detach_net_programs(&mut self) {
+        if let Some(link_id) = self.dns_tc_attached.take() {
+            if let Some(bpf) = self.dns_bpf.as_mut() {
+                if let Some(prog) = bpf.program_mut("dns_tc_ingress") {
+                    let tc_res: Result<&mut SchedClassifier, _> = prog.try_into();
+                    match tc_res {
+                        Ok(tc) => match tc.detach(link_id) {
+                            Ok(()) => info!("[EbpfBackend] ✅ DNS tc ingress 已卸载"),
+                            Err(e) => warn!("[EbpfBackend] ⚠ DNS tc ingress 卸载失败: {}", e),
+                        },
+                        Err(e) => warn!("[EbpfBackend] ⚠ DNS tc 程序类型转换失败: {}", e),
+                    }
+                }
+            }
+        }
         if let Some((name, link_id)) = self.tc_attached.take() {
             if let Some(bpf) = self.net_bpf.as_mut() {
                 if let Some(prog) = bpf.program_mut(&name) {

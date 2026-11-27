@@ -69,6 +69,29 @@ struct {
     __type(value, struct proc_rule_ino);
 } proc_rules_ino SEC(".maps");
 
+// 全局信任目录（与 file_agent 中各定义一份，用户态写两遍）：
+// key 为目录 (dev,inode)，value=1 表示信任整个子树。
+// executable 位于这些目录下时 exec 直接放行，不产生进程告警。
+struct dir_key {
+    __u64 dev;
+    __u64 inode;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 512);
+    __type(key, struct dir_key);
+    __type(value, __u8);
+} trusted_dirs SEC(".maps");
+
+// 为 0 时跳过信任目录遍历，避免 exec 热路径无谓开销。
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} trusted_dir_count SEC(".maps");
+
 struct pattern_key {
     char pattern[32];
 };
@@ -187,6 +210,32 @@ static __always_inline __u64 kernel_dev_to_user(dev_t kdev) {
     }
 }
 
+// 可执行文件是否位于信任目录（含子树）下：沿 dentry 父链有界遍历。
+static __always_inline int is_trusted_exe_file(struct file *file) {
+    if (!file) return 0;
+    __u32 zero = 0;
+    __u32 *count = bpf_map_lookup_elem(&trusted_dir_count, &zero);
+    if (!count || *count == 0) return 0;
+    struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
+    if (!dentry) return 0;
+    struct dentry *cur = BPF_CORE_READ(dentry, d_parent);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (!cur) break;
+        struct inode *inode = BPF_CORE_READ(cur, d_inode);
+        if (inode) {
+            struct dir_key key;
+            dev_t kdev = BPF_CORE_READ(inode, i_sb, s_dev);
+            key.dev = kernel_dev_to_user(kdev);
+            key.inode = BPF_CORE_READ(inode, i_ino);
+            __u8 *whole_dir = bpf_map_lookup_elem(&trusted_dirs, &key);
+            if (whole_dir && (*whole_dir || i == 0)) return 1;
+        }
+        cur = BPF_CORE_READ(cur, d_parent);
+    }
+    return 0;
+}
+
 static __always_inline int feature_enabled(__u32 feature_idx) {
     __u8 *enabled = bpf_map_lookup_elem(&feature_switches, &feature_idx);
     return enabled && *enabled;
@@ -273,6 +322,10 @@ int BPF_PROG(enforce_bprm_check_security, struct linux_binprm *bprm) {
     // bpf_d_path 的 ARG_PTR_TO_BTF_ID 入参，会触发 verifier 报错。
     struct file *file = bprm->file;
     if (!file) return 0;
+
+    // 全局信任目录优先：可执行文件位于信任目录下时直接放行，
+    // 不产生 EVENT_PROC / EVENT_PROC_UNKNOWN 告警。
+    if (is_trusted_exe_file(file)) return 0;
 
     // ★ 只有相对路径（./、../、sub/...）才补偿：bprm->filename 是用户传的原始串，
     //   绝对路径时它已是全路径；相对路径用已解析的 dentry 反推全路径。
