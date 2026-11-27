@@ -276,13 +276,36 @@ static __always_inline int is_protected_pid(__u32 tgid) {
 
 // ===== LSM Hooks =====
 
+// 受保护 PID 只放行"默认动作无害"的信号，其余一律拦截。
+//
+// 只拦 9/15/19 是可绕过的：kill -HUP(1)/-INT(2)/-QUIT(3)/-ABRT(6)/-SEGV(11)/
+// -USR1(10)/-USR2(12)/-ALRM(14) 以及实时信号(34~64) 的默认动作都是终止进程，
+// -TSTP(20)/-TTIN(21)/-TTOU(22) 则会把进程停住，效果同样等于自保失效。
+// 注意：终端里 Ctrl+C 不受影响。tty 驱动投递的 SIGINT 是 SI_KERNEL 信号，
+// 内核 check_kill_permission() 对 !si_fromuser() 直接放行、根本不会调用
+// security_task_kill；只有用户态进程 kill(2)/tgkill(2)/pidfd_send_signal()
+// 发的 SI_USER/SI_TKILL 信号才会走到这里。前台运行时 Ctrl+C 仍按原路径退出。
+//
+// 白名单只留"任何情况下都不可能让进程终止或停止"的信号：
+// 不依赖用户态的 signal disposition（例如 SIGPIPE 虽然被 SIG_IGN，也照样拦），
+// 这样即使以后有人改了 handler 配置，自保也不会被意外打穿。
+static __always_inline int signal_allowed(int sig) {
+    switch (sig) {
+        case 0:  return 1;  // kill -0：只做存在性/权限检查，不投递
+        case 17: return 1;  // SIGCHLD
+        case 18: return 1;  // SIGCONT
+        case 23: return 1;  // SIGURG
+        case 28: return 1;  // SIGWINCH
+        case 29: return 1;  // SIGIO
+        default: return 0;
+    }
+}
+
 // Protect agent and designated processes from being killed by external processes.
-// Signals 9 (SIGKILL), 15 (SIGTERM), 19 (SIGSTOP) are blocked for protected PIDs
-// unless the sender is the agent process itself.
 SEC("lsm/task_kill")
 int BPF_PROG(enforce_task_kill, struct task_struct *p, struct kernel_siginfo *info, int sig, const struct cred *cred) {
-    // Only block destructive signals
-    if (sig != 9 && sig != 15 && sig != 19) {
+    // 无害信号直接放行（含 kill -0 探测）
+    if (signal_allowed(sig)) {
         return 0;
     }
 
