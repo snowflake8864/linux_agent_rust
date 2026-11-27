@@ -173,6 +173,8 @@ async fn main() -> std::io::Result<()> {
     CustomLogger::init("/opt/osec/osec_backend.conf")
         .await
         .expect("无法初始化日志");
+    // panic 默认只写 stderr；daemon 化后 stderr 指向已关闭的 pty，panic 会彻底静默
+    install_panic_hook();
     // 忽略 SIGPIPE 信号
     unsafe {
         let mut sa: sigaction = std::mem::zeroed();
@@ -718,6 +720,17 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
+    // 关键后台任务守护：这些任务一旦 panic 或提前返回，进程就变成
+    // "还活着但不拉任务、不上报、自保也关不掉"的半死状态，外部完全看不出来。
+    // 统一交给 watchdog：任一任务结束 = 业务链已断 -> 清理后退出，由 systemd/osecmonitor 拉起。
+    spawn_critical_watchdog(vec![
+        ("start_services(online)", start_services_handle),
+        ("task_fetcher", task_fetcher_handle),
+        ("log_services", log_services_handler),
+        ("auto_process", auto_process_handle),
+        ("timer_task", timer_task_handle),
+    ]);
+
     let event_handler = Arc::new(Mutex::new(EventHandler::new()));
     let event_handler_send = Arc::clone(&event_handler);
     let mut task_kernel_rcv_handler = None;
@@ -854,6 +867,71 @@ async fn main() -> std::io::Result<()> {
      std::process::exit(0);
     //Ok(())
 
+}
+
+/// 安装 panic hook：把 panic 的线程名、位置、内容写进 backend.log。
+///
+/// Rust 的 panic 默认只写 stderr，而 agent 常以前台/daemon 方式长期运行，
+/// stderr 一旦丢失，panic 就完全静默 —— 现场只能看到"日志写到一半没了"。
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = info.payload();
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<非字符串 panic payload>".to_string());
+        logging::log_error!(
+            "[panic] 线程='{}' 位置={} 内容={}",
+            std::thread::current().name().unwrap_or("<unnamed>"),
+            location,
+            msg
+        );
+        // 保留默认行为：RUST_BACKTRACE=1 时仍能拿到栈
+        default_hook(info);
+    }));
+}
+
+/// 关键后台任务 watchdog。
+///
+/// 这些任务都是裸 `tokio::spawn`，panic 只结束那一个任务，进程本身继续运行，
+/// 于是出现"自保还开着 + 不拉任务 + 后门失效"的半死状态（见 2026-11-26 现场分析）。
+/// 这里轮询 JoinHandle，任一任务结束就当作致命错误：打印原因、走与正常退出相同的
+/// 清理路径（卸载 XDP/TC，避免 filter 残留拦流量），然后 exit(1)。
+fn spawn_critical_watchdog(
+    mut tasks: Vec<(&'static str, tokio::task::JoinHandle<std::io::Result<String>>)>,
+) {
+    tokio::spawn(async move {
+        loop {
+            if let Some(pos) = tasks.iter().position(|(_, h)| h.is_finished()) {
+                let (name, handle) = tasks.swap_remove(pos);
+                let reason = match handle.await {
+                    Ok(Ok(_)) => "任务正常返回，业务链已断".to_string(),
+                    Ok(Err(e)) => format!("任务返回错误: {}", e),
+                    Err(e) if e.is_panic() => format!("任务 panic: {}", e),
+                    Err(e) => format!("任务被取消: {}", e),
+                };
+                logging::log_error!("[watchdog] 关键任务 {} 已结束（{}）", name, reason);
+                logging::log_error!("[watchdog] 进程无法继续提供服务，执行清理后退出");
+                if let Some(b) = common::backend::get_backend() {
+                    b.shutdown();
+                }
+                if let Err(e) = unload_driver() {
+                    logging::log_error!("[watchdog] 卸载驱动失败: {}", e);
+                }
+                // 给日志一点 flush 时间
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                logging::log_error!("[watchdog] 退出，交由 systemd/osecmonitor 重新拉起");
+                std::process::exit(1);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        }
+    });
 }
 
 async fn shutdown_signal() {
